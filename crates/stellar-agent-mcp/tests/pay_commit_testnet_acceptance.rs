@@ -1,8 +1,7 @@
 //! Testnet acceptance: the approval-gated payment commit completes on-chain.
 //!
-//! Closes the end-to-end gap noted in
-//! `toolset_sign_payment_gated_testnet_acceptance.rs`: a payment the policy engine
-//! gates with `RequireApproval` is simulated, approved, then committed and
+//! A payment the policy engine gates with `RequireApproval` is simulated,
+//! approved, then committed and
 //! submitted to the live testnet ledger. The operator's `approve` step surfaces
 //! the HMAC attestation blob the commit requires; this test recomputes that blob
 //! exactly as `approve` does and presents it to the commit.
@@ -60,6 +59,8 @@ use stellar_agent_network::{StellarRpcClient, fetch_account};
 use stellar_agent_test_support::keyring_mock;
 use tempfile::TempDir;
 use zeroize::Zeroizing;
+
+mod common;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -229,6 +230,12 @@ fn seed_keyring(profile: &Profile, seed: &Zeroizing<[u8; 32]>, attestation_key: 
 #[tokio::test]
 #[serial]
 async fn pay_with_approval_commits_and_submits_on_testnet() {
+    common::payment_matrix::run(
+        common::payment_matrix::Route::Direct,
+        "pay_with_approval_commits_and_submits_on_testnet",
+        false,
+    )
+    .await;
     let storage_sandbox =
         stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
     let _storage_home =
@@ -454,6 +461,12 @@ fn per_tx_cap_document(tools: &[&str]) -> PolicyDocument {
 #[tokio::test]
 #[serial]
 async fn pay_v1_engine_commit_records_matching_leg_content_on_testnet() {
+    common::payment_matrix::run(
+        common::payment_matrix::Route::Direct,
+        "pay_v1_engine_commit_records_matching_leg_content_on_testnet",
+        false,
+    )
+    .await;
     let storage_sandbox =
         stellar_agent_test_support::sandbox::StateSandbox::new().expect("storage sandbox");
     let _storage_home =
@@ -653,6 +666,12 @@ fn per_period_cap_document(tools: &[&str], window: &str, cap_stroops: i128) -> P
 #[tokio::test]
 #[serial]
 async fn pay_v1_per_period_cap_second_payment_denied_by_persisted_window_on_testnet() {
+    common::payment_matrix::run(
+        common::payment_matrix::Route::Alternating,
+        "pay_v1_per_period_cap_second_payment_denied_by_persisted_window_on_testnet",
+        false,
+    )
+    .await;
     keyring_mock::install().expect("mock keyring store init");
 
     let home_dir = stellar_agent_test_support::sandbox::StateSandbox::new().expect("tempdir");

@@ -3,6 +3,7 @@ fn total_plan(sequence: i64, entries: &[WindowEntry]) -> crate::SignedIntentPlan
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn intent_total_admission_sweeps_expired_unclaimed_hold() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -38,6 +39,7 @@ fn intent_total_admission_sweeps_expired_unclaimed_hold() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn intent_total_recorder_routes() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -65,6 +67,7 @@ async fn intent_total_recorder_routes() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn intent_total_two_process_stale_admission() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -184,6 +187,7 @@ fn intent_total_two_process_stale_admission() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn intent_total_linked_rows_never_own_the_charge() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -248,7 +252,10 @@ fn intent_total_linked_rows_never_own_the_charge() {
             Err(WindowStoreError::DuplicateReservation)
         ));
         assert_eq!(f.sum(D1), 6);
-        assert_eq!(f.store.total_usage(&f.profile, D1).unwrap(), native_usage(6));
+        assert_eq!(
+            f.store.total_usage(&f.profile, D1).unwrap(),
+            native_usage(6)
+        );
         assert_eq!(f.hydrated(D1), 6);
         if mixed {
             let memory = PolicyStateStore::new();
@@ -267,7 +274,10 @@ fn intent_total_linked_rows_never_own_the_charge() {
         f.clock.set(T + 1001 + RETENTION_MS);
         f.authorized(&[f.windowed(1)]).unwrap();
         assert_eq!(f.sum(D1), 6);
-        assert_eq!(f.store.total_usage(&f.profile, D1).unwrap(), native_usage(6));
+        assert_eq!(
+            f.store.total_usage(&f.profile, D1).unwrap(),
+            native_usage(6)
+        );
         assert_eq!(f.hydrated(D1), 6);
         assert!(f.wire().signed_intents.is_empty());
         assert_eq!(f.wire().total_sums[0].amount, 6);
@@ -321,6 +331,7 @@ fn alias_total(f: &Fx, amount: i128) -> WindowEntry {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn intent_total_alias_batch() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -351,6 +362,7 @@ fn intent_total_alias_batch() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn intent_total_zero_and_mixed_duration() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -373,6 +385,7 @@ fn intent_total_zero_and_mixed_duration() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn intent_total_non_total_epoch_preflight() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -396,6 +409,7 @@ fn intent_total_non_total_epoch_preflight() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn intent_total_negative_and_overflow() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -441,6 +455,7 @@ fn intent_total_negative_and_overflow() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn intent_total_replay_epoch_and_multiset() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -469,6 +484,7 @@ fn intent_total_replay_epoch_and_multiset() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn intent_total_original_cancellation() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -491,6 +507,7 @@ fn intent_total_original_cancellation() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn intent_total_replay_invalidates_cancellation() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -555,6 +572,7 @@ fn total_closure_witness(plan: &crate::SignedIntentPlan) -> LedgerWitnessCapabil
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn intent_total_closure_collection_and_reset() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -643,6 +661,7 @@ fn intent_total_closure_collection_and_reset() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn intent_total_collection_overflow_and_timestamp() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -698,6 +717,7 @@ fn intent_total_collection_overflow_and_timestamp() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn intent_total_collection_merges_existing_alias() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -730,6 +750,7 @@ fn intent_total_collection_merges_existing_alias() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn intent_total_replay_checks_pin_and_retirement() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -765,6 +786,7 @@ fn intent_total_replay_checks_pin_and_retirement() {
 /// no longer pinned, writes nothing, and leaves the intent unbound. The same
 /// legs bind once the pin names their digest again.
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn intent_total_bind_checks_the_pin() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -897,6 +919,7 @@ intent_corruption_test!(intent_total_unknown_epoch, "unknown_epoch");
 intent_corruption_test!(intent_total_old_version, "old_version");
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn intent_total_old_non_total_lifecycle() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -962,6 +985,7 @@ fn intent_total_old_non_total_lifecycle() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn intent_total_commit_boundaries() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1027,6 +1051,7 @@ fn intent_total_commit_boundaries() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn intent_total_version_floor_and_reader() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();

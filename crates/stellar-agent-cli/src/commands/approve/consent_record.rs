@@ -294,8 +294,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
     #[serial_test::serial(mainnet_clock)]
+    #[serial_test::serial]
     async fn inbox_precheck_requires_a_real_record_in_both_listeners() {
         for signed in [false, true] {
             let (mut f, _tls) = if signed {
@@ -368,6 +368,7 @@ mod tests {
     /// also commits its verified direct delivery; a compatibility consent
     /// commits none.
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn serve_installs_the_consent_adapter_for_both_listeners() {
         for (signed, published) in [(false, false), (true, false), (false, true), (true, true)] {
@@ -432,6 +433,7 @@ mod tests {
     /// approval prepared before records existed: it attests and the window
     /// file keeps its bytes.
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn inbox_consent_without_a_record_keeps_todays_path() {
         let f = Fixture::new();
@@ -458,6 +460,7 @@ mod tests {
     /// The consent commit runs after the inbox store is released: inside the
     /// window commit, another handle opens the inbox store.
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn consent_paths_hold_no_inbox_lock_across_the_window_commit() {
         let f = Fixture::new();
@@ -482,6 +485,7 @@ mod tests {
     /// approve completes the consent from the stored receipt as `recovered`,
     /// writes no second row, and keeps its refusal.
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn a_crashed_consent_commit_recovers_without_a_second_row() {
         let f = Fixture::new();
@@ -527,6 +531,7 @@ mod tests {
     /// the lock itself at that moment, so the completion's commit finds both
     /// released.
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn consent_requests_no_window_lock_while_the_inbox_is_held() {
         for published in [true, false] {
@@ -622,6 +627,7 @@ mod tests {
     /// attests and commits one consent; the two rows name the same nonce.
     /// A published consent behaves the same and commits its direct delivery.
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn a_crash_after_the_row_approves_again_with_one_consent() {
         for published in [false, true] {
@@ -670,6 +676,7 @@ mod tests {
     /// attested entry. The stored page recovers the consent from the stored
     /// receipt once; a second page writes nothing and no route writes a row.
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn a_crash_after_the_attestation_recovers_once() {
         let f = Fixture::new();
@@ -697,6 +704,7 @@ mod tests {
     /// The inbox's own consent is a compatibility consent and stores no
     /// publication handoff, while its recording commits consent.
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn an_inbox_consent_stores_no_publication_handoff() {
         let f = Fixture::new();
@@ -717,6 +725,7 @@ mod tests {
     /// approve and the stored page complete the consent as `recovered`
     /// without delivery facts, and leave the inbox file's bytes unchanged.
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn inbox_recovery_keeps_a_stored_publication_handoff() {
         let f = Fixture::new();
@@ -759,6 +768,7 @@ mod tests {
     /// the approve reports no attestation. A repeated approve changes nothing
     /// and keeps its refusal.
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn a_crash_after_the_commit_keeps_one_consent() {
         let f = Fixture::new();
@@ -789,6 +799,7 @@ mod tests {
     /// under the later one the record reads expired and no mint admits it.
     /// Neither writes a row.
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn a_restart_clock_neither_revives_nor_releases_early() {
         for later in [false, true] {
@@ -825,6 +836,7 @@ mod tests {
     /// Two stored pages served at once both recover the same consent: one
     /// consent, both pages show the blob, and no row is written.
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn competing_recoveries_record_one_consent() {
         let f = Fixture::new();
@@ -850,6 +862,7 @@ mod tests {
     /// the record keeps every lifecycle path, a revocation lookup and a no-op
     /// repeat, while its mint refuses as revoked.
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn an_unusable_record_hides_the_blob_and_keeps_its_lifecycle() {
         let f = Fixture::new();
@@ -888,8 +901,8 @@ mod tests {
     /// `routed_admission_refuses_pins_and_orphans` pins. The missing record
     /// is `inbox_precheck_requires_a_real_record_in_both_listeners`.
     #[tokio::test]
-    #[serial_test::serial]
     #[serial_test::serial(mainnet_clock)]
+    #[serial_test::serial]
     async fn inbox_challenge_requires_reservation_in_both_listeners() {
         for signed in [false, true] {
             for mode in ["inventory", "capacity", "reserved"] {

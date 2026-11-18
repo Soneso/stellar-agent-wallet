@@ -171,6 +171,11 @@ impl<'a> StageMarkedRecorder<'a> {
     pub fn take_committed(&self) -> CommittedBatch {
         self.inner.take_committed()
     }
+
+    /// See [`WalletSubmissionRecorder::complete_owed_approval`].
+    pub fn complete_owed_approval(&self) {
+        self.inner.complete_owed_approval();
+    }
 }
 
 impl std::fmt::Debug for StageMarkedRecorder<'_> {
@@ -1338,6 +1343,7 @@ mod tests {
     /// `NotSent`.
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn reconcile_pass_runs_expire_due() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1435,6 +1441,7 @@ mod tests {
     /// the caller's batch.
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn flow_batches_keep_expiry_edges() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1622,6 +1629,7 @@ mod tests {
 
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn stage_marked_recorder_marks_only_the_authorized_pre_send() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();

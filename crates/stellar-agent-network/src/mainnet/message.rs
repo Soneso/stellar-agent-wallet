@@ -394,6 +394,7 @@ mod tests {
 
     #[cfg(feature = "mainnet-write")]
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn the_challenge_of_the_receipt_passes() {
         assert_eq!(challenge_case("accept"), Ok(()));
@@ -460,6 +461,7 @@ mod tests {
     /// domain; no key, no digest and no other bound fact.
     #[cfg(feature = "mainnet-write")]
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn the_receipt_prints_no_key_and_no_digest() {
         use super::super::fixtures::{MESSAGE_HOME_DOMAIN, message_facts, x402_fixture, x402_root};

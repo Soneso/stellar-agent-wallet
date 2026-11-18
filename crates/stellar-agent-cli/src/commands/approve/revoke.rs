@@ -669,6 +669,7 @@ pub(super) mod tests {
                     expires_at_ms: u64::MAX,
                 },
                 chain_deadline_ms: None,
+                restriction_end_ms: None,
                 authorization_ttl_ms: 1,
                 bindings: BindingFacts {
                     endpoint: None,
@@ -679,6 +680,7 @@ pub(super) mod tests {
                     reservation: None,
                     authority: [7; 32],
                     audit: [8; 32],
+                    restriction: None,
                 },
                 holds: vec![stellar_agent_core::policy::v1::criteria::state_store::WindowEntry::new(
                     stellar_agent_core::policy::v1::criteria::state_store::StateKey::new(self.core.name(), 1, "native", 86_400),
@@ -748,6 +750,7 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn revocation_cli_selects_the_profile_and_record() {
         // A profile name of its own keeps earlier audit keys out of this test.
@@ -830,6 +833,7 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn cli_revocation_persists_through_the_facade() {
         let f = Fixture::new();
@@ -1017,6 +1021,7 @@ pub(super) mod tests {
     }
 
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn revocation_audit_single_call_order_and_failures() {
         for (consented, scenario) in [false, true].into_iter().flat_map(|consented| {
@@ -1102,6 +1107,7 @@ pub(super) mod tests {
     }
 
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn revocation_surfaces_preserve_windows_and_noops() {
         for state in ["pending", "consented", "consumed"] {
@@ -1163,6 +1169,7 @@ pub(super) mod tests {
     }
 
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn surface_revocation_blocks_first_mint_and_remint() {
         for carrier in [false, true] {
@@ -1262,6 +1269,7 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn revocation_survives_restart_and_inbox_collection() {
         // A profile name of its own keeps earlier audit keys out of this test.
@@ -1441,6 +1449,7 @@ pub(super) mod tests {
     }
 
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn consumed_revocation_enforces_the_selected_authority() {
         use stellar_agent_approval_ui::decision::{
@@ -1591,6 +1600,7 @@ pub(super) mod tests {
     }
 
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn revocation_entry_and_profile_binding_refuse_before_lookup() {
         use stellar_agent_approval_ui::decision::{
@@ -1659,6 +1669,7 @@ pub(super) mod tests {
     }
 
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn inbox_revocation_without_listener_persists_through_the_facade() {
         use stellar_agent_approval_ui::decision::{
@@ -1949,6 +1960,7 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn inbox_revocation_persists_through_the_facade() {
         use stellar_agent_core::approval::mainnet_fixtures::SIGNED_ORIGIN;
@@ -2047,6 +2059,7 @@ pub(super) mod tests {
     /// the counter, the session, the pending store and the durable record
     /// stay byte-identical, and the same body then revokes.
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn a_busy_revocation_changes_nothing_and_retries() {
         use stellar_agent_core::approval::mainnet_fixtures::SIGNED_RP_ID;
@@ -2110,6 +2123,7 @@ pub(super) mod tests {
     /// take it. When it takes the lock after the response, the durable
     /// record is already revoked.
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn a_writer_waits_for_the_durable_revocation() {
         use std::sync::mpsc;
@@ -2162,6 +2176,7 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn revocation_control_matches_record_eligibility() {
         for signed in [false, true] {
@@ -2213,6 +2228,7 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn revocation_authentication_matrix() {
         for signed in [false, true] {
@@ -2321,6 +2337,7 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn signed_revocation_keeps_origin_policy_and_counter_checks() {
         use stellar_agent_core::approval::mainnet_fixtures::SIGNED_RP_ID;
@@ -2465,6 +2482,7 @@ pub(super) mod tests {
     /// The ceremony prints through `eprintln!` with no capturable writer;
     /// `cli/tests/cli/mainnet_presence.rs:753` guards the printed line.
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn revocation_link_formatter_and_served_location_use_the_signed_origin() {
         let (f, _files) = signed_fixture();
@@ -2501,6 +2519,7 @@ pub(super) mod tests {
     }
 
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn revocation_status_is_revoked_and_read_only() {
         let f = Fixture::new();
@@ -2519,6 +2538,7 @@ pub(super) mod tests {
     }
 
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn revocation_results_expose_no_consent_payload() {
         let mut f = Fixture::new();

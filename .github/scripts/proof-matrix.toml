@@ -620,6 +620,7 @@ rows = ["cli.pay"]
 tests = [
   { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "commands::submission_record::tests::payment_recorder_hashes_the_complete_destination_and_debit" },
   { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "commands::pay::tests::mainnet_full::every_payment_recorder_hashes_the_complete_destination", builds = "feature-on" },
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "commands::pay::tests::mainnet_full::pay_results_carry_the_complete_destination_on_mainnet", builds = "feature-on" },
   { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "commands::submission_record::tests::the_mainnet_recorder_hashes_the_complete_destination", builds = "feature-on" },
 ]
 
@@ -692,10 +693,10 @@ claim = "sizing.reserve_refuses"
 rows = ["mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.trustline", "cli.accounts_create"]
 pending = "row-test"
 
-# Cells: the sizing claims a later change delivers.
 # Classified hold composition has API and atomic-mint proofs in
-# policy_state::ledger::tests::composed. Public handlers currently supply one
-# evaluation, so these proofs do not close the pending tool-row cells.
+# policy_state::ledger::tests::composed, and the restricted resolver has
+# proofs in mainnet::restriction::tests. Tool-row cells additionally require
+# the public dispatcher proofs for that route.
 
 [[cell]]
 claim = "sizing.paired_frame"
@@ -943,3 +944,711 @@ tests = [
 claim = "remote.consent_at_signed_origin"
 rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
 pending = "row-test"
+
+# Verified toolset payment adapters.
+
+[[claim]]
+id = "sizing.toolset_memo_and_base_reads"
+family = "sizing"
+statement = "Both public payment boundaries preserve typed base-account read failures, the SEP-29 muxed exception, and explicit memo-policy requirements for native and issued assets."
+applies = ["prepare", "commit"]
+builds = "feature-on"
+
+[[cell]]
+claim = "sizing.toolset_memo_and_base_reads"
+rows = ["mcp.toolset_pay", "mcp.toolset_pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "muxed_destination_integration::public_toolset_destination_read_failures_keep_their_codes_at_both_boundaries", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "muxed_destination_integration::public_toolset_sep29_uses_the_full_destination_for_native_and_issued", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_toolset_memo_policy_applies_to_every_destination_and_asset", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "sizing.toolset_memo_and_base_reads"
+rows = ["mcp.pay", "mcp.pay_commit", "mcp.create_account", "mcp.create_account_commit", "mcp.claim", "mcp.claim_commit", "mcp.trustline", "mcp.trustline_commit"]
+not_applicable = "This claim covers the verified toolset payment adapters."
+
+[[row]]
+id = "mcp.toolset_pay"
+surface = "mcp"
+name = "stellar_toolset_invoke/stellar_pay"
+phase = "prepare"
+source = "crates/stellar-agent-mcp/src/tools/toolsets.rs"
+
+[[row]]
+id = "mcp.toolset_pay_commit"
+surface = "mcp"
+name = "stellar_toolset_invoke/stellar_pay_commit"
+phase = "commit"
+source = "crates/stellar-agent-mcp/src/tools/toolsets.rs"
+
+[[cell]]
+claim = "approval.required_blocks_commit"
+rows = ["mcp.toolset_pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "approval_cap_integration::toolset_policy_consent_keeps_effects_and_reservation" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_commit_is_unattended_or_queues_before_nonce_use", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "approval.single_use"
+rows = ["mcp.toolset_pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "approval_cap_integration::payment_recovery_public_terminal_statuses_survive_restart" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::simultaneous_public_proofs_have_one_payment_effect", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "approval.mainnet_presence"
+rows = ["mcp.toolset_pay_commit"]
+pending = "row-test"
+
+[[cell]]
+claim = "approval.follows_decision"
+rows = ["mcp.toolset_pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_commit_is_unattended_or_queues_before_nonce_use", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "approval.durable"
+rows = ["mcp.toolset_pay_commit"]
+pending = "row-test"
+
+[[cell]]
+claim = "approval.binds_intent"
+rows = ["mcp.toolset_pay_commit"]
+pending = "row-test"
+
+[[cell]]
+claim = "approval.rebuild_from_intent"
+rows = ["mcp.toolset_pay_commit"]
+pending = "row-test"
+
+[[cell]]
+claim = "sizing.caps_refuse"
+rows = ["mcp.toolset_pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "toolset_sign_payment_gated_integration::outer_cap_uses_envelope_and_missing_envelope_keeps_raw_gate" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_outer_cap_uses_payment_value_at_both_boundaries", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_composed_cap_debits_once_and_preserves_exact_headroom", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "sizing.paired_frame"
+rows = ["mcp.toolset_pay"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_toolset_pairs_share_one_frame_and_leave_direct_calls_independent", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "sizing.paired_frame"
+rows = ["mcp.toolset_pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_toolset_pairs_share_one_frame_and_leave_direct_calls_independent", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "sizing.reserve_refuses"
+rows = ["mcp.toolset_pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "toolset_sign_payment_gated_integration::payment_outer_gate_defers_reserve_check" },
+]
+
+[[cell]]
+claim = "sizing.accounting_inputs"
+rows = ["mcp.toolset_pay_commit"]
+pending = "row-test"
+
+[[cell]]
+claim = "sizing.hold_follows_evidence"
+rows = ["mcp.toolset_pay_commit"]
+pending = "row-test"
+
+[[cell]]
+claim = "audit.writer_before_signer"
+rows = ["mcp.toolset_pay_commit"]
+pending = "row-test"
+
+[[cell]]
+claim = "audit.outcome_row"
+rows = ["mcp.toolset_pay_commit"]
+pending = "row-test"
+
+[[cell]]
+claim = "audit.outbox_at_shutdown"
+rows = ["mcp.toolset_pay_commit"]
+pending = "row-test"
+
+[[cell]]
+claim = "halt.refuses_first"
+rows = ["mcp.toolset_pay"]
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "halt_integration::every_tool_that_is_not_read_only_refuses_while_halted_without_signer_or_rpc" },
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "halt_integration::read_only_tools_and_the_profile_resource_answer_while_halted" },
+]
+
+[[cell]]
+claim = "halt.refuses_first"
+rows = ["mcp.toolset_pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "halt_integration::every_tool_that_is_not_read_only_refuses_while_halted_without_signer_or_rpc" },
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "halt_integration::read_only_tools_and_the_profile_resource_answer_while_halted" },
+]
+
+[[cell]]
+claim = "feature.off_build_refuses_mainnet"
+rows = ["mcp.toolset_pay"]
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "toolset_sign_payment_gated_integration::mainnet_sign_payment_refuses_at_entry", builds = "feature-off" },
+]
+
+[[cell]]
+claim = "feature.off_build_refuses_mainnet"
+rows = ["mcp.toolset_pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "toolset_sign_payment_gated_integration::mainnet_sign_payment_refuses_at_entry", builds = "feature-off" },
+]
+
+[[cell]]
+claim = "feature.on_build_needs_signed_policy"
+rows = ["mcp.toolset_pay"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::exact_payment_actions_require_complete_mainnet_context", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "feature.on_build_needs_signed_policy"
+rows = ["mcp.toolset_pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::exact_payment_actions_require_complete_mainnet_context", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "status.transaction_reconciles"
+rows = ["mcp.toolset_pay_commit"]
+pending = "row-test"
+
+[[cell]]
+claim = "status.operation_view"
+rows = ["mcp.toolset_pay_commit"]
+pending = "row-test"
+
+[[cell]]
+claim = "status.approval_view"
+rows = ["mcp.toolset_pay_commit"]
+pending = "row-test"
+
+[[cell]]
+claim = "status.retry_returns_stored"
+rows = ["mcp.toolset_pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::common::tests::mainnet::payment_process_recovery_and_replay", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "notification.committed_transition"
+rows = ["mcp.toolset_pay_commit"]
+pending = "row-test"
+
+[[cell]]
+claim = "revocation.refuses_commit"
+rows = ["mcp.toolset_pay_commit"]
+pending = "row-test"
+
+[[cell]]
+claim = "remote.refused_without_signed_origin"
+rows = ["mcp.toolset_pay_commit"]
+pending = "row-test"
+
+[[cell]]
+claim = "remote.consent_at_signed_origin"
+rows = ["mcp.toolset_pay_commit"]
+pending = "row-test"
+
+[[cell]]
+claim = "approval.payment_envelope_facts"
+rows = ["mcp.toolset_pay"]
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "approval_cap_integration::payment_approval_facts_come_from_the_retained_envelope" },
+]
+
+[[cell]]
+claim = "approval.payment_captured_end"
+rows = ["mcp.toolset_pay"]
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "approval_cap_integration::payment_approval_delay_keeps_the_captured_end" },
+]
+
+[[cell]]
+claim = "approval.payment_authority_end"
+rows = ["mcp.toolset_pay_commit"]
+pending = "row-test"
+
+[[cell]]
+claim = "approval.payment_recovery"
+rows = ["mcp.toolset_pay"]
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "approval_cap_integration::payment_recovery_public_terminal_statuses_survive_restart" },
+  { package = "stellar-agent-core", target = "lib", name = "approval::store::recovery::tests::payment_recovery_process_exit_preserves_atomic_pair" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::common::tests::mainnet::payment_process_recovery_and_replay", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "approval.payment_settlement_refusal"
+rows = ["mcp.toolset_pay"]
+pending = "row-test"
+
+[[cell]]
+claim = "audit.payment_destination"
+rows = ["mcp.toolset_pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "approval_cap_integration::every_payment_recorder_hashes_the_complete_destination" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::granted_mainnet_payment_preserves_six_complete_destinations", builds = "feature-on" },
+]
+
+[[claim]]
+id = "sizing.toolset_signed_minimums"
+family = "sizing"
+statement = "The exact outer payment rule loads through the signed minimum validator without changing preset targets."
+applies = ["prepare", "commit"]
+builds = "feature-on"
+
+[[cell]]
+claim = "sizing.toolset_signed_minimums"
+rows = ["mcp.toolset_pay", "mcp.toolset_pay_commit"]
+tests = [
+  { package = "stellar-agent-core", target = "test:core", name = "policy_v2::signed_toolset_payment_rule_loads_with_payment_minimums", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::toolset_preparation_composes_before_exposure", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "sizing.toolset_signed_minimums"
+rows = ["mcp.pay", "mcp.pay_commit", "mcp.create_account", "mcp.create_account_commit", "mcp.claim", "mcp.claim_commit", "mcp.trustline", "mcp.trustline_commit"]
+not_applicable = "This claim covers the verified toolset payment adapters."
+
+[[claim]]
+id = "feature.toolset_exact_payment_context"
+family = "feature-matrix"
+statement = "Only the exact payment pair enters an enabled mainnet toolset route; incomplete context refuses before payment work."
+applies = ["prepare", "commit"]
+builds = "feature-on"
+
+[[cell]]
+claim = "feature.toolset_exact_payment_context"
+rows = ["mcp.toolset_pay", "mcp.toolset_pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::exact_payment_actions_require_complete_mainnet_context", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "feature.toolset_exact_payment_context"
+rows = ["mcp.pay", "mcp.pay_commit", "mcp.create_account", "mcp.create_account_commit", "mcp.claim", "mcp.claim_commit", "mcp.trustline", "mcp.trustline_commit"]
+not_applicable = "This claim covers the verified toolset payment adapters."
+
+[[claim]]
+id = "approval.toolset_preparation"
+family = "approval"
+statement = "Propose-only preparation composes the outer policy before approval or nonce exposure and signs nothing."
+applies = ["prepare"]
+builds = "feature-on"
+
+[[cell]]
+claim = "approval.toolset_preparation"
+rows = ["mcp.toolset_pay"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::toolset_preparation_composes_before_exposure", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "approval.toolset_preparation"
+rows = ["mcp.pay", "mcp.create_account", "mcp.claim", "mcp.trustline"]
+not_applicable = "This claim covers the verified toolset payment adapters."
+
+[[claim]]
+id = "approval.toolset_verified_commit"
+family = "approval"
+statement = "The public granted commit preserves the composed approval requirement before nonce use and permits an unattended Allow."
+applies = ["commit"]
+builds = "feature-on"
+
+[[cell]]
+claim = "approval.toolset_verified_commit"
+rows = ["mcp.toolset_pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_commit_is_unattended_or_queues_before_nonce_use", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "approval.toolset_verified_commit"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit"]
+not_applicable = "This claim covers the verified toolset payment adapters."
+
+[[claim]]
+id = "sizing.toolset_authoritative_caps"
+family = "sizing"
+statement = "Both public payment actions evaluate an outer-only cap against the decoded payment amount."
+applies = ["prepare", "commit"]
+builds = "feature-on"
+
+[[cell]]
+claim = "sizing.toolset_authoritative_caps"
+rows = ["mcp.toolset_pay", "mcp.toolset_pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_outer_cap_uses_payment_value_at_both_boundaries", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_outer_reserve_uses_authoritative_fee_for_native_and_issued", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "sizing.toolset_authoritative_caps"
+rows = ["mcp.pay", "mcp.pay_commit", "mcp.create_account", "mcp.create_account_commit", "mcp.claim", "mcp.claim_commit", "mcp.trustline", "mcp.trustline_commit"]
+not_applicable = "This claim covers the verified toolset payment adapters."
+
+[[claim]]
+id = "approval.toolset_exact_muxed_grant"
+family = "approval"
+statement = "An exact M grant permits its full ID and requires first-invoke consent for a different ID."
+applies = ["commit"]
+builds = "feature-on"
+
+[[cell]]
+claim = "approval.toolset_exact_muxed_grant"
+rows = ["mcp.toolset_pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::exact_muxed_mainnet_grant_preserves_its_id", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "approval.toolset_exact_muxed_grant"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit"]
+not_applicable = "This claim covers the verified toolset payment adapters."
+
+[[claim]]
+id = "approval.toolset_route_free_lifetime"
+family = "approval"
+statement = "Public route changes reuse consent without renewing the earlier governing end; simultaneous verified proofs have one payment effect."
+applies = ["commit"]
+builds = "feature-on"
+
+[[cell]]
+claim = "approval.toolset_route_free_lifetime"
+rows = ["mcp.toolset_pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::signed_policy_composition_reuses_consent_across_public_routes", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::simultaneous_public_proofs_have_one_payment_effect", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_mainnet_terminal_consent_survives_restart_and_clock_rollback", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "approval.toolset_route_free_lifetime"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit"]
+not_applicable = "This claim covers the verified toolset payment adapters."
+
+[[claim]]
+id = "sizing.toolset_one_debit"
+family = "sizing"
+statement = "Composed payment accounting retains tighter headroom and the outer unlisted classification with one debit per complete key."
+applies = ["commit"]
+builds = "feature-on"
+
+[[cell]]
+claim = "sizing.toolset_one_debit"
+rows = ["mcp.toolset_pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_composed_cap_debits_once_and_preserves_exact_headroom", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_outer_unlisted_classification_controls_threshold_and_holds", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_classic_payments_share_contract_named_accounting_in_both_route_orders", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_composed_rate_counts_once_across_routes_and_restart", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_composed_total_epoch_survives_aging_reset_and_restart", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::process::public_stale_process_gate_cannot_overwrite_a_competing_payment", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "sizing.toolset_one_debit"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit"]
+not_applicable = "This claim covers the verified toolset payment adapters."
+
+[[claim]]
+id = "revocation.toolset_lease"
+family = "revocation"
+statement = "Child-process writers refuse while the payment lease is held, succeed after return or process exit, and the public busy refusal writes nothing."
+applies = ["commit"]
+builds = "feature-on"
+
+[[cell]]
+claim = "revocation.toolset_lease"
+rows = ["mcp.toolset_pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "toolset_payment_context::lease_holds_toolset_writers_off_until_submission_returns", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "toolset_payment_context::public_payment_reports_coordination_busy_without_writing", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_grant_replacement_after_proof_requires_fresh_resolution", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "revocation.toolset_lease"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit"]
+not_applicable = "This claim covers the verified toolset payment adapters."
+
+[[claim]]
+id = "status.toolset_process_retry"
+family = "status"
+statement = "Fresh process retries in both route directions retain the original operation, consent and destination after response loss with one send."
+applies = ["commit"]
+builds = "feature-on"
+
+[[cell]]
+claim = "status.toolset_process_retry"
+rows = ["mcp.toolset_pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::common::tests::mainnet::payment_process_recovery_and_replay", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::process::public_noninclusion_after_restart_releases_only_the_original_payment", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_toolset_tombstone_replay_is_status_only", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "status.toolset_process_retry"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit"]
+not_applicable = "This claim covers the verified toolset payment adapters."
+
+[[claim]]
+id = "audit.toolset_six_destinations"
+family = "audit"
+statement = "Granted native and issued payments to G, M0 and Mmax retain exact sent terms, audit hashes and receipt destinations."
+applies = ["commit"]
+builds = "feature-on"
+
+[[cell]]
+claim = "audit.toolset_six_destinations"
+rows = ["mcp.toolset_pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::granted_mainnet_payment_preserves_six_complete_destinations", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_direct_and_toolset_payment_audit_bodies_match", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "audit.toolset_six_destinations"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit"]
+not_applicable = "This claim covers the verified toolset payment adapters."
+
+[[claim]]
+id = "status.toolset_sequence_crash_write_boundaries"
+family = "status"
+statement = "The admitted toolset payment path preserves crash write boundaries across its applicable disturbance sequence."
+applies = ["commit"]
+builds = "feature-on"
+
+[[cell]]
+claim = "status.toolset_sequence_crash_write_boundaries"
+rows = ["mcp.toolset_pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::process::public_payment_crashes_preserve_recovery_at_every_durable_write", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "status.toolset_sequence_crash_write_boundaries"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit"]
+not_applicable = "This claim covers the admitted toolset payment path."
+
+[[claim]]
+id = "status.toolset_sequence_restart_clock_bounds"
+family = "status"
+statement = "The admitted toolset payment path preserves restart clock bounds across its applicable disturbance sequence."
+applies = ["commit"]
+builds = "feature-on"
+
+[[cell]]
+claim = "status.toolset_sequence_restart_clock_bounds"
+rows = ["mcp.toolset_pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_mainnet_terminal_consent_survives_restart_and_clock_rollback", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::common::tests::mainnet::payment_process_recovery_and_replay", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_composed_total_epoch_survives_aging_reset_and_restart", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "status.toolset_sequence_restart_clock_bounds"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit"]
+not_applicable = "This claim covers the admitted toolset payment path."
+
+[[claim]]
+id = "status.toolset_sequence_process_lock_order"
+family = "status"
+statement = "The admitted toolset payment path preserves process lock order across its applicable disturbance sequence."
+applies = ["commit"]
+builds = "feature-on"
+
+[[cell]]
+claim = "status.toolset_sequence_process_lock_order"
+rows = ["mcp.toolset_pay_commit"]
+pending = "row-test"
+
+[[cell]]
+claim = "status.toolset_sequence_process_lock_order"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit"]
+not_applicable = "This claim covers the admitted toolset payment path."
+
+[[claim]]
+id = "status.toolset_sequence_repeat_without_second_effect"
+family = "status"
+statement = "The admitted toolset payment path preserves repeat without second effect across its applicable disturbance sequence."
+applies = ["commit"]
+builds = "feature-on"
+
+[[cell]]
+claim = "status.toolset_sequence_repeat_without_second_effect"
+rows = ["mcp.toolset_pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::common::tests::mainnet::payment_process_recovery_and_replay", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_commit_is_unattended_or_queues_before_nonce_use", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_toolset_tombstone_replay_is_status_only", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "status.toolset_sequence_repeat_without_second_effect"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit"]
+not_applicable = "This claim covers the admitted toolset payment path."
+
+[[claim]]
+id = "status.toolset_sequence_arithmetic_bounds"
+family = "status"
+statement = "The admitted toolset payment path preserves arithmetic bounds across its applicable disturbance sequence."
+applies = ["commit"]
+builds = "feature-on"
+
+[[cell]]
+claim = "status.toolset_sequence_arithmetic_bounds"
+rows = ["mcp.toolset_pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_amount_boundaries_refuse_before_consent_or_nonce_use", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "approval_cap_integration::payment_approval_delay_keeps_the_captured_end", builds = "feature-on" },
+  { package = "stellar-agent-network", target = "lib", name = "policy_state::store::tests::total_budget::a_row_sum_overflow_refuses", builds = "feature-on" },
+  { package = "stellar-agent-network", target = "lib", name = "policy_state::store::tests::total_budget::a_hold_sum_overflow_refuses", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "status.toolset_sequence_arithmetic_bounds"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit"]
+not_applicable = "This claim covers the admitted toolset payment path."
+
+[[claim]]
+id = "status.toolset_sequence_canonical_identities"
+family = "status"
+statement = "A different full M ID conflicts with the retained business intent before and after send; replay retains the original M destination."
+applies = ["commit"]
+builds = "feature-on"
+
+[[cell]]
+claim = "status.toolset_sequence_canonical_identities"
+rows = ["mcp.toolset_pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_muxed_business_conflict_keeps_the_original_payment", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "status.toolset_sequence_canonical_identities"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit"]
+not_applicable = "This claim covers the admitted toolset payment path."
+
+[[claim]]
+id = "status.toolset_sequence_legacy_lifecycle"
+family = "status"
+statement = "The admitted toolset payment path preserves legacy lifecycle across its applicable disturbance sequence."
+applies = ["commit"]
+builds = "feature-on"
+
+[[cell]]
+claim = "status.toolset_sequence_legacy_lifecycle"
+rows = ["mcp.toolset_pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_grant_schema_and_legacy_lifecycle_preserve_other_payments", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "status.toolset_sequence_legacy_lifecycle"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit"]
+not_applicable = "This claim covers the admitted toolset payment path."
+
+[[claim]]
+id = "status.toolset_sequence_malformed_store"
+family = "status"
+statement = "Public preparation refuses duplicate, missing and unknown recovery fields without rewriting them; a broken link remains listable and rejectable while an independent payment succeeds."
+applies = ["commit"]
+builds = "feature-on"
+
+[[cell]]
+claim = "status.toolset_sequence_malformed_store"
+rows = ["mcp.toolset_pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_payment_recovery_refuses_malformed_store_and_isolates_broken_links", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_grant_schema_and_legacy_lifecycle_preserve_other_payments", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "status.toolset_sequence_malformed_store"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit"]
+not_applicable = "This claim covers the admitted toolset payment path."
+
+[[claim]]
+id = "status.toolset_sequence_capacity_recovery"
+family = "status"
+statement = "At approval capacity, public preparation reuses the existing recovery key without changing the retained approval or writing a new record."
+applies = ["commit"]
+builds = "feature-on"
+
+[[cell]]
+claim = "status.toolset_sequence_capacity_recovery"
+rows = ["mcp.toolset_pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_payment_reuses_consent_at_approval_capacity", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_operation_capacity_expires_waiting_without_releasing_uncertainty", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "status.toolset_sequence_capacity_recovery"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit"]
+not_applicable = "This claim covers the admitted toolset payment path."
+
+[[claim]]
+id = "status.toolset_sequence_typed_adapter_errors"
+family = "status"
+statement = "The admitted toolset payment path preserves typed adapter errors across its applicable disturbance sequence."
+applies = ["commit"]
+builds = "feature-on"
+
+[[cell]]
+claim = "status.toolset_sequence_typed_adapter_errors"
+rows = ["mcp.toolset_pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "toolset_payment_context::public_payment_reports_coordination_busy_without_writing", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "toolset_payment_context::grant_end_is_checked_again_at_the_nonce", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "muxed_destination_integration::public_toolset_destination_read_failures_keep_their_codes_at_both_boundaries", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_grant_replacement_after_proof_requires_fresh_resolution", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "status.toolset_sequence_typed_adapter_errors"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit"]
+not_applicable = "This claim covers the admitted toolset payment path."
+
+[[claim]]
+id = "status.toolset_sequence_unattended_recovery"
+family = "status"
+statement = "The admitted toolset payment path preserves unattended recovery across its applicable disturbance sequence."
+applies = ["commit"]
+builds = "feature-on"
+
+[[cell]]
+claim = "status.toolset_sequence_unattended_recovery"
+rows = ["mcp.toolset_pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::common::tests::mainnet::payment_process_recovery_and_replay", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::process::public_noninclusion_after_restart_releases_only_the_original_payment", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_grant_schema_and_legacy_lifecycle_preserve_other_payments", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_operation_capacity_expires_waiting_without_releasing_uncertainty", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_toolset_tombstone_replay_is_status_only", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "status.toolset_sequence_unattended_recovery"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit"]
+not_applicable = "This claim covers the admitted toolset payment path."

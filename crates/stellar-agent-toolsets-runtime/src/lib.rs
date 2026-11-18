@@ -42,9 +42,8 @@
 //!    resolves; tool ∈ `allowed_tools`).
 //! 2. A current, matching first-invoke grant in the [`ToolsetGrantStore`].
 //!
-//! A `DispatchOutcome::Allow` from the policy engine is OVERRIDDEN to
-//! `RequireApproval` for all toolset-routed payments (unconditional per-action
-//! approval).
+//! The caller composes the routed and outer payment policies. A grant adds
+//! restrictions; payment approval is required when either policy requires it.
 //!
 //! **Authenticated install record**: both resolvers and the list read the
 //! capabilities from the install record, whose HMAC tag is verified under the
@@ -517,8 +516,8 @@ impl std::fmt::Debug for GatedInvokeParams<'_> {
 #[derive(Debug)]
 pub enum GatedResolveOutcome {
     /// The gated tool name (`"stellar_pay_commit"`) was resolved and a current
-    /// grant was found. The per-action approval gate MUST be forced on
-    /// unconditionally by the caller.
+    /// grant was found. The caller composes the payment policies and retains
+    /// a rechecked grant lease through nonce verification and submission.
     Resolved {
         /// The static tool name constant (`"stellar_pay_commit"`).
         tool_name: &'static str,
@@ -643,6 +642,33 @@ impl ToolsetGrantLease {
     #[must_use]
     pub fn grant(&self) -> &VerifiedToolsetGrant {
         &self.grant
+    }
+}
+
+/// The facts come from the invocation acquisition checked and the token it
+/// reverified, so the destination is the invocation's exact address even
+/// when the stored grant names its base account.
+impl stellar_agent_core::mainnet::toolset_grant::ToolsetGrantEvidence for ToolsetGrantLease {
+    fn facts(&self) -> stellar_agent_core::mainnet::toolset_grant::ToolsetGrantFacts<'_> {
+        let VerifiedToolsetGrant {
+            pin,
+            grant,
+            invocation,
+        } = &self.grant;
+        stellar_agent_core::mainnet::toolset_grant::ToolsetGrantFacts {
+            grant_id: &grant.grant_id,
+            expires_at_unix_ms: grant.expires_at_unix_ms,
+            install_id: &pin.install_id,
+            package_version: &pin.version,
+            package_shasum: &pin.shasum,
+            profile_name: &invocation.profile_name,
+            chain_id: &invocation.chain_id,
+            toolset_name: &invocation.toolset_name,
+            action: &invocation.action,
+            destination: &invocation.destination,
+            asset: &invocation.asset,
+            amount_stroops: invocation.amount_stroops,
+        }
     }
 }
 
@@ -891,9 +917,8 @@ fn grant_store_open_error(error: ApprovalError) -> ToolsetRuntimeError {
 ///    If none → queue `ToolsetFirstInvokeGate` approval, return
 ///    [`GatedResolveOutcome::FirstInvokeApprovalRequired`], REFUSE.
 /// 3. On grant match → return [`GatedResolveOutcome::Resolved`] with the
-///    [`VerifiedToolsetGrant`]. The CALLER MUST then route to
-///    `stellar_pay_commit` with the per-action `PaymentSimulated` approval
-///    FORCED ON UNCONDITIONALLY.
+///    [`VerifiedToolsetGrant`]. The caller composes the payment policies and
+///    acquires a matching lease before consuming the nonce or signing.
 ///
 /// # Locks
 ///
@@ -905,14 +930,13 @@ fn grant_store_open_error(error: ApprovalError) -> ToolsetRuntimeError {
 ///
 /// - All matching is computed from the AUTHORITATIVE envelope params in
 ///   `params` — NEVER from toolset-supplied args.
-/// - A `DispatchOutcome::Allow` from the policy engine MUST be overridden to
-///   `RequireApproval` by the caller for toolset-routed payments. This function
-///   returns `GatedResolveOutcome::Resolved` to signal the path is open; the
-///   unconditional per-action approval enforcement is the caller's responsibility.
+/// - The caller composes the routed payment and outer invocation policies.
+///   A matching grant clears only first-invoke consent; it cannot override a
+///   denial or an approval requirement from those policies.
 /// - Only a verified version 3 grant for the current install identity, version
 ///   and shasum, within the default TTL and issued after the current
 ///   installation suppresses the first-invoke prompt. A forged or edited grant
-///   suppresses nothing. Per-action payment approval always fires.
+///   suppresses nothing. Payment consent follows the composed policies.
 ///
 /// # Errors
 ///
@@ -998,12 +1022,11 @@ pub fn resolve_toolset_sign_payment_gated(
         grant_store.find_matching(&query, params.attestation_key, params.attestation_binding)
     {
         // Grant found — the first-invoke gate is short-circuited.
-        // The CALLER MUST force the per-action PaymentSimulated approval
-        // unconditionally (Override Allow → RequireApproval).
+        // The caller still applies the composed payment policy gates.
         tracing::debug!(
             toolset = %toolset_name,
             capability = %capability_str,
-            "first-invoke gate: matching grant found; routing to gated tool (per-action approval will be forced on by caller)"
+            "first-invoke gate: matching grant found; routing to the payment policy gates"
         );
         let grant = Box::new(VerifiedToolsetGrant {
             grant: grant.clone(),
@@ -3796,6 +3819,70 @@ attestation_version = 3
         fixture.record_grant();
         drop(stellar_agent_toolsets_install::lock_toolsets(fixture.dir.path()).unwrap());
         fixture.recheck(&token).unwrap();
+    }
+
+    /// A stored G grant covers a lease for an exact M invocation; the
+    /// lease's evidence reports that invocation, and boxed as evidence it
+    /// still holds off writers until the box drops.
+    #[test]
+    #[cfg(feature = "test-helpers")]
+    #[serial_test::serial]
+    fn lease_evidence_reports_the_checked_invocation() {
+        use stellar_agent_core::mainnet::toolset_grant::{ToolsetGrantEvidence, ToolsetGrantFacts};
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let fixture = GatedGrantFixture::new();
+        let recorded = fixture.record_grant();
+        let key = stellar_strkey::ed25519::PublicKey::from_string(GatedGrantFixture::DESTINATION)
+            .unwrap()
+            .0;
+        for id in [0, u64::MAX] {
+            let muxed = stellar_strkey::ed25519::MuxedAccount { ed25519: key, id }
+                .to_string()
+                .to_string();
+            let params = GatedInvokeParams {
+                authoritative_destination: &muxed,
+                ..fixture.params()
+            };
+            let token = match resolve_toolset_sign_payment_gated(&params).unwrap() {
+                GatedResolveOutcome::Resolved { grant, .. } => *grant,
+                other => panic!("expected Resolved: {other:?}"),
+            };
+            let recheck = GrantRecheckParams {
+                authoritative_destination: &muxed,
+                ..fixture.recheck_params()
+            };
+            let lease =
+                acquire_lease_with_clock(&token, &recheck, &mut || Ok(GatedGrantFixture::NOW_MS))
+                    .unwrap();
+            let pin = lease.grant().pin().clone();
+            let evidence: Box<dyn ToolsetGrantEvidence> = Box::new(lease);
+            assert_eq!(
+                evidence.facts(),
+                ToolsetGrantFacts {
+                    grant_id: &recorded.grant_id,
+                    expires_at_unix_ms: recorded.expires_at_unix_ms,
+                    install_id: &pin.install_id,
+                    package_version: &pin.version,
+                    package_shasum: &pin.shasum,
+                    profile_name: "test",
+                    chain_id: "stellar:testnet",
+                    toolset_name: "pay-toolset",
+                    action: "stellar_pay_commit",
+                    destination: &muxed,
+                    asset: "XLM",
+                    amount_stroops: 10,
+                },
+                "{id}"
+            );
+            assert!(matches!(
+                fixture.record_grant_result(),
+                Err(ToolsetRuntimeError::CoordinationBusy)
+            ));
+            drop(evidence);
+        }
+        fixture.record_grant();
     }
 
     #[test]

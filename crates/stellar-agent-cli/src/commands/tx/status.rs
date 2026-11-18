@@ -571,6 +571,7 @@ mod tests {
     /// same recovery object.
     #[cfg(feature = "mainnet-write")]
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn status_handlers_forward_retry_on_a_managed_attempt() {
         use crate::commands::pay::tests::mainnet_full as pay;

@@ -378,6 +378,105 @@ decision = "allow"
         result_json(&result)
     }
 
+    fn install_payment_toolset(&mut self) {
+        let root = self.policy_dir.path().join("toolsets");
+        stellar_agent_toolsets_install::write_toolset_for_test(
+            &root,
+            "payment-toolset",
+            &["propose-transaction", "sign-payment"],
+            &[],
+            "2026-06-02T00:00:00Z",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &crate::common::toolset_pin_key(),
+        )
+        .unwrap();
+        let now = now_unix_ms().unwrap();
+        let grant = build_attested_grant(
+            "payment-toolset".to_owned(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "1.0.0".to_owned(),
+            "0".repeat(64),
+            "sign-payment".to_owned(),
+            DEST.to_owned(),
+            "XLM".to_owned(),
+            1,
+            100_000_000,
+            process_uid_for_attestation().unwrap(),
+            now,
+            TOOLSET_GRANT_DEFAULT_TTL_MS,
+            &ATTESTATION_KEY,
+            &stellar_agent_core::approval::AttestationBinding::new(&self.name, "stellar:testnet"),
+        )
+        .unwrap();
+        ToolsetGrantStore::open(root.join("grants.toml"), now)
+            .unwrap()
+            .insert(grant)
+            .unwrap();
+        self.bind_payment_toolset();
+    }
+
+    fn bind_payment_toolset(&mut self) {
+        let root = self.policy_dir.path().join("toolsets");
+        self.server.set_toolsets_root_for_test(root.clone());
+        self.server
+            .set_toolset_pin_key_for_test(crate::common::toolset_pin_key());
+        self.server
+            .set_grant_store_path_for_test(root.join("grants.toml"));
+    }
+
+    async fn prepare_pay_route(
+        &self,
+        args: Value,
+        toolset: bool,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if toolset {
+            self.server
+                .call_stellar_toolset_invoke(StellarToolsetInvokeArgs {
+                    toolset: "payment-toolset".to_owned(),
+                    action: "stellar_pay".to_owned(),
+                    chain_id: Some("stellar:testnet".to_owned()),
+                    args,
+                })
+                .await
+        } else {
+            self.server
+                .call_stellar_pay(serde_json::from_value(args).unwrap())
+                .await
+        }
+    }
+
+    async fn simulate_pay_route(&self, amount: i128, toolset: bool) -> Value {
+        result_json(
+            &self
+                .prepare_pay_route(
+                    json!({"chain_id":"stellar:testnet", "source":self.source,
+                        "destination":DEST,"asset":"native","amount_in_stroops":amount.to_string()}),
+                    toolset,
+                )
+                .await
+                .unwrap(),
+        )
+    }
+
+    async fn commit_pay_route(&self, args: StellarPayCommitArgs, toolset: bool) -> Value {
+        if toolset {
+            result_json(
+                &self
+                    .server
+                    .call_stellar_toolset_invoke(StellarToolsetInvokeArgs {
+                        toolset: "payment-toolset".to_owned(),
+                        action: "stellar_pay_commit".to_owned(),
+                        chain_id: Some("stellar:testnet".to_owned()),
+                        args: pay_json(&args),
+                    })
+                    .await
+                    .unwrap(),
+            )
+        } else {
+            self.commit_pay(args).await
+        }
+    }
+
     fn attest(&self, data: &Value) -> (String, String) {
         let nonce = data["approval"]["approval_nonce"]
             .as_str()
@@ -1045,178 +1144,199 @@ async fn approved_sponsored_account_creation_reserves_and_settles() {
 
 #[tokio::test]
 #[serial]
-async fn toolset_forced_approval_keeps_allow_effects_and_reservation() {
-    let mut h = Harness::with_policy_chain(
-        "cap-toolset-forced",
-        "allow",
-        Outcome::Success,
-        "",
-        "stellar:testnet",
-    )
-    .await;
-    let cache = Arc::new(crate::common::CountingCounterpartyCache::default());
-    h.server.set_counterparty_resolver_for_test(cache.clone());
-    let carried = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let observed = Arc::clone(&carried);
-    h.server
-        .set_forced_snapshot_observer_for_test(Arc::new(move |same| {
-            assert!(same, "forced approval retains the live gate frame");
-            observed.fetch_add(1, Ordering::SeqCst);
-        }));
-    let tools = tempfile::tempdir().unwrap();
-    stellar_agent_toolsets_install::write_toolset_for_test(
-        tools.path(),
-        "payment-toolset",
-        &["sign-payment"],
-        &[],
-        "2026-06-02T00:00:00Z",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        &crate::common::toolset_pin_key(),
-    )
-    .unwrap();
-    let grant_path = tools.path().join("grants.toml");
-    let now = now_unix_ms().unwrap();
-    let grant = build_attested_grant(
-        "payment-toolset".to_owned(),
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
-        "1.0.0".to_owned(),
-        "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
-        "sign-payment".to_owned(),
-        DEST.to_owned(),
-        "XLM".to_owned(),
-        1,
-        100_000_000,
-        process_uid_for_attestation().unwrap(),
-        now,
-        TOOLSET_GRANT_DEFAULT_TTL_MS,
-        &ATTESTATION_KEY,
-        &stellar_agent_core::approval::AttestationBinding::new(&h.name, "stellar:testnet"),
-    )
-    .unwrap();
-    ToolsetGrantStore::open(grant_path.clone(), now)
-        .unwrap()
-        .insert(grant)
+async fn toolset_policy_consent_keeps_effects_and_reservation() {
+    for decision in ["allow", "require_approval"] {
+        let mut h = Harness::with_policy_chain(
+            "cap-toolset-policy",
+            decision,
+            Outcome::Success,
+            "",
+            "stellar:testnet",
+        )
+        .await;
+        let cache = Arc::new(crate::common::CountingCounterpartyCache::default());
+        h.server.set_counterparty_resolver_for_test(cache.clone());
+        let tools = tempfile::tempdir().unwrap();
+        stellar_agent_toolsets_install::write_toolset_for_test(
+            tools.path(),
+            "payment-toolset",
+            &["sign-payment"],
+            &[],
+            "2026-06-02T00:00:00Z",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &crate::common::toolset_pin_key(),
+        )
         .unwrap();
-    h.server.set_toolsets_root_for_test(tools.path().to_owned());
-    h.server
-        .set_toolset_pin_key_for_test(crate::common::toolset_pin_key());
-    h.server.set_grant_store_path_for_test(grant_path.clone());
-    let sim = h.simulate_pay(AMOUNT).await;
-    assert_eq!(
-        cache.reads(),
-        1,
-        "preparation and paired commit share the cache"
-    );
-    assert!(sim["data"]["approval"].is_null());
-    let args = h.pay_args(&sim["data"], AMOUNT, None);
-    let invoke = |params| StellarToolsetInvokeArgs {
-        toolset: "payment-toolset".to_owned(),
-        action: "stellar_pay_commit".to_owned(),
-        chain_id: Some("stellar:testnet".to_owned()),
-        args: params,
-    };
-    let mut contradictory = pay_json(&args);
-    contradictory["amount_in_stroops"] = json!("1");
-    contradictory["memo_text"] = json!("caller memo");
-    contradictory["fee"] = json!("500");
-    let prompt = result_json(
-        &h.server
-            .call_stellar_toolset_invoke(invoke(contradictory))
-            .await
-            .unwrap(),
-    );
-    assert_eq!(
-        prompt["error"]["code"], "policy.approval_required",
-        "{prompt}"
-    );
-    // The resolver's toolset and grant locks end with its call.
-    drop(ToolsetGrantStore::open(grant_path, now).expect("a grant writer opens after the call"));
-    drop(
-        stellar_agent_toolsets_install::lock_toolsets(tools.path())
-            .expect("an install proceeds after the call"),
-    );
-    let nonce = {
-        let store =
-            PendingApprovalStore::open(h.approval_dir.path().join(format!("{}.toml", h.name)))
-                .unwrap();
-        let entries = store.snapshot(now_unix_ms().unwrap());
-        assert_eq!(entries.len(), 1, "toolset queues per-action approval");
-        let entry = store.get(&entries[0].approval_nonce).unwrap();
-        let stellar_agent_core::approval::ApprovalKind::PaymentSimulated {
-            summary_simulated_seq_num,
-            summary_simulated_fee_stroops,
-            envelope_xdr_b64,
-            summary_amount_stroops,
-            summary_memo,
-            ..
-        } = &entry.kind
-        else {
-            panic!("payment entry")
-        };
-        assert_eq!(*summary_simulated_seq_num, 43);
-        assert_eq!(*summary_simulated_fee_stroops, 100);
-        assert_eq!(
-            envelope_xdr_b64,
-            sim["data"]["envelope_xdr"].as_str().unwrap()
-        );
-        assert_eq!(*summary_amount_stroops, 60_000_000);
-        assert!(summary_memo.is_none());
-        let facts = stellar_agent_core::approval::attest::classic_entry_summary(&entry.kind)
+        let grant_path = tools.path().join("grants.toml");
+        let now = now_unix_ms().unwrap();
+        let grant = build_attested_grant(
+            "payment-toolset".to_owned(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "1.0.0".to_owned(),
+            "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+            "sign-payment".to_owned(),
+            DEST.to_owned(),
+            "XLM".to_owned(),
+            1,
+            100_000_000,
+            process_uid_for_attestation().unwrap(),
+            now,
+            TOOLSET_GRANT_DEFAULT_TTL_MS,
+            &ATTESTATION_KEY,
+            &stellar_agent_core::approval::AttestationBinding::new(&h.name, "stellar:testnet"),
+        )
+        .unwrap();
+        ToolsetGrantStore::open(grant_path.clone(), now)
             .unwrap()
+            .insert(grant)
             .unwrap();
+        h.server.set_toolsets_root_for_test(tools.path().to_owned());
+        h.server
+            .set_toolset_pin_key_for_test(crate::common::toolset_pin_key());
+        h.server.set_grant_store_path_for_test(grant_path.clone());
+        let sim = h.simulate_pay(AMOUNT).await;
         assert_eq!(
-            facts.memo,
-            stellar_agent_core::envelope_decode::ClassicMemo::None
+            cache.reads(),
+            1,
+            "preparation and paired commit share the cache"
         );
-        assert!(h.sends.lock().unwrap().is_empty());
-        assert_eq!(h.signer_reads.load(Ordering::SeqCst), 0);
-        assert_eq!(h.window().pending, 0);
-        entries[0].approval_nonce.clone()
-    };
-    for candidate in [nonce.clone(), "A".repeat(22)] {
-        let invalid = h.pay_args(
-            &sim["data"],
-            AMOUNT,
-            Some((candidate, "invalid".to_owned())),
-        );
-        let refusal = result_json(
+        assert_eq!(sim["data"]["approval"].is_null(), decision == "allow");
+        let args = h.pay_args(&sim["data"], AMOUNT, None);
+        let invoke = |params| StellarToolsetInvokeArgs {
+            toolset: "payment-toolset".to_owned(),
+            action: "stellar_pay_commit".to_owned(),
+            chain_id: Some("stellar:testnet".to_owned()),
+            args: params,
+        };
+        if decision == "allow" {
+            let result = result_json(
+                &h.server
+                    .call_stellar_toolset_invoke(invoke(pay_json(&args)))
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(result["ok"], true, "{result}");
+            assert!(
+                !h.approval_dir
+                    .path()
+                    .join(format!("{}.toml", h.name))
+                    .exists()
+            );
+            h.assert_send_reserved();
+            assert_eq!(
+                h.window(),
+                WindowSnapshot {
+                    amount: AMOUNT,
+                    entries: 1,
+                    pending: 1
+                }
+            );
+            h.assert_legs("value_action_pending", "payment", Some(AMOUNT));
+            let rows = crate::common::audit_rows(&h.profile);
+            assert_eq!(
+                crate::common::rows_of_kind(&rows, "value_action_pending")[0]["policy_decision"],
+                "allow"
+            );
+            drop(ToolsetGrantStore::open(grant_path, now).unwrap());
+            drop(stellar_agent_toolsets_install::lock_toolsets(tools.path()).unwrap());
+            continue;
+        }
+        let mut contradictory = pay_json(&args);
+        contradictory["amount_in_stroops"] = json!("1");
+        contradictory["memo_text"] = json!("caller memo");
+        contradictory["fee"] = json!("500");
+        let prompt = result_json(
             &h.server
-                .call_stellar_toolset_invoke(invoke(pay_json(&invalid)))
+                .call_stellar_toolset_invoke(invoke(contradictory))
                 .await
                 .unwrap(),
         );
-        assert_eq!(refusal["error"], prompt["error"], "{refusal}");
-    }
-    let approval = h.attest_nonce(&nonce, &args.envelope_xdr);
-    let result = result_json(
-        &h.server
-            .call_stellar_toolset_invoke(invoke(pay_json(&h.pay_args(
-                &sim["data"],
-                AMOUNT,
-                Some(approval),
-            ))))
-            .await
-            .unwrap(),
-    );
-    assert_eq!(result["ok"], true, "{result}");
-    h.assert_send_reserved();
-    assert_eq!(
-        h.window(),
-        WindowSnapshot {
-            amount: AMOUNT,
-            entries: 1,
-            pending: 1
+        assert_eq!(
+            prompt["error"]["code"], "policy.approval_required",
+            "{prompt}"
+        );
+        // The resolver's toolset and grant locks end with its call.
+        drop(
+            ToolsetGrantStore::open(grant_path, now).expect("a grant writer opens after the call"),
+        );
+        drop(
+            stellar_agent_toolsets_install::lock_toolsets(tools.path())
+                .expect("an install proceeds after the call"),
+        );
+        let nonce = {
+            let store =
+                PendingApprovalStore::open(h.approval_dir.path().join(format!("{}.toml", h.name)))
+                    .unwrap();
+            let entries = store.snapshot(now_unix_ms().unwrap());
+            assert_eq!(entries.len(), 1, "toolset queues per-action approval");
+            let entry = store.get(&entries[0].approval_nonce).unwrap();
+            let stellar_agent_core::approval::ApprovalKind::PaymentSimulated {
+                summary_simulated_seq_num,
+                summary_simulated_fee_stroops,
+                envelope_xdr_b64,
+                summary_amount_stroops,
+                summary_memo,
+                ..
+            } = &entry.kind
+            else {
+                panic!("payment entry")
+            };
+            assert_eq!(*summary_simulated_seq_num, 43);
+            assert_eq!(*summary_simulated_fee_stroops, 100);
+            assert_eq!(
+                envelope_xdr_b64,
+                sim["data"]["envelope_xdr"].as_str().unwrap()
+            );
+            assert_eq!(*summary_amount_stroops, 60_000_000);
+            assert!(summary_memo.is_none());
+            let facts = stellar_agent_core::approval::attest::classic_entry_summary(&entry.kind)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                facts.memo,
+                stellar_agent_core::envelope_decode::ClassicMemo::None
+            );
+            assert!(h.sends.lock().unwrap().is_empty());
+            assert_eq!(h.signer_reads.load(Ordering::SeqCst), 0);
+            assert_eq!(h.window().pending, 0);
+            entries[0].approval_nonce.clone()
+        };
+        let approval = h.attest_nonce(&nonce, &args.envelope_xdr);
+        for candidate in [nonce.clone(), "A".repeat(22)] {
+            let invalid = h.pay_args(&sim["data"], AMOUNT, Some((candidate, "A".repeat(43))));
+            let refusal = result_json(
+                &h.server
+                    .call_stellar_toolset_invoke(invoke(pay_json(&invalid)))
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(refusal["error"], prompt["error"], "{refusal}");
         }
-    );
-    assert_eq!(
-        carried.load(Ordering::SeqCst),
-        2,
-        "matching nonce reaches the forced branch for invalid attestation and successful commit"
-    );
-    h.assert_legs("value_action_pending", "payment", Some(AMOUNT));
+        let result = result_json(
+            &h.server
+                .call_stellar_toolset_invoke(invoke(pay_json(&h.pay_args(
+                    &sim["data"],
+                    AMOUNT,
+                    Some(approval),
+                ))))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(result["ok"], true, "{result}");
+        h.assert_send_reserved();
+        assert_eq!(
+            h.window(),
+            WindowSnapshot {
+                amount: AMOUNT,
+                entries: 1,
+                pending: 1
+            }
+        );
+        h.assert_legs("value_action_pending", "payment", Some(AMOUNT));
+    }
 }
 
-/// The toolset route's forced commit records a payment leg hashing the
+/// The toolset route's unattended commit records a payment leg hashing the
 /// complete G, M0, and maximum-ID destination of the grant's account, with the
 /// literal digest and redaction, the gate-sized amount and asset, and no row
 /// holding the address. Its success carries the complete destination.
@@ -1321,33 +1441,18 @@ async fn every_payment_recorder_hashes_the_complete_destination() {
                 chain_id: Some("stellar:testnet".to_owned()),
                 args: params,
             };
-            let prompt = result_json(
+            let result = result_json(
                 &h.server
                     .call_stellar_toolset_invoke(invoke(pay_json(&with_destination(None))))
                     .await
                     .unwrap(),
             );
-            assert_eq!(
-                prompt["error"]["code"], "policy.approval_required",
-                "{destination}: {prompt}"
-            );
-            let nonce = {
-                let store = PendingApprovalStore::open(
-                    h.approval_dir.path().join(format!("{}.toml", h.name)),
-                )
-                .unwrap();
-                let entries = store.snapshot(now_unix_ms().unwrap());
-                assert_eq!(entries.len(), 1, "{destination}");
-                entries[0].approval_nonce.clone()
-            };
-            let approval = h.attest_nonce(&nonce, sim["data"]["envelope_xdr"].as_str().unwrap());
-            let result = result_json(
-                &h.server
-                    .call_stellar_toolset_invoke(invoke(pay_json(&with_destination(Some(
-                        approval,
-                    )))))
-                    .await
-                    .unwrap(),
+            assert!(
+                !h.approval_dir
+                    .path()
+                    .join(format!("{}.toml", h.name))
+                    .exists(),
+                "Allow queues no consent"
             );
             assert_eq!(result["ok"], true, "{destination}: {result}");
             assert_eq!(result["data"]["destination"], destination, "{result}");
@@ -1574,8 +1679,15 @@ async fn rule_approval_shape_reaches_pending_and_response() {
 #[tokio::test]
 #[serial]
 async fn payment_approval_facts_come_from_the_retained_envelope() {
+    for toolset in [true, false] {
+        payment_approval_facts_on_route(toolset).await;
+    }
+}
+
+async fn payment_approval_facts_on_route(toolset: bool) {
     use stellar_agent_core::approval::{ApprovalKind, attest::classic_entry_summary};
-    let h = Harness::new("payment-facts", "require_approval", Outcome::Success).await;
+    let mut h = Harness::new("payment-facts", "require_approval", Outcome::Success).await;
+    h.install_payment_toolset();
     for (field, value, details, legacy) in [
         (
             "memo_text",
@@ -1618,12 +1730,7 @@ async fn payment_approval_facts_come_from_the_retained_envelope() {
         let mut args = json!({"chain_id":"stellar:testnet", "source":h.source,
             "destination":DEST,"asset":"native","amount_in_stroops":"60000000","fee":"177"});
         args[field] = value;
-        let response = result_json(
-            &h.server
-                .call_stellar_pay(serde_json::from_value(args).unwrap())
-                .await
-                .unwrap(),
-        );
+        let response = result_json(&h.prepare_pay_route(args, toolset).await.unwrap());
         assert_eq!(response["ok"], true, "{response}");
         let data = &response["data"];
         let approval = &data["approval"];
@@ -1665,6 +1772,12 @@ async fn payment_approval_facts_come_from_the_retained_envelope() {
 #[tokio::test]
 #[serial]
 async fn payment_approval_delay_keeps_the_captured_end() {
+    for toolset in [true, false] {
+        payment_approval_delay_on_route(toolset).await;
+    }
+}
+
+async fn payment_approval_delay_on_route(toolset: bool) {
     use stellar_agent_core::policy::v1::criteria::state_store::set_query_time_for_test;
     let mut h = Harness::with_approval_fields(
         "payment-delay",
@@ -1673,13 +1786,14 @@ async fn payment_approval_delay_keeps_the_captured_end() {
         "ttl_secs = 2\nreason = \"review\"",
     )
     .await;
+    h.install_payment_toolset();
     let evaluated = now_unix_ms().unwrap();
     let policy_clock = set_query_time_for_test(evaluated);
     let end = evaluated + 2_000;
     for remaining in [1, 999, 1_000, 1_001] {
         h.server
             .set_clock_for_test(Arc::new(MockClock::new(move || Ok(end - remaining))));
-        let response = h.simulate_pay(AMOUNT).await;
+        let response = h.simulate_pay_route(AMOUNT, toolset).await;
         assert_eq!(response["ok"], true, "{response}");
         let approval = &response["data"]["approval"];
         let store =
@@ -1698,7 +1812,7 @@ async fn payment_approval_delay_keeps_the_captured_end() {
     let nonce_reads = h.nonce_reads.load(Ordering::SeqCst);
     h.server
         .set_clock_for_test(Arc::new(MockClock::new(move || Ok(end))));
-    let refused = h.server.call_stellar_pay(serde_json::from_value(json!({"chain_id":"stellar:testnet", "source":h.source,"destination":DEST,"asset":"native","amount_in_stroops":"60000000"})).unwrap()).await;
+    let refused = h.prepare_pay_route(json!({"chain_id":"stellar:testnet", "source":h.source,"destination":DEST,"asset":"native","amount_in_stroops":"60000000"}), toolset).await;
     assert_eq!(
         result_json(&refused.unwrap())["error"]["code"],
         "policy.approval_required"
@@ -1708,7 +1822,7 @@ async fn payment_approval_delay_keeps_the_captured_end() {
     assert_eq!(std::fs::read(&path).unwrap(), before);
     assert_eq!(h.nonce_reads.load(Ordering::SeqCst), nonce_reads);
     policy_clock.set(u64::MAX - 1);
-    let overflow = h.server.call_stellar_pay(serde_json::from_value(json!({"chain_id":"stellar:testnet", "source":h.source,"destination":DEST,"asset":"native","amount_in_stroops":"60000000"})).unwrap()).await;
+    let overflow = h.prepare_pay_route(json!({"chain_id":"stellar:testnet", "source":h.source,"destination":DEST,"asset":"native","amount_in_stroops":"60000000"}), toolset).await;
     assert!(overflow.is_ok(), "overflow returns a typed policy refusal");
     let overflow = result_json(&overflow.unwrap());
     assert_eq!(overflow["error"]["code"], "policy.unexpected_decision");
@@ -1864,6 +1978,12 @@ async fn payment_recovery_public_process_retry() {
 #[tokio::test]
 #[serial]
 async fn payment_recovery_public_terminal_statuses_survive_restart() {
+    for toolset in [true, false] {
+        payment_recovery_terminal_statuses_on_route(toolset).await;
+    }
+}
+
+async fn payment_recovery_terminal_statuses_on_route(toolset: bool) {
     use stellar_agent_core::policy::v1::criteria::state_store::set_query_time_for_test;
     for (mode, code) in [
         ("expired", "policy.approval_required"),
@@ -1873,7 +1993,8 @@ async fn payment_recovery_public_terminal_statuses_survive_restart() {
         ("inconsistent", "approval.entry_inconsistent"),
     ] {
         let mut h = Harness::new("queue-terminal", "require_approval", Outcome::Success).await;
-        let sim = h.simulate_pay(AMOUNT).await;
+        h.install_payment_toolset();
+        let sim = h.simulate_pay_route(AMOUNT, toolset).await;
         let approval = h.attest(&sim["data"]);
         let args = h.pay_args(&sim["data"], AMOUNT, Some(approval));
         let nonce = args.approval_nonce.as_ref().unwrap();
@@ -1925,7 +2046,7 @@ async fn payment_recovery_public_terminal_statuses_survive_restart() {
                 .set_clock_for_test(Arc::new(MockClock::new(move || Ok(end))));
             // Off mainnet the retention ends with the interval: the same
             // request receives fresh consent, and the old nonce stays dead.
-            let expired = h.simulate_pay(AMOUNT).await;
+            let expired = h.simulate_pay_route(AMOUNT, toolset).await;
             assert_eq!(expired["ok"], true, "{expired}");
             assert_ne!(
                 expired["data"]["approval"]["approval_nonce"].as_str(),
@@ -1937,17 +2058,18 @@ async fn payment_recovery_public_terminal_statuses_survive_restart() {
                 .unwrap();
         h.server
             .set_approval_dir_for_test(h.approval_dir.path().to_owned());
+        h.bind_payment_toolset();
         let earlier = original.created_at_unix_ms + 1;
         h.server
             .set_clock_for_test(Arc::new(MockClock::new(move || Ok(earlier))));
         let _clock = set_query_time_for_test(earlier);
         let before = std::fs::read(&path).unwrap();
         let nonce_reads = h.nonce_reads.load(Ordering::SeqCst);
-        let retried = h.simulate_pay(AMOUNT).await;
+        let retried = h.simulate_pay_route(AMOUNT, !toolset).await;
         assert_eq!(retried["error"]["code"], code, "{mode}: {retried}");
         assert_eq!(h.nonce_reads.load(Ordering::SeqCst), nonce_reads);
         assert_eq!(std::fs::read(&path).unwrap(), before);
-        let committed = h.commit_pay(args).await;
+        let committed = h.commit_pay_route(args, !toolset).await;
         assert_eq!(
             committed["error"]["code"], code,
             "{mode}: public commit after rollback"
@@ -2026,15 +2148,14 @@ async fn allowed_submission_ignores_an_unverified_approval_nonce() {
     }
 }
 
-/// A requiring rule's lifetime bounds an approval recovered by a toolset at
-/// commit, and one the forced toolset path created first with its default
-/// lifetime.
+/// A requiring rule's lifetime bounds both a recovered approval and a
+/// legacy unbound approval with the default lifetime.
 #[tokio::test]
 #[serial]
 async fn rule_ttl_bounds_toolset_queued_approval_at_commit() {
     const RULE_TTL_SECS: u64 = 600;
     const AMOUNT: i128 = 20_000_000;
-    for (n, (age_ms, admitted, forced_first)) in [
+    for (n, (age_ms, admitted, legacy_first)) in [
         (599_999, true, true),
         (600_000, false, true),
         (599_999, true, false),
@@ -2090,25 +2211,54 @@ async fn rule_ttl_bounds_toolset_queued_approval_at_commit() {
         h.server
             .set_toolset_pin_key_for_test(crate::common::toolset_pin_key());
         h.server.set_grant_store_path_for_test(grant_path);
+        let created = now_unix_ms().unwrap();
+        let now0 = created + age_ms;
+        let _policy_clock =
+            stellar_agent_core::policy::v1::criteria::state_store::set_query_time_for_test(created);
+        h.server
+            .set_clock_for_test(Arc::new(MockClock::new(move || Ok(created))));
         let sim = h.simulate_pay(AMOUNT).await;
         let rule_nonce = sim["data"]["approval"]["approval_nonce"]
             .as_str()
             .unwrap()
             .to_owned();
         let args = h.pay_args(&sim["data"], AMOUNT, None);
-        if forced_first {
-            // The forced toolset path queues the first entry for this envelope.
-            std::fs::write(h.approval_dir.path().join(format!("{}.toml", h.name)), "").unwrap();
-        }
+        let legacy_nonce = if legacy_first {
+            let path = h.approval_dir.path().join(format!("{}.toml", h.name));
+            // Serialize the old unbound shape; never edit a recovery binding's interval.
+            std::fs::write(&path, "").unwrap();
+            let entry = stellar_agent_core::approval::PendingApproval::new_payment_pending_until(
+                args.envelope_xdr.clone(),
+                process_uid_for_attestation().unwrap(),
+                created,
+                created + stellar_agent_core::approval::DEFAULT_TTL_MS,
+                created,
+                None,
+            )
+            .unwrap();
+            let nonce = entry.approval_nonce.clone();
+            PendingApprovalStore::open(path)
+                .unwrap()
+                .insert(entry, created)
+                .unwrap();
+            Some(nonce)
+        } else {
+            None
+        };
         let invoke = |params| StellarToolsetInvokeArgs {
             toolset: "payment-toolset".to_owned(),
             action: "stellar_pay_commit".to_owned(),
             chain_id: Some("stellar:testnet".to_owned()),
             args: params,
         };
+        let mut prompt_args = pay_json(&args);
+        if let Some(nonce) = &legacy_nonce {
+            prompt_args["approval_nonce"] = nonce.clone().into();
+            prompt_args["approval_attestation"] = "forged".into();
+        }
         let prompt = result_json(
             &h.server
-                .call_stellar_toolset_invoke(invoke(pay_json(&args)))
+                .call_stellar_toolset_invoke(invoke(prompt_args))
                 .await
                 .unwrap(),
         );
@@ -2116,74 +2266,28 @@ async fn rule_ttl_bounds_toolset_queued_approval_at_commit() {
             prompt["error"]["code"], "policy.approval_required",
             "{prompt}"
         );
-        let now0 = now_unix_ms().unwrap();
         let nonce = {
             let path = h.approval_dir.path().join(format!("{}.toml", h.name));
-            let disk = std::fs::read_to_string(&path)
-                .unwrap()
-                .parse::<toml_edit::DocumentMut>()
-                .unwrap();
-            assert_eq!(
-                disk["pending"].as_array_of_tables().unwrap().len(),
-                1,
-                "direct and forced routes reuse one durable consent"
-            );
             let store = PendingApprovalStore::open(path).unwrap();
-            let queued = store.snapshot(now_unix_ms().unwrap());
-            assert_eq!(
-                queued.len(),
-                1,
-                "direct and forced routes reuse one consent"
-            );
-            if forced_first {
-                let forced = store.get(&queued[0].approval_nonce).unwrap();
-                assert_ne!(forced.approval_nonce, rule_nonce);
-                assert_eq!(
-                    forced.expires_at_unix_ms - forced.created_at_unix_ms,
-                    stellar_agent_core::approval::DEFAULT_TTL_MS,
-                    "the forced path queues with its default lifetime"
-                );
+            let queued = store.snapshot(created);
+            assert_eq!(queued.len(), 1, "one original consent remains");
+            let entry = store.get(&queued[0].approval_nonce).unwrap();
+            assert_eq!(entry.created_at_unix_ms, created, "creation is immutable");
+            let lifetime = if legacy_first {
+                stellar_agent_core::approval::DEFAULT_TTL_MS
+            } else {
+                RULE_TTL_SECS * 1000
+            };
+            assert_eq!(entry.expires_at_unix_ms, created + lifetime);
+            if let Some(legacy) = &legacy_nonce {
+                assert_eq!(&entry.approval_nonce, legacy);
             } else {
                 assert_eq!(
-                    queued[0].approval_nonce, rule_nonce,
-                    "route identity does not duplicate consent"
+                    entry.approval_nonce, rule_nonce,
+                    "routes reuse the bound consent"
                 );
             }
-            assert!(
-                !queued[0].expired,
-                "the toolset entry carries its own expiry"
-            );
-            let nonce = queued[0].approval_nonce.clone();
-            let mut entry = store.get(&nonce).unwrap().clone();
-            entry.created_at_unix_ms = now0 - age_ms;
-            assert!(!entry.is_expired(now0), "the stored expiry remains live");
-            drop(store);
-            // Age the fixture's original interval in both halves before attesting it.
-            let path = h.approval_dir.path().join(format!("{}.toml", h.name));
-            let mut document: toml_edit::DocumentMut =
-                std::fs::read_to_string(&path).unwrap().parse().unwrap();
-            for table in document["pending"]
-                .as_array_of_tables_mut()
-                .unwrap()
-                .iter_mut()
-            {
-                if table["approval_nonce"].as_str() == Some(nonce.as_str()) {
-                    table["created_at_unix_ms"] =
-                        toml_edit::value(i64::try_from(entry.created_at_unix_ms).unwrap());
-                }
-            }
-            for table in document["payment_recovery"]
-                .as_array_of_tables_mut()
-                .unwrap()
-                .iter_mut()
-            {
-                if table["nonce"].as_str() == Some(nonce.as_str()) {
-                    table["created"] =
-                        toml_edit::value(i64::try_from(entry.created_at_unix_ms).unwrap());
-                }
-            }
-            std::fs::write(path, document.to_string()).unwrap();
-            nonce
+            entry.approval_nonce.clone()
         };
         let approval = h.attest_nonce(&nonce, &args.envelope_xdr);
         h.server
@@ -2212,7 +2316,7 @@ async fn rule_ttl_bounds_toolset_queued_approval_at_commit() {
                 } else {
                     assert_eq!(
                         result["ok"], true,
-                        "age {age_ms}, forced first {forced_first}: {result}"
+                        "age {age_ms}, legacy first {legacy_first}: {result}"
                     );
                 }
                 assert_eq!(h.sends.lock().unwrap().len(), 1);
@@ -2228,7 +2332,7 @@ async fn rule_ttl_bounds_toolset_queued_approval_at_commit() {
             } else {
                 assert_eq!(
                     result["error"], prompt["error"],
-                    "age {age_ms}, forced first {forced_first}: {result}"
+                    "age {age_ms}, legacy first {legacy_first}: {result}"
                 );
                 assert!(h.sends.lock().unwrap().is_empty());
                 assert!(

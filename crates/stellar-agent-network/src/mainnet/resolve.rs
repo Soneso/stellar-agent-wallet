@@ -170,6 +170,12 @@ pub struct TxSignRequest<'a> {
     /// authorization, and the record admits only an authorization naming
     /// its next attempt.
     pub operation: Option<OperationLink>,
+    /// The live toolset grant restricting an MCP payment commit: `Some`
+    /// adds the restriction's binding, the outer `stellar_toolset_invoke`
+    /// evaluation in one private policy frame, and the grant's original
+    /// end. The minted authorization owns it until submission starts;
+    /// submission retains it until it returns.
+    pub restriction: Option<super::restriction::ToolsetRestriction>,
 }
 
 /// The network-bound invocation a Soroban payment authorizes.
@@ -628,6 +634,7 @@ fn report_detail<T>(
 #[cfg(feature = "mainnet-write")]
 mod enabled {
     use super::super::authority::PolicyAuthority;
+    use super::super::restriction::ToolsetRestriction;
     use super::super::{
         AccountingRefusal, AuthorizationDomain, MainnetPrecondition as P, RecomputedFacts,
         authorization::{SorobanIntentInner, SubmitInner, TxSignInner},
@@ -668,10 +675,10 @@ mod enabled {
         mainnet::{enablement::normalize_endpoint_host, verified_policy::MainnetBody},
         policy::{
             Decision, DenyReason, Evaluation, McpToolRegistration, PolicyEngine, PolicyError,
-            ToolDescriptor, ToolValueKind,
+            PolicyEvaluationInputs, PolicyEvaluationSnapshot, ToolDescriptor, ToolValueKind,
             v1::{
-                ActionKind, PolicyEngineV1, ValueClass, ValueLeg,
-                criteria::state_store::WindowEntry,
+                AccountReservesView, ActionKind, PolicyEngineV1, PolicyStateStore, ValueClass,
+                ValueLeg, criteria::state_store::WindowEntry, value::derive_value_class,
             },
         },
         profile::schema::same_provider_host,
@@ -779,12 +786,7 @@ mod enabled {
         evaluation: &Evaluation,
         authority: &MainnetAuthority<'_>,
     ) -> Result<ValueClass, MainnetAuthorizationError> {
-        let value = || {
-            evaluation
-                .value_effects
-                .clone()
-                .map_or(ValueClass::ReadOnly, ValueClass::Value)
-        };
+        let value = || crate::mainnet::holds::value_class(evaluation);
         if !matches!(evaluation.decision, Decision::Deny(_))
             && let Some(reason) = evaluation
                 .rule_ordinal
@@ -941,7 +943,8 @@ mod enabled {
     /// The authority, audit and signer checks every signing resolution ends
     /// with. An approval must approve `subject` as `kind` for the context's
     /// profile, mainnet and the verified policy, be live at `now`, and live
-    /// at most as long as the evaluated rule permits. A policy authority passes
+    /// at most `rule_ttl_ms`, the shortest lifetime the evaluated rules
+    /// permit. A policy authority passes
     /// [`check_policy_authority`]; the subject and kind are bound by the
     /// authorization it mints.
     #[allow(
@@ -954,7 +957,7 @@ mod enabled {
         authority: &MainnetAuthority<'_>,
         subject: [u8; 32],
         kind: ApprovedKind,
-        evaluation: &Evaluation,
+        rule_ttl_ms: u64,
         audit: &AuditReadiness,
         signer: &EnrolledSigner,
         now: u64,
@@ -973,7 +976,7 @@ mod enabled {
                     approval.witness(),
                     subject,
                     kind,
-                    evaluation,
+                    rule_ttl_ms,
                     now,
                 )?;
                 check_policy_authority(context, policy, approval.bound(), now)?;
@@ -1068,7 +1071,7 @@ mod enabled {
         approval: &stellar_agent_core::approval::witness::ApprovalWitness,
         subject: [u8; 32],
         kind: ApprovedKind,
-        evaluation: &Evaluation,
+        rule_ttl_ms: u64,
         now: u64,
     ) -> Result<(), MainnetAuthorizationError> {
         require(
@@ -1094,10 +1097,7 @@ mod enabled {
             .expires_at_ms()
             .checked_sub(approval.created_at_ms())
             .ok_or_else(|| refused(P::ApprovalTtlExceedsRule))?;
-        require(
-            lifetime <= governing_ttl_ms(evaluation),
-            P::ApprovalTtlExceedsRule,
-        )
+        require(lifetime <= rule_ttl_ms, P::ApprovalTtlExceedsRule)
     }
     #[allow(
         clippy::too_many_arguments,
@@ -1129,6 +1129,7 @@ mod enabled {
             policy_digest: policy.digest(),
             authority: mint_authority(authority),
             chain_deadline_ms,
+            restriction_end_ms: None,
             authorization_ttl_ms: u64::from(
                 body.authorization_ttl_seconds
                     .unwrap_or(MAINNET_AUTHORIZATION_TTL_SECONDS_DEFAULT),
@@ -1142,6 +1143,7 @@ mod enabled {
                 reservation: None,
                 authority: authority_fact(authority),
                 audit: audit.fact_digest(),
+                restriction: None,
             },
             holds,
             parent: None,
@@ -1150,6 +1152,79 @@ mod enabled {
             native_reservation: None,
         }
     }
+    /// The engine, context, source account view, and instant a restricted
+    /// payment's two evaluations share. The account view is the floor source
+    /// when a floor rule matches the routed descriptor.
+    struct RestrictedFrame<'a> {
+        engine: &'a PolicyEngineV1,
+        context: &'a MainnetWriteContext,
+        account: &'a dyn AccountReservesView,
+        now: u64,
+    }
+
+    impl RestrictedFrame<'_> {
+        /// Evaluates the routed descriptor and the outer
+        /// `stellar_toolset_invoke` descriptor against one private window
+        /// image hydrated from the authenticated store at the frame's instant.
+        ///
+        /// The outer arguments are the authoritative arguments plus the raw
+        /// toolset and action. Both evaluations start from the payment value
+        /// derived from the authoritative arguments and classify recipients
+        /// independently. No identity or cache view is supplied: a signed
+        /// mainnet policy holds no home-domain criterion. The image reserves
+        /// nothing; the locked mint rechecks durable headroom.
+        fn evaluate(
+            &self,
+            store: &PersistedWindowStore,
+            routed: &ToolDescriptor,
+            args: &serde_json::Value,
+            restriction: &ToolsetRestriction,
+        ) -> Result<(Evaluation, (ToolDescriptor, Evaluation)), MainnetAuthorizationError> {
+            let state = PolicyStateStore::new();
+            store
+                .load_into_at(
+                    self.context.profile_name(),
+                    self.context.profile(),
+                    &state,
+                    self.now,
+                )
+                .map_err(|_| refused(P::StoreUnavailable))?;
+            let snapshot = PolicyEvaluationSnapshot::new(state, self.now);
+            #[cfg(test)]
+            crate::mainnet::restriction::tests::observe("hydrate", args, self.now);
+            let facts = restriction.facts();
+            let mut outer_args = args.clone();
+            outer_args["toolset"] = facts.toolset_name.into();
+            outer_args["action"] = facts.action.into();
+            let value = derive_value_class("stellar_pay_commit", args);
+            let evaluate = |tool: &ToolDescriptor, args: &serde_json::Value| {
+                #[cfg(test)]
+                crate::mainnet::restriction::tests::observe(&tool.name, args, self.now);
+                self.engine
+                    .evaluate_in_snapshot(
+                        PolicyEvaluationInputs {
+                            tool,
+                            args,
+                            profile: self.context.profile(),
+                            value: Some(value.clone()),
+                            account_view: Some(self.account),
+                            identity_view: None,
+                            counterparty_cache: None,
+                            sep10_sessions: None,
+                            sep45_sessions: None,
+                            provisional: false,
+                        },
+                        &snapshot,
+                    )
+                    .map_err(|error| engine_refusal(&error))
+            };
+            let outer = descriptor("stellar_toolset_invoke");
+            let routed = evaluate(routed, args)?;
+            let outer_evaluation = evaluate(&outer, &outer_args)?;
+            Ok((routed, (outer, outer_evaluation)))
+        }
+    }
+
     /// The key of an unmuxed source; a muxed source names no G-strkey and
     /// has none.
     fn source_key(source: &MuxedAccount) -> Option<[u8; 32]> {
@@ -1263,6 +1338,11 @@ mod enabled {
         )?;
         require(tx.signatures.is_empty(), P::EnvelopePreSigned)?;
         let chain_deadline = check_classic_deadline(&tx.tx.cond, now).map_err(refused)?;
+        let bound = req
+            .restriction
+            .as_ref()
+            .map(|restriction| restriction.bind(req.context, req.consumer, &args, now, detail))
+            .transpose()?;
         let endpoint = endpoint(req.context, req.client, deadline, req.enablement).await?;
         let hash =
             crate::submit::compute_local_tx_hash_hex(&envelope, req.context.network_passphrase())
@@ -1310,36 +1390,60 @@ mod enabled {
         // The evaluation instant follows every awaited read.
         let now = self::now()?;
         let adapter = AccountViewAdapter::new(&view);
-        let evaluation = engine
-            .evaluate_full(
-                &descriptor,
-                &args,
-                req.context.profile(),
-                Some(FloorSource::view_or(floor.as_ref(), &adapter)),
+        let account = FloorSource::view_or(floor.as_ref(), &adapter);
+        #[cfg(test)]
+        if req.restriction.is_none() {
+            crate::mainnet::restriction::tests::observe(&descriptor.name, &args, now);
+        }
+        let (evaluation, outer) = match &req.restriction {
+            None => (
+                engine
+                    .evaluate_full(
+                        &descriptor,
+                        &args,
+                        req.context.profile(),
+                        Some(account),
+                        None,
+                        None,
+                        None,
+                        None,
+                        now,
+                    )
+                    .map_err(|error| engine_refusal(&error))?,
                 None,
-                None,
-                None,
-                None,
-                now,
-            )
-            .map_err(|error| engine_refusal(&error))?;
+            ),
+            Some(restriction) => {
+                let frame = RestrictedFrame {
+                    engine: &engine,
+                    context: req.context,
+                    account,
+                    now,
+                };
+                let (routed, outer) = frame.evaluate(req.store, &descriptor, &args, restriction)?;
+                (routed, Some(outer))
+            }
+        };
         check_evaluation(&engine, &evaluation, req.authority)?;
+        if let Some((_, outer)) = &outer {
+            check_evaluation(&engine, outer, req.authority)?;
+        }
         let entries = crate::mainnet::holds::size_evaluated_holds(
             &engine,
             req.context.profile(),
             (&descriptor, &evaluation),
-            None,
+            outer.as_ref().map(|(tool, evaluation)| (tool, evaluation)),
             now,
         )
         .map_err(|error| engine_refusal(&error))?;
+        let rule_ttl_ms = outer
+            .as_ref()
+            .map_or(u64::MAX, |(_, outer)| governing_ttl_ms(outer))
+            .min(governing_ttl_ms(&evaluation));
         let asset = match req.consumer {
-            MainnetConsumer::CliPay | MainnetConsumer::McpPay => {
-                Some(match args["asset"].as_str().unwrap_or("") {
-                    "XLM" | "native" => CanonicalAsset::Native,
-                    asset => CanonicalAsset::parse_threshold_key(asset)
-                        .map_err(|_| refused(P::EnvelopeShape))?,
-                })
-            }
+            MainnetConsumer::CliPay | MainnetConsumer::McpPay => Some(
+                CanonicalAsset::parse_payment_asset(args["asset"].as_str().unwrap_or(""))
+                    .map_err(|_| refused(P::EnvelopeShape))?,
+            ),
             MainnetConsumer::CliCreateAccount | MainnetConsumer::McpCreateAccount => {
                 Some(CanonicalAsset::Native)
             }
@@ -1379,7 +1483,7 @@ mod enabled {
             req.authority,
             canonical.as_ref().map_or(digest, |c| c.digest),
             kind,
-            &evaluation,
+            rule_ttl_ms,
             &req.audit,
             req.signer,
             now,
@@ -1409,6 +1513,8 @@ mod enabled {
         request.operation = req.operation;
         request.intent_digest = canonical.as_ref().map(|c| c.digest);
         request.predecessor = canonical.as_ref().and_then(|c| c.predecessor);
+        request.restriction_end_ms = bound.map(|bound| bound.end_ms);
+        request.bindings.restriction = bound.map(|bound| bound.fact_digest);
         // The native debit is the action's native amount, zero for another
         // asset; the fee is the envelope's own fee cap.
         request.native_reservation = Some(NativeReservation {
@@ -1438,6 +1544,7 @@ mod enabled {
             header,
             binding: request.binding,
             entries: request.holds,
+            _restriction: req.restriction,
         }))
     }
     fn network_id(context: &MainnetWriteContext) -> [u8; 32] {
@@ -1559,7 +1666,7 @@ mod enabled {
                 |receipt| approval_subject_x402_authenticated(&digest, receipt.home_domain()),
             ),
             ApprovedKind::X402Payment,
-            &evaluation,
+            governing_ttl_ms(&evaluation),
             &req.audit,
             req.signer,
             now,
@@ -1707,6 +1814,7 @@ mod enabled {
             policy_digest: req.policy.digest(),
             authority: mint_authority(req.authority),
             chain_deadline_ms: None,
+            restriction_end_ms: None,
             authorization_ttl_ms: u64::from(
                 body.authorization_ttl_seconds
                     .unwrap_or(MAINNET_AUTHORIZATION_TTL_SECONDS_DEFAULT),
@@ -1720,6 +1828,7 @@ mod enabled {
                 reservation: None,
                 authority: authority_fact(req.authority),
                 audit: req.audit.fact_digest(),
+                restriction: None,
             },
             holds: vec![],
             parent: None,
@@ -1885,6 +1994,7 @@ mod enabled {
             policy_digest: header.policy.digest,
             authority: header.authority.mint_authority(),
             chain_deadline_ms: None,
+            restriction_end_ms: None,
             authorization_ttl_ms: req.receipt.authorization_ttl_ms,
             bindings: req.receipt.facts,
             holds: vec![],
@@ -1989,6 +2099,7 @@ mod tests {
             audit: f.audit(),
             store: &f.window,
             operation: None,
+            restriction: None,
         }
     }
 
@@ -2044,30 +2155,35 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn tx_refuses_an_envelope_without_a_deadline() {
         deadline_refusal(0, None, P::DeadlineMissing).await;
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn tx_refuses_an_elapsed_deadline() {
         deadline_refusal(0, Some(-1), P::DeadlineElapsed).await;
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn tx_refuses_a_deadline_beyond_the_ceiling() {
         deadline_refusal(0, Some(121), P::DeadlineTooFar).await;
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn tx_refuses_a_min_time_bound() {
         deadline_refusal(1, Some(120), P::DeadlineMissing).await;
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn resolve_tx_sign_accepts() {
         let f = ResolverFixture::new();
@@ -2132,6 +2248,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn clock_unavailable_refuses() {
         let f = ResolverFixture::new();
@@ -2411,6 +2528,7 @@ mod tests {
     endpoint_case!(account_read_failure_refuses, "account", AccountUnavailable);
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn classic_resolver_refuses_x402_consumer() {
         let f = ResolverFixture::new();
@@ -2445,12 +2563,14 @@ mod tests {
         );
     }
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn allow_rule_bounds_approval_to_confirmation_ttl() {
         approval_time_refusal(0, 601_000, P::ApprovalTtlExceedsRule).await;
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn future_created_approval_refuses() {
         let mut f = ResolverFixture::new();
@@ -2485,6 +2605,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn expired_approval_refuses() {
         let mut f = ResolverFixture::new();
@@ -2666,6 +2787,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn resolve_soroban_intent_accepts() {
         let f = soroban_fixture();
@@ -2683,12 +2805,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn resolve_muxed_payees_preserves_full_destination() {
         assert_muxed_payees(false).await;
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn resolve_muxed_unlisted_budget_records_and_requires_approval_beyond_it() {
         assert_muxed_payees(true).await;
@@ -2975,6 +3099,7 @@ mod tests {
     );
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn consume_soroban_intent_returns_receipt() {
         let f = soroban_fixture();
@@ -2990,6 +3115,7 @@ mod tests {
         assert_eq!(f.wire()["authorizations"][0]["state"], "used");
     }
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn other_intent_refuses() {
         let f = soroban_fixture();
@@ -3008,6 +3134,7 @@ mod tests {
         );
     }
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn expired_intent_refuses_consume() {
         let f = soroban_fixture();
@@ -3031,6 +3158,7 @@ mod tests {
         );
     }
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn resolve_soroban_submit_accepts() {
         let f = soroban_fixture();
@@ -3061,6 +3189,7 @@ mod tests {
         assert!(wire["holds"].as_array().is_none_or(Vec::is_empty));
     }
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn x402_chain_retains_one_debit() {
         let f = soroban_fixture();
@@ -3099,6 +3228,7 @@ mod tests {
         assert_eq!(wire["authorizations"][1]["state"], "used");
     }
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn release_consume_refuses_other_envelope() {
         let f = soroban_fixture();
@@ -3294,31 +3424,37 @@ mod tests {
         }
     }
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn required_witness_accepts() {
         witness_case("required", None).await;
     }
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn witness_subject_refuses() {
         witness_case("subject", Some(P::WitnessSubject)).await;
     }
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn same_host_witness_refuses_before_oracle_binding() {
         witness_case("same_host", Some(P::WitnessSameHost)).await;
     }
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn witness_oracle_binding_refuses() {
         witness_case("third_host", Some(P::WitnessOracleUnbound)).await;
     }
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn not_required_witness_still_checked() {
         witness_case("not_required", Some(P::WitnessSubject)).await;
     }
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn test_transport_keeps_profile_authority() {
         let f = large_payment_fixture(true);
@@ -3387,17 +3523,20 @@ mod tests {
         );
     }
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn witness_required_refuses() {
         requirement_refusal(true, P::WitnessRequired).await;
     }
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn witness_oracle_missing_refuses() {
         requirement_refusal(false, P::WitnessOracleMissing).await;
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn resolver_fetches_account_from_checked_client() {
         let f = ResolverFixture::new();
@@ -3431,6 +3570,7 @@ mod tests {
     /// A resolved native payment stores the payment amount as its native
     /// debit and the signed envelope's own fee, not a default, as its fee.
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn resolved_native_payment_derives_its_debit_and_envelope_fee() {
         let f = ResolverFixture::new();
@@ -3458,6 +3598,7 @@ mod tests {
 
     /// A resolved x402 intent reserves no native debit and no native fee.
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn resolved_x402_intent_reserves_no_native_amount() {
         let f = soroban_fixture();
@@ -3472,6 +3613,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn resolver_counts_the_envelope_fee_in_reserve() {
         let f = ResolverFixture::configured(
@@ -3500,6 +3642,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn policy_denial_keeps_policy_code() {
         let f = ResolverFixture::configured(
@@ -3529,6 +3672,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn admission_refusal_keeps_policy_code() {
         let f = ResolverFixture::configured(
@@ -3563,6 +3707,7 @@ mod tests {
         assert_eq!(f.wire(), before);
     }
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn duplicate_open_refuses() {
         let f = ResolverFixture::new();
@@ -3626,11 +3771,13 @@ mod tests {
         );
     }
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn policy_pin_absent_refuses() {
         pin_refusal(false, P::PolicyPinAbsent).await;
     }
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn policy_pin_mismatch_refuses() {
         pin_refusal(true, P::PolicyPinMismatch).await;
@@ -3754,6 +3901,7 @@ mod tests {
     /// call with the approval's own kind passes, so the kind is the only
     /// difference.
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn approval_kind_refuses() {
         use stellar_agent_core::approval::witness::ApprovedKind;
@@ -3798,7 +3946,7 @@ mod tests {
                 &authority,
                 subject,
                 kind,
-                &evaluation,
+                stellar_agent_core::approval::store::governing_ttl_ms(&evaluation),
                 &audit,
                 &f.signer,
                 f.now,
@@ -3819,6 +3967,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn audit_at_its_ttl_accepts() {
         let f = ResolverFixture::new();
@@ -3905,16 +4054,19 @@ mod tests {
         }
     }
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn lagging_anchor_refuses_intent_consume() {
         anchor_consume(false, false).await;
     }
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn repaired_anchor_passes_intent_consume() {
         anchor_consume(true, false).await;
     }
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn release_consume_refuses_lagging_anchor() {
         anchor_consume(false, true).await;
@@ -4010,6 +4162,7 @@ mod tests {
     );
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn invalidate_unconsumed_records_stage() {
         for (stage, reason) in [
@@ -4044,6 +4197,7 @@ mod tests {
         }
     }
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn invalidate_unconsumed_refuses_used_record() {
         let f = soroban_fixture();
@@ -4068,6 +4222,7 @@ mod tests {
     }
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn invalidate_unconsumed_reports_store_failure() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -4097,6 +4252,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn bound_witness_identifies_mainnet_oracle() {
         let f = large_payment_fixture(true);
@@ -4107,6 +4263,7 @@ mod tests {
         assert_eq!(witness.authority(), "https://oracle.example.invalid");
     }
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn legacy_witness_still_refuses_mainnet_oracle() {
         use crate::cross_check::{
@@ -4150,6 +4307,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn soroban_fixture_verifies_its_proofs() {
         let f = soroban_fixture();
@@ -4197,16 +4355,19 @@ mod tests {
         assert_refused(resolve_tx_sign(req).await, expected, &f, &before);
     }
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn policy_without_mainnet_body_refuses() {
         policy_binding_refusal("body", P::PolicyNotMainnet).await;
     }
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn policy_profile_refuses() {
         policy_binding_refusal("name", P::ProfileMismatch).await;
     }
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn enablement_sequence_refuses() {
         policy_binding_refusal("sequence", P::EnablementSequenceMismatch).await;
@@ -4269,16 +4430,19 @@ mod tests {
         }
     }
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn enablement_profile_refuses() {
         enablement_binding_refusal(true).await;
     }
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn enablement_host_refuses() {
         enablement_binding_refusal(false).await;
     }
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn policy_evaluation_error_refuses() {
         use stellar_agent_core::policy::v1::criteria::state_store::StateKey;
@@ -4312,6 +4476,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn snapshot_ignores_merged_threshold() {
         let f = ResolverFixture::configured(
@@ -4354,6 +4519,7 @@ mod tests {
         assert_refused(resolve_tx_sign(req).await, P::WitnessRequired, &f, &before);
     }
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn witness_threshold_missing_refuses() {
         let token = token();
@@ -4388,6 +4554,7 @@ mod tests {
     /// refuses under the re-signed policy: the consent names the policy it
     /// was verified against, whatever lifetime the new rule would allow.
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn approval_before_a_shortened_rule_refuses_as_another_policy() {
         let mut f = ResolverFixture::configured(
@@ -4452,6 +4619,7 @@ mod tests {
         );
     }
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn open_authorization_limit_refuses() {
         let f = ResolverFixture::configured(
@@ -4483,6 +4651,7 @@ mod tests {
     }
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn mint_store_failure_refuses() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -4508,6 +4677,7 @@ mod tests {
         assert_refused(result, P::StoreUnavailable, &f, &before);
     }
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn signer_coordinate_refuses() {
         use stellar_agent_core::profile::signer_identity::SignerIdentityRecord;
@@ -4557,6 +4727,7 @@ mod tests {
         );
     }
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn soroban_future_created_approval_refuses() {
         let f = soroban_fixture();
@@ -4600,6 +4771,7 @@ mod tests {
         );
     }
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn nonce_held_in_any_state_refuses_root_mint() {
         use super::super::{
@@ -5143,6 +5315,7 @@ mod tests {
     /// latest ledger, and simulates nothing; a current ledger passes as
     /// `NotRequired`.
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn below_threshold_mainnet_payment_reads_the_oracle_ledger() {
         let (outcome, primary, oracle) =
@@ -5161,6 +5334,7 @@ mod tests {
     /// An oracle three ledgers behind the primary's simulation cannot vouch
     /// for it: a primary that inflates its ledger is refused before signing.
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn below_threshold_oracle_three_ledgers_behind_refuses() {
         let (outcome, _, oracle) = below_threshold_case(BelowThresholdOracle::Ledger(997)).await;
@@ -5173,6 +5347,7 @@ mod tests {
 
     /// An oracle already at the signature expiration ledger refuses.
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn below_threshold_oracle_at_the_expiration_refuses() {
         let (outcome, _, _) = below_threshold_case(BelowThresholdOracle::Ledger(1060)).await;
@@ -5185,6 +5360,7 @@ mod tests {
     /// A mainnet profile without an oracle refuses a payment below the
     /// threshold before any request, naming `oracle_provider_url`.
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn below_threshold_mainnet_without_an_oracle_refuses() {
         let (outcome, primary, oracle) =
@@ -5211,6 +5387,7 @@ mod tests {
     /// An oracle that reports another network refuses at its identity check
     /// and is never asked for its ledger.
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn below_threshold_oracle_on_another_network_refuses() {
         let (outcome, _, oracle) = below_threshold_case(BelowThresholdOracle::Testnet).await;
@@ -5236,6 +5413,7 @@ mod tests {
         );
     }
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn changed_audit_provenance_refuses_intent_consume() {
         let f = soroban_fixture();
@@ -5284,6 +5462,7 @@ mod tests {
     /// `authorization_ttl_seconds`, the default, and an approval that
     /// expires first.
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn message_resolver_mints_a_zero_value_record() {
         use super::super::digest::bindings_digest;
@@ -5352,6 +5531,7 @@ mod tests {
                 reservation: None,
                 authority: approval.fact_digest(),
                 audit: header.audit.fact_digest(),
+                restriction: None,
             };
             assert_eq!(header.bindings_digest, bindings_digest(&facts), "{case}");
         }
@@ -5529,6 +5709,7 @@ mod tests {
     /// the creation repair moves the clock to the approval's expiry, and the
     /// expiry repair moves it to the approval's creation.
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn message_resolver_refusals_follow_the_check_order() {
         use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
@@ -5642,6 +5823,7 @@ mod tests {
     /// An approval created after the resolver's clock refuses: the creation
     /// time is checked against the clock before the expiry.
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn message_future_created_approval_refuses() {
         use stellar_agent_core::approval::subject::{
@@ -5678,6 +5860,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn message_clock_unavailable_refuses() {
         let f = x402_fixture();
@@ -5699,6 +5882,7 @@ mod tests {
     /// is single use, an open content cannot be minted twice, and the policy
     /// pin must name the authorization's policy.
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn message_mint_keeps_the_store_rules() {
         let f = x402_fixture();
@@ -5746,6 +5930,7 @@ mod tests {
     /// The consume returns the receipt of the record it settles, also after
     /// an anchored append grew the log between the mint and the consume.
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn consume_message_sign_returns_the_receipt() {
         for grown in [false, true] {
@@ -5788,6 +5973,7 @@ mod tests {
     /// A consume that the audit refuses invalidates its record with the
     /// reason `consume_refused`.
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn audit_refusal_at_the_message_consume_invalidates_the_record() {
         use stellar_agent_core::audit_log::{AuditWriter, tip_anchor::InMemoryTipAnchorStore};
@@ -5855,6 +6041,7 @@ mod tests {
     /// A record consumed already refuses its consume with `NotOpen`, stays
     /// used, and needs no cleanup: the refusal is the one line logged.
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn consuming_a_used_message_record_refuses_without_cleanup() {
         let f = x402_fixture();
@@ -5913,6 +6100,7 @@ mod tests {
     /// The cleanup leaves a used record and an unknown identity as they
     /// are, and logs nothing for either.
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn the_message_cleanup_ignores_settled_and_unknown_records() {
         let f = x402_fixture();
@@ -5933,6 +6121,7 @@ mod tests {
     /// refusal and one cleanup failure, and leaves the record open.
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn a_failed_message_cleanup_keeps_the_primary_refusal() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -6062,6 +6251,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn authenticated_intent_names_its_message_parent() {
         let f = x402_fixture();
@@ -6126,6 +6316,7 @@ mod tests {
     /// The authenticated intent evaluates the authenticated tool's rule: it
     /// denies while the create tool's rule allows the same payment.
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn authenticated_intent_evaluates_the_authenticated_rule() {
         let f = ResolverFixture::configured(
@@ -6212,6 +6403,7 @@ mod tests {
     /// generic code, log `fresh_decision_requires_approval`, and mint
     /// nothing.
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn policy_authority_refuses_when_the_fresh_decision_requires_approval() {
         let edits: [fn(&str) -> String; 2] = [
@@ -6259,6 +6451,7 @@ mod tests {
     /// scope refuse and log `authority_scope_mismatch`; the matching scope
     /// mints a record bound to that authority.
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn policy_authority_refuses_a_scope_mismatch() {
         let f = x402_fixture();
@@ -6318,6 +6511,7 @@ mod tests {
     /// and mints nothing, while the same witness under the matching scope
     /// mints.
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn message_approval_refuses_a_classic_scope_decision() {
         let f = x402_fixture();
@@ -6361,6 +6555,7 @@ mod tests {
     /// final resolution under both authority kinds with `not_yet_valid`,
     /// while the witness itself is already valid, and mints nothing.
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn final_resolution_refuses_a_clock_before_the_decision_instant() {
         let f = ResolverFixture::new();
@@ -6411,6 +6606,7 @@ mod tests {
     /// `clock_unavailable` before any request or evaluation, under the
     /// generic code, and mints nothing.
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn resolver_clock_failure_refuses_as_clock_unavailable() {
         let f = ResolverFixture::new();
@@ -6444,6 +6640,7 @@ mod tests {
     /// the one-minute window is full and the policy denies, while at the
     /// host clock the entry would have aged out.
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn resolver_evaluates_at_its_resolve_instant() {
         let f = ResolverFixture::configured(
@@ -6504,6 +6701,7 @@ mod tests {
     /// chain, policy digest and sequence. An authorization that outlives its
     /// governing end is inconsistent.
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn policy_authority_requires_governing_until() {
         use stellar_agent_core::approval::witness::ApprovedKind;
@@ -6542,7 +6740,7 @@ mod tests {
                 authority,
                 subject,
                 ApprovedKind::Payment,
-                &evaluation,
+                stellar_agent_core::approval::store::governing_ttl_ms(&evaluation),
                 &audit,
                 &f.signer,
                 now,
@@ -6664,6 +6862,7 @@ mod tests {
     /// a thirty-second governing end. Its holds are those of the same
     /// action under an approval.
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn allow_without_witness_mints_within_the_authorization_ttl() {
         let f = ResolverFixture::new();
@@ -6725,6 +6924,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn resolve_tx_sign_preserves_repeated_windowed_criteria() {
         use stellar_agent_core::policy::v1::criteria::state_store::{
@@ -6770,6 +6970,7 @@ mod tests {
 
     /// Both authorities keep a captured end through delay, durable reopen and header checks.
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn captured_authority_ends_survive_resolution_and_reopen() {
         use stellar_agent_core::mainnet::decision::{
@@ -6889,12 +7090,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn captured_approval_end_bounds_intent() {
         captured_end_for_shared_domain(false).await;
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn captured_approval_end_bounds_message() {
         captured_end_for_shared_domain(true).await;
@@ -7158,6 +7361,7 @@ mod tests {
                 expires_at_ms: f.now + 120_000,
             },
             chain_deadline_ms: None,
+            restriction_end_ms: None,
             authorization_ttl_ms: 120_000,
             bindings: super::super::digest::BindingFacts {
                 endpoint: None,
@@ -7168,6 +7372,7 @@ mod tests {
                 reservation: None,
                 authority: [7; 32],
                 audit: [8; 32],
+                restriction: None,
             },
             holds: vec![],
             parent: None,

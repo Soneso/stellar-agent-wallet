@@ -15,6 +15,7 @@ fn inspect(fx: &Fx, now: u64) -> Result<Value, WalletError> {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn approval_status_durable_lifecycle_and_clock_views() {
     for consumed in [false, true] {
@@ -179,6 +180,7 @@ fn approval_status_durable_lifecycle_and_clock_views() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn approval_status_duplicate_durable_identity_refuses() {
     let mut fx = Fx::new(300_000);

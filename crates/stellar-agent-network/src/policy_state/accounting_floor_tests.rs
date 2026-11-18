@@ -123,6 +123,7 @@ fn floor_checked_input_uses_verified_first_rule_and_operating_source() {
             expires_at_ms: f.now + 120_000,
         },
         chain_deadline_ms: None,
+        restriction_end_ms: None,
         authorization_ttl_ms: 120_000,
         bindings: BindingFacts {
             endpoint: None,
@@ -133,6 +134,7 @@ fn floor_checked_input_uses_verified_first_rule_and_operating_source() {
             reservation: None,
             authority: [7; 32],
             audit: [8; 32],
+            restriction: None,
         },
         holds: vec![],
         parent: None,

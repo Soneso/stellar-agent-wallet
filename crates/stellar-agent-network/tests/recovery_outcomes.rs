@@ -157,6 +157,7 @@ impl Fixture {
                     scope: AuthorityScope::Classic,
                 }),
                 chain_deadline_ms: None,
+                restriction_end_ms: None,
                 authorization_ttl_ms: 120_000,
                 bindings: BindingFacts {
                     endpoint: None,
@@ -167,6 +168,7 @@ impl Fixture {
                     reservation: None,
                     authority: [7; 32],
                     audit: [8; 32],
+                    restriction: None,
                 },
                 holds: vec![WindowEntry::new(
                     StateKey::new("outcomes", 0, "native", 86_400),
@@ -384,6 +386,7 @@ async fn transaction_unreachable(ledger: u32) -> MockServer {
 /// primary's successfully read answer as evidence and in the diagnostic,
 /// and decides nothing.
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn recovery_partial_transaction_evidence_is_kept_without_a_decision() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -419,6 +422,7 @@ async fn recovery_partial_transaction_evidence_is_kept_without_a_decision() {
 /// Two attempts decided in one pass both commit: each decision binds the
 /// generation of a fresh verified read, never the pass's first snapshot.
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn recovery_decisions_of_one_pass_bind_fresh_generations() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -437,6 +441,7 @@ async fn recovery_decisions_of_one_pass_bind_fresh_generations() {
 /// An oracle whose transaction answer arrives after the pass deadline ends
 /// the pass at the deadline and durably stops the spent reservation.
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn recovery_pass_ends_at_its_deadline_and_durably_stops_the_reserved_attempt() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -482,6 +487,7 @@ fn included(status: &str, envelope: impl Into<Value>, result: impl Into<Value>) 
 /// missing, a single endpoint's success, or a lagging absence leave the
 /// attempt unknown, and each pass reads each identity once.
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn recovery_outcome_requires_the_configured_pair_in_one_pass() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -527,6 +533,7 @@ async fn recovery_outcome_requires_the_configured_pair_in_one_pass() {
 /// An agreed inclusion of another envelope at the attempt's hash closes
 /// nothing and counts one disagreement.
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn recovery_consumed_sequence_without_original_envelope_stays_unknown() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -552,6 +559,7 @@ async fn recovery_consumed_sequence_without_original_envelope_stays_unknown() {
 /// separate 24 attempt and four shared requests and sends no transaction
 /// read twice.
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn recovery_combined_pass_limits_attempts_requests_refresh_and_deadline() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -580,6 +588,7 @@ async fn recovery_combined_pass_limits_attempts_requests_refresh_and_deadline() 
 /// The mainnet legacy stage settles nothing on a primary success or any
 /// other answer and sends no request; recovery owns the decision.
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn recovery_mainnet_legacy_stage_settles_nothing_and_testnet_is_unchanged() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();

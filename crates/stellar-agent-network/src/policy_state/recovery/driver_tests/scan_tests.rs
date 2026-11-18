@@ -44,6 +44,7 @@ async fn starts(server: &MockServer) -> Vec<u32> {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_scan_rejects_tip_regression_after_release_read() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -84,6 +85,7 @@ fn next_run(fx: &Fixture) {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_scan_budget_leaves_later_attempt_unreserved() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -117,6 +119,7 @@ async fn driver_scan_budget_leaves_later_attempt_unreserved() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_scan_crash_keeps_prefix_and_spends_run() {
     use super::super::super::store::{COMMIT_FAULT_AFTER_COUNTER, COMMIT_FAULT_AFTER_PREPARED};
@@ -159,6 +162,7 @@ async fn driver_scan_crash_keeps_prefix_and_spends_run() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_scan_resumes_prefix_and_stops_at_b() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -225,6 +229,7 @@ async fn driver_scan_resumes_prefix_and_stops_at_b() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_missing_provenance_stops_explicit() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -254,6 +259,7 @@ async fn driver_missing_provenance_stops_explicit() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_scan_never_reads_after_b() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -272,6 +278,7 @@ async fn driver_scan_never_reads_after_b() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_changed_configuration_restarts_at_p() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -307,6 +314,7 @@ async fn driver_changed_configuration_restarts_at_p() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn scan_stop_classes_and_configuration_reopen() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -351,6 +359,7 @@ async fn scan_stop_classes_and_configuration_reopen() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_failed_attempt_then_deciding_attempt() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -412,6 +421,7 @@ async fn fresh_health(pair: &[MockServer; 2]) {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_complete_history_decides_after_b() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -450,6 +460,7 @@ async fn driver_complete_history_decides_after_b() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_complete_history_requires_durable_matching_scan() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -492,6 +503,7 @@ async fn driver_complete_history_requires_durable_matching_scan() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_final_hash_follows_persisted_b() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -557,6 +569,7 @@ async fn driver_final_hash_follows_persisted_b() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_absent_account_enters_scan() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -581,6 +594,7 @@ async fn driver_absent_account_enters_scan() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_one_sided_absence_keeps_stop() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -635,6 +649,7 @@ async fn driver_one_sided_absence_keeps_stop() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_health_pruning_stops_before_scan_request() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -678,6 +693,7 @@ async fn driver_health_pruning_stops_before_scan_request() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_release_close_refuses_unchanged_prefix() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -730,6 +746,7 @@ async fn driver_release_close_refuses_unchanged_prefix() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_scan_tip_regresses_between_steps() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -762,6 +779,7 @@ async fn driver_scan_tip_regresses_between_steps() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_configuration_reopen_respects_run_cap() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -787,6 +805,7 @@ async fn driver_configuration_reopen_respects_run_cap() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_history_crash_restart_is_idempotent() {
     use super::super::super::store::{COMMIT_FAULT_AFTER_COUNTER, COMMIT_FAULT_AFTER_PREPARED};
@@ -863,6 +882,7 @@ async fn driver_history_crash_restart_is_idempotent() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_history_clock_restart_preserves_eligibility() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -893,6 +913,7 @@ async fn driver_history_clock_restart_preserves_eligibility() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_history_stale_decision_cannot_replace_new_owner() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -947,6 +968,7 @@ async fn driver_history_stale_decision_cannot_replace_new_owner() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_absent_account_scan_checks_arithmetic() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -982,6 +1004,7 @@ async fn driver_absent_account_scan_checks_arithmetic() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_history_operator_spelling_reuses_scan() {
     use stellar_agent_core::profile::schema::{PrimaryProviderRecord, Providers};
@@ -1015,6 +1038,7 @@ async fn driver_history_operator_spelling_reuses_scan() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_history_legacy_and_unusable_records_are_isolated() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1067,6 +1091,7 @@ async fn driver_history_legacy_and_unusable_records_are_isolated() {
 /// An explicit run continues the saved scan only after a spent allowance;
 /// any other stop restarts from P. Sticky history loss survives both.
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn explicit_retry_and_configuration_binding() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();

@@ -201,6 +201,9 @@ pub(crate) struct PreparedRecorder<'a> {
     approval: Option<ApprovalTombstone>,
     receipts: ReceiptStore,
     pub window: PersistedWindowStore,
+    /// Whether a toolset restriction leases the grant, so the recorder
+    /// defers the approval consumption until the lease drops.
+    restricted: bool,
 }
 
 /// The tombstone a mainnet submission under `authority` owes: the verified
@@ -255,6 +258,7 @@ pub(crate) fn prepare_authorized_recorder<'a>(
         approval,
         receipts,
         window,
+        restricted: false,
     })
 }
 
@@ -301,6 +305,7 @@ impl<'a> PreparedRecorder<'a> {
         )
         .with_sequence_floor(floor)
         .with_approval(self.approval)
+        .with_deferred_approval(self.restricted)
         .with_witness(witness)
         .with_operation(operation)
         .with_pre_exposure_ledger(observation.pre_exposure_ledger)
@@ -381,6 +386,7 @@ pub(crate) async fn sign_and_submit_classic(
     witness: Option<&stellar_agent_network::cross_check::CrossCheckWitness>,
     floor: Option<&dyn SequenceFloorHook>,
     operation: Option<&stellar_agent_network::policy_state::OperationHandle>,
+    restriction: Option<stellar_agent_network::mainnet::restriction::ToolsetRestriction>,
 ) -> Result<stellar_agent_network::submit::SubmissionResult, CallToolResult> {
     use stellar_agent_network::{
         signing::envelope_signing::{attach_signature, attach_signature_authorized},
@@ -393,6 +399,9 @@ pub(crate) async fn sign_and_submit_classic(
     stellar_agent_network::signing::envelope_signing::check_envelope_address_forms(envelope)
         .map_err(render)?;
     let timeout = super::common::submit_timeout(record.profile);
+    // A restricted submission's outcome leaves the approval consumption owed;
+    // it completes here after the grant lease drops.
+    let restricted = restriction.is_some();
     if let Some(guard) = guard {
         let authority = authority.ok_or_else(|| {
             super::common::approval_required_indistinguishable(&record.profile_name)
@@ -424,8 +433,10 @@ pub(crate) async fn sign_and_submit_classic(
         let profile = record.profile;
         let writer = Arc::clone(&record.audit);
         let request_id = uuid::Uuid::new_v4().to_string();
-        let prepared = prepare_authorized_recorder(record, server.window_store.clone(), authority)
-            .map_err(render)?;
+        let mut prepared =
+            prepare_authorized_recorder(record, server.window_store.clone(), authority)
+                .map_err(render)?;
+        prepared.restricted = restricted;
         let authorization = stellar_agent_network::mainnet::resolve::resolve_tx_sign(
             stellar_agent_network::mainnet::resolve::TxSignRequest {
                 context: guard.context,
@@ -441,6 +452,7 @@ pub(crate) async fn sign_and_submit_classic(
                 audit,
                 store: &prepared.window,
                 operation: operation.map(stellar_agent_network::operation_entry::next_attempt_link),
+                restriction,
             },
         )
         .await
@@ -520,6 +532,8 @@ pub(crate) async fn sign_and_submit_classic(
             );
             recorder.end_refused_attempt(error.code());
         }
+        // The submission's scope dropped the restriction, and its lease.
+        recorder.complete_owed_approval();
         result.map_err(|error| submission_error_result(&error, &signed))
     } else {
         let handle = stellar_agent_network::keyring::enrolled_keyring_signer(
@@ -535,8 +549,9 @@ pub(crate) async fn sign_and_submit_classic(
             .map_err(render)?;
         let recorder = build_recorder(record, floor)
             .map_err(render)?
-            .with_witness(witness);
-        submit_transaction_and_wait(
+            .with_witness(witness)
+            .with_deferred_approval(restricted);
+        let result = submit_transaction_and_wait(
             client,
             &signed,
             timeout,
@@ -544,8 +559,10 @@ pub(crate) async fn sign_and_submit_classic(
             Some(SubmissionSignerKind::Keyring),
             Some(&recorder),
         )
-        .await
-        .map_err(|error| submission_error_result(&error, &signed))
+        .await;
+        drop(restriction);
+        recorder.complete_owed_approval();
+        result.map_err(|error| submission_error_result(&error, &signed))
     }
 }
 

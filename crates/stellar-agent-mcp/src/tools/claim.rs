@@ -747,11 +747,8 @@ impl WalletServer {
 
     /// Inner implementation of `stellar_claim_commit`.
     ///
-    /// Separated from the public tool handler for testability via the
-    /// `call_stellar_claim_commit` test helper. Unlike `stellar_pay_commit`,
-    /// there is no `forced_dispatch_outcome` override: `stellar_claim_commit`
-    /// has no toolset-gated tier (it is denylist-only), so the policy-engine
-    /// outcome drives the attestation gate directly.
+    /// The policy outcome drives the attestation gate. Claim commits remain
+    /// on the toolset signing denylist and have no gated toolset route.
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn stellar_claim_commit_impl(
         &self,
@@ -1172,6 +1169,7 @@ impl WalletServer {
             &args.chain_id,
             "stellar_claim_commit",
             now_ms,
+            None,
         )
         .await
         {
@@ -1225,6 +1223,7 @@ impl WalletServer {
             cross_check.witness(),
             Some(&floor_hook),
             operation.as_ref(),
+            None,
         )
         .await
         {

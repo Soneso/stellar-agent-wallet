@@ -574,11 +574,13 @@ fn gated(envelope: &str, destination: &str) -> StellarToolsetInvokeArgs {
 /// approval stores.
 fn gated_server(
     fixture: &Fixture,
+    rpc: &MockServer,
     approvals: &std::path::Path,
     grants: &std::path::Path,
     toolsets: &std::path::Path,
 ) -> WalletServer {
-    let profile = fixture.profile.clone();
+    let mut profile = fixture.profile.clone();
+    profile.rpc_url = rpc.uri();
     stellar_agent_toolsets_install::write_toolset_for_test(
         toolsets,
         TOOLSET,
@@ -642,7 +644,8 @@ async fn gated_route_keeps_the_full_id(fx: &Fixture, key: [u8; 32]) {
     let toolsets = tempfile::TempDir::new().unwrap();
     let approvals = tempfile::TempDir::new().unwrap();
     let grants = approvals.path().join("grants.toml");
-    let server = gated_server(fx, approvals.path(), &grants, toolsets.path());
+    let rpc = endpoint(&[g(key)], Vec::new(), &[]).await;
+    let server = gated_server(fx, &rpc, approvals.path(), &grants, toolsets.path());
     let error = server
         .call_stellar_toolset_invoke(gated(&envelope, &m17))
         .await
@@ -659,34 +662,41 @@ async fn gated_route_keeps_the_full_id(fx: &Fixture, key: [u8; 32]) {
     };
     assert_eq!(destination, m17);
 
-    // A grant for M17 or for its G base reaches the per-action approval for
-    // M17; a grant for another ID does not.
-    for (granted, first_invoke) in [(m17.clone(), false), (g(key), false), (m(key, 18), true)] {
+    // M17 and G-base grants permit a real Allow send; another ID prompts.
+    for (index, (granted, first_invoke)) in
+        [(m17.clone(), false), (g(key), false), (m(key, 18), true)]
+            .into_iter()
+            .enumerate()
+    {
         let toolsets = tempfile::TempDir::new().unwrap();
         let approvals = tempfile::TempDir::new().unwrap();
         let grants = approvals.path().join("grants.toml");
         insert_grant(fx, &grants, &granted);
-        let server = gated_server(fx, approvals.path(), &grants, toolsets.path());
-        let outcome = server
-            .call_stellar_toolset_invoke(gated(&envelope, &m17))
-            .await;
+        let rpc = endpoint(&[g(key)], Vec::new(), &[]).await;
+        let server = gated_server(fx, &rpc, approvals.path(), &grants, toolsets.path());
+        let mut args = pay_args(&m17);
+        args.amount = Some(serde_json::from_str(r#""1 XLM""#).unwrap());
+        args.memo_id = Some(index as u64);
+        let data = prepare(&server, &args).await;
+        let mut invoke = gated(data["envelope_xdr"].as_str().unwrap(), &m17);
+        invoke.args["nonce"] = data["nonce"].clone();
+        invoke.args["expires_at_unix_ms"] = data["expires_at_unix_ms"].clone();
+        invoke.args["memo_id"] = serde_json::json!(index);
+        let outcome = server.call_stellar_toolset_invoke(invoke).await;
         match (first_invoke, outcome) {
             (false, Ok(result)) => {
                 assert_eq!(
-                    json_of(&result)["error"]["code"],
-                    "policy.approval_required",
-                    "the grant for {granted} covers M17"
+                    json_of(&result)["ok"],
+                    true,
+                    "the grant for {granted} covers M17: {}",
+                    json_of(&result)
                 );
-                let ApprovalKind::PaymentSimulated {
-                    summary_to,
-                    envelope_xdr_b64,
-                    ..
-                } = only_pending(approvals.path(), &fx.name)
-                else {
-                    panic!("a per-action payment approval");
-                };
-                assert_eq!(summary_to, m17);
-                assert_eq!(payment_of(&envelope_xdr_b64).destination, muxed(key, 17));
+                assert_eq!(json_of(&result)["data"]["destination"], m17);
+                let sent = sent_payments(&rpc).await;
+                assert_eq!(sent.len(), 1);
+                assert_eq!(sent[0].destination, muxed(key, 17));
+                assert_eq!(sent[0].amount, 10_000_000);
+                assert!(!approvals.path().join(format!("{}.toml", fx.name)).exists());
             }
             (true, Err(error)) => assert!(
                 error.message.contains("first_invoke_approval_required"),
@@ -1519,6 +1529,298 @@ async fn pay_commit_success_carries_the_complete_destination() {
             assert_eq!(json["data"]["destination"], destination, "{json}");
             assert!(json["data"].get("destinations").is_none(), "{json}");
             assert_eq!(sent_payments(&rpc).await.len(), 1, "{destination}");
+        }
+    }
+}
+
+fn public_payment_server(
+    fx: &Fixture,
+    rpc: &MockServer,
+    approvals: &std::path::Path,
+    grants: &std::path::Path,
+    toolsets: &std::path::Path,
+    asset: &str,
+) -> WalletServer {
+    let server = gated_server(fx, rpc, approvals, grants, toolsets);
+    stellar_agent_toolsets_install::write_toolset_for_test(
+        toolsets,
+        TOOLSET,
+        &["propose-transaction", "sign-payment"],
+        &[],
+        "2026-06-02T00:00:00Z",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        &crate::common::toolset_pin_key(),
+    )
+    .unwrap();
+    let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+    let grant = build_attested_grant(
+        TOOLSET.into(),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        "1.0.0".into(),
+        "0".repeat(64),
+        "sign-payment".into(),
+        RESULT_G.into(),
+        asset.into(),
+        1,
+        100_000_000,
+        process_uid_for_attestation().unwrap(),
+        now,
+        TOOLSET_GRANT_DEFAULT_TTL_MS,
+        &GRANT_KEY,
+        &stellar_agent_core::approval::AttestationBinding::new(&fx.name, "stellar:testnet"),
+    )
+    .unwrap();
+    ToolsetGrantStore::open(grants.to_owned(), now)
+        .unwrap()
+        .insert(grant)
+        .unwrap();
+    server
+}
+
+async fn public_payment_call(
+    server: &WalletServer,
+    action: &str,
+    args: serde_json::Value,
+) -> serde_json::Value {
+    json_of(
+        &server
+            .call_stellar_toolset_invoke(StellarToolsetInvokeArgs {
+                toolset: TOOLSET.into(),
+                action: action.into(),
+                chain_id: Some("stellar:testnet".into()),
+                args,
+            })
+            .await
+            .expect("public payment returns a business envelope"),
+    )
+}
+
+fn matrix_asset(issued: bool) -> (String, Vec<(String, String)>) {
+    use stellar_agent_test_support::xdr_fixtures::{trustline_entry_xdr, trustline_ledger_key_xdr};
+    if issued {
+        (
+            format!("USDC:{RESULT_ISSUER}"),
+            vec![(
+                trustline_ledger_key_xdr(&source_g(), "USDC", RESULT_ISSUER),
+                trustline_entry_xdr(&source_g(), "USDC", RESULT_ISSUER, 10_000_000_000),
+            )],
+        )
+    } else {
+        ("XLM".into(), Vec::new())
+    }
+}
+
+fn matrix_args(destination: &str, issued: bool) -> StellarPayArgs {
+    let mut args = pay_args(destination);
+    if issued {
+        args.asset = format!("USDC:{RESULT_ISSUER}");
+        args.amount = Some(serde_json::from_str(r#""10 USDC""#).unwrap());
+    }
+    args
+}
+
+fn matrix_pay_wire(args: &StellarPayArgs) -> serde_json::Value {
+    serde_json::json!({
+        "chain_id": args.chain_id, "source": args.source, "destination": args.destination,
+        "asset": args.asset, "amount": args.amount, "memo_id": args.memo_id,
+    })
+}
+
+fn matrix_commit_wire(args: &StellarPayCommitArgs) -> serde_json::Value {
+    serde_json::json!({
+        "chain_id": args.chain_id, "source": args.source, "destination": args.destination,
+        "asset": args.asset, "amount": args.amount, "memo_id": args.memo_id,
+        "envelope_xdr": args.envelope_xdr, "nonce": args.nonce,
+        "expires_at_unix_ms": args.expires_at_unix_ms,
+    })
+}
+
+#[tokio::test]
+#[serial]
+async fn public_toolset_destination_read_failures_keep_their_codes_at_both_boundaries() {
+    let fx = Fixture::new();
+    let base_key = account_ledger_key_xdr(RESULT_G);
+    for issued in [false, true] {
+        for destination in [RESULT_G, RESULT_M0, RESULT_MMAX] {
+            for (index, code) in ["network.rpc_unreachable", "network.rpc_credential_refused"]
+                .into_iter()
+                .enumerate()
+            {
+                let (asset, entries) = matrix_asset(issued);
+                let rpc = endpoint(
+                    &[RESULT_G.into(), RESULT_ISSUER.into()],
+                    entries.clone(),
+                    &[],
+                )
+                .await;
+                let failing = endpoint_refusing(
+                    &[RESULT_G.into(), RESULT_ISSUER.into()],
+                    entries,
+                    &if index == 0 {
+                        vec![RESULT_G.into()]
+                    } else {
+                        Vec::new()
+                    },
+                    &if index == 1 {
+                        vec![RESULT_G.into()]
+                    } else {
+                        Vec::new()
+                    },
+                )
+                .await;
+                let approvals = tempfile::tempdir().unwrap();
+                let root = tempfile::tempdir().unwrap();
+                let grants = root.path().join("grants.toml");
+                let server = public_payment_server(
+                    &fx,
+                    &rpc,
+                    approvals.path(),
+                    &grants,
+                    root.path(),
+                    &asset,
+                );
+                let bad = public_payment_server(
+                    &fx,
+                    &failing,
+                    approvals.path(),
+                    &grants,
+                    root.path(),
+                    &asset,
+                );
+                let mut args = matrix_args(destination, issued);
+                args.memo_id = Some(index as u64);
+                for _ in 0..2 {
+                    let refused =
+                        public_payment_call(&bad, "stellar_pay", matrix_pay_wire(&args)).await;
+                    assert_eq!(
+                        refused["error"]["code"], code,
+                        "public toolset preparation preserves read refusal: {refused}"
+                    );
+                    assert!(refused.get("data").is_none(), "no returned nonce");
+                }
+                let prepared =
+                    public_payment_call(&server, "stellar_pay", matrix_pay_wire(&args)).await;
+                assert_eq!(prepared["ok"], true, "{prepared}");
+                let mut commit = commit_args(&args, &prepared["data"]);
+                commit.memo_id = args.memo_id;
+                let refused =
+                    public_payment_call(&bad, "stellar_pay_commit", matrix_commit_wire(&commit))
+                        .await;
+                assert_eq!(
+                    refused["error"]["code"], code,
+                    "public toolset commit preserves read refusal: {refused}"
+                );
+                assert!(sent_payments(&failing).await.is_empty());
+                assert_eq!(pending_count(approvals.path(), &fx.name), 0);
+                assert!(
+                    read_keys(&failing)
+                        .await
+                        .iter()
+                        .filter(|key| **key == base_key)
+                        .count()
+                        >= 3
+                );
+                let result =
+                    public_payment_call(&server, "stellar_pay_commit", matrix_commit_wire(&commit))
+                        .await;
+                assert_eq!(
+                    result["ok"], true,
+                    "the same nonce works after the read recovers: {result}"
+                );
+                let sent = sent_payments(&rpc).await;
+                assert_eq!(sent.len(), 1);
+                assert_eq!(
+                    sent[0].destination,
+                    stellar_agent_core::payment_accounts::PaymentAccount::parse(destination)
+                        .unwrap()
+                        .to_muxed_account()
+                );
+                assert_eq!(sent[0].amount, 100_000_000);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn public_toolset_sep29_uses_the_full_destination_for_native_and_issued() {
+    let fx = Fixture::new();
+    let base_key = account_ledger_key_xdr(RESULT_G);
+    for issued in [false, true] {
+        for destination in [RESULT_G, RESULT_M0, RESULT_MMAX] {
+            let (asset, mut entries) = matrix_asset(issued);
+            let (data_key, data_entry) = memo_required_entry(RESULT_G);
+            let unflagged = endpoint(
+                &[RESULT_G.into(), RESULT_ISSUER.into()],
+                entries.clone(),
+                &[],
+            )
+            .await;
+            entries.push((data_key.clone(), data_entry));
+            let rpc = endpoint(&[RESULT_G.into(), RESULT_ISSUER.into()], entries, &[]).await;
+            let approvals = tempfile::tempdir().unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let grants = root.path().join("grants.toml");
+            let server =
+                public_payment_server(&fx, &rpc, approvals.path(), &grants, root.path(), &asset);
+            let before_flag = public_payment_server(
+                &fx,
+                &unflagged,
+                approvals.path(),
+                &grants,
+                root.path(),
+                &asset,
+            );
+            let mut args = matrix_args(destination, issued);
+            if destination == RESULT_G {
+                let prepared =
+                    public_payment_call(&before_flag, "stellar_pay", matrix_pay_wire(&args)).await;
+                assert_eq!(prepared["ok"], true, "{prepared}");
+                let commit = commit_args(&args, &prepared["data"]);
+                let refused =
+                    public_payment_call(&server, "stellar_pay_commit", matrix_commit_wire(&commit))
+                        .await;
+                assert_eq!(
+                    refused["error"]["code"], "validation.memo_required",
+                    "the G account's new flag is enforced at commit: {refused}"
+                );
+                let refused =
+                    public_payment_call(&server, "stellar_pay", matrix_pay_wire(&args)).await;
+                assert_eq!(
+                    refused["error"]["code"], "validation.memo_required",
+                    "the G account requires a memo at preparation: {refused}"
+                );
+                assert!(sent_payments(&rpc).await.is_empty());
+                args.memo_id = Some(7);
+            }
+            let prepared =
+                public_payment_call(&server, "stellar_pay", matrix_pay_wire(&args)).await;
+            assert_eq!(
+                prepared["ok"], true,
+                "full payment destination governs SEP-29 at preparation: {prepared}"
+            );
+            let mut commit = commit_args(&args, &prepared["data"]);
+            commit.memo_id = args.memo_id;
+            let result =
+                public_payment_call(&server, "stellar_pay_commit", matrix_commit_wire(&commit))
+                    .await;
+            assert_eq!(
+                result["ok"], true,
+                "full payment destination governs SEP-29 at commit: {result}"
+            );
+            let reads = read_keys(&rpc).await;
+            assert!(
+                reads.iter().filter(|key| **key == base_key).count() >= 2,
+                "both boundaries read the G base"
+            );
+            assert_eq!(
+                reads.contains(&data_key),
+                destination == RESULT_G,
+                "M destinations never read the memo data entry"
+            );
+            assert_eq!(sent_payments(&rpc).await.len(), 1);
+            assert_eq!(result["data"]["destination"], destination);
+            assert_eq!(pending_count(approvals.path(), &fx.name), 0);
         }
     }
 }

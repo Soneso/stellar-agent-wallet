@@ -478,6 +478,114 @@ fn rule(doc: &mut DocumentMut) -> &mut toml_edit::Table {
         .get_mut(0)
         .unwrap()
 }
+
+/// A signed outer payment rule has every payment minimum, while presets keep
+/// their explicit recipient-editing targets and wildcard tools still refuse.
+#[cfg(feature = "mainnet-write")]
+#[test]
+#[serial]
+fn signed_toolset_payment_rule_loads_with_payment_minimums() {
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+    let (dir, profile, key) = fixture();
+    let body = FULL.replace("stellar_pay", "stellar_toolset_invoke");
+    for decision in ["allow", "require_approval", "deny"] {
+        let mut doc = body.parse::<DocumentMut>().unwrap();
+        rule(&mut doc)["decision"] = value(decision);
+        if decision != "require_approval" {
+            rule(&mut doc).remove("ttl_secs");
+            rule(&mut doc).remove("reason");
+        }
+        let loaded = load(
+            dir.path(),
+            &doc.to_string(),
+            &profile,
+            &key,
+            PinMode::CompareOnly,
+        );
+        assert!(loaded.is_ok(), "signed outer {decision}: {loaded:?}");
+    }
+    for (kind, index) in [
+        ("asset_allowlist", 0),
+        ("destination", 1),
+        ("per_tx_cap", 2),
+        ("per_period_cap", 3),
+        ("rate_limit", 4),
+    ] {
+        let mut doc = body.parse::<DocumentMut>().unwrap();
+        rule(&mut doc)["criteria"]
+            .as_array_mut()
+            .unwrap()
+            .remove(index);
+        let result = load(
+            dir.path(),
+            &doc.to_string(),
+            &profile,
+            &key,
+            PinMode::CompareOnly,
+        );
+        assert!(
+            matches!(result, Err(PolicyError::MainnetMinimumUnmet { requirement, rule: Some(0) }) if requirement == kind),
+            "missing {kind}: {result:?}"
+        );
+    }
+    for (field, expected) in [
+        ("classic_max_fee_per_op_stroops", "fee_cap"),
+        ("cross_check_thresholds", "thresholds"),
+    ] {
+        let mut doc = body.parse::<DocumentMut>().unwrap();
+        if field == "cross_check_thresholds" {
+            doc["mainnet"][field]["native"] = value("0");
+        } else {
+            doc["mainnet"].as_table_like_mut().unwrap().remove(field);
+        }
+        let result = load(
+            dir.path(),
+            &doc.to_string(),
+            &profile,
+            &key,
+            PinMode::CompareOnly,
+        );
+        assert!(
+            matches!(result, Err(PolicyError::MainnetMinimumUnmet { requirement, rule: None }) if requirement == expected),
+            "missing {field}: {result:?}"
+        );
+    }
+    let mut deny = body.parse::<DocumentMut>().unwrap();
+    rule(&mut deny)["decision"] = value("deny");
+    rule(&mut deny).remove("ttl_secs");
+    rule(&mut deny).remove("reason");
+    rule(&mut deny)["criteria"] = value(toml_edit::Array::new());
+    assert!(
+        load(
+            dir.path(),
+            &deny.to_string(),
+            &profile,
+            &key,
+            PinMode::CompareOnly
+        )
+        .is_ok()
+    );
+    let wildcard = body.replace("stellar_toolset_invoke", "*");
+    assert!(matches!(
+        load(dir.path(), &wildcard, &profile, &key, PinMode::CompareOnly),
+        Err(PolicyError::MainnetMinimumUnmet {
+            requirement: "tool",
+            rule: Some(0)
+        })
+    ));
+    assert_eq!(
+        mainnet_minimum::MAINNET_VALUE_OUT_TOOLS,
+        [
+            "stellar_pay",
+            "stellar_pay_commit",
+            "stellar_create_account",
+            "stellar_create_account_commit",
+            "stellar_x402_create_payment",
+            "stellar_x402_authenticated_payment"
+        ]
+    );
+}
 minimum!(
     minimum_body_version,
     "body_version",

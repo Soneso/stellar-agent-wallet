@@ -274,6 +274,7 @@ async fn override_answer(server: &MockServer, name: &str, value: Value) {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_same_call_and_saved_upper() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -348,6 +349,7 @@ async fn driver_same_call_and_saved_upper() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_quality_stop_then_fresh_account_pair() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -429,6 +431,7 @@ async fn driver_quality_stop_then_fresh_account_pair() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_hash_peer_failure_keeps_successful_side() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -492,6 +495,7 @@ async fn driver_hash_peer_failure_keeps_successful_side() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_untimed_matched_release_stays_automatic() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -556,6 +560,7 @@ async fn driver_untimed_matched_release_stays_automatic() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_untimed_cap_and_backoff() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -618,6 +623,7 @@ async fn driver_untimed_cap_and_backoff() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn stopped_attempts_do_not_starve_selection() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -690,6 +696,7 @@ async fn stopped_attempts_do_not_starve_selection() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_cap_counts_completed_and_interrupted_reservations() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -754,6 +761,7 @@ async fn driver_cap_counts_completed_and_interrupted_reservations() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_sixteenth_reservation_can_finish_its_decision() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -809,6 +817,7 @@ async fn driver_sixteenth_reservation_can_finish_its_decision() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_prefix_and_identity_are_read_only() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -883,6 +892,7 @@ async fn driver_prefix_and_identity_are_read_only() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_commit_seams_use_verified_context() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -937,6 +947,7 @@ commit_seam_test!(driver_seam_decision_compaction, 4, COMMIT_FAULT_COMPACTION);
 /// append and before their prepared image: the prior generation and run stay
 /// byte-identical, and the refusal keeps the root code and verified progress.
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_audit_append_seam_keeps_prior_generation() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1101,6 +1112,7 @@ async fn commit_seams(stages: &[u8], seams: &[u8]) {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_account_coverage_and_high_sequence() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1178,6 +1190,7 @@ async fn driver_account_coverage_and_high_sequence() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_partial_rows_follow_each_commit_seam() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1261,6 +1274,7 @@ async fn driver_partial_rows_follow_each_commit_seam() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_resolved_requires_exact_projection_before_successor() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1299,6 +1313,7 @@ async fn driver_resolved_requires_exact_projection_before_successor() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_source_defects_only_read_hashes() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1359,6 +1374,7 @@ async fn driver_source_defects_only_read_hashes() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_unreached_state_and_separate_causes() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1407,6 +1423,7 @@ async fn driver_unreached_state_and_separate_causes() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_hash_shape_refuses_without_release() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1462,6 +1479,7 @@ fn target_page(close: u64) -> Value {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_strict_expiry_and_checked_close_conversions() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1530,6 +1548,7 @@ async fn driver_strict_expiry_and_checked_close_conversions() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_retention_and_fresh_target() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1594,6 +1613,7 @@ async fn driver_retention_and_fresh_target() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_old_health_never_reserves() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1713,6 +1733,7 @@ impl keyring_core::api::CredentialApi for ProxyCredential {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_process_child() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1786,6 +1807,7 @@ fn losing_refusal(error: &RecoveryError) -> Option<&'static str> {
 /// A reservation that cannot take the window lock returns the lock refusal
 /// with verified progress, sends no attempt request and writes nothing.
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_reservation_refuses_while_the_window_lock_is_held() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1828,6 +1850,7 @@ async fn driver_reservation_refuses_while_the_window_lock_is_held() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_two_processes_race_reservation() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1959,6 +1982,7 @@ async fn driver_two_processes_race_reservation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_new_owner_refuses_old_release_stop_and_decision() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -2074,6 +2098,7 @@ async fn replaced_owner(stages: &[u8]) {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_unrelated_write_preserves_ownership_and_fresh_generation() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -2140,6 +2165,7 @@ async fn driver_unrelated_write_preserves_ownership_and_fresh_generation() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_request_budget_stops_durably() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -2177,6 +2203,7 @@ async fn driver_request_budget_stops_durably() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_remaining_lease_bounds_pending_future() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -2240,6 +2267,7 @@ async fn driver_remaining_lease_bounds_pending_future() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_writer_schedule_overflow_has_store_context() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -2268,6 +2296,7 @@ async fn driver_writer_schedule_overflow_has_store_context() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_clock_regression_stores_one_stable_stop() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -2332,6 +2361,7 @@ async fn driver_clock_regression_stores_one_stable_stop() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_prefix_quality_is_ephemeral_and_unavailable_is_unknown() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -2442,6 +2472,7 @@ async fn driver_rpc_timeout_keeps_its_exact_cause() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_oversized_utf8_prefix_is_bounded_and_read_only() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -2482,6 +2513,7 @@ async fn driver_oversized_utf8_prefix_is_bounded_and_read_only() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_four_timed_attempts_share_one_prefix() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -2534,6 +2566,7 @@ async fn driver_four_timed_attempts_share_one_prefix() {
 /// reservation write refuses: the call refuses, and the caller's batch keeps
 /// the decision's edge beside the durable decision.
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_batch_keeps_decision_before_later_error() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -2581,6 +2614,7 @@ async fn driver_batch_keeps_decision_before_later_error() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_each_peer_failure_preserves_only_successful_evidence() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -2718,6 +2752,7 @@ async fn driver_each_peer_failure_preserves_only_successful_evidence() {
 
 #[cfg(feature = "mainnet-write")]
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_public_decision_then_separate_receipt_repair() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -2876,6 +2911,7 @@ async fn receipt_seams(seams: &[u8]) {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_inclusion_keeps_validated_fee_and_untimed_hash_only() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -3002,6 +3038,7 @@ async fn driver_inclusion_keeps_validated_fee_and_untimed_hash_only() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_disagreements_keep_both_roles() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -3049,6 +3086,7 @@ async fn driver_disagreements_keep_both_roles() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_release_crash_reuses_only_release_after_interruption() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -3105,6 +3143,7 @@ async fn driver_release_crash_reuses_only_release_after_interruption() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_missing_configuration_is_explicit_ephemeral() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -3145,6 +3184,7 @@ async fn driver_missing_configuration_is_explicit_ephemeral() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn driver_store_context_reaches_unchanged_warning_adapter() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();

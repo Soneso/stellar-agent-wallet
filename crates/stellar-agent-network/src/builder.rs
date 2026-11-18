@@ -1504,6 +1504,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn mainnet_time_bounds_builder_sets_the_window_on_mainnet_only() {
         use stellar_agent_core::profile::caip2::{MAINNET_PASSPHRASE, TESTNET_PASSPHRASE};

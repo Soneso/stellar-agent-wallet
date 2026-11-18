@@ -480,7 +480,7 @@ fn resolve_payment_amount(
 /// The internal-error prefix of a direct payment queueing failure.
 const STORE: &str = "approval.store_error";
 
-/// The internal-error prefix of a forced toolset queueing failure.
+/// The internal-error prefix of a toolset payment queueing failure.
 const GATED_CREATE: &str = "toolset.gated_approval_create";
 
 /// Maps a queueing failure to its wire result; an error without a wire code
@@ -519,9 +519,39 @@ pub(crate) enum PaymentQueue {
     /// Direct preparation requires a verified policy; the winning operation
     /// ID and waiting end are present on mainnet.
     Direct(Option<([u8; 16], u64)>),
-    /// Forced toolset preparation binds under a verified policy and otherwise
-    /// queues an unbound entry.
-    Forced,
+    /// A toolset payment binds under a verified policy and otherwise queues
+    /// an unbound entry.
+    Toolset(Option<([u8; 16], u64)>),
+}
+
+/// Process-local preparation facts used before approval queueing. The full
+/// issued nonce keys this lookup; normal commit verification still runs.
+pub(crate) struct PreparedPaymentNonce {
+    handle: stellar_agent_network::policy_state::OperationHandle,
+    subject: [u8; 32],
+    expires: u64,
+    consumed: bool,
+}
+
+/// A verified proposal route's raw invocation and provisional outer outcome.
+/// It conveys no signing authority; commit resolves its own grant.
+pub(crate) struct ToolsetPreparationContext {
+    pub(super) toolset: String,
+    pub(super) action: String,
+    pub(super) outer: Option<DispatchOutcome>,
+}
+
+/// The toolset invocation a payment commit runs for.
+///
+/// It holds the raw toolset and action names, the grant the gated resolver
+/// verified for them, and, on a server without a mainnet context, the
+/// outcome of the invocation's outer `stellar_toolset_invoke` gate. The
+/// public dispatcher builds one only from a verified `Resolved` outcome.
+pub(crate) struct ToolsetPaymentContext {
+    pub(super) toolset: String,
+    pub(super) action: String,
+    pub(super) grant: Box<stellar_agent_toolsets_runtime::VerifiedToolsetGrant>,
+    pub(super) outer: Option<DispatchOutcome>,
 }
 
 fn approval_storage_error(error: impl std::error::Error + Send + Sync + 'static) -> ApprovalError {
@@ -536,7 +566,7 @@ impl WalletServer {
     /// Persists the retained payment envelope with its captured interval in
     /// the profile's approval store, under one lock and one clock observation.
     /// A verified policy binds the entry for recovery; without one, only the
-    /// forced toolset path queues, as an unbound entry.
+    /// toolset path queues, as an unbound entry.
     ///
     /// # Errors
     ///
@@ -556,7 +586,7 @@ impl WalletServer {
     ) -> Result<PendingApproval, ApprovalError> {
         let policy = match (self.verified_policy.as_deref(), queue) {
             (Some(policy), _) => Some(policy),
-            (None, PaymentQueue::Forced) => None,
+            (None, PaymentQueue::Toolset(_)) => None,
             (None, PaymentQueue::Direct(_)) => {
                 return Err(ApprovalError::InvalidEntry {
                     detail: "payment recovery requires a verified policy".to_owned(),
@@ -564,8 +594,7 @@ impl WalletServer {
             }
         };
         let operation = match queue {
-            PaymentQueue::Direct(operation) => operation,
-            PaymentQueue::Forced => None,
+            PaymentQueue::Direct(operation) | PaymentQueue::Toolset(operation) => operation,
         };
         #[cfg(any(test, feature = "test-helpers"))]
         let approvals_dir = match self.approval_dir_override {
@@ -609,11 +638,89 @@ impl WalletServer {
             request,
         )
     }
+
+    /// Queues the approval `outcome` requires for a toolset payment of
+    /// `envelope_xdr`, over the outcome's captured interval, and answers
+    /// `policy.approval_required`. The approval store's recovery reuses an
+    /// earlier approval of the same envelope. On mainnet the queue opens the
+    /// durable approval record of the prepared operation, as a direct
+    /// preparation does.
+    async fn queue_toolset_payment(
+        &self,
+        args: &StellarPayCommitArgs,
+        outcome: &DispatchOutcome,
+        request: &stellar_agent_core::policy::ApprovalRequest,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let (created_at_ms, expires_at_ms) = match outcome.captured_interval() {
+            Ok(interval) => interval,
+            Err(error) => return error.into_result(),
+        };
+        let handle = if self.context.chain_id.is_mainnet() {
+            let nonce = match stellar_agent_nonce::Nonce::from_base64(&args.nonce) {
+                Ok(nonce) => nonce,
+                Err(_) => return Ok(commit_path_error_result("nonce parse failed")),
+            };
+            let now = now_unix_ms()
+                .map_err(|error| rmcp::ErrorData::internal_error(error.to_string(), None))?;
+            let prepared = self.prepared_payments.lock().await;
+            let Some(prepared) = prepared.get(&nonce.to_base64()).filter(|entry| {
+                entry.subject
+                    == stellar_agent_core::approval::subject::approval_subject_classic(
+                        &args.envelope_xdr,
+                    )
+                    && entry.expires == args.expires_at_unix_ms
+                    && now < entry.expires
+            }) else {
+                return Ok(commit_path_error_result("payment nonce lookup failed"));
+            };
+            if prepared.consumed {
+                return Ok(super::common::nonce_replayed_error_result());
+            }
+            Some(prepared.handle.clone())
+        } else {
+            None
+        };
+        let operation = handle
+            .as_ref()
+            .map(|handle| (*handle.id().as_bytes(), handle.waiting_expires_at_ms()));
+        let expires_at_ms = operation.map_or(expires_at_ms, |(_, end)| expires_at_ms.min(end));
+        let profile = self.profile_name_for_approval();
+        let write = PaymentWrite {
+            server: self,
+            envelope_xdr: &args.envelope_xdr,
+            interval: (created_at_ms, expires_at_ms),
+            profile_name: &profile,
+            request,
+            queue: PaymentQueue::Toolset(operation),
+        };
+        let entry = match handle {
+            Some(handle) => match self.payment_pending_approval(
+                Some(&handle),
+                outcome.audit_decision(),
+                (created_at_ms, expires_at_ms),
+                write,
+            ) {
+                Ok(Ok(entry)) => entry,
+                Ok(Err(error)) => return payment_store_refusal(&error, &profile),
+                Err(error) => return Ok(super::common::ledger_err_result(&error)),
+            },
+            None => match super::business_entry::InboxWrite::persist(write, None) {
+                Ok(entry) => entry,
+                Err(error) => return payment_recovery_refusal(&error, &profile, GATED_CREATE),
+            },
+        };
+        tracing::debug!(
+            nonce = %entry.approval_nonce,
+            "toolset payment approval queued"
+        );
+        Ok(super::common::approval_required_indistinguishable(&profile))
+    }
 }
 
-/// The inbox write of a mainnet payment approval under a verified policy.
-/// Its persist reuses or creates the entry with its recovery binding. A
-/// published consent builds the entry first and binds it only after its
+/// The inbox write of a payment approval, direct or toolset as `queue` names.
+/// Its persist reuses or creates the entry with the recovery binding `queue`
+/// selects. A published consent, which runs only on mainnet under a verified
+/// policy, builds the entry first and binds it only after its
 /// record reserves. A retained recovery binding of the same payment without
 /// a durable record is therefore found only after the new record opens and
 /// reserves: the bind refuses, the call answers `approval.entry_inconsistent`,
@@ -624,7 +731,7 @@ pub(crate) struct PaymentWrite<'a> {
     pub(crate) interval: (u64, u64),
     pub(crate) profile_name: &'a str,
     pub(crate) request: &'a stellar_agent_core::policy::ApprovalRequest,
-    pub(crate) operation: Option<([u8; 16], u64)>,
+    pub(crate) queue: PaymentQueue,
 }
 
 impl super::business_entry::InboxWrite for PaymentWrite<'_> {
@@ -677,7 +784,9 @@ impl super::business_entry::InboxWrite for PaymentWrite<'_> {
                 profile: self.profile_name,
                 chain: self.server.context.chain_id,
                 policy,
-                operation: self.operation,
+                operation: match self.queue {
+                    PaymentQueue::Direct(operation) | PaymentQueue::Toolset(operation) => operation,
+                },
             },
             entry,
             now_ms,
@@ -694,7 +803,7 @@ impl super::business_entry::InboxWrite for PaymentWrite<'_> {
             self.interval.1,
             self.profile_name,
             self.request,
-            PaymentQueue::Direct(self.operation),
+            self.queue,
         )
     }
 }
@@ -793,6 +902,16 @@ impl WalletServer {
     async fn stellar_pay(
         &self,
         Parameters(args): Parameters<StellarPayArgs>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.stellar_pay_impl(args, None).await
+    }
+
+    /// Prepares through the ordinary payment gates, composing the verified
+    /// proposal route's outer rule before exposing consent or a nonce.
+    pub(crate) async fn stellar_pay_impl(
+        &self,
+        args: StellarPayArgs,
+        toolset: Option<ToolsetPreparationContext>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         // Starting at entry bounds the primary identity check, the readiness
         // check and the reads before the send by one pre-send budget; the
@@ -1219,6 +1338,43 @@ impl WalletServer {
             Err(error) => return error.into_result(),
         };
 
+        let is_toolset = toolset.is_some();
+        let dispatch_outcome = if let Some(context) = toolset {
+            let mut authoritative =
+                match decode_authoritative_args(&envelope_xdr, "stellar_pay_commit") {
+                    Ok(args) => args,
+                    Err(error) => {
+                        return Ok(super::common::business_error_result(
+                            "simulation.divergence",
+                            error.to_string(),
+                        ));
+                    }
+                };
+            authoritative["chain_id"] = args.chain_id.clone().into();
+            // The context is consumed exactly once, after the retained envelope
+            // and routed pair have selected the facts and frame.
+            match self
+                .toolset_governing_outcome(
+                    dispatch_outcome,
+                    context.outer,
+                    &context.toolset,
+                    &context.action,
+                    &authoritative,
+                    &args.chain_id,
+                    Some(&source_adapter),
+                    dest_adapter
+                        .as_ref()
+                        .map(|a| a as &dyn stellar_agent_core::policy::v1::AccountIdentityView),
+                )
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => return error.into_result(),
+            }
+        } else {
+            dispatch_outcome
+        };
+
         let approval_block =
             if let DispatchOutcome::RequireApproval(ref approval) = dispatch_outcome {
                 let (created_at_ms, policy_end) = match dispatch_outcome.captured_interval() {
@@ -1229,6 +1385,12 @@ impl WalletServer {
                     .waiting_end
                     .map_or(policy_end, |end| policy_end.min(end));
                 let profile_name = self.profile_name_for_approval();
+                let operation = prepared.operation_id.zip(prepared.waiting_end);
+                let queue = if is_toolset {
+                    PaymentQueue::Toolset(operation)
+                } else {
+                    PaymentQueue::Direct(operation)
+                };
                 let entry = match self.payment_pending_approval(
                     prepared.handle.as_ref(),
                     dispatch_outcome.audit_decision(),
@@ -1239,7 +1401,7 @@ impl WalletServer {
                         interval: (created_at_ms, expires_at_ms),
                         profile_name: &profile_name,
                         request: &approval.request,
-                        operation: prepared.operation_id.zip(prepared.waiting_end),
+                        queue,
                     },
                 ) {
                     Ok(entry) => entry,
@@ -1284,6 +1446,21 @@ impl WalletServer {
         };
 
         let nonce_b64 = nonce.to_base64();
+        if let Some(handle) = prepared.handle {
+            let mut issued = self.prepared_payments.lock().await;
+            issued.retain(|_, entry| now_ms < entry.expires);
+            issued.insert(
+                nonce_b64.clone(),
+                PreparedPaymentNonce {
+                    handle,
+                    subject: stellar_agent_core::approval::subject::approval_subject_classic(
+                        &envelope_xdr,
+                    ),
+                    expires: expiry_unix_ms,
+                    consumed: false,
+                },
+            );
+        }
         let nonce_id_prefix = nonce_id_prefix(&nonce);
         tracing::info!(
             tool = "stellar_pay",
@@ -1434,31 +1611,23 @@ impl WalletServer {
         self.stellar_pay_commit_impl(args, None).await
     }
 
-    /// Inner implementation of `stellar_pay_commit`.
+    /// Commits a payment with an optional verified toolset invocation.
+    /// The routed and outer policies govern consent and the shortest end.
+    /// Proof verification precedes the lease; the lease precedes nonce use
+    /// and remains held until submission returns.
     ///
-    /// Separated from the public tool handler so the toolset-gated path
-    /// (`invoke_stellar_pay_commit_toolset_gated`) can supply a forced
-    /// `DispatchOutcome::RequireApproval` override.
-    ///
-    /// When `forced_dispatch_outcome` is `Some(outcome)`, the supplied outcome
-    /// replaces the policy-engine result AFTER the chain_id check still runs via
-    /// `dispatch_gate`.  The `Allow` no-op shortcut in `verify_attestation_gate`
-    /// is therefore bypassed unconditionally for toolset-routed
-    /// payments, making per-action approval cryptographically enforced regardless
-    /// of what the policy engine returns.
-    ///
-    /// When `forced_dispatch_outcome` is `None`, the behaviour is identical to
-    /// the original public handler (policy-engine outcome drives attestation gate).
-    ///
-    /// # Security
-    ///
-    /// The forced override is the load-bearing per-action-approval mechanism.
-    /// Do NOT pass `None` from the toolset-gated routing arm.
+    /// With a context, a required approval without a proof queues on both
+    /// chains before any nonce, hold, or key use. On mainnet it binds the
+    /// operation this process prepared for the nonce; a nonce without that
+    /// entry refuses `nonce.expired` before any queue write. Without a
+    /// context, admission, the routed gate and pair, proof or mainnet
+    /// authority, the nonce, signing, and submission still run; outer
+    /// composition, queueing, and the lease do not.
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn stellar_pay_commit_impl(
         &self,
         args: StellarPayCommitArgs,
-        forced_dispatch_outcome: Option<super::common::DispatchOutcome>,
+        mut toolset: Option<ToolsetPaymentContext>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let mainnet = if self.context.chain_id.is_mainnet() {
             match self
@@ -1613,75 +1782,18 @@ impl WalletServer {
         // destructive_hint = true → engine evaluates per profile.policy.engine;
         // Noop refuses on mainnet, V1 evaluates typed criteria.
         //
-        // When `forced_dispatch_outcome` is Some, the caller (toolset-gated path)
-        // has already computed a RequireApproval outcome that MUST be used
-        // instead of the policy-engine result.  We still call dispatch_gate to
-        // preserve the chain_id validation and Deny arm — but if
-        // forced_dispatch_outcome overrides Allow, the allow no-op in
-        // verify_attestation_gate is bypassed.
-        // Effects sized by the gate, retained even when the toolset-gated path
-        // overrides Allow with a forced RequireApproval: the post-submit audit
-        // row must carry the legs the gate sized (single-derivation invariant).
-        let mut overridden_gate_effects: Option<stellar_agent_core::policy::v1::ValueEffects> =
-            None;
-        let dispatch_outcome = match forced_dispatch_outcome {
-            Some(mut forced) => {
-                // Still run dispatch_gate for chain_id validation + Deny check;
-                // override Allow with the forced outcome if the gate does not deny.
-                let gate_outcome = match self
-                    .dispatch_gate_with_views(
-                        "stellar_pay_commit",
-                        &authoritative_args,
-                        &args.chain_id,
-                        Some(&source_adapter),
-                        identity_view,
-                    )
-                    .await
-                {
-                    Ok(o) => o,
-                    Err(e) => return e.into_result(),
-                };
-                match gate_outcome {
-                    super::common::DispatchOutcome::Allow(effects) => {
-                        // Override: policy said Allow but toolset-gated path forces RequireApproval.
-                        overridden_gate_effects = effects.value_effects;
-                        #[cfg(any(test, feature = "test-helpers"))]
-                        let captured = effects.snapshot.clone();
-                        if let DispatchOutcome::RequireApproval(approval) = &mut forced {
-                            approval.snapshot = effects.snapshot;
-                        }
-                        #[cfg(any(test, feature = "test-helpers"))]
-                        if let Some(observe) = &self.forced_snapshot_observer {
-                            observe(captured.as_ref().zip(forced.snapshot().ok()).is_some_and(
-                                |(captured, retained)| std::sync::Arc::ptr_eq(captured, retained),
-                            ));
-                        }
-                        tracing::debug!(
-                            tool = "stellar_pay_commit",
-                            "toolset_gated: overriding DispatchOutcome::Allow → forced RequireApproval"
-                        );
-                        forced
-                    }
-                    // Deny and RequireApproval from the engine are honoured as-is.
-                    other => other,
-                }
-            }
-            None => {
-                // Normal path: use the policy-engine outcome directly.
-                match self
-                    .dispatch_gate_with_views(
-                        "stellar_pay_commit",
-                        &authoritative_args,
-                        &args.chain_id,
-                        Some(&source_adapter),
-                        identity_view,
-                    )
-                    .await
-                {
-                    Ok(o) => o,
-                    Err(e) => return e.into_result(),
-                }
-            }
+        let dispatch_outcome = match self
+            .dispatch_gate_with_views(
+                "stellar_pay_commit",
+                &authoritative_args,
+                &args.chain_id,
+                Some(&source_adapter),
+                identity_view,
+            )
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => return error.into_result(),
         };
         // On mainnet the stricter decision of this commit and its
         // preparation governs.
@@ -1699,26 +1811,38 @@ impl WalletServer {
             Ok(outcome) => outcome,
             Err(error) => return error.into_result(),
         };
+        let dispatch_outcome = match toolset.as_mut() {
+            Some(context) => match self
+                .toolset_governing_outcome(
+                    dispatch_outcome,
+                    context.outer.take(),
+                    &context.toolset,
+                    &context.action,
+                    &authoritative_args,
+                    &args.chain_id,
+                    Some(&source_adapter),
+                    identity_view,
+                )
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => return error.into_result(),
+            },
+            None => dispatch_outcome,
+        };
+        // A toolset payment that requires approval and carries no proof
+        // queues the envelope's approval before any nonce, hold, or key use.
+        if toolset.is_some()
+            && !(args.approval_nonce.is_some() && args.approval_attestation.is_some())
+            && let DispatchOutcome::RequireApproval(approval) = &dispatch_outcome
+        {
+            return self
+                .queue_toolset_payment(&args, &dispatch_outcome, &approval.request)
+                .await;
+        }
 
-        // ── Attestation verification gate ────────────────────────────────────
-        //
-        // Placed BEFORE nonce parse to:
-        //   (a) Ensure the attestation gate fires before nonce HMAC+replay.
-        //   (b) Avoid expensive nonce-HMAC operations when the attestation is
-        //       absent or forged (fail-fast principle). The source (+
-        //       optionally destination) account fetch runs before the policy
-        //       gate because the gate consumes its `account_view` /
-        //       `identity_view`.
-        //   (c) Make toolset-gated tests practical: the `forced_dispatch_outcome`
-        //       override causes this gate to ALWAYS run for toolset-routed payments
-        //       regardless of policy, so tests can verify the gate fires without
-        //       needing a live RPC.
-        //
-        // Off mainnet this is a no-op when `dispatch_outcome` is
-        // `DispatchOutcome::Allow`. For the toolset-gated path,
-        // `forced_dispatch_outcome = Some(RequireApproval)` makes it ALWAYS
-        // active. On mainnet the authority wrapper runs in its place: an
-        // `Allow` without a proof signs under policy authority.
+        // Policy-required consent verifies before nonce HMAC and replay use.
+        // Mainnet Allow obtains policy authority through the same wrapper.
         let mut witness: Option<stellar_agent_core::approval::witness::ApprovalWitness> = None;
         let authority = if mainnet.is_some() {
             match super::common::mainnet_authority(
@@ -1763,25 +1887,11 @@ impl WalletServer {
             .mainnet_decision()
             .map(stellar_agent_core::mainnet::decision::MainnetDecision::provenance);
 
-        // Extract the gate-sized legs for the post-submit audit row: the SAME
-        // ValueEffects the policy gate evaluated (single-derivation invariant),
-        // threaded from the dispatch outcome — or, on the toolset-gated forced
-        // path, from the Allow the override displaced. Empty when the engine
-        // sized no value (the row then records an unsized allow).
-        // Resolved once and reused for BOTH the audit row's legs and the
-        // pre-send window reservation, on which confirmation records its
-        // success report.
-        let gate_value_effects: Option<stellar_agent_core::policy::v1::ValueEffects> =
-            match &dispatch_outcome {
-                super::common::DispatchOutcome::Allow(allowed) => allowed
-                    .value_effects
-                    .clone()
-                    .or_else(|| overridden_gate_effects.clone()),
-                super::common::DispatchOutcome::RequireApproval(approval) => approval
-                    .value_effects
-                    .clone()
-                    .or_else(|| overridden_gate_effects.clone()),
-            };
+        // The routed effects feed both payment audit and hold sizing.
+        let gate_value_effects = match &dispatch_outcome {
+            DispatchOutcome::Allow(allowed) => allowed.value_effects.clone(),
+            DispatchOutcome::RequireApproval(approval) => approval.value_effects.clone(),
+        };
         #[cfg(any(test, feature = "test-helpers"))]
         let gate_value_effects = sized_effects_hook::take().or(gate_value_effects);
         // A payment leg with a destination records the SHA-256 of the
@@ -1982,6 +2092,17 @@ impl WalletServer {
             }
         };
 
+        // The grant lease holds off every grant and installation writer from
+        // here until submission returns; the nonce helper checks the grant's
+        // end again under the replay mutex.
+        let restriction = match toolset {
+            Some(context) => match self.lease_toolset_grant(&context, &authoritative_args) {
+                Ok(lease) => Some(self.toolset_restriction(lease)),
+                Err(result) => return Ok(result),
+            },
+            None => None,
+        };
+
         // Delegates to `commit_envelope_and_verify_nonce` in `tools/common.rs`.
         // Same split-phase pattern as stellar_create_account_commit; all wire
         // codes and indistinguishability invariants are preserved inside the
@@ -1995,10 +2116,20 @@ impl WalletServer {
             &args.chain_id,
             "stellar_pay_commit",
             now_ms,
+            restriction.as_ref(),
         )
         .await
         {
             return e.into_result();
+        }
+
+        if let Some(prepared) = self
+            .prepared_payments
+            .lock()
+            .await
+            .get_mut(&nonce.to_base64())
+        {
+            prepared.consumed = true;
         }
 
         // The record the preparation opened; a retained operation answers
@@ -2048,6 +2179,7 @@ impl WalletServer {
             cross_check.witness(),
             Some(&floor_hook),
             operation.as_ref(),
+            restriction,
         )
         .await
         {
@@ -2107,174 +2239,9 @@ impl WalletServer {
     pub(crate) async fn invoke_stellar_pay(
         &self,
         args: StellarPayArgs,
+        toolset: Option<ToolsetPreparationContext>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.stellar_pay(Parameters(args)).await
-    }
-
-    /// Invokes `stellar_pay_commit` for a toolset-gated signing-adjacent path
-    /// with the per-action `PaymentSimulated` approval FORCED ON unconditionally.
-    ///
-    /// The toolset resolver has validated the asset and amount through
-    /// [`parse_asset_and_amount`] before either gate, so an invalid amount
-    /// reaches no approval.
-    ///
-    /// Unlike direct `stellar_pay_commit` which is a no-op when policy returns
-    /// `Allow`, this wrapper FORCES the `RequireApproval` path by:
-    ///
-    /// 1. Running `decode_authoritative_args` on `args.envelope_xdr`.
-    /// 2. If `args.approval_nonce` and `args.approval_attestation` are absent,
-    ///    synthesise a `PaymentSimulated` `PendingApproval` queue entry and
-    ///    return `policy.approval_required`. The operator approves via
-    ///    `stellar-agent approve --id <nonce> --profile <profile>`.
-    ///    The error payload carries the approval nonce.
-    /// 3. If approval fields ARE present → delegate to the normal `stellar_pay_commit`
-    ///    handler which will verify the attestation.
-    ///
-    /// # Security
-    ///
-    /// A `DispatchOutcome::Allow` from the policy engine is NEVER a shortcut
-    /// for toolset-gated payments.  The per-action approval ALWAYS fires.
-    pub(crate) async fn invoke_stellar_pay_commit_toolset_gated(
-        &self,
-        args: StellarPayCommitArgs,
-    ) -> Result<CallToolResult, rmcp::ErrorData> {
-        use super::common::approval_required_indistinguishable;
-        use stellar_agent_core::approval::DEFAULT_TTL_MS;
-
-        // ── Forced approval check ─────────────────────────────────────────────
-        //
-        // If approval_nonce + approval_attestation are ABSENT, the policy engine
-        // returned Allow (no approval was queued yet).  We MUST force the
-        // RequireApproval path: synthesise a PaymentSimulated pending approval,
-        // persist it, and return policy.approval_required.
-        //
-        // If they ARE present, delegate to the normal stellar_pay_commit flow
-        // which will verify the attestation (the approval was cleared by
-        // `stellar-agent approve --id <nonce> --profile <profile>`).
-        // approval_nonce + approval_attestation are expected to come from a
-        // previously-queued and operator-approved PaymentSimulated pending
-        // approval (synthesised by the `!has_approval` branch below on the prior
-        // invocation).  We MUST verify them against the stored entry — we CANNOT
-        // delegate to `stellar_pay_commit` with the normal dispatch flow because
-        // `verify_attestation_gate` is a no-op when the policy engine returns Allow.
-        //
-        // `stellar_pay_commit_impl` accepts a `forced_dispatch_outcome` parameter.
-        // When `Some(RequireApproval(...))` is supplied, it overrides any `Allow`
-        // result from the policy engine so that `verify_attestation_gate` ALWAYS
-        // runs the cryptographic HMAC check regardless of policy.  This is the
-        // load-bearing mechanism; field-presence alone CANNOT substitute.
-        let has_approval = args.approval_nonce.is_some() && args.approval_attestation.is_some();
-
-        if !has_approval {
-            // Force per-action approval unconditionally. The pending payment
-            // approval holds one plain payment, so the decoder's path payments
-            // refuse here with the decode refusal's code and prefix.
-            use stellar_agent_core::envelope_decode::{
-                ClassicOperation, ClassicTransactionKind, classic_summary,
-            };
-            if let Err(e) = decode_authoritative_args(&args.envelope_xdr, "stellar_pay_commit") {
-                return Ok(crate::tools::common::business_error_result(
-                    "simulation.divergence",
-                    format!("toolset_gated envelope_xdr decode: {e}"),
-                ));
-            }
-            if !matches!(
-                classic_summary(&args.envelope_xdr, ClassicTransactionKind::Payment)
-                    .map(|summary| summary.operation),
-                Ok(ClassicOperation::Payment { .. })
-            ) {
-                return Ok(crate::tools::common::business_error_result(
-                    "simulation.divergence",
-                    "toolset_gated envelope_xdr decode: the forced approval needs one payment operation",
-                ));
-            }
-
-            let now_ms = self.clock.now_unix_ms().map_err(|e| {
-                rmcp::ErrorData::internal_error(format!("approval.clock_error: {e}"), None)
-            })?;
-            let end = now_ms.checked_add(DEFAULT_TTL_MS).ok_or_else(|| {
-                rmcp::ErrorData::internal_error("approval interval overflows", None)
-            })?;
-            let request = stellar_agent_core::policy::ApprovalRequest::new(
-                String::new(),
-                (DEFAULT_TTL_MS / 1000) as u32,
-            );
-            let pending = match self.persist_pay_pending_approval(
-                &args.envelope_xdr,
-                now_ms,
-                end,
-                &self.profile_name_for_approval(),
-                &request,
-                PaymentQueue::Forced,
-            ) {
-                Ok(entry) => entry,
-                Err(error) => {
-                    return payment_recovery_refusal(
-                        &error,
-                        &self.profile_name_for_approval(),
-                        GATED_CREATE,
-                    );
-                }
-            };
-
-            let approval_nonce = pending.approval_nonce.clone();
-
-            tracing::debug!(
-                nonce = %approval_nonce,
-                "toolset_gated: forced per-action approval queued"
-            );
-
-            // Return indistinguishable approval_required (the nonce is in the
-            // tracing log for operator forensics; not in the wire error).
-            return Ok(approval_required_indistinguishable(
-                &self.profile_name_for_approval(),
-            ));
-        }
-
-        // The forced gate carries the persisted request. Before submission the
-        // attestation must verify against the nonce, envelope and user, and the
-        // pending approval must be unexpired under both its stored expiry and
-        // the rule's ttl.
-        let approvals_dir = match self.resolve_approval_dir() {
-            Ok(dir) => dir,
-            Err(_) => {
-                return Ok(approval_required_indistinguishable(
-                    &self.profile_name_for_approval(),
-                ));
-            }
-        };
-        let store_path = approvals_dir.join(format!("{}.toml", self.profile_name_for_approval()));
-        let store =
-            match open_with_retry(&store_path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF) {
-                Ok(store) => store,
-                Err(_) => {
-                    return Ok(approval_required_indistinguishable(
-                        &self.profile_name_for_approval(),
-                    ));
-                }
-            };
-        let Some(pending) = args
-            .approval_nonce
-            .as_deref()
-            .and_then(|nonce| store.get(nonce))
-        else {
-            return Ok(approval_required_indistinguishable(
-                &self.profile_name_for_approval(),
-            ));
-        };
-        let forced_outcome = DispatchOutcome::RequireApproval(super::common::ApprovalOutcome {
-            snapshot: None,
-            request: pending.approval_request(),
-            value_effects: None,
-            governing_ttl_ms: pending
-                .expires_at_unix_ms
-                .saturating_sub(pending.created_at_unix_ms),
-            now_ms: None,
-            decision: None,
-        });
-        drop(store);
-        self.stellar_pay_commit_impl(args, Some(forced_outcome))
-            .await
+        self.stellar_pay_impl(args, toolset).await
     }
 }
 

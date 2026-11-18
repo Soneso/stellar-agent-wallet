@@ -160,6 +160,7 @@ pub(crate) fn mint_header(header: &mut Header, binding: &DomainBinding, holds: &
                 policy_digest: header.policy.digest,
                 authority: header.authority.mint_authority(),
                 chain_deadline_ms: None,
+                restriction_end_ms: None,
                 authorization_ttl_ms: TTL_MS,
                 bindings: BindingFacts {
                     endpoint: None,
@@ -170,6 +171,7 @@ pub(crate) fn mint_header(header: &mut Header, binding: &DomainBinding, holds: &
                     reservation: None,
                     authority: [5; 32],
                     audit: [6; 32],
+                    restriction: None,
                 },
                 holds: holds.to_vec(),
                 parent: None,
@@ -243,6 +245,7 @@ pub(crate) fn tx_authorization(
         header,
         binding,
         entries: vec![],
+        _restriction: None,
     })
 }
 
@@ -284,6 +287,7 @@ pub(crate) fn soroban_authorization(
             reservation: None,
             authority: [0; 32],
             audit: [0; 32],
+            restriction: None,
         },
         authorization_ttl_ms: TTL_MS,
         header,
@@ -650,6 +654,7 @@ impl LedgerFixture {
                         expires_at_ms: header.authority.expires_at_ms(),
                     },
                     chain_deadline_ms: None,
+                    restriction_end_ms: None,
                     authorization_ttl_ms: TTL_MS,
                     bindings: BindingFacts {
                         endpoint: Some([1; 32]),
@@ -660,6 +665,7 @@ impl LedgerFixture {
                         reservation: None,
                         authority: [5; 32],
                         audit: [6; 32],
+                        restriction: None,
                     },
                     holds: holds.to_vec(),
                     parent: None,
@@ -682,6 +688,7 @@ impl LedgerFixture {
             header,
             binding,
             entries: holds.to_vec(),
+            _restriction: None,
         })
     }
 

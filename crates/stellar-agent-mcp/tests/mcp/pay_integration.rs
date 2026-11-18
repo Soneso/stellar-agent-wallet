@@ -2246,6 +2246,7 @@ async fn commit_invalid_memo_parse_matches_nonce_hmac_wire_response() {
 /// the handler boundary.  That finding should be escalated; the structural wire-collapse
 /// defence (`commit_invalid_memo_parse_matches_nonce_hmac_wire_response`) is unaffected.
 #[tokio::test]
+#[serial_test::serial(mainnet_clock)]
 #[serial]
 #[ignore = "timing measurement; run on demand — use `cargo test -- --ignored timing_expired_rebuild_vs_hmac_mismatch_rebuild`"]
 async fn timing_expired_rebuild_vs_hmac_mismatch_rebuild() {
@@ -3101,6 +3102,7 @@ async fn dispatch_observes_stored_endpoints_before_refresh() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn dispatch_stored_endpoints_environment_child() {
     if std::env::var_os("DISPATCH_STORED_ENDPOINTS_CHILD").is_none() {
@@ -5500,6 +5502,7 @@ async fn the_gate_reconcile_client_is_the_only_other_client_a_v1_round_trip_buil
 /// simulate builds two clients, its own and the reconcile's, and each reads
 /// the credential once.
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn the_gate_reconcile_client_reads_the_primary_credential() {
     use std::sync::atomic::{AtomicUsize, Ordering};

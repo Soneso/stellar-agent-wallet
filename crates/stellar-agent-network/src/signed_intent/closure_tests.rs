@@ -276,6 +276,7 @@ fn witness(arrival: u64) -> LedgerWitnessCapability {
 }
 
 #[tokio::test]
+#[serial_test::serial(mainnet_clock)]
 #[serial_test::serial]
 async fn entryless_admission_commits_progress() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -414,6 +415,7 @@ async fn entryless_admission_commits_progress() {
 }
 
 #[test]
+#[serial_test::serial(mainnet_clock)]
 #[serial_test::serial]
 fn envelope_bound_mismatch_keeps_admitted_charge() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();

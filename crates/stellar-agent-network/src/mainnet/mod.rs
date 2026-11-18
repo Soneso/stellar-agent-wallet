@@ -17,6 +17,8 @@
 //!   subjects and labels by the names their consumers use.
 //! - [`message`]: the SEP-10 message facts, the message use receipt, and the
 //!   check of a challenge against the receipt before the ephemeral key signs.
+//! - [`restriction`]: the live toolset grant evidence a restricted classic
+//!   payment binds.
 //! - [`soroban`]: the check of a Soroban authorization preimage against an
 //!   intent authorization.
 //!
@@ -39,6 +41,7 @@ pub mod message;
 pub(crate) mod mint;
 pub(crate) mod refusal;
 pub mod resolve;
+pub mod restriction;
 pub mod soroban;
 #[cfg(all(feature = "mainnet-write", feature = "test-helpers"))]
 #[doc(hidden)]

@@ -583,6 +583,7 @@ impl Respond for AdvancingLedger {
 /// identity, stamps the moment its own answer arrived, and stays under the
 /// deadline given at preparation.
 #[tokio::test]
+#[serial_test::serial(mainnet_clock)]
 #[serial_test::serial]
 async fn prepared_observation_keeps_client_deadline_and_arrival_time() {
     let server = serve_get_network(network(TESTNET_PASSPHRASE, 29)).await;

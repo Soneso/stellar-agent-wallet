@@ -49,8 +49,8 @@ fn composed_entries_keep_complete_keys_limits_and_singleton() {
         );
         assert_eq!(
             compose_window_entries(&[routed.clone(), routed.clone()], Some(&[])).unwrap(),
-            vec![routed.clone()],
-            "an empty outer vector still opts into composition: {kind}"
+            vec![routed.clone(), routed.clone()],
+            "an empty outer vector keeps the routed multiplicity: {kind}"
         );
         assert_eq!(
             compose_window_entries(
@@ -58,8 +58,8 @@ fn composed_entries_keep_complete_keys_limits_and_singleton() {
                 Some(std::slice::from_ref(&outer))
             )
             .unwrap(),
-            vec![outer.clone()],
-            "one debit with tighter limit and its labels: {kind}"
+            vec![outer.clone(), routed.clone()],
+            "the shared occurrence takes the tighter limit and its labels: {kind}"
         );
         assert_eq!(
             compose_window_entries(
@@ -116,6 +116,42 @@ fn composed_entries_keep_complete_keys_limits_and_singleton() {
             vec![large],
             "composition never sums, clamps, or changes a debit"
         );
+    }
+}
+
+/// Occurrences pair across the two vectors only: each input keeps its own
+/// multiplicity, the composed count is the larger one, and a paired
+/// occurrence carries the tighter cap.
+#[test]
+fn composition_keeps_the_larger_multiplicity_of_each_input() {
+    for kind in 0..4 {
+        for (routed_cap, outer_cap) in [(200, 100), (100, 200)] {
+            let routed = entry(kind, routed_cap, "native");
+            let outer = entry(kind, outer_cap, "XLM");
+            let tighter = if outer_cap < routed_cap {
+                &outer
+            } else {
+                &routed
+            };
+            for routed_count in 0..4 {
+                for outer_count in 0..4 {
+                    let shared = routed_count.min(outer_count);
+                    let mut expected = vec![tighter.clone(); shared];
+                    expected.extend(vec![routed.clone(); routed_count - shared]);
+                    expected.extend(vec![outer.clone(); outer_count - shared]);
+                    assert_eq!(
+                        compose_window_entries(
+                            &vec![routed.clone(); routed_count],
+                            Some(&vec![outer.clone(); outer_count]),
+                        )
+                        .unwrap(),
+                        expected,
+                        "multiplicity {routed_count}/{outer_count}, caps \
+                         {routed_cap}/{outer_cap}: {kind}"
+                    );
+                }
+            }
+        }
     }
 }
 

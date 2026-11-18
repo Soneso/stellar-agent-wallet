@@ -2648,6 +2648,11 @@ fn persist_locked(guard: &mut MutexGuard<'_, StoreState>) -> Result<(), ReceiptS
             source: e,
         })?;
 
+    #[cfg(any(test, feature = "test-helpers"))]
+    crate::approval::store::persist_test_seam::run(
+        &guard.file_path,
+        crate::approval::store::persist_test_seam::Step::TemporarySynced,
+    );
     #[cfg(test)]
     if tests::BEFORE_RENAME_FAILS.get() {
         return Err(ReceiptStoreError::Io {
@@ -2662,7 +2667,18 @@ fn persist_locked(guard: &mut MutexGuard<'_, StoreState>) -> Result<(), ReceiptS
             source: e.error,
         })?;
 
-    sync_directory(dir)
+    #[cfg(any(test, feature = "test-helpers"))]
+    crate::approval::store::persist_test_seam::run(
+        &guard.file_path,
+        crate::approval::store::persist_test_seam::Step::Renamed,
+    );
+    sync_directory(dir)?;
+    #[cfg(any(test, feature = "test-helpers"))]
+    crate::approval::store::persist_test_seam::run(
+        &guard.file_path,
+        crate::approval::store::persist_test_seam::Step::DirectorySynced,
+    );
+    Ok(())
 }
 
 /// Confirms that the stored file and its directory are durable without

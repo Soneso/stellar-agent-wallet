@@ -6469,6 +6469,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn outbox_drain_never_reacquires_the_window_lock() {
         use std::sync::Arc;
@@ -6761,6 +6762,7 @@ pub(crate) mod tests {
                 policy_digest: [7; 32],
                 authority,
                 chain_deadline_ms: None,
+                restriction_end_ms: None,
                 authorization_ttl_ms: TTL_MS,
                 bindings: BindingFacts {
                     endpoint: None,
@@ -6771,6 +6773,7 @@ pub(crate) mod tests {
                     reservation: None,
                     authority: [7; 32],
                     audit: [8; 32],
+                    restriction: None,
                 },
                 holds,
                 parent: None,
@@ -7058,6 +7061,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn recovery_emitted_kinds_survive_eviction() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -7103,6 +7107,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn evidence_key_is_kind_and_observed_ledger() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -7170,6 +7175,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn recovery_evidence_eviction_tie_breaks_on_sequence() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -7305,6 +7311,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn outcome_snapshot_selects_oldest_eligible_and_targets_by_hash() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -7389,6 +7396,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn open_returns_new_replay_resumable_and_conflict() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -7451,6 +7459,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn envelope_record_retry_with_the_same_intent_resumes_with_the_stored_envelope() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -7471,6 +7480,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn envelope_record_expiry_is_capped_at_max_time() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -7492,6 +7502,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn begin_attempt_refuses_another_envelope_for_an_envelope_record() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -7547,6 +7558,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn waiting_operations_cap_refuses_the_seventeenth() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -7581,6 +7593,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn begin_attempt_refuses_an_open_attempt_and_a_ninth() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -7610,6 +7623,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn longest_transition_path_fits_commit_ids() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -7684,6 +7698,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn every_edge_outside_the_table_refuses() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -7742,6 +7757,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn expose_after_not_sent_refuses() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -7775,6 +7791,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn begin_attempt_refuses_oversized_envelope_before_mint() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -8017,6 +8034,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn largest_record_fits_m() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -8088,6 +8106,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     #[allow(
         clippy::too_many_lines,
@@ -8307,6 +8326,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn free_text_bounds_measure_serialized_bytes() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -8392,6 +8412,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn sweep_adopts_waiting_operation_before_restart() {
         for expired in [false, true] {
@@ -8539,6 +8560,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn sweep_marks_open_unused_with_an_always_row_and_keeps_claimed() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -8607,6 +8629,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn remint_retires_unused_reservation_atomically() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -8727,6 +8750,7 @@ pub(crate) mod tests {
     /// its holds and gets no row, and a file naming an open one under an
     /// exposure refuses the remint before any write.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn retire_after_expose_refused() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -8800,6 +8824,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn unexposed_sending_after_authorization_expiry_records_not_sent() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -8878,6 +8903,7 @@ pub(crate) mod tests {
     /// commits, and `false` for the unsigned envelope digests the records
     /// bind and for a hash no exposure names.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn sequence_releases_reads_by_envelope_hash() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -8941,6 +8967,7 @@ pub(crate) mod tests {
     /// claimed. The committed exposure means its bytes may have reached the
     /// network.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn an_exposed_sending_attempt_never_recovers_as_not_sent() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -8965,6 +8992,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn claimed_unexposed_attempt_stays_sending() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -8987,6 +9015,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn unreleased_reservation_blocks_compaction() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -9088,6 +9117,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn late_release_ordinary_pruning_raises_floor() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -9164,6 +9194,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn mainnet_reset_keeps_the_floors() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -9372,6 +9403,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn history_incomplete_survives_restart_and_eviction() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -9434,6 +9466,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn evidence_cap_evicts_lowest_ledger_and_keeps_the_watermark() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -9487,6 +9520,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn record_evidence_appends_one_audit_row_with_a_contiguous_range() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -9597,6 +9631,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn audit_append_failure_commits_nothing() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -9673,6 +9708,7 @@ pub(crate) mod tests {
     /// transitions, both decision outcomes and non-inclusion, both expiry
     /// paths and the x402 obligation expiry.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn committed_batch_holds_every_state_edge() {
         use OperationState as S;
@@ -9936,6 +9972,7 @@ pub(crate) mod tests {
     /// the commit is durable. A failed optional compaction still returns
     /// success and publishes its edge.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn committed_batch_is_empty_without_a_commit() {
         use super::super::store::{
@@ -10013,6 +10050,7 @@ pub(crate) mod tests {
     /// An expiry a lookup commits stays in the recorder's batch when the
     /// recorder's next step refuses.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn committed_batch_keeps_changes_before_a_later_error() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -10044,6 +10082,7 @@ pub(crate) mod tests {
     /// Each drain moves the accumulated edges out once, with the record's
     /// identity, business id and approval link.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn recorder_drains_once() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -10084,6 +10123,7 @@ pub(crate) mod tests {
     /// A transition another recorder commits reaches this recorder's
     /// verified reads, never its batch.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn external_commits_add_no_notice() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -10118,6 +10158,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn record_observation_writes_no_audit_row() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -10286,6 +10327,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn list_since_returns_open_and_recently_closed() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -10411,6 +10453,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn expose_refuses_an_unclaimed_authorization() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -10448,6 +10491,7 @@ pub(crate) mod tests {
     /// the expiry sweep or a reset, even when it was never claimed; its record
     /// stays `Sending` or `SentOutcomeUnknown`.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn an_exposed_authorization_expires_without_a_release_row() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -10508,6 +10552,7 @@ pub(crate) mod tests {
     /// A reset of an ended operation keeps an exposed authorization that
     /// still holds capacity without a release row.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_reset_writes_no_row_for_an_exposed_authorization() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -10541,6 +10586,7 @@ pub(crate) mod tests {
     /// An approval nonce whose earlier authorization was claimed carries no
     /// remint, even after that authorization expired.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn remint_refuses_after_a_claimed_expired_carrier() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -10572,6 +10618,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn sent_outcome_unknown_needs_a_committed_exposure() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -10614,6 +10661,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn payload_released_needs_a_committed_exposure() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -10654,6 +10702,7 @@ pub(crate) mod tests {
     /// the commit that ends its operation; seven days and one retention later
     /// the record compacts and the authorization is pruned.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn an_invalidated_linked_authorization_is_released_when_its_operation_ends() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -10710,6 +10759,7 @@ pub(crate) mod tests {
     /// without a write; adoption through a linked open authorization still
     /// starts one.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn begin_attempt_refuses_after_the_waiting_expiry() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -10767,6 +10817,7 @@ pub(crate) mod tests {
     /// in milliseconds for one with it. Each form refuses the other exposure,
     /// and a cancellation without a clear refuses.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn clear_writes_the_unknown_row_in_its_commit() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -10850,6 +10901,7 @@ pub(crate) mod tests {
     /// An unknown outcome keeps its reservation unreleased through expiry
     /// passes and every other step until the operator clear.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn no_unknown_row_without_the_clear() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -10885,6 +10937,7 @@ pub(crate) mod tests {
     /// record holds has its audit row after another operation's mint, an
     /// expiry pass and a reset.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn transition_rows_match_commit_ids() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -10947,6 +11000,7 @@ pub(crate) mod tests {
     /// A claimed authorization linked to an operation that has not ended
     /// stays through one more full retention after it expired.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_claimed_expired_link_outlives_the_retention() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -10979,6 +11033,7 @@ pub(crate) mod tests {
     /// A reset after a linked authorization's authority ended keeps it while
     /// it has no release row.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_reset_keeps_a_link_whose_authority_ended() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -11017,6 +11072,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn an_exposed_unknown_outcome_expires_without_a_row() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -11035,6 +11091,7 @@ pub(crate) mod tests {
     /// An expiry pass over an ended record leaves an open authorization an
     /// exposure names without a release row.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn expire_due_keeps_an_exposed_open_link_of_an_ended_record() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -11059,6 +11116,7 @@ pub(crate) mod tests {
     /// An exposed `Sending` attempt stays `Sending` once its authorization
     /// ended unused.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn an_exposed_sending_attempt_stays_sending_after_its_authorization_ended() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -11080,6 +11138,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_mint_linking_an_ended_operation_refuses() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -11105,6 +11164,7 @@ pub(crate) mod tests {
 
     /// A mint link names the operation's next attempt and no other.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_mint_link_names_the_next_attempt() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -11147,6 +11207,7 @@ pub(crate) mod tests {
     /// operation step commits the expiry and the adoption with their audit
     /// rows.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn reset_counts_a_record_its_expiry_edge_ends() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -11413,6 +11474,7 @@ pub(crate) mod tests {
     /// older observation keeps the row, and the stored observation stands
     /// in for a caller that passes none.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn recovery_release_counting_boundaries() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -11496,6 +11558,7 @@ pub(crate) mod tests {
     /// complete old state; its appended row names a commit the record does
     /// not retain. An append failure persists nothing.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn recovery_transition_before_commit_point_keeps_old_state() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -11554,6 +11617,7 @@ pub(crate) mod tests {
     /// A commit that stops after its counter moves reopens the complete new
     /// state: outcome, decision, accounting and release row together.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn recovery_transition_after_commit_point_reopens_new_state() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -11594,6 +11658,7 @@ pub(crate) mod tests {
     /// `proved_unspent` row. The claimed authorization keeps its state and
     /// its holds.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn recovery_non_inclusion_keeps_a_claimed_authorizations_holds() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -11637,6 +11702,7 @@ pub(crate) mod tests {
     /// non-inclusion without its sequence release and direct proofs all
     /// refuse and write nothing.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn recovery_checked_decision_refuses_stale_substituted_or_direct_proofs() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -11774,6 +11840,7 @@ pub(crate) mod tests {
     /// digest across restart and evidence eviction. Endpoint evidence keeps
     /// XDR digests only, and envelope bounds hold at 8,192 and 8,193.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn recovery_persisted_outcome_keeps_bounded_result_and_original_envelope_digest() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -11886,6 +11953,7 @@ pub(crate) mod tests {
     /// selects one, and only the decision's own commit writes its
     /// projection marker, once.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn recovery_committed_decisions_survive_restart_and_gate_retry() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -11997,6 +12065,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn every_rebuilt_receipt_keeps_its_destination() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -12039,6 +12108,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn unusable_provenance_projects_none() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -12132,6 +12202,7 @@ pub(crate) mod tests {
     /// successor with `recovery.retry_refused`, and the marker alone admits
     /// it; a receipt claims nothing here.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn recovery_committed_decisions_gate_the_successor_on_projection() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -12155,6 +12226,7 @@ pub(crate) mod tests {
     /// commit. The proof, accounting, release row and audit rows stay as
     /// the first commit writes them, before and after restart.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn recovery_transition_replay_is_idempotent() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -12229,6 +12301,7 @@ pub(crate) mod tests {
     /// request id stays outer. All six evidence kinds audit, an uncovered
     /// answer falls back to the shared ledger, and no row names an endpoint.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn recovery_transition_and_evidence_audit_rows_name_the_committed_proofs() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -12347,6 +12420,7 @@ pub(crate) mod tests {
     /// and reverse linkage: every audit row classifies as committed or
     /// evicted, and a projection marker writes no audit row.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn recovery_evidence_ranges_preserve_every_class() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -12894,6 +12968,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_mainnet_consumption_carries_destinations() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -13047,6 +13122,7 @@ pub(crate) mod tests {
     /// unprojected, confirmed-failure or changed-policy successor refuses.
     /// The projected one starts the next attempt.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn recovery_retry_permission_requires_evidenced_non_inclusion_and_live_authority() {
         let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -13141,6 +13217,7 @@ pub(crate) mod tests {
     /// sequence refuses as a minted one does; one under the predecessor's
     /// policy starts the next attempt.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn recovery_linked_successor_requires_the_predecessor_policy() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -13281,6 +13358,7 @@ pub(crate) mod tests {
     /// and without a write. The attempt cap, the execution expiry and an
     /// open attempt keep their codes.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn successor_without_attempt_or_proof_refuses_retry() {
         let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -13387,6 +13465,7 @@ pub(crate) mod tests {
     /// authorization, and leaves nothing to repair after a restart; with
     /// the pin unchanged the same admission starts attempt 2.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn linked_successor_refuses_a_changed_policy_pin() {
         let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -13459,6 +13538,7 @@ pub(crate) mod tests {
     /// A successor under a fresh approval authorization admits, minted in
     /// the admission or linked before it, while the pin names its policy.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn approval_successor_admits_under_an_unchanged_pin() {
         let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -13490,6 +13570,7 @@ pub(crate) mod tests {
     /// decision's evidence and ledgers once; a racing second begin refuses
     /// and writes no second row.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn recovery_retry_audit_row_from_begin_attempt() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -13593,6 +13674,7 @@ pub(crate) mod tests {
     /// crash after the counter reopens the complete new state: the release
     /// row and, for live x402, the `Expired` state together.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn recovery_obligation_release_crosses_the_commit_point_as_one_unit() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -13680,6 +13762,7 @@ pub(crate) mod tests {
     /// obligations take no classic slot, and a repeated pass releases
     /// nothing again.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn recovery_obligation_enumeration_and_release_rows_are_verified_and_atomic() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -13839,6 +13922,7 @@ pub(crate) mod tests {
     /// missing or unusable run record changes nothing; due enumeration and
     /// release keep their strict proofs.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn release_candidates_are_authenticated_and_pre_due() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -13950,6 +14034,7 @@ pub(crate) mod tests {
     /// A malformed authentic file refuses the candidate query with the same
     /// typed error as the due query, never with an empty success.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn release_candidates_reject_invalid_state() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -14098,6 +14183,7 @@ pub(crate) mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_cancelled_clear_keeps_the_total_debit() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -14133,6 +14219,7 @@ pub(crate) mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn public_non_inclusion_keeps_the_total_debit() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -14171,6 +14258,7 @@ pub(crate) mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn release_unused_releases_a_total_hold() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -14203,6 +14291,7 @@ pub(crate) mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn release_linked_unused_releases_a_total_hold() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -14247,6 +14336,7 @@ pub(crate) mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn public_unsent_evidence_keeps_the_total() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -14397,6 +14487,7 @@ pub(crate) mod tests {
         /// attempt's total debit: zero use, then the full allocation admits.
         /// The failure keeps its charged fee and its settled native release.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_checked_decision_releases_the_total_debit() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -14452,6 +14543,7 @@ pub(crate) mod tests {
         /// A checked failure or non-inclusion releases each, and a total row
         /// of another authorization stays counted.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_checked_decision_releases_every_shape_of_the_attempt() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -14500,6 +14592,7 @@ pub(crate) mod tests {
         /// A success, a repeated decision, a stale decision, and a decision
         /// for another envelope release nothing.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn only_a_fresh_checked_failure_or_non_inclusion_releases() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -14556,6 +14649,7 @@ pub(crate) mod tests {
         /// The release commits with the decision: a stop before the counter
         /// keeps the debit, a stop after it keeps the release.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn the_release_follows_the_commit_counter() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -14597,6 +14691,7 @@ pub(crate) mod tests {
 
         /// Recovery steps of version 12 state read no pin.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn recovery_needs_no_pin() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -14635,6 +14730,7 @@ pub(crate) mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn retirement_refuses_a_total_operation_mint() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -14715,6 +14811,7 @@ pub(crate) mod tests {
         /// hold, then the clock moves back inside that hold's lifetime and
         /// the hold is claimed after a restart.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_rolled_back_clock_cannot_revive_a_reused_hold() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -14756,6 +14853,7 @@ pub(crate) mod tests {
         /// The reuse is a reservation written through the prepared commit:
         /// every commit seam leaves the allocation at the one hold.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_reservation_never_reuses_an_unswept_live_hold() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -14813,6 +14911,7 @@ pub(crate) mod tests {
         /// and an unclaimed one linked to a live operation. An unlinked
         /// unclaimed hold counts in neither once its writer sweeps.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn hydration_and_admission_agree_beside_live_and_exposed_holds() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -14897,6 +14996,7 @@ pub(crate) mod tests {
         /// failure of D7's attempt then releases D7's 6 and cannot reduce
         /// D8's 10, also when the decision is replayed.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_release_after_a_repin_cannot_credit_the_new_digest() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -14950,6 +15050,7 @@ pub(crate) mod tests {
         /// failure and projection, the reset succeeds, a fresh 10 admits,
         /// and a replay of the decision credits nothing more.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_replay_after_a_reset_cannot_credit_the_new_allocation() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -15025,6 +15126,7 @@ pub(crate) mod tests {
         /// acknowledgement then succeeds, and only afterwards does the
         /// released row age out.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn an_open_projection_survives_two_collections() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -15063,6 +15165,7 @@ pub(crate) mod tests {
         /// Past the retention they age out before capacity is checked: a new
         /// operation opens, and the full allocation admits.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn final_released_totals_age_out_before_capacity_is_checked() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -15114,6 +15217,7 @@ pub(crate) mod tests {
 
         /// A counted total row as old as a pruned released one stays counted.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_counted_total_of_the_same_age_survives_the_pruning() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -15164,6 +15268,7 @@ pub(crate) mod tests {
         /// unrelated pending 3: the use stays 9, and the window rows keep
         /// their exact amounts.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_checked_success_marks_only_its_own_rows_final() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -15210,6 +15315,7 @@ pub(crate) mod tests {
         /// A success decided while the claim still holds keeps the hold
         /// charged; the later conversion becomes final.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_checked_success_finalizes_every_shape() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -15249,6 +15355,7 @@ pub(crate) mod tests {
         /// keeps its final row of 6. A new operation opens, 2 more admit,
         /// and 1 refuses.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn capacity_reclaims_history_and_folds_final_charges() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -15323,6 +15430,7 @@ pub(crate) mod tests {
         /// unrelated attempt and its proof. A checked success then refuses
         /// with the typed detail, appends no audit row, and writes nothing.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_refused_fold_keeps_reads_and_appends_nothing() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -15392,6 +15500,7 @@ pub(crate) mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn intent_total_overflow_precedes_operation_audit() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -15432,6 +15541,7 @@ pub(crate) mod tests {
         /// the terminal-record cap fills. Its hold converts into a final row;
         /// then the record leaves under the cap, and the row folds into 6.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn the_terminal_cap_keeps_a_success_until_its_hold_is_final() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -15528,6 +15638,7 @@ pub(crate) mod tests {
         /// row, which becomes final while the success is retained. Past the
         /// cap and the age limit the row folds into 6 and the record leaves.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_late_consumption_after_a_checked_success_becomes_final() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -15630,6 +15741,7 @@ pub(crate) mod tests {
 
         /// The clock moves back before any reuse: the hold still counts.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_rollback_before_the_reuse_keeps_the_hold() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -15658,6 +15770,7 @@ pub(crate) mod tests {
         /// committed with the reuse, so a rolled-back claim refuses and the
         /// next reuses stop at the total.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_rollback_between_two_reuses_keeps_the_expiry() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -15692,6 +15805,7 @@ pub(crate) mod tests {
         /// The clock moves back while the expired live hold is claimed: the
         /// claim keeps the hold counted through every later step.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_claim_under_a_rolled_back_clock_stays_counted() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -15722,6 +15836,7 @@ pub(crate) mod tests {
         /// The operation's own step commits the expiry of its hold. Only then
         /// is the capacity reused, and a rolled-back claim refuses.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn an_operation_step_commits_the_expiry_before_reuse() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -15753,6 +15868,7 @@ pub(crate) mod tests {
         /// refuses while the operation is open, and an unlinked expired hold
         /// is released by the reset, after which the claim refuses.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_reset_between_expiry_and_rollback_keeps_the_total() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -15814,6 +15930,7 @@ pub(crate) mod tests {
         /// The operation mint refuses a malformed entry before its prechecks
         /// read the pin or the hold timestamps.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn an_operation_mint_checks_the_shape_before_its_prechecks() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -15879,6 +15996,7 @@ pub(crate) mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn an_operation_mint_refuses_a_total_limit_on_a_windowed_key() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -15906,6 +16024,7 @@ pub(crate) mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn an_operation_mint_refuses_an_amount_limit_on_a_total_key() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -16044,6 +16163,7 @@ pub(crate) mod tests {
         /// of each payment operation when they differ. A non-payment record
         /// and a canonical intent that does not validate carry neither member.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_pay_replay_carries_its_destination() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -16122,6 +16242,7 @@ pub(crate) mod tests {
         /// replays from a fresh store on the same file with `next` `wait` and
         /// its destination.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_pay_replay_carries_its_destination_after_a_restart() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -16147,6 +16268,7 @@ pub(crate) mod tests {
         /// A tombstone keeps only its intent digest, so its replay carries
         /// neither destination member.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_pay_replay_carries_its_destination_except_a_tombstone() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();

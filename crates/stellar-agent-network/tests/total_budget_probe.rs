@@ -169,6 +169,7 @@ fn pay(
 /// Pays 6, confirms it, then pays 6 again after a fresh hydration past
 /// every horizon: both the gate and the reservation refuse.
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn testnet_total_survives_hydration() {
     let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
