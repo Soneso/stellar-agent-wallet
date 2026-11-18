@@ -15,18 +15,19 @@ use stellar_agent_core::approval::{
     retry::{DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, open_with_retry},
     witness::ApprovedKind,
 };
-use stellar_agent_core::audit_log::PolicyDecision;
+use stellar_agent_core::audit_log::{AuditOutbox, PolicyDecision};
 use stellar_agent_core::error::{ApprovalFailure, InternalError, SubmissionError, WalletError};
 use stellar_agent_core::mainnet::verified_policy::VerifiedPolicy;
 use stellar_agent_network::fees::ClassicFeeChoice;
 use stellar_agent_network::mainnet::MainnetConsumer;
 use stellar_agent_network::operation_entry::{
-    self, ClassicEntry, CommitEntry, EnvelopeFacts, IdentityFacts, IntentBaseFacts, OpenedEntry,
-    Preparation,
+    self, ClassicEntry, CommitEntry, ConsentAdmission, EnvelopeFacts, IdentityFacts,
+    IntentBaseFacts, OpenedEntry, Preparation,
 };
 use stellar_agent_network::policy_state::{
     ApprovalRecorder, ApprovalState, ApprovalStatus, ApprovalView, BusinessId, OperationHandle,
     OperationKind, OperationRecorder, OperationState, OperationTool,
+    approvals::PendingApprovalFacts,
 };
 
 use crate::server::WalletServer;
@@ -217,6 +218,63 @@ enum Unlinked {
     Recover,
 }
 
+/// The inbox write of a durable producer: the entry it builds and how the
+/// inbox stores it.
+pub(crate) trait InboxWrite {
+    /// The producer's inbox refusal.
+    type Error;
+
+    /// Builds the entry without storing it. `intent` is the operation's
+    /// validated stored canonical intent, when it has one.
+    fn build(
+        &self,
+        intent: Option<&stellar_agent_core::approval::ClassicIntent>,
+    ) -> Result<PendingApproval, Self::Error>;
+
+    /// Stores `entry`, which [`Self::build`] returned.
+    fn insert(self, entry: PendingApproval) -> Result<PendingApproval, Self::Error>;
+
+    /// Builds and stores the entry: the write of a producer whose consent is
+    /// not published.
+    fn persist(
+        self,
+        intent: Option<&stellar_agent_core::approval::ClassicIntent>,
+    ) -> Result<PendingApproval, Self::Error>
+    where
+        Self: Sized,
+    {
+        let entry = self.build(intent)?;
+        self.insert(entry)
+    }
+}
+
+/// An [`InboxWrite`] from its build and insert steps.
+pub(crate) struct Staged<B, I> {
+    /// Builds the entry.
+    pub(crate) build: B,
+    /// Stores the built entry.
+    pub(crate) insert: I,
+}
+
+impl<B, I, E> InboxWrite for Staged<B, I>
+where
+    B: Fn(Option<&stellar_agent_core::approval::ClassicIntent>) -> Result<PendingApproval, E>,
+    I: FnOnce(PendingApproval) -> Result<PendingApproval, E>,
+{
+    type Error = E;
+
+    fn build(
+        &self,
+        intent: Option<&stellar_agent_core::approval::ClassicIntent>,
+    ) -> Result<PendingApproval, E> {
+        (self.build)(intent)
+    }
+
+    fn insert(self, entry: PendingApproval) -> Result<PendingApproval, E> {
+        (self.insert)(entry)
+    }
+}
+
 /// Pre-insert inbox failures keep the insertion protocol's error channel.
 enum ProducerError {
     Inbox(ApprovalError),
@@ -236,7 +294,7 @@ impl WalletServer {
         &self,
         handle: Option<&OperationHandle>,
         decision: PolicyDecision,
-        persist: impl FnOnce() -> Result<PendingApproval, WalletError>,
+        write: impl InboxWrite<Error = WalletError>,
     ) -> Result<PendingApproval, WalletError> {
         self.start_approval(
             handle,
@@ -244,7 +302,7 @@ impl WalletServer {
             decision,
             Unlinked::Replace,
             |path, view, _| linked_entry(path, &view.record.nonce).map(Ok),
-            |_| persist(),
+            write,
         )
         .map_err(|error| match error {
             ProducerError::Inbox(error) => record_error(&error),
@@ -260,9 +318,7 @@ impl WalletServer {
         handle: Option<&OperationHandle>,
         kind: ApprovedKind,
         decision: PolicyDecision,
-        persist: impl FnOnce(
-            Option<&stellar_agent_core::approval::ClassicIntent>,
-        ) -> Result<PendingApproval, String>,
+        write: impl InboxWrite<Error = String>,
     ) -> Result<PendingApproval, crate::tools::common::ToolError> {
         use crate::tools::common::ToolError;
         self.start_approval(
@@ -271,7 +327,7 @@ impl WalletServer {
             decision,
             Unlinked::Replace,
             |path, view, _| linked_entry(path, &view.record.nonce).map(Ok),
-            persist,
+            write,
         )
         .map_err(|error| match error {
             ProducerError::Inbox(error) => ToolError::Protocol(rmcp::ErrorData::internal_error(
@@ -304,7 +360,7 @@ impl WalletServer {
         handle: Option<&OperationHandle>,
         decision: PolicyDecision,
         interval: (u64, u64),
-        persist: impl FnOnce() -> Result<PendingApproval, ApprovalError>,
+        write: impl InboxWrite<Error = ApprovalError>,
     ) -> Result<Result<PendingApproval, ApprovalError>, WalletError> {
         match self.start_approval(
             handle,
@@ -312,7 +368,7 @@ impl WalletServer {
             decision,
             Unlinked::Recover,
             |path, view, handle| self.linked_payment(path, view, handle, interval),
-            |_| persist(),
+            write,
         ) {
             Ok(result) => Ok(result),
             Err(ProducerError::Inbox(error)) => Ok(Err(ApprovalError::Io {
@@ -423,8 +479,14 @@ impl WalletServer {
 
     /// Runs the durable producer flow for `handle` under the producer lock.
     /// `linked` reads the entry a durable record names for `handle`;
-    /// `persist` stores the entry this call opens a record for.
-    fn start_approval<E>(
+    /// `write` stores the entry this call opens a record for.
+    ///
+    /// For a kind whose consent is published, every returned entry holds an
+    /// evidence reservation: an existing record reacquires its slot before
+    /// `linked` runs, a revoked record refuses with `approval.revoked`
+    /// before the reacquisition, and a new entry is stored only after its record opens
+    /// and reserves (see [`Self::admit_approval`]).
+    fn start_approval<E, W: InboxWrite<Error = E>>(
         &self,
         handle: Option<&OperationHandle>,
         kind: ApprovedKind,
@@ -435,12 +497,10 @@ impl WalletServer {
             &ApprovalView,
             &OperationHandle,
         ) -> Result<Result<PendingApproval, E>, WalletError>,
-        persist: impl FnOnce(
-            Option<&stellar_agent_core::approval::ClassicIntent>,
-        ) -> Result<PendingApproval, E>,
+        write: W,
     ) -> Result<Result<PendingApproval, E>, ProducerError> {
         if !self.context.chain_id.is_mainnet() {
-            return Ok(persist(None));
+            return Ok(write.persist(None));
         }
         let handle = handle.ok_or_else(|| {
             WalletError::Internal(InternalError::UnexpectedState {
@@ -463,10 +523,23 @@ impl WalletServer {
         );
         let _producer = producer_lock(&directory.join(format!("{name}.producer.lock")))?;
         let status = ApprovalStatus::new(&self.window_store, self.security_profile());
+        let published =
+            stellar_agent_network::policy_state::approvals::delivery_enforced(&name, kind);
         if let Some(view) = status
             .find_by_operation(handle.id())
             .map_err(operation_entry::operation_refusal)?
         {
+            if published {
+                // A revoked record holds no slot to reacquire; it answers
+                // with its state, as the unpublished route does.
+                if view.record.state == ApprovalState::Revoked {
+                    return Err(WalletError::Approval(ApprovalFailure::Revoked {
+                        detail: "the operation's approval has been revoked".to_owned(),
+                    })
+                    .into());
+                }
+                self.reacquire_reservation(&view)?;
+            }
             return linked(&path, &view, handle).map_err(Into::into);
         }
         if handle.state() != OperationState::Prepared {
@@ -485,27 +558,24 @@ impl WalletServer {
             } else {
                 None
             };
-        let entry = match persist(intent.as_ref()) {
+        if published {
+            return self.admit_approval(
+                &path,
+                handle,
+                kind,
+                decision,
+                unlinked,
+                linked,
+                write,
+                intent.as_ref(),
+            );
+        }
+        let entry = match write.persist(intent.as_ref()) {
             Ok(entry) => entry,
             Err(error) => return Ok(Err(error)),
         };
         let opened = (|| {
-            let ttl = entry
-                .expires_at_unix_ms
-                .checked_sub(entry.created_at_unix_ms)
-                .ok_or_else(|| {
-                    WalletError::Internal(InternalError::UnexpectedState {
-                        detail: "the signed approval interval ends before it starts".to_owned(),
-                    })
-                })?;
-            let subject = stellar_agent_core::approval::mainnet_consent_subject(
-                &entry,
-                &stellar_agent_core::approval::AttestationBinding::new(
-                    &name,
-                    self.context.chain_id.caip2_str(),
-                ),
-            )?;
-            let facts = operation_entry::pending_approval_facts(&entry, handle, kind, subject, ttl);
+            let facts = self.approval_facts(&entry, handle, kind)?;
             self.approval_step(|recorder| {
                 recorder
                     .open_pending(handle.id(), &facts, decision)
@@ -536,6 +606,179 @@ impl WalletServer {
             _ => {}
         }
         Err(error.into())
+    }
+
+    /// The facts of the record `entry` opens for `handle`: the entry's signed
+    /// interval and its subject under this server's binding.
+    fn approval_facts(
+        &self,
+        entry: &PendingApproval,
+        handle: &OperationHandle,
+        kind: ApprovedKind,
+    ) -> Result<PendingApprovalFacts, WalletError> {
+        let ttl = entry
+            .expires_at_unix_ms
+            .checked_sub(entry.created_at_unix_ms)
+            .ok_or_else(|| {
+                WalletError::Internal(InternalError::UnexpectedState {
+                    detail: "the signed approval interval ends before it starts".to_owned(),
+                })
+            })?;
+        let subject = stellar_agent_core::approval::mainnet_consent_subject(
+            entry,
+            &stellar_agent_core::approval::AttestationBinding::new(
+                &self.profile_name_for_approval(),
+                self.context.chain_id.caip2_str(),
+            ),
+        )?;
+        Ok(operation_entry::pending_approval_facts(
+            entry, handle, kind, subject, ttl,
+        ))
+    }
+
+    /// The keyed outbox that holds this profile's consent evidence.
+    fn consent_outbox(&self) -> Result<AuditOutbox, WalletError> {
+        let profile = self.security_profile();
+        let (key, anchor) = stellar_agent_network::keyring::keyed_audit_access(
+            profile,
+            &self.profile_name_for_approval(),
+            self.audit_binding,
+        )?
+        .into_parts();
+        Ok(AuditOutbox::for_log_keyed(
+            &profile.audit_log_path,
+            anchor,
+            key,
+        ))
+    }
+
+    /// Reacquires the evidence slot of the record `view` with its
+    /// authenticated facts, without an audit writer or the window lock.
+    fn reacquire_reservation(&self, view: &ApprovalView) -> Result<(), WalletError> {
+        ConsentAdmission::reacquire(
+            &self.window_store,
+            self.security_profile(),
+            view.record.operation_id,
+            &view.record.facts(),
+            &self.consent_outbox()?,
+        )
+        .map(drop)
+    }
+
+    /// Admits a new published approval for `handle`. It builds the entry
+    /// with the operation's canonical `intent`, opens its record with the
+    /// held audit writer, and reserves the record's
+    /// evidence after the window transaction. Only then, with the writer
+    /// released, does it store the entry. A refusal before the insert stores
+    /// nothing and keeps the committed record and any reservation. When a
+    /// conflicting open's winner names another nonce, the producer answers
+    /// with the winner's entry.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the producer's kind, decision, recovery mode, inbox steps and intent are each explicit"
+    )]
+    fn admit_approval<E, W: InboxWrite<Error = E>>(
+        &self,
+        path: &std::path::Path,
+        handle: &OperationHandle,
+        kind: ApprovedKind,
+        decision: PolicyDecision,
+        unlinked: Unlinked,
+        linked: impl Fn(
+            &std::path::Path,
+            &ApprovalView,
+            &OperationHandle,
+        ) -> Result<Result<PendingApproval, E>, WalletError>,
+        write: W,
+        intent: Option<&stellar_agent_core::approval::ClassicIntent>,
+    ) -> Result<Result<PendingApproval, E>, ProducerError> {
+        let entry = match write.build(intent) {
+            Ok(entry) => entry,
+            Err(error) => return Ok(Err(error)),
+        };
+        let facts = self.approval_facts(&entry, handle, kind)?;
+        let profile = self.security_profile();
+        let outbox = self.consent_outbox()?;
+        let writer = crate::tools::value_audit::require_value_audit_writer(
+            profile,
+            &self.profile_name_for_approval(),
+            self.audit_binding,
+        )?;
+        let mut guard = writer.lock().map_err(|_| {
+            WalletError::Submission(SubmissionError::RecordUnavailable {
+                detail: "the audit writer mutex is poisoned, so the approval cannot be recorded"
+                    .to_owned(),
+            })
+        })?;
+        ConsentAdmission {
+            store: &self.window_store,
+            profile,
+            writer: &mut guard,
+            outbox: &outbox,
+        }
+        .admit(
+            handle.id(),
+            &facts,
+            |writer, facts| {
+                ApprovalRecorder::new(
+                    &self.window_store,
+                    profile,
+                    writer,
+                    uuid::Uuid::new_v4().to_string(),
+                )
+                .open_pending(handle.id(), facts, decision)
+                .map_err(operation_entry::operation_refusal)
+            },
+            |_, _| Ok(()),
+        )?;
+        drop(guard);
+        let view = ApprovalStatus::new(&self.window_store, profile)
+            .find_by_operation(handle.id())
+            .map_err(operation_entry::operation_refusal)?
+            .ok_or_else(|| {
+                WalletError::Internal(InternalError::UnexpectedState {
+                    detail: "the admitted approval record is not readable".to_owned(),
+                })
+            })?;
+        if view.record.nonce != entry.approval_nonce {
+            return linked(path, &view, handle).map_err(Into::into);
+        }
+        let entry = match write.insert(entry) {
+            Ok(entry) => entry,
+            Err(error) => return Ok(Err(error)),
+        };
+        if unlinked == Unlinked::Recover {
+            return linked(path, &view, handle).map_err(Into::into);
+        }
+        Ok(Ok(entry))
+    }
+
+    /// Stores a built classic value `entry` in the approval store of
+    /// `profile_name`, creating its directory, and returns it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a string error description on any I/O, store-lock, or clock
+    /// failure.
+    pub(crate) fn insert_classic_pending(
+        &self,
+        profile_name: &str,
+        entry: PendingApproval,
+    ) -> Result<PendingApproval, String> {
+        let approvals_dir = self
+            .resolve_approval_dir()
+            .map_err(|e| format!("approval dir resolution failed: {e}"))?;
+        std::fs::create_dir_all(&approvals_dir)
+            .map_err(|e| format!("approval dir create_all failed: {e}"))?;
+        let store_path = approvals_dir.join(format!("{profile_name}.toml"));
+        let mut store = open_with_retry(&store_path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF)
+            .map_err(|e| format!("approval store open failed: {e}"))?;
+        let now_ms = stellar_agent_core::timefmt::now_unix_ms()
+            .map_err(|e| format!("approval store insert: current time unavailable: {e}"))?;
+        store
+            .insert(entry.clone(), now_ms)
+            .map_err(|e| format!("approval store insert failed: {e}"))?;
+        Ok(entry)
     }
 
     /// The business id a value tool enters with.
@@ -1437,20 +1680,25 @@ mod tests {
             Some(&handle),
             ApprovedKind::Payment,
             PolicyDecision::RequireApproval,
-            |stored| {
-                assert_eq!(
-                    stored,
-                    Some(&intent),
-                    "producer receives validated stored intent"
-                );
-                let mut entry = make();
-                entry.expires_at_unix_ms = entry.created_at_unix_ms + 120_000;
-                operation_entry::stage_pending(&mut entry, stored, 300_000).unwrap();
-                open_inbox(&path)
-                    .unwrap()
-                    .insert(entry.clone(), entry.created_at_unix_ms)
-                    .unwrap();
-                Ok(entry)
+            Staged {
+                build: |stored: Option<&stellar_agent_core::approval::ClassicIntent>| {
+                    assert_eq!(
+                        stored,
+                        Some(&intent),
+                        "producer receives validated stored intent"
+                    );
+                    let mut entry = make();
+                    entry.expires_at_unix_ms = entry.created_at_unix_ms + 120_000;
+                    operation_entry::stage_pending(&mut entry, stored, 300_000).unwrap();
+                    Ok(entry)
+                },
+                insert: |entry: PendingApproval| {
+                    open_inbox(&path)
+                        .unwrap()
+                        .insert(entry.clone(), entry.created_at_unix_ms)
+                        .unwrap();
+                    Ok(entry)
+                },
             },
         );
         assert!(
@@ -1489,7 +1737,17 @@ mod tests {
                 Some(&handle),
                 ApprovedKind::Payment,
                 PolicyDecision::RequireApproval,
-                |_| unreachable!("retry must reuse the linked entry"),
+                Staged {
+                    build: |_: Option<&stellar_agent_core::approval::ClassicIntent>| -> Result<
+                        PendingApproval,
+                        String,
+                    > {
+                        unreachable!("retry must reuse the linked entry")
+                    },
+                    insert: |_: PendingApproval| -> Result<PendingApproval, String> {
+                        unreachable!("retry must reuse the linked entry")
+                    },
+                },
             )
             .unwrap();
         assert_eq!(

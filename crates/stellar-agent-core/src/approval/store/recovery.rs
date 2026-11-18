@@ -51,6 +51,19 @@ pub(super) struct Recovery {
     disposition: Disposition,
 }
 
+impl RecoveryKey {
+    fn new(context: &PaymentRecoveryContext<'_>, envelope: &str) -> Self {
+        Self {
+            profile: context.profile.to_owned(),
+            chain: context.chain,
+            operation: context.operation.map(|(id, _)| id),
+            subject: super::super::subject::approval_subject_classic(envelope),
+            policy_digest: context.policy.digest(),
+            policy_sequence: context.policy.sequence(),
+        }
+    }
+}
+
 fn malformed() -> ApprovalError {
     ApprovalError::InvalidEntry {
         detail: "the payment recovery section is malformed".to_owned(),
@@ -260,14 +273,7 @@ impl PendingApprovalStore {
         now: u64,
         request: &crate::policy::ApprovalRequest,
     ) -> Result<PendingApproval, ApprovalError> {
-        let key = RecoveryKey {
-            profile: context.profile.to_owned(),
-            chain: context.chain,
-            operation: context.operation.map(|(id, _)| id),
-            subject: super::super::subject::approval_subject_classic(envelope),
-            policy_digest: context.policy.digest(),
-            policy_sequence: context.policy.sequence(),
-        };
+        let key = RecoveryKey::new(&context, envelope);
         // A binding whose retention has ended is absent; the insertion below
         // prunes it and its expired payload in the same write.
         if let Some(index) = self
@@ -299,6 +305,61 @@ impl PendingApprovalStore {
             now,
             request.reason.clone(),
         )?;
+        self.insert_bound(key, context, entry, (created, expires), now)
+    }
+
+    /// Stores the payment `entry`, built for `context` and not yet stored,
+    /// with a new active recovery binding, atomically. A retained binding of
+    /// the same key refuses: its entry is recoverable work of an earlier
+    /// write, which this entry never replaces.
+    ///
+    /// The MCP payment producer calls this after the entry's durable record
+    /// reserves its consent evidence; other callers use
+    /// [`Self::recover_payment`].
+    ///
+    /// # Errors
+    /// [`ApprovalError::RecoveryInconsistent`] for a retained binding of the
+    /// key or an entry of another kind, [`ApprovalError::Expired`] when `now`
+    /// lies outside the entry's signed interval, then the capacity, nonce and
+    /// persistence refusals of [`Self::recover_payment`].
+    #[doc(hidden)]
+    pub fn bind_payment(
+        &mut self,
+        context: PaymentRecoveryContext<'_>,
+        entry: PendingApproval,
+        now: u64,
+    ) -> Result<PendingApproval, ApprovalError> {
+        let ApprovalKind::PaymentSimulated {
+            envelope_xdr_b64, ..
+        } = &entry.kind
+        else {
+            return Err(ApprovalError::RecoveryInconsistent);
+        };
+        let key = RecoveryKey::new(&context, envelope_xdr_b64);
+        if self
+            .payment_recovery
+            .iter()
+            .any(|b| b.key == key && now < b.retain_until)
+        {
+            return Err(ApprovalError::RecoveryInconsistent);
+        }
+        let interval = (entry.created_at_unix_ms, entry.expires_at_unix_ms);
+        if now < interval.0 || now >= interval.1 {
+            return Err(ApprovalError::Expired);
+        }
+        self.insert_bound(key, context, entry, interval, now)
+    }
+
+    /// Stores `entry` with a new active binding of `key` over the signed
+    /// `(created, expires)` interval, under the capacity and nonce checks.
+    fn insert_bound(
+        &mut self,
+        key: RecoveryKey,
+        context: PaymentRecoveryContext<'_>,
+        entry: PendingApproval,
+        (created, expires): (u64, u64),
+        now: u64,
+    ) -> Result<PendingApproval, ApprovalError> {
         let binding = Recovery {
             key,
             nonce: entry.approval_nonce.clone(),

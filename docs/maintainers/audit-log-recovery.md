@@ -572,8 +572,12 @@ The closed batch hashes every ordered row independently of evidence membership.
 Unreserved compatibility rows audit without creating live evidence.
 
 **Integrated admission and publication.** An integrated request is presented only after its committed pending record holds a reservation.
-Admission requires an authenticated inventory of the whole owner scope, then explicit owner initialization, then the reservation.
-No such inventory exists yet, so integrated admission refuses with `owner-scope inventory unavailable`.
+Admission requires a readiness proof of the whole owner scope from stored state, then explicit owner initialization, then the reservation.
+Readiness refuses with `owner scope shared or unreadable` when a sibling profile names an audit scope coordinate or a profile file cannot be read.
+It refuses with `live grant without delivery facts` while the verified window holds a live consent of an enforced kind without delivery facts.
+Such a grant ends at its execution expiry, or at once with `stellar-agent approve revoke --id <NONCE> --profile <NAME>`; readiness never revokes it.
+Readiness takes no window lock and writes nothing, so a concurrent older binary on the same store can still record such a grant.
+A grant held only in the inbox, without a window record, is outside the proof and refuses at use for an enforced kind.
 A retry reuses the committed record's nonce, signed clocks, and facts; a refused presentation keeps the record and its slot.
 Integrated consent succeeds only after the window commit holds the receipt, the authenticated sink, and the exact queued reference.
 The strict mainnet attester stores a sink handoff in the same inbox replacement as the attestation blob and receipt.
@@ -585,13 +589,31 @@ Queued success reports `audit.outbox_queued` at once and never waits for deliver
 The CLI confirmation routes for payment, account creation, claim, and trustline use the shared kind capability.
 When enabled, they reserve before inbox insertion, summary display, and presence.
 The audited pending open borrows the held writer; an existing request reacquires its slot through the keyed outbox without that writer.
-Both paths refuse unknown inventory, uninitialized evidence, and unresolved migration pins.
+Both paths refuse an unready scope, uninitialized evidence, and unresolved migration pins.
 Every production kind capability remains disabled.
 
 CLI publication verifies the original receipt and handoff under policy admission.
 It releases the writer, inbox, and admission before the window commit, and returns a witness or success only after that commit.
 An already published `approve --id` repeat performs no proof verification or consent commit.
-The missing-record and post-wait disposition guards, and integrated inbox and MCP routes, remain prerequisites for activation.
+
+Both inbox listeners select publication through the same kind capability.
+When enabled, the challenge precheck reacquires the record's reservation before either challenge form is issued.
+A fresh approve reacquires it again before the row, then attests through the strict direct writer, which stores the handoff.
+Every inbox response that shows a value attestation verifies the handoff under policy admission and shows it only after the window commit.
+These are the fresh, repeated, raced, consumed-assertion retry, and stored-page responses; inbox consent is always direct.
+Before the handoff of an uncommitted consent, the listener reacquires the reservation and checks the inventory, and a failure refuses and commits no consent.
+
+The MCP payment, account creation, claim, trustline, and both x402 producers select publication through the same kind capability.
+When enabled, an MCP producer opens or selects the committed record and reserves before it stores the inbox entry or returns an approval block.
+The audited open borrows the held value audit writer, and the entry is stored only after that writer is released.
+A conflicting open answers with the committed winner's entry and never stores the loser.
+A retry reacquires the committed record's slot before it returns the linked approval block, so a full scope still answers the retry.
+A revoked record refuses with `approval.revoked` before that reacquisition.
+A refusal keeps its wire code, such as `approval.evidence_capacity` or `audit.outbox_evidence_unusable`, and exposes no approval block.
+The payment producer binds its recovery entry after the reservation; a retained binding of the same payment refuses with `approval.entry_inconsistent`.
+A crash between the reservation and the inbox insert leaves a reserved record without an entry, and a retry refuses with `approval.not_found`.
+That operation ends at its waiting expiry; prepare again under a new business id.
+The readiness proof precedes every admission and every reacquisition.
 
 A crash after the pending open retains its identity even if reservation or insertion fails.
 A missing winner inbox entry refuses; it never supplies authority to release evidence or create a replacement grant.
@@ -606,13 +628,13 @@ Use `audit verify` to inspect evidence failures; never erase evidence to make a 
 
 **Lifecycle and clocks.** Release follows authenticated revocation or final operation termination, outside the policy-window lock.
 First consumption and a missing approval record do not authorize release; retryable consumed grants retain their proof.
-`approve revoke --id` releases its grant at once; integrated admission, each recovery pass, and each CLI revocation release every retained ended grant, so a failed or deferred release retries.
+`approve revoke --id` releases its grant at once; integrated admission, each recovery pass, and each CLI revocation of an enforced kind release every retained ended grant, so a failed or deferred release retries.
 Explicit floor advancement removes records expiring at or below the persistent maximum clock, and migration pins never expire through clock collection.
 Admission can reclaim expired slots before refusing capacity.
 Every Approval mint, claim, consumption, and signing expiry check of an enforced kind uses the greater of wall time and the evidence floor, read fresh for that decision.
 A floor that cannot be read refuses as a storage error, never as expiry.
 Recoverable storage and publication errors retry the existing grant without another ceremony.
-Production activation requires authenticated sink provenance, retained references, publication and lifecycle adapters, and a complete live-grant inventory.
+Production activation requires authenticated sink provenance, retained references, publication and lifecycle adapters, and the per-scope readiness proof.
 Unresolved pins and incomplete producer integration block activation; initialization remains explicit.
 Populations exceeding capacity require an authenticated migration before activation.
 
@@ -623,6 +645,9 @@ A missing pin refuses with `missing migration pin`, and a deadline at or below t
 An identity that holds other facts refuses with `conflicting reservation`, and an exact retry returns the same reservation.
 At evidence generation `u64::MAX` an exact retry refuses with `evidence-generation overflow`, as every mutation does.
 Adoption uses the evidence transaction below; it reads no approval storage, samples no clock, and drains nothing.
+Reacquisition adopts each pin whose digest equals the queued reference of a live grant of an enforced kind in the verified window.
+It uses that grant's identity and checked deadline, so a crash before the commit keeps the pin and the next admission retries.
+Any other pin keeps refusing admission with `unresolved migration pin`, and no command clears it, so a migrated scope with an unmatched pin stays blocked.
 
 **Binding and verification.** A carrier binding authenticates the source generation's evidence image with its queue before it stages anything.
 A newer authenticated source image is committed to the source owner first, while the record names the source or a staged successor that retires it.

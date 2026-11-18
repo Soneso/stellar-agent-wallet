@@ -5,7 +5,7 @@ mod tests {
         BindingCheck, MAX_EVIDENCE_ENTRIES, test_helpers::seed_reserved_evidence,
     };
     use stellar_agent_network::policy_state::approvals::{
-        ConsentDeliveryV1, ConsentEvidenceEnforcementGuard, ConsentEvidenceInventoryGuard,
+        ConsentDeliveryV1, ConsentEvidenceEnforcementGuard, UnreadableSiblingProfile,
     };
 
     fn initialize(fixture: &MainnetConsentFixture) {
@@ -33,8 +33,7 @@ mod tests {
             park(&fixture, &entry);
             let _enabled =
                 ConsentEvidenceEnforcementGuard::new(fixture.name(), ApprovedKind::Payment);
-            let _ready =
-                (mode != "inventory").then(|| ConsentEvidenceInventoryGuard::new(fixture.name()));
+            let _unready = (mode == "inventory").then(UnreadableSiblingProfile::plant);
             initialize(&fixture);
             if mode == "capacity" {
                 let access = stellar_agent_network::keyring::keyed_audit_access(
@@ -108,7 +107,6 @@ mod tests {
         let entry = fixture.payment(300_000);
         let pending = park(&fixture, &entry);
         let _enabled = ConsentEvidenceEnforcementGuard::new(fixture.name(), ApprovedKind::Payment);
-        let _ready = ConsentEvidenceInventoryGuard::new(fixture.name());
         initialize(&fixture);
         let _presence = driver::install(driver::fixture_credential());
         let fault = arm_accounting_fault(COMMIT_FAULT_AFTER_PREPARED);
@@ -138,6 +136,50 @@ mod tests {
         assert_eq!(driver::ceremonies().len(), 1);
     }
 
+    /// An attested grant whose publication failed reacquires its reservation
+    /// before the retry publishes: in an unready scope or with unusable
+    /// evidence, the retry refuses and commits no consent or ceremony.
+    #[tokio::test]
+    #[serial]
+    async fn approve_recovery_reacquires_before_publication() {
+        for mode in ["inventory", "corrupt"] {
+            let fixture = fixture(&format!("approve-recovery-reacquire-{mode}"));
+            let entry = fixture.payment(300_000);
+            park(&fixture, &entry);
+            let _enabled =
+                ConsentEvidenceEnforcementGuard::new(fixture.name(), ApprovedKind::Payment);
+            initialize(&fixture);
+            let _presence = driver::install(driver::fixture_credential());
+            let fault = arm_accounting_fault(COMMIT_FAULT_AFTER_PREPARED);
+            let (code, _) = invoke(fixture.name(), &entry.approval_nonce, false).await;
+            drop(fault);
+            assert_eq!(code, 1);
+            assert!(
+                stored(&fixture, &entry.approval_nonce)
+                    .consent_publication
+                    .is_some()
+            );
+            let _unready = (mode == "inventory").then(UnreadableSiblingProfile::plant);
+            if mode == "corrupt" {
+                for suffix in [".evidence.0", ".evidence.1"] {
+                    let mut path =
+                        stellar_agent_core::audit_log::outbox_path(&fixture.audit_path())
+                            .into_os_string();
+                    path.push(suffix);
+                    std::fs::write(PathBuf::from(path), b"torn evidence").unwrap();
+                }
+            }
+            let (code, result) = invoke(fixture.name(), &entry.approval_nonce, false).await;
+            assert_eq!(code, 1, "{mode}");
+            assert_eq!(
+                result["error"]["code"], "audit.outbox_evidence_unusable",
+                "{mode}: recovery reacquires before it publishes"
+            );
+            assert!(record(&fixture, &entry.approval_nonce).consent.is_none());
+            assert_eq!(driver::ceremonies().len(), 1);
+        }
+    }
+
     #[tokio::test]
     #[serial]
     async fn published_approve_repeat_does_no_proof_or_commit_work() {
@@ -145,7 +187,6 @@ mod tests {
         let entry = fixture.payment(300_000);
         park(&fixture, &entry);
         let _enabled = ConsentEvidenceEnforcementGuard::new(fixture.name(), ApprovedKind::Payment);
-        let _ready = ConsentEvidenceInventoryGuard::new(fixture.name());
         initialize(&fixture);
         let _presence = driver::install(driver::fixture_credential());
         assert_eq!(

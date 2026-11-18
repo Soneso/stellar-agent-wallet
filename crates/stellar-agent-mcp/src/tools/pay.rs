@@ -611,6 +611,94 @@ impl WalletServer {
     }
 }
 
+/// The inbox write of a mainnet payment approval under a verified policy.
+/// Its persist reuses or creates the entry with its recovery binding. A
+/// published consent builds the entry first and binds it only after its
+/// record reserves. A retained recovery binding of the same payment without
+/// a durable record is therefore found only after the new record opens and
+/// reserves: the bind refuses, the call answers `approval.entry_inconsistent`,
+/// and the new record keeps its reservation.
+pub(crate) struct PaymentWrite<'a> {
+    pub(crate) server: &'a WalletServer,
+    pub(crate) envelope_xdr: &'a str,
+    pub(crate) interval: (u64, u64),
+    pub(crate) profile_name: &'a str,
+    pub(crate) request: &'a stellar_agent_core::policy::ApprovalRequest,
+    pub(crate) operation: Option<([u8; 16], u64)>,
+}
+
+impl super::business_entry::InboxWrite for PaymentWrite<'_> {
+    type Error = ApprovalError;
+
+    fn build(
+        &self,
+        _: Option<&stellar_agent_core::approval::ClassicIntent>,
+    ) -> Result<PendingApproval, ApprovalError> {
+        let now_ms = self
+            .server
+            .clock
+            .now_unix_ms()
+            .map_err(approval_storage_error)?;
+        PendingApproval::new_payment_pending_until(
+            self.envelope_xdr.to_owned(),
+            process_uid_for_attestation()?,
+            self.interval.0,
+            self.interval.1,
+            now_ms,
+            self.request.reason.clone(),
+        )
+    }
+
+    fn insert(self, entry: PendingApproval) -> Result<PendingApproval, ApprovalError> {
+        let policy =
+            self.server
+                .verified_policy
+                .as_deref()
+                .ok_or_else(|| ApprovalError::InvalidEntry {
+                    detail: "payment recovery requires a verified policy".to_owned(),
+                })?;
+        let directory = self
+            .server
+            .resolve_approval_dir()
+            .map_err(approval_storage_error)?;
+        std::fs::create_dir_all(&directory).map_err(approval_storage_error)?;
+        let mut store = open_with_retry(
+            &directory.join(format!("{}.toml", self.profile_name)),
+            DEFAULT_RETRY_ATTEMPTS,
+            DEFAULT_RETRY_BACKOFF,
+        )?;
+        let now_ms = self
+            .server
+            .clock
+            .now_unix_ms()
+            .map_err(approval_storage_error)?;
+        store.bind_payment(
+            PaymentRecoveryContext {
+                profile: self.profile_name,
+                chain: self.server.context.chain_id,
+                policy,
+                operation: self.operation,
+            },
+            entry,
+            now_ms,
+        )
+    }
+
+    fn persist(
+        self,
+        _: Option<&stellar_agent_core::approval::ClassicIntent>,
+    ) -> Result<PendingApproval, ApprovalError> {
+        self.server.persist_pay_pending_approval(
+            self.envelope_xdr,
+            self.interval.0,
+            self.interval.1,
+            self.profile_name,
+            self.request,
+            PaymentQueue::Direct(self.operation),
+        )
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tool router impl block
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1145,15 +1233,13 @@ impl WalletServer {
                     prepared.handle.as_ref(),
                     dispatch_outcome.audit_decision(),
                     (created_at_ms, expires_at_ms),
-                    || {
-                        self.persist_pay_pending_approval(
-                            &envelope_xdr,
-                            created_at_ms,
-                            expires_at_ms,
-                            &profile_name,
-                            &approval.request,
-                            PaymentQueue::Direct(prepared.operation_id.zip(prepared.waiting_end)),
-                        )
+                    PaymentWrite {
+                        server: self,
+                        envelope_xdr: &envelope_xdr,
+                        interval: (created_at_ms, expires_at_ms),
+                        profile_name: &profile_name,
+                        request: &approval.request,
+                        operation: prepared.operation_id.zip(prepared.waiting_end),
                     },
                 ) {
                     Ok(entry) => entry,

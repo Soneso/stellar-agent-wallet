@@ -409,6 +409,9 @@ pub(super) mod tests {
         pub(in crate::commands::approve) clock: TestClockGuard,
         pub(in crate::commands::approve) entry: PendingApproval,
         handle: OperationHandle,
+        /// Serve through a writer over the keyed log, as a published consent
+        /// needs; otherwise through the fixture's unkeyed writer.
+        pub(in crate::commands::approve) keyed: bool,
     }
     impl Fixture {
         pub(in crate::commands::approve) fn new() -> Self {
@@ -429,6 +432,7 @@ pub(super) mod tests {
                 clock,
                 entry,
                 handle,
+                keyed: false,
             }
         }
     }
@@ -502,6 +506,10 @@ pub(super) mod tests {
             object.remove("approvals");
             value
         }
+        /// A writer over the fixture's log with its keyed, anchored access.
+        pub(in crate::commands::approve) fn keyed_writer(&self) -> AuditWriter {
+            crate::common::approval_fixture::keyed_writer(self.core.profile(), self.core.name())
+        }
         pub(in crate::commands::approve) fn access(&self) -> DurableRevocations {
             DurableRevocations::new(
                 self.core.name(),
@@ -518,7 +526,11 @@ pub(super) mod tests {
                     self.core.name(),
                     self.core.profile(),
                 ),
-                Arc::new(Mutex::new(self.core.audit_writer())),
+                Arc::new(Mutex::new(if self.keyed {
+                    self.keyed_writer()
+                } else {
+                    self.core.audit_writer()
+                })),
                 None,
             )
             .with_mainnet_authority(self.core.authority())
@@ -602,7 +614,9 @@ pub(super) mod tests {
             .record_consent(view.record.id, &witness, &payload)
             .unwrap();
         }
-        fn presence(&self) -> stellar_agent_core::approval::VerifiedMainnetPresence {
+        pub(in crate::commands::approve) fn presence(
+            &self,
+        ) -> stellar_agent_core::approval::VerifiedMainnetPresence {
             use stellar_agent_core::approval::presence::{
                 ListenerIdentity, PresenceListener, issue_mainnet_intent_presence,
                 verify_mainnet_presence,
@@ -691,7 +705,7 @@ pub(super) mod tests {
         args: super::super::ApproveArgs,
     }
     /// Mints the audit chain key that CLI and serve audit writers require.
-    async fn mint_audit_key(name: &str) {
+    pub(in crate::commands::approve) async fn mint_audit_key(name: &str) {
         let args = crate::commands::profile::rotate_audit_key::RotateAuditKeyArgs {
             name: Some(name.to_owned()),
             profile: None,

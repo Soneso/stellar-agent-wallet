@@ -1854,6 +1854,26 @@ mod tests {
                     "a caller time before the floor {floor} cannot revive expiry"
                 );
             }
+            // A Policy header of the same profile keeps wall time beside a
+            // floor above its expiry.
+            let mut policy = f.tx();
+            policy.0.header.claim = ClaimTarget {
+                store: PersistedWindowStore::for_profile(core.name()),
+                profile: core.profile().clone(),
+            };
+            policy.0.header.authority =
+                AuthorityBinding::Policy(crate::policy_state::PolicyAuthorityBinding {
+                    policy_digest: [7; 32],
+                    policy_sequence: 7,
+                    rule_index: 0,
+                    evaluated_at_ms: 1_000,
+                    governing_until_ms: 2_000,
+                    scope: stellar_agent_core::mainnet::decision::AuthorityScope::Classic,
+                });
+            policy
+                .check_not_expired(1_000)
+                .expect("a Policy header decides at wall time, not at the floor");
+            assert_eq!(refused(policy.check_not_expired(1_500)), P::Expired);
             drop(enabled);
             a.check_not_expired(1_000).unwrap();
             let enabled = ConsentEvidenceEnforcementGuard::new(core.name(), ApprovedKind::Payment);

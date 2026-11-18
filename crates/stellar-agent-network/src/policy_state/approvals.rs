@@ -27,7 +27,10 @@ use stellar_agent_core::audit_log::{
 };
 use stellar_agent_core::policy::state_lock::WindowStoreLock;
 use stellar_agent_core::profile::{
-    Profile, name::profile_name_for_approval, owner_key::OwnerKeyContext,
+    Profile,
+    key_scope::{KeyScopeFinding, key_scope_findings},
+    name::profile_name_for_approval,
+    owner_key::OwnerKeyContext,
 };
 
 use super::WindowStoreError;
@@ -1152,85 +1155,165 @@ pub enum VerifiedConsentDelivery {
     },
 }
 
+/// The approval kinds whose production paths all enforce consent delivery.
+/// The capability and the floor and maintenance gates read only this list.
+const ENFORCED_KINDS: &[ApprovedKind] = &[];
+
 /// Whether all production paths of this kind enforce consent delivery.
 #[must_use]
 pub fn consent_evidence_enforced(kind: ApprovedKind) -> bool {
-    match kind {
-        ApprovedKind::Payment
-        | ApprovedKind::Claim
-        | ApprovedKind::Trustline
-        | ApprovedKind::X402Payment => false,
-        _ => false,
-    }
+    ENFORCED_KINDS.contains(&kind)
 }
 
-/// Requires an authenticated inventory of every grant in the owner scope of
-/// `profile` before an integrated request is admitted.
+/// Requires stored proof that the owner scope of `profile`'s consent
+/// evidence holds no grant the evidence cannot account for, before an
+/// integrated request is admitted. The proof takes no window lock and
+/// writes nothing.
 ///
-/// The scope spans every profile that shares the owner coordinate, with its
-/// pending reservations, live and retryable consumed grants and unintegrated
-/// earlier grants. An initialized evidence image or an empty inbox does not
-/// account for them. This build holds no such inventory, so every scope
-/// refuses.
+/// The scope is proven from the profiles directory and the profile's
+/// authenticated window. It refuses when a sibling profile names one of the
+/// scope's audit coordinates, or when a profile file or the directory cannot
+/// be read. It also refuses while the window holds a live consented record
+/// of an enforced kind without delivery facts. Such a record is live while
+/// it is not revoked, its operation has not ended, and its execution expiry
+/// exceeds the greater of wall time and the evidence floor of `outbox`. The
+/// floor is read only when a record is live by wall time.
 ///
 /// # Errors
 ///
-/// `audit.outbox_evidence_unusable` naming the unavailable inventory.
-pub fn require_consent_evidence_inventory(profile: &str) -> Result<(), WalletError> {
-    #[cfg(any(test, feature = "test-helpers"))]
-    if inventory_test_override::enabled(profile) {
+/// `audit.outbox_evidence_unusable` naming the unproven scope or the
+/// undelivered grant, the window refusals of
+/// [`crate::operation_entry::operation_refusal`], and the refusals of
+/// [`AuditOutbox::evidence_time_floor`].
+pub fn require_consent_evidence_inventory(
+    store: &PersistedWindowStore,
+    profile: &Profile,
+    outbox: &AuditOutbox,
+) -> Result<(), WalletError> {
+    let name = profile_name_for_approval(profile);
+    let unready =
+        |reason| audit_writer_refusal(&name, &WriterError::OutboxEvidenceUnusable { reason });
+    if key_scope_findings(profile, &name)
+        .iter()
+        .any(KeyScopeFinding::blocks_evidence_scope)
+    {
+        return Err(unready("owner scope shared or unreadable"));
+    }
+    let refusal = crate::operation_entry::operation_refusal;
+    let wire = store
+        .read_for_inspection(profile)
+        .map_err(refusal)?
+        .unwrap_or_default();
+    let now = now_ms().map_err(refusal)?;
+    let undelivered_after = |at: u64| {
+        records(&wire).iter().any(|r| {
+            delivery_enforced(&name, r.kind)
+                && live_consent(&wire, r, at)
+                && r.consent.as_ref().is_some_and(|c| c.delivery.is_none())
+        })
+    };
+    if undelivered_after(now) {
+        let floor = outbox
+            .evidence_time_floor()
+            .map_err(|error| audit_writer_refusal(&name, &error))?;
+        if undelivered_after(now.max(floor)) {
+            return Err(unready("live grant without delivery facts"));
+        }
+    }
+    Ok(())
+}
+
+/// An unparsable sibling profile file in the current data root's profiles
+/// directory, which leaves every profile's owner scope there unproven until
+/// dropped. Production builds exclude it.
+#[cfg(any(test, feature = "test-helpers"))]
+#[derive(Debug)]
+pub struct UnreadableSiblingProfile(std::path::PathBuf);
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl UnreadableSiblingProfile {
+    /// Writes `unreadable-sibling.toml` into the profiles directory.
+    ///
+    /// # Panics
+    /// Panics when the directory or the file cannot be written.
+    #[must_use]
+    #[allow(clippy::expect_used, reason = "test fixture")]
+    pub fn plant() -> Self {
+        let dir = stellar_agent_core::profile::schema::default_profile_dir().expect("profiles");
+        std::fs::create_dir_all(&dir).expect("profiles directory");
+        let path = dir.join("unreadable-sibling.toml");
+        std::fs::write(&path, "chain_id = [").expect("sibling file");
+        Self(path)
+    }
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl Drop for UnreadableSiblingProfile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Whether `record` holds consent that neither revocation, the end of its
+/// operation nor its execution expiry at or before `at` has ended.
+fn live_consent(wire: &WireFile, record: &WireApproval, at: u64) -> bool {
+    record
+        .consent
+        .as_ref()
+        .is_some_and(|c| c.execution_expires_at_ms > at)
+        && !record_ended(wire, record)
+}
+
+/// Adopts each migration pin of `outbox` whose full digest equals the queued
+/// reference of a live consented record of an enforced kind in `profile`'s
+/// authenticated window. The record's identity and its checked conservative
+/// deadline become the Delivered record's facts, so occupancy stays the same.
+/// Every other pin stays and keeps blocking admission. Liveness uses the
+/// greater of wall time and the evidence floor.
+///
+/// # Errors
+/// The refusals of [`AuditOutbox::evidence`], the window refusals of
+/// [`crate::operation_entry::operation_refusal`],
+/// `audit.outbox_evidence_unusable` with `expiry overflow` for a deadline
+/// that overflows, and the refusals of [`AuditOutbox::adopt_evidence_pin`].
+pub(crate) fn adopt_consent_evidence_pins(
+    store: &PersistedWindowStore,
+    profile: &Profile,
+    outbox: &AuditOutbox,
+) -> Result<(), WalletError> {
+    let name = profile_name_for_approval(profile);
+    let evidence_refusal = |error: WriterError| audit_writer_refusal(&name, &error);
+    let Some(evidence) = outbox.evidence().map_err(evidence_refusal)? else {
+        return Ok(());
+    };
+    if !evidence.holds_migration_pins() {
         return Ok(());
     }
-    Err(audit_writer_refusal(
-        profile,
-        &WriterError::OutboxEvidenceUnusable {
-            reason: "owner-scope inventory unavailable",
-        },
-    ))
-}
-
-#[cfg(any(test, feature = "test-helpers"))]
-mod inventory_test_override {
-    use std::sync::{Mutex, PoisonError};
-    static READY: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-    pub(super) fn enabled(profile: &str) -> bool {
-        READY
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .any(|name| name == profile)
-    }
-
-    /// Stands in for an authenticated complete inventory of one profile's
-    /// owner scope in a fixture, until dropped. Production builds exclude it.
-    #[derive(Debug)]
-    pub struct ConsentEvidenceInventoryGuard(String);
-
-    impl ConsentEvidenceInventoryGuard {
-        /// Installs the fixture inventory of `profile`.
-        #[must_use]
-        pub fn new(profile: &str) -> Self {
-            READY
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(profile.to_owned());
-            Self(profile.to_owned())
+    let refusal = crate::operation_entry::operation_refusal;
+    let wire = store
+        .read_for_inspection(profile)
+        .map_err(refusal)?
+        .unwrap_or_default();
+    let at = now_ms().map_err(refusal)?.max(evidence.time_floor_ms());
+    for record in records(&wire) {
+        let reference = record
+            .consent
+            .as_ref()
+            .and_then(|c| c.payload.as_ref())
+            .and_then(|p| p.outbox_row.as_ref());
+        if let Some(reference) = reference
+            && delivery_enforced(&name, record.kind)
+            && live_consent(&wire, record, at)
+            && evidence.holds_migration_pin(reference)
+        {
+            let deadline =
+                EvidenceReservation::deadline(record.waiting_expires_at_ms, record.rule_ttl_ms)
+                    .map_err(evidence_refusal)?;
+            outbox.adopt_evidence_pin(record.id, reference, deadline)?;
         }
     }
-
-    impl Drop for ConsentEvidenceInventoryGuard {
-        fn drop(&mut self) {
-            let mut ready = READY.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Some(index) = ready.iter().rposition(|name| *name == self.0) {
-                ready.remove(index);
-            }
-        }
-    }
+    Ok(())
 }
-
-#[cfg(any(test, feature = "test-helpers"))]
-pub use inventory_test_override::ConsentEvidenceInventoryGuard;
 
 /// Whether this profile's producers and consumers use integrated consent
 /// for `kind`. Production capabilities remain closed until every route is ready.
@@ -1262,16 +1345,16 @@ pub fn require_consent_evidence_time(
     Ok(())
 }
 
-/// Whether `profile` enforces delivery for any approval kind.
+/// Whether `profile` enforces delivery for any approval kind: a kind of
+/// [`ENFORCED_KINDS`], or one a fixture enables.
 fn enforces_any_kind(profile: &str) -> bool {
-    [
-        ApprovedKind::Payment,
-        ApprovedKind::Claim,
-        ApprovedKind::Trustline,
-        ApprovedKind::X402Payment,
-    ]
-    .into_iter()
-    .any(|kind| delivery_enforced(profile, kind))
+    #[cfg(any(test, feature = "test-helpers"))]
+    if delivery_test_override::enables_any(profile) {
+        return true;
+    }
+    ENFORCED_KINDS
+        .iter()
+        .any(|&kind| delivery_enforced(profile, kind))
 }
 
 /// The keyed outbox of `profile`'s audit log, which holds its consent evidence.
@@ -1314,9 +1397,11 @@ pub fn consent_evidence_time_floor(
 /// `wire`: the greater of `now` and a fresh evidence floor when the record's
 /// kind enforces delivery, and `now` otherwise.
 ///
-/// A floor that cannot be read refuses as a storage error, which the
-/// authorization interface reports as `StoreUnavailable`, never as expiry.
-/// It logs a warning with the evidence failure's code first.
+/// A floor that cannot be read refuses as a storage error, never as expiry.
+/// It reuses [`WindowStoreError::Keyring`], whose documented subject is the
+/// window key, because the authorization interface maps that variant to
+/// `StoreUnavailable`; the detail names the evidence floor. It logs a
+/// warning with the evidence failure's code first.
 pub(super) fn decision_time(
     wire: &WireFile,
     profile: &Profile,
@@ -1662,6 +1747,14 @@ mod delivery_test_override {
             .any(|(name, tag)| name == profile && *tag == kind.tag())
     }
 
+    pub(super) fn enables_any(profile: &str) -> bool {
+        ENABLED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|(name, _)| name == profile)
+    }
+
     /// Enables one profile and kind for a fixture, restoring its previous setting on drop.
     #[derive(Debug)]
     pub struct ConsentEvidenceEnforcementGuard(String, u8);
@@ -1793,6 +1886,8 @@ mod admission_tests;
 pub(crate) mod durable_tests;
 #[cfg(test)]
 pub(crate) mod lifecycle_tests;
+#[cfg(test)]
+mod readiness_tests;
 
 #[cfg(test)]
 pub(in crate::policy_state) mod tests {
@@ -2211,7 +2306,7 @@ pub(in crate::policy_state) mod tests {
             )
         }
 
-        fn reference(&self, file: &str) -> OutboxRowRef {
+        pub(super) fn reference(&self, file: &str) -> OutboxRowRef {
             use stellar_agent_core::audit_log::{
                 AuditOutbox, AuditWriter, KeyedAuditAccess, tip_anchor::InMemoryTipAnchorStore,
             };

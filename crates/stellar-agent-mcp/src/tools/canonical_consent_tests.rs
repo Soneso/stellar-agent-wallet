@@ -134,13 +134,19 @@ fn canonical_shared_producer_consent_uses_full_subject() {
                 Some(&handle),
                 intent.approved_kind(),
                 PolicyDecision::RequireApproval,
-                |stored| {
-                    operation_entry::stage_pending(&mut entry, stored, 120_000).unwrap();
-                    open_inbox(&path)
-                        .unwrap()
-                        .insert(entry.clone(), entry.created_at_unix_ms)
-                        .unwrap();
-                    Ok(entry)
+                crate::tools::business_entry::Staged {
+                    build: |stored: Option<&stellar_agent_core::approval::ClassicIntent>| {
+                        let mut entry = entry.clone();
+                        operation_entry::stage_pending(&mut entry, stored, 120_000).unwrap();
+                        Ok(entry)
+                    },
+                    insert: |entry: PendingApproval| {
+                        open_inbox(&path)
+                            .unwrap()
+                            .insert(entry.clone(), entry.created_at_unix_ms)
+                            .unwrap();
+                        Ok(entry)
+                    },
                 },
             )
             .unwrap();

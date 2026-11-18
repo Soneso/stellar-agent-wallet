@@ -232,16 +232,22 @@ fn uid() -> String {
 pub(crate) type CompletionCall = (String, crate::decision::ConsentRowSource);
 
 /// A consent recording that notes each completion and refuses every one
-/// while `refuse` is set.
+/// while `refuse` is set. While `publish` is set it publishes every kind and
+/// notes whether each completion carried a verified publication handoff.
 #[derive(Default)]
 pub(crate) struct RecordingConsent {
     pub(crate) calls: StdMutex<Vec<CompletionCall>>,
     pub(crate) refuse: std::sync::atomic::AtomicBool,
     pub(crate) missing_record: std::sync::atomic::AtomicBool,
+    pub(crate) publish: std::sync::atomic::AtomicBool,
+    pub(crate) published: StdMutex<Vec<bool>>,
 }
 impl RecordingConsent {
     pub(crate) fn calls(&self) -> Vec<CompletionCall> {
         self.calls.lock().unwrap().clone()
+    }
+    pub(crate) fn published(&self) -> Vec<bool> {
+        self.published.lock().unwrap().clone()
     }
 }
 impl crate::decision::ConsentRecording for RecordingConsent {
@@ -259,11 +265,19 @@ impl crate::decision::ConsentRecording for RecordingConsent {
         Ok(())
     }
 
+    fn publishes(&self, _: stellar_agent_core::approval::witness::ApprovedKind) -> bool {
+        self.publish.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn complete(
         &self,
         consent: crate::decision::VerifiedConsent,
         row: crate::decision::ConsentRowSource,
     ) -> Result<(), stellar_agent_core::error::WalletError> {
+        self.published
+            .lock()
+            .unwrap()
+            .push(consent.publication.is_some());
         self.calls
             .lock()
             .unwrap()

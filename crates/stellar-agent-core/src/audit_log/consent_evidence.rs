@@ -501,6 +501,14 @@ impl OutboxEvidence {
             .any(|record| record.state == RecordState::LegacyPin)
     }
 
+    /// Whether a migration pin holds the full digest of `reference`.
+    #[must_use]
+    pub fn holds_migration_pin(&self, reference: &OutboxRowRef) -> bool {
+        self.records.iter().any(|record| {
+            record.state == RecordState::LegacyPin && record.digest == *reference.digest()
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn records(&self) -> &[EvidenceRecord] {
         &self.records

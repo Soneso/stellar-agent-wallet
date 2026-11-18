@@ -445,11 +445,18 @@ struct MainnetApproved {
 /// A linked value approval releases the inbox and commits durable consent
 /// before this function returns success.
 ///
+/// For a kind the shared capability integrates, the record's evidence slot
+/// is reacquired through the keyed outbox before presence, without an audit
+/// writer. The policy then loads under the held admission, which drops with
+/// the inbox before the publication commit.
+///
 /// # Errors
 ///
 /// `approval.wrong_kind` for a kind without a mainnet consent path, the
 /// presence refusals of [`acquire_mainnet_presence_with_mode`], and the policy, key,
-/// sink, attester and durable store refusals.
+/// sink, attester and durable store refusals. An integrated kind also refuses
+/// with `audit.outbox_evidence_unusable` for an unready scope or unusable
+/// evidence and `approval.evidence_capacity` for a full scope.
 async fn approve_mainnet(
     store: PendingApprovalStore,
     store_path: &Path,
@@ -2337,7 +2344,6 @@ mod tests {
             for (integrated, recover) in [(false, false), (true, false), (true, true)] {
                 let fixture = fixture(&format!("approve-contended-{integrated}-{recover}"));
                 let _enabled = integrated.then(|| stellar_agent_network::policy_state::approvals::ConsentEvidenceEnforcementGuard::new(fixture.name(), ApprovedKind::Payment));
-                let _ready = integrated.then(|| stellar_agent_network::policy_state::approvals::ConsentEvidenceInventoryGuard::new(fixture.name()));
                 let entry = fixture.payment(300_000);
                 park(&fixture, &entry);
                 let mut writer = AuditWriter::open(
@@ -2453,6 +2459,25 @@ mod tests {
                 assert_eq!(reference.sequence(), row["s"].as_u64().unwrap());
                 assert!(consent_rows(fixture.profile()).is_empty());
                 assert_eq!(inspect_outbox(&fixture.audit_path()).unwrap().pending, 1);
+                if integrated {
+                    let mut writer = crate::common::approval_fixture::keyed_writer(
+                        fixture.profile(),
+                        fixture.name(),
+                    );
+                    writer.drain_outbox().unwrap();
+                    assert_eq!(consent_rows(fixture.profile()).len(), 1);
+                    assert!(
+                        writer
+                            .outbox_evidence()
+                            .unwrap()
+                            .unwrap()
+                            .contains_delivered(
+                                &record(&fixture, &entry.approval_nonce).id,
+                                &reference
+                            ),
+                        "the drained row is delivered for the record identity and reservation"
+                    );
+                }
             }
         }
 
