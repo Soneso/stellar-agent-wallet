@@ -388,6 +388,26 @@ CI_OFF_JOBS = {
     "test": ("  test:\n    name: test (offline)\n",
              "cargo test --workspace --no-default-features --features test-helpers,"),
 }
+# The dependency and condition lines that skip a ci.yml job on a docs-only
+# pull request into mainnet-write.
+DOCS_ONLY_JOB = ("    needs: changes\n"
+                 "    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}\n")
+DOCS_ONLY_FEATURE_JOBS = ("clippy", "doc", "test", "feature-on-clippy", "feature-on-doc", "feature-on-test",
+                          "release-shape")
+DOCS_TESTS_HEADER = ("  docs-tests:\n    name: docs-tests\n    needs: changes\n"
+                     "    if: ${{ !cancelled() && needs.changes.outputs.docs_only == 'true' }}\n")
+DOCS_TESTS_ON_RUN = ("        run: python3 .github/scripts/run-docs-tests.py "
+                     "--features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry\n")
+
+
+def conditional_feature_job(header):
+    """Returns the edit that runs a feature job under if: false."""
+    job = header.split(":", 1)[0].strip()
+    if job in DOCS_ONLY_FEATURE_JOBS:
+        return (CI, header + DOCS_ONLY_JOB, header + "    needs: changes\n    if: false\n", 1)
+    return (CI, header, header + "    if: false\n", 1)
+
+
 COVERAGE_OFF_RUN = "        run: cargo llvm-cov --workspace --no-default-features --features test-helpers,"
 # The host recipe lines that build the CLI package alone, and the lines that
 # derive its debug alias, compare the bytes and check both markers.
@@ -753,9 +773,9 @@ PASSING = [
     ("coverage seed branches in another order pass", [
         (COVERAGE, COVERAGE_PUSH_BLOCK, "  push:\n    branches: [main, mainnet-write]\n", 1)]),
     ("save-if as a quoted expression passes", [
-        (CI, CACHE_SAVE_LINE, "          save-if: \"${{ github.event_name == 'push' }}\"\n", 8)]),
+        (CI, CACHE_SAVE_LINE, "          save-if: \"${{ github.event_name == 'push' }}\"\n", 9)]),
     ("save-if with inner spaces passes", [
-        (CI, CACHE_SAVE_LINE, "          save-if: ${{  github.event_name == 'push'  }}\n", 8)]),
+        (CI, CACHE_SAVE_LINE, "          save-if: ${{  github.event_name == 'push'  }}\n", 9)]),
     ("cancel-in-progress with inner spaces passes", [
         (COVERAGE, COVERAGE_CANCEL_LINE, "  cancel-in-progress: ${{  github.event_name == 'pull_request'  }}\n", 1)]),
     ("Wasm save guard wrapped in ${{ }} passes", [
@@ -1876,8 +1896,8 @@ CASES = [
         (RELEASE, RELEASE_WORKFLOW_ENV,
          RELEASE_WORKFLOW_ENV + "defaults:\n  run:\n    working-directory: ${{ github.token }}\n", 1)]),
 ] + [
-    (f"conditional {job}", "ci-feature-jobs", f"ci.yml: ci-feature-jobs: {job} can be bypassed", [
-        (CI, f"  {job}:\n    name: {job}\n", f"  {job}:\n    name: {job}\n    if: false\n", 1)])
+    (f"conditional {job}", "ci-feature-jobs", f"ci.yml: ci-feature-jobs: {job} can be bypassed",
+     [conditional_feature_job(f"  {job}:\n    name: {job}\n")])
     for job in CI_FEATURE_JOBS
 ] + [
     (f"{job} step that continues on error", "ci-feature-jobs", f"ci.yml: ci-feature-jobs: {job} step can be bypassed", [
@@ -1937,9 +1957,29 @@ CASES = [
      ".github/scripts/release/check-host.sh: ci-feature-jobs: does not run unconditionally: " + HOST_RELEASE_CMP.strip(), [
         (HOST_SCRIPT, HOST_RELEASE_CMP, "", 1)]),
 ] + [
-    (f"conditional {job}", "ci-feature-jobs", f"ci.yml: ci-feature-jobs: {job} can be bypassed", [
-        (CI, header, header + "    if: false\n", 1)])
+    (f"conditional {job}", "ci-feature-jobs", f"ci.yml: ci-feature-jobs: {job} can be bypassed",
+     [conditional_feature_job(header)])
     for job, (header, _) in CI_OFF_JOBS.items()
+] + [
+    ("docs-only job without the changes dependency", "ci-feature-jobs", "ci.yml: ci-feature-jobs: doc can be bypassed", [
+        (CI, CI_OFF_JOBS["doc"][0] + DOCS_ONLY_JOB, CI_OFF_JOBS["doc"][0] + DOCS_ONLY_JOB.replace(
+            "needs: changes", "needs: [changes, fmt]"), 1)]),
+    ("docs-only job that a failed changes job skips", "ci-feature-jobs",
+     "ci.yml: ci-feature-jobs: release-shape can be bypassed", [
+        (CI, "  release-shape:\n    name: release-shape\n" + DOCS_ONLY_JOB,
+         "  release-shape:\n    name: release-shape\n" + DOCS_ONLY_JOB.replace("!cancelled() && ", ""), 1)]),
+    ("docs-tests job removed", "ci-feature-jobs", "ci.yml: ci-feature-jobs: missing docs-tests", [
+        (CI, DOCS_TESTS_HEADER, "  docs-tests-renamed:\n    name: docs-tests\n    needs: changes\n"
+         "    if: ${{ !cancelled() && needs.changes.outputs.docs_only == 'true' }}\n", 1)]),
+    ("docs-tests on every pull request", "ci-feature-jobs", "ci.yml: ci-feature-jobs: docs-tests can be bypassed", [
+        (CI, DOCS_TESTS_HEADER, DOCS_TESTS_HEADER.replace("docs_only == 'true'", "docs_only != 'true'"), 1)]),
+    ("docs-tests without the feature-on run", "ci-feature-jobs",
+     "ci.yml: ci-feature-jobs: docs-tests does not run unconditionally: python3 .github/scripts/run-docs-tests.py "
+     "--features mainnet-write", [
+        (CI, DOCS_TESTS_ON_RUN, DOCS_TESTS_ON_RUN.replace("mainnet-write,", ""), 1)]),
+    ("docs-tests step that continues on error", "ci-feature-jobs",
+     "ci.yml: ci-feature-jobs: docs-tests step can be bypassed", [
+        (CI, DOCS_TESTS_ON_RUN, DOCS_TESTS_ON_RUN + "        continue-on-error: true\n", 1)]),
 ] + [
     (f"{job} step that continues on error", "ci-feature-jobs", f"ci.yml: ci-feature-jobs: {job} step can be bypassed", [
         (CI, f"        run: {command}", f"        continue-on-error: true\n        run: {command}", 1)])

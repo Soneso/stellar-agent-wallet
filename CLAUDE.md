@@ -2,7 +2,9 @@ Read [AGENTS.md](AGENTS.md) first.
 Start local verification with `bash .github/scripts/preflight.sh` and run the
 issue-specific acceptance commands. `bash .github/scripts/preflight.sh --full`
 runs the complete local registry, including coverage.
-CI runs the offline workspace suite on every pull request. Pull-request
+CI runs the offline gates on every pull request; a docs-only pull request into
+`mainnet-write` runs the reduced set that `docs/maintainers/building.md`
+describes. Pull-request
 coverage requires the `coverage` label; live acceptance uses its separate
 workflow. Local coverage, machete, and deny are optional reproductions.
 Complete the [self-review](docs/maintainers/review-checklist.md#self-review-before-you-open-a-pull-request).
