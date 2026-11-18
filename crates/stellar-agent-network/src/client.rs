@@ -1227,6 +1227,9 @@ pub fn send_attempts_on_this_thread() -> usize {
 }
 
 /// An opt-in counter shared with an isolated acceptance child.
+///
+/// The counter file lives in the acceptance home, which the marker owner in
+/// `stellar-agent-core` admits only inside a marked fixture directory.
 #[cfg(feature = "test-hooks")]
 #[allow(
     clippy::expect_used,
@@ -1236,13 +1239,8 @@ fn record_send_attempt_for_test() {
     SEND_ATTEMPTS.with(|count| count.set(count.get() + 1));
     if std::env::var_os("STELLAR_AGENT_TEST_COUNT_SENDS").is_some() {
         use std::io::Write as _;
-        let home = std::path::PathBuf::from(
-            std::env::var_os("STELLAR_AGENT_HOME").expect("isolated acceptance home"),
-        );
-        assert!(
-            home.is_absolute() && home.join(".stellar-agent-test-sandbox").is_file(),
-            "the send observer requires an isolated acceptance home"
-        );
+        let home = stellar_agent_core::profile::schema::sandboxed_override("STELLAR_AGENT_HOME")
+            .expect("the send observer requires an isolated acceptance home");
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
