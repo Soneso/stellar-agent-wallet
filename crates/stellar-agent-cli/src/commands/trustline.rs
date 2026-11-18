@@ -3269,6 +3269,7 @@ pub(crate) mod tests {
         /// Accept: the trustline is witnessed through the routed oracle,
         /// signed through the keyring handle and sent once.
         #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial(mainnet_clock)]
         #[serial_test::serial]
         async fn mainnet_time_bounds_trustline() {
             let fixture = spec("mainnet-trustline-accept").build().await;
@@ -3301,6 +3302,7 @@ pub(crate) mod tests {
         /// before any signer is resolved: the keyring never signs and nothing
         /// is sent.
         #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial(mainnet_clock)]
         #[serial_test::serial]
         async fn mainnet_time_bounds_trustline_elapsed_refuses_before_signing() {
             let mut fixture = spec("mainnet-trustline-elapsed").build().await;
@@ -3575,6 +3577,7 @@ pub(crate) mod tests {
         /// Rendering: a refusal inside the submit renders the after-signing
         /// text under the generic code.
         #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial(mainnet_clock)]
         #[serial_test::serial]
         async fn a_submit_refusal_renders_the_after_signing_text() {
             let started_at = now();
@@ -3703,6 +3706,7 @@ pub(crate) mod tests {
         }
     }
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn early_observation_precedes_window_gate() {
         use crate::commands::submission_record::intent_gate_fixture::{IntentGateState, home};

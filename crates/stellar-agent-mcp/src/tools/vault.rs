@@ -218,7 +218,8 @@ impl WalletServer {
     )]
     #[tool(
         name = "stellar_defindex_vault_deposit",
-        description = "Deposit assets into a DeFindex vault. Enforces ordered trust gate: vault \
+        description = "Deposit assets into a DeFindex vault. Testnet only. A mainnet profile \
+                       refuses with network.mainnet_write_forbidden at entry. Enforces ordered trust gate: vault \
                        WASM-hash pin (two-RPC), upgradable-flag check (self-managed exempt), \
                        role disclosure, asset-count validation, Blend-strategy detection. \
                        Refuses upgradable=true non-self-managed vaults by default \
@@ -709,7 +710,9 @@ impl WalletServer {
     )]
     #[tool(
         name = "stellar_defindex_vault_withdraw",
-        description = "Withdraw assets from a DeFindex vault by redeeming shares. Enforces \
+        description = "Withdraw assets from a DeFindex vault by redeeming shares. Testnet \
+                       only. A mainnet profile refuses with network.mainnet_write_forbidden at \
+                       entry. Enforces \
                        ordered trust gate: vault WASM-hash pin (two-RPC), upgradable-flag check \
                        (self-managed exempt), role disclosure, asset-count validation, \
                        Blend-strategy detection. Refuses upgradable=true non-self-managed \

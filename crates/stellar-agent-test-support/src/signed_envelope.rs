@@ -78,6 +78,77 @@ pub fn account_id_for_seed(seed: [u8; 32]) -> String {
     )
 }
 
+/// Builds a testnet transaction that opens a USD trustline and funds it.
+/// Both supplied accounts must already exist. The issuer pays the fee and
+/// uses `issuer_sequence`; the recipient signs its ChangeTrust operation.
+///
+/// # Panics
+/// Panics if fixture XDR values cannot be encoded.
+#[must_use]
+#[allow(clippy::unwrap_used, reason = "fixed test fixture XDR shapes")]
+pub fn funded_issued_payment_envelope(
+    recipient_seed: [u8; 32],
+    issuer_seed: [u8; 32],
+    issuer_sequence: i64,
+) -> (String, String) {
+    use stellar_xdr::{AlphaNum4, AssetCode4, ChangeTrustAsset, ChangeTrustOp};
+    let recipient = public_key_for_seed(recipient_seed);
+    let issuer = public_key_for_seed(issuer_seed);
+    let credit = AlphaNum4 {
+        asset_code: AssetCode4(*b"USD\0"),
+        issuer: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(issuer))),
+    };
+    let transaction = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(issuer)),
+        fee: 200_000,
+        seq_num: SequenceNumber(issuer_sequence),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![
+            Operation {
+                source_account: Some(MuxedAccount::Ed25519(Uint256(recipient))),
+                body: OperationBody::ChangeTrust(ChangeTrustOp {
+                    line: ChangeTrustAsset::CreditAlphanum4(credit.clone()),
+                    limit: 10_000_000_000,
+                }),
+            },
+            Operation {
+                source_account: None,
+                body: OperationBody::Payment(PaymentOp {
+                    destination: MuxedAccount::Ed25519(Uint256(recipient)),
+                    asset: Asset::CreditAlphanum4(credit),
+                    amount: 1_000_000_000,
+                }),
+            },
+        ]
+        .try_into()
+        .unwrap(),
+        ext: TransactionExt::V0,
+    };
+    let hash = payload_hash(
+        TESTNET_PASSPHRASE,
+        &TransactionSignaturePayloadTaggedTransaction::Tx(transaction.clone()),
+    );
+    let signatures = [issuer_seed, recipient_seed].map(|seed| {
+        let key = SigningKey::from_bytes(&seed);
+        let bytes = key.verifying_key().to_bytes();
+        DecoratedSignature {
+            hint: SignatureHint(bytes[28..].try_into().unwrap()),
+            signature: Signature(key.sign(&hash).to_bytes().to_vec().try_into().unwrap()),
+        }
+    });
+    let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx: transaction,
+        signatures: signatures.to_vec().try_into().unwrap(),
+    })
+    .to_xdr_base64(Limits::none())
+    .unwrap();
+    (
+        format!("USD:{}", account_id_for_seed(issuer_seed)),
+        envelope,
+    )
+}
+
 /// Returns a `getNetwork` JSON-RPC result body reporting `passphrase`.
 ///
 /// The body reports protocol version 29, a version the wallet supports, so a

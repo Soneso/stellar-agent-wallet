@@ -698,7 +698,7 @@ destructive tool and is refused on a mainnet profile.
 | `toolset.args_not_object` | `args` was not a JSON object. | Pass `args` as a JSON object. |
 | `toolset.args_validation` / `toolset.args_deserialise` / `toolset.gated_args_deserialise` | The toolset arguments failed validation or deserialization. | Fix the argument shape to match the routed tool's schema and retry. |
 | `toolset.route_missing` / `toolset.gated_route_missing` | The toolset matrix names a tool this binary has no routing arm for. The answer is an internal error. An unknown action name answers `toolset.unknown_action` instead. | Not agent-recoverable. Report it to the operator. |
-| `toolset.enforcement_error` with nested `toolset.coordination_busy` | An install, uninstall, or grant write holds a lock the gated call needs. The answer is an internal error. | Retry once the install, uninstall, or grant write ends. |
+| `toolset.coordination_busy` | An install, uninstall, or grant write holds a lock the gated call needs. A payment call answers this business code. A rule-creation call answers an internal error whose message starts `toolset.enforcement_error:` and holds the nested `toolset.coordination_busy`. | Retry once the install, uninstall, or grant write ends. |
 
 ## MCP server availability
 

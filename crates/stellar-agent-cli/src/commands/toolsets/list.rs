@@ -1,4 +1,4 @@
-//! `toolset list` subcommand.
+//! `toolsets list` subcommand.
 //!
 //! Canonical scriptable enumeration of installed toolsets and their declared
 //! actions.  Emits JSON (not parsed from `--help`).
@@ -16,7 +16,7 @@ use stellar_agent_toolsets_runtime::{PinKey, ToolsetListEntry, list_pinned_tools
 
 use crate::common::render::render_json;
 
-/// Arguments for `toolset list`.
+/// Arguments for `toolsets list`.
 #[derive(Debug, Args)]
 pub struct ToolsetListArgs {
     /// Override the toolsets root directory (default: OS-conventional toolsets dir).
@@ -24,14 +24,14 @@ pub struct ToolsetListArgs {
     pub toolsets_dir: Option<std::path::PathBuf>,
 }
 
-/// JSON success payload for `toolset list`, carried under the envelope `data` field.
+/// JSON success payload for `toolsets list`, carried under the envelope `data` field.
 #[derive(Debug, Serialize)]
 struct ListSuccess {
     /// Installed toolsets.
     toolsets: Vec<ToolsetListEntry>,
 }
 
-/// Runs the `toolset list` subcommand.
+/// Runs the `toolsets list` subcommand.
 ///
 /// # Exit codes
 ///

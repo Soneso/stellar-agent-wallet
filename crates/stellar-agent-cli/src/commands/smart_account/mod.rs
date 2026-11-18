@@ -129,8 +129,8 @@ pub enum SmartAccountSubcommand {
     ///   via OZ `remove_policy`.
     /// - **`smart-account rules list`** — enumerate all active context rules (canonical
     ///   name). Delegates to `smart-account list-rules`; both produce identical
-    ///   JSON envelopes. `smart-account list-rules` is retained for
-    ///   backwards-compat (no deprecation warning).
+    ///   JSON envelopes. `smart-account list-rules` is a second entry point for
+    ///   the same command and prints no warning.
     ///
     /// All write subcommands invoke `Signer::sign_auth_digest` exclusively
     /// (inverse-bypass discipline) and emit
@@ -237,9 +237,8 @@ pub enum SmartAccountSubcommand {
     /// Mainnet is structurally refused. Use `--dry-run` to derive the
     /// deterministic policy address without any network access.
     ///
-    /// `--kind spending-limit` routes to the same substrate as the standalone
-    /// `smart-account deploy-spending-limit-policy` verb, which remains
-    /// available unchanged.
+    /// `--kind spending-limit` and `smart-account deploy-spending-limit-policy`
+    /// deploy the same contract.
     ///
     /// Each kind's WASM SHA-256 is re-verified at runtime before any
     /// submission. Idempotent per network + kind: re-running with the same

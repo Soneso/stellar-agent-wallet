@@ -401,6 +401,7 @@ impl CanonicalFx {
 }
 
 #[tokio::test]
+#[serial_test::serial(mainnet_clock)]
 #[serial_test::serial]
 async fn canonical_resolver_binds_intent_and_envelope() {
     let fx = CanonicalFx::new(false, 900_000, str::to_owned);
@@ -437,6 +438,7 @@ async fn canonical_resolver_binds_intent_and_envelope() {
 }
 
 #[tokio::test]
+#[serial_test::serial(mainnet_clock)]
 #[serial_test::serial]
 async fn canonical_resolver_rereads_the_claim() {
     for changed in ["same", "amount", "vanished", "transport", "decode"] {
@@ -503,6 +505,7 @@ async fn canonical_resolver_rereads_the_claim() {
 }
 
 #[tokio::test]
+#[serial_test::serial(mainnet_clock)]
 #[serial_test::serial]
 async fn intent_clock_reaches_real_signing() {
     for ttl in [300_000, 900_000] {
@@ -590,6 +593,7 @@ async fn intent_clock_reaches_real_signing() {
 }
 
 #[tokio::test]
+#[serial_test::serial(mainnet_clock)]
 #[serial_test::serial]
 async fn rebuilt_policy_governs() {
     for (allowed, required, approval) in [
@@ -702,6 +706,7 @@ async fn rebuilt_policy_governs() {
 }
 
 #[tokio::test]
+#[serial_test::serial(mainnet_clock)]
 #[serial_test::serial]
 async fn consented_unminted_intent_survives_waiting_end() {
     use crate::policy_state::{OperationState, PersistedWindowStore};
@@ -819,6 +824,7 @@ async fn consented_unminted_intent_survives_waiting_end() {
                         expires_at_ms: fx.witness.execution_expires_at_ms(),
                     },
                     chain_deadline_ms: Some((now / 1000 + 120) * 1000),
+                    restriction_end_ms: None,
                     authorization_ttl_ms: 60_000,
                     bindings: crate::mainnet::digest::BindingFacts {
                         endpoint: None,
@@ -829,6 +835,7 @@ async fn consented_unminted_intent_survives_waiting_end() {
                         reservation: None,
                         authority: [4; 32],
                         audit: [5; 32],
+                        restriction: None,
                     },
                     holds: vec![],
                     parent: None,
@@ -867,6 +874,7 @@ async fn consented_unminted_intent_survives_waiting_end() {
 }
 
 #[tokio::test]
+#[serial_test::serial(mainnet_clock)]
 #[serial_test::serial]
 async fn canonical_header_binds_attempt_and_intent() {
     use super::super::super::types::AuthorizationId;
@@ -1003,6 +1011,7 @@ async fn canonical_header_binds_attempt_and_intent() {
 }
 
 #[tokio::test]
+#[serial_test::serial(mainnet_clock)]
 #[serial_test::serial]
 async fn legacy_binding_is_never_promoted() {
     for slot in ["absent", "envelope", "x402"] {
@@ -1084,6 +1093,7 @@ async fn legacy_binding_is_never_promoted() {
 }
 
 #[tokio::test]
+#[serial_test::serial(mainnet_clock)]
 #[serial_test::serial]
 async fn bad_canonical_slots_refuse_only_use() {
     use crate::policy_state::OperationState;
@@ -1144,6 +1154,7 @@ async fn bad_canonical_slots_refuse_only_use() {
 }
 
 #[test]
+#[serial_test::serial(mainnet_clock)]
 #[serial_test::serial]
 fn consented_waiters_keep_capacity_until_execution_end() {
     let fx = CanonicalFx::new(false, 900_000, str::to_owned);
@@ -1190,6 +1201,7 @@ fn consented_waiters_keep_capacity_until_execution_end() {
 }
 
 #[test]
+#[serial_test::serial(mainnet_clock)]
 #[serial_test::serial]
 fn revoked_consent_wins_over_stale_process_handle() {
     use crate::policy_state::operations::tests::{

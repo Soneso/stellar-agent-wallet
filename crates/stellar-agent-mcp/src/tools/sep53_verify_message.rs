@@ -33,8 +33,8 @@ use crate::server::WalletServer;
 ///   match what was used during signing.
 /// - `signature` — base64-standard-encoded 64-byte ed25519 signature.
 /// - `public_key` — G-strkey of the signer to verify against.
-/// - `chain_id` — optional CAIP-2 chain identifier (not required; verification
-///   is chain-agnostic, but passed for dispatch-gate compatibility).
+/// - `chain_id`: CAIP-2 chain identifier. `chain_id` is required and must match
+///   the profile. Verification itself does not depend on the chain.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(crate = "rmcp::serde")]
 pub struct Sep53VerifyMessageArgs {

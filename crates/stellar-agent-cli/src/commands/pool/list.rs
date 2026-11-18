@@ -26,6 +26,7 @@ pub struct PoolListArgs {
     /// Profile name.
     ///
     /// Defaults to the `STELLAR_AGENT_PROFILE` env var, then `"default"`.
+    /// A mainnet profile must be named with this flag.
     #[arg(long, value_name = "NAME")]
     pub profile: Option<String>,
 

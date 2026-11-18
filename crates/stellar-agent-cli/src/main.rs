@@ -73,15 +73,18 @@ enum Commands {
     /// Run the MCP stdio server.
     Mcp(commands::mcp::McpArgs),
 
-    /// Wallet-owned approval spine — interactive y/n for pending approvals.
+    /// Approve a pending approval: a terminal prompt on testnet, a pinned passkey on mainnet.
     ///
     /// Provides:
     /// - `approve --id <nonce> --profile <name>`: read a pending approval from the store,
-    ///   render a wallet-controlled summary, prompt y/n, and on approval
-    ///   compute and record the HMAC attestation blob.
-    /// - `approve --id <nonce> --profile <name> --yes`: non-interactive auto-approve.
-    ///   Bypasses the tty prompt; use only in trusted automation flows.
-    /// - `approve gc`: evict all expired pending approvals for a profile.
+    ///   render a wallet-controlled summary, and record the approval. A testnet
+    ///   profile prompts y/n at the terminal. A mainnet profile approves with a
+    ///   passkey, in the local browser or at the signed approval origin.
+    /// - `approve --id <nonce> --profile <name> --yes`: approves without a prompt
+    ///   on testnet. A mainnet profile refuses it with
+    ///   `approve.yes_refused_on_mainnet`.
+    /// - Subcommands: `revoke`, `gc`, `list`, `status`, `serve`, `operator`, and
+    ///   `credential`.
     Approve(commands::approve::ApproveArgs),
 
     /// Submission-record subcommand group.
@@ -100,11 +103,13 @@ enum Commands {
     /// - `audit verify <log-path>` — walk the hash-chained audit log at
     ///   `<log-path>` and verify the chain integrity from the oldest rotated
     ///   file to the current active file.
+    /// - `audit reanchor`, `audit acknowledge-outbox-loss`, and
+    ///   `audit bind-carriers`.
     Audit(commands::audit::AuditArgs),
 
     /// Account-management subcommand group.
     ///
-    /// Currently provides:
+    /// Provides:
     /// - `accounts create` — create a new Stellar account on-chain via
     ///   sponsored `CreateAccount` op or Friendbot (testnet only).
     /// - `accounts deploy-c` — deploy a new OZ smart-account (C-account)
@@ -124,6 +129,8 @@ enum Commands {
     /// - `counterparty refresh <home-domain> [--profile <name>]` — force-fetch
     ///   `https://<home-domain>/.well-known/stellar.toml`, HMAC-protect it, and
     ///   write to the per-profile cache.
+    /// - `counterparty evict`, `counterparty warm-up`, and
+    ///   `counterparty rotate-hmac-key`.
     Counterparty(commands::counterparty::CounterpartyArgs),
 
     /// Fund a testnet or futurenet account via the Stellar Friendbot endpoint.
@@ -176,6 +183,10 @@ enum Commands {
     ///   chain-root HMAC key.
     /// - `profile rotate-counterparty-key <name>` — rotate the stellar.toml
     ///   cache-integrity HMAC key.
+    /// - `profile init`, `policy`, `policy-check`, `apply-fragment`,
+    ///   `bind-signer`, `enable-mainnet`, `enroll-rpc-credential`,
+    ///   `add-counterparty`, `rotate-policy-state-key`, `reset-window-state`,
+    ///   `reset-mpp-state`, `halt`, and `resume`.
     Profile(commands::profile::ProfileArgs),
 
     /// WebAuthn passkey credential lifecycle.
@@ -195,14 +206,17 @@ enum Commands {
     ///
     /// Enforces the ordered trust gate: vault WASM-hash pin, upgradable-flag
     /// check, role disclosure.  Signs and submits via the wallet's
-    /// smart-account.
+    /// smart-account. Testnet only. A mainnet profile refuses with
+    /// `network.mainnet_write_forbidden` before any key access or RPC request.
     Vault(commands::vault::VaultArgs),
 
     /// Swap tokens via the Soroswap ROUTER-DIRECT path.
     ///
     /// Enforces the ordered trust gate: venue allowlist, router WASM-hash pin,
     /// on-chain slippage re-verify.  Requires absolute `amount_out_min` (not a
-    /// percent).  Signs and submits via the wallet's smart-account.
+    /// percent).  Signs and submits via the wallet's smart-account. Testnet
+    /// only. A mainnet profile refuses with `network.mainnet_write_forbidden`
+    /// before any key access or RPC request.
     Trade(commands::trade::TradeArgs),
 
     /// Create or remove a Stellar classic trustline (`ChangeTrust`).
@@ -227,7 +241,7 @@ enum Commands {
     /// `--submit-only <xdr>`. Default: build → sign → submit atomically.
     Claim(Box<commands::claim::ClaimArgs>),
 
-    /// Toolset install and uninstall.
+    /// Toolset install, uninstall, list, and capability check (`toolsets run`).
     ///
     /// Provides:
     /// - `toolsets install <pkg>@<version> --file <path> --shasum <hex>
@@ -235,6 +249,7 @@ enum Commands {
     ///   — install a toolset from a signed `.tar.gz` package with cryptographic
     ///   provenance verification (hash + ed25519 signature + trust set).
     /// - `toolsets uninstall <pkg>` — remove an installed toolset.
+    /// - `toolsets list` and `toolsets run`.
     ///
     /// No MCP tool or capability registration at install time.
     Toolsets(commands::toolsets::ToolsetsArgs),
@@ -250,7 +265,8 @@ enum Commands {
     /// - `smart-account rules <create | get | set-name | set-valid-until |
     ///   delete | add-policy | remove-policy | list>` — context-rule lifecycle.
     /// - `smart-account signers <list | refresh | add | remove |
-    ///   set-threshold>` — signer-set lifecycle.
+    ///   set-threshold | batch-add | set-weighted-threshold |
+    ///   set-signer-weight>` — signer-set lifecycle.
     /// - `smart-account multicall` — submit a batched invocation bundle.
     /// - `smart-account deploy-webauthn-verifier` — deploy the OZ
     ///   WebAuthn-verifier WASM and record its address.
@@ -267,9 +283,11 @@ enum Commands {
     ///   the local multicall-router registry.
     /// - `smart-account timelock <schedule | cancel | execute | list-pending>`
     ///   — OZ upgrade-timelock operations.
+    /// - `smart-account deploy-policy`, `list-intents`, and `execute`.
     ///
-    /// All write subcommands invoke `Signer::sign_auth_digest` exclusively
-    /// and structurally refuse mainnet.
+    /// Every subcommand that signs refuses mainnet. `signers list`,
+    /// `signers refresh`, the read verbs, and the multicall registry verbs
+    /// accept a mainnet profile.
     #[command(visible_alias = "sa")]
     SmartAccount(commands::smart_account::SmartAccountArgs),
 }

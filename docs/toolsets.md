@@ -127,7 +127,7 @@ The **gated tier** is a separate table for the signing-adjacent capabilities:
 
 | Capability | Tool | Admission |
 |---|---|---|
-| `sign-payment` | `stellar_pay_commit` | First-invoke gate plus unconditional per-action approval only |
+| `sign-payment` | `stellar_pay_commit` | First-invoke grant plus composed payment policy |
 | `sign-rule-create` | `stellar_rule_create_commit` | First-invoke gate plus unconditional per-proposal `RuleProposalSimulated` attestation only |
 
 `sign-rule-create`'s first-invoke gate reuses the same payment-shaped
@@ -220,8 +220,9 @@ An absent or empty auditor trust set fails closed for a key-touching toolset. Th
 only sanctioned bypass is `--override-attestation`, which logs a structured warning
 and proceeds; no environment variable or config default skips the gate. Under
 override a key-touching capability (`sign-payment` or `sign-rule-create`) is
-persisted inert, and the runtime
-first-invoke and per-action approval gates still fire at signing time.
+persisted inert, and its runtime first-invoke grant still applies at signing time.
+A `sign-payment` commit still meets the payment policy gates. A `sign-rule-create`
+commit still requires its per-proposal attestation.
 
 The install records its result as one of `attested`, `overridden`, or
 `not-required`, reflecting what the gate actually did rather than what flags were
@@ -282,7 +283,7 @@ removes the directory named by the validated requested package name (never a nam
 path read from the record), refuses a symlinked leaf, and removes the directory and
 pin. A record that does not verify can therefore be removed.
 
-## First-invoke gate and per-action payment approval
+## First-invoke grants and payment policy
 
 Through the dispatcher, `stellar_pay_commit` is reachable only through the gated
 resolver, never the ungated path. The gated resolver enforces, in order:
@@ -324,9 +325,30 @@ surfaces show the version, the first 12 shasum characters and the install identi
 A pending request without these fields cannot be approved; invoke again to request
 fresh consent.
 
-A matching grant suppresses only the first-invoke re-prompt. Per-action payment
-approval fires on every toolset-routed payment: a policy-engine `Allow` becomes
-`RequireApproval`, and the approval binds the actual executed envelope.
+A matching grant suppresses the first-invoke re-prompt. The payment and outer
+toolset policies still apply. A composed `Allow` submits without another approval;
+`RequireApproval` from either policy requires consent bound to the executed envelope.
+The earlier policy or grant end limits signing authority. Preparation needs
+`propose-transaction` and no signing grant; commit resolves its own grant.
+The payment is reserved and debited once per complete accounting key, including
+limits from both policies. Complete M destinations retain their mux ID in consent,
+submitted transactions, results and receipts. Payment audit rows hash the complete
+destination and contain its redaction rather than its raw value.
+
+Direct and toolset routes reuse the same retained payment consent when the
+verified policy, operation and envelope match. Retrying does not renew its
+original interval. A policy-required commit queues before consuming its protocol
+nonce; an unknown nonce queues nothing on mainnet. On mainnet the queued consent
+binds the operation that the running server prepared for the nonce. After a
+server restart, a commit without approval proof for an earlier preparation
+refuses `nonce.expired` and queues nothing, so the agent prepares again.
+The pending approval store holds at most 4,096 live entries. A new consent at
+that limit refuses with `approval.store_error`. Run
+`stellar-agent approve gc --profile <profile>` to remove expired entries; add
+`--include-consumed` to also remove consumed ones. Rejected, consumed and
+retained-expired consent cannot authorize another send. Retry with the same
+business ID to recover the stored result; an uncertain submission needs status
+reconciliation by its transaction hash, not a replacement payment.
 
 ### Grant and installation locks
 
@@ -347,9 +369,11 @@ revokes anything. The resolver and the grant writer `record_first_invoke_grant`
 return `toolset.coordination_busy` as a library result, which each surface
 wraps:
 
-- MCP `stellar_toolset_invoke` answers an internal error whose message is
-  `toolset.enforcement_error:` followed by the nested
-  `toolset.coordination_busy` diagnostic.
+- MCP payment invocation answers the business code `toolset.coordination_busy`.
+  Retry the same invocation after the writer returns.
+- MCP rule-creation invocation answers an internal error whose message is
+  `toolset.enforcement_error:` followed by the nested `toolset.coordination_busy`
+  diagnostic.
 - `approve` answers `approval.grant_persist`, whose detail is the nested
   `toolset.coordination_busy` diagnostic. Its consent audit row is already
   written, and the pending approval stays queued.
@@ -366,8 +390,9 @@ locks, refuses at or after the stored expiry, and never renews it. It creates,
 repairs, and prunes nothing. While it holds its locks, no install, uninstall, or
 grant change proceeds.
 
-The recheck is a runtime library function that no CLI command or MCP tool calls.
-It returns these refusals as library results, with no surface wrapper:
+A `stellar_pay_commit` action of `stellar_toolset_invoke` runs the recheck
+before it uses the nonce and holds the grant lease through submission. No CLI
+command runs it. It answers these refusals as business codes:
 
 - `toolset.grant_invocation_mismatch`: the invocation differs from the one the
   grant was verified for.
@@ -377,7 +402,7 @@ It returns these refusals as library results, with no surface wrapper:
 - `toolset.grant_changed`: the installation changed, or the grant was revoked,
   replaced, or no longer verifies.
 - `toolset.grant_expired`: the clock reads at or after the stored expiry.
-- `toolset.io_error: clock_unavailable`: the clock cannot be read.
+- `toolset.io_error` with `clock_unavailable`: the clock cannot be read.
 
 Binding, install record, manifest, capability, amount, and grant store failures
 return the resolver's existing results. The locks bind only wallet processes; they do not stop
@@ -532,9 +557,10 @@ dispatch gate.
 
 The dispatcher is annotated destructive (`destructiveHint = true`,
 `readOnlyHint = false`), because its signing actions route to the signing commit
-tools. On a mainnet profile it is refused: the default engine refuses a destructive
-tool, and a mainnet policy rule cannot name it. On testnet its own dispatch gate
-evaluates it as a destructive tool before the routed tool's gate runs.
+tools. With enabled mainnet setup, only exact `stellar_pay` and
+`stellar_pay_commit` actions enter payment routing. The signed outer rule meets
+ordinary payment minimums. Other mainnet actions and incomplete setup refuse.
+On testnet its own gate evaluates payment effects before the routed gate runs.
 
 | Field | Meaning |
 |---|---|
@@ -570,7 +596,7 @@ a prior `stellar_pay` simulate call, and its `asset` with `amount` or
 `amount_in_stroops`. The destination, asset, and amount are decoded authoritatively
 from that envelope. If the first-invoke gate fires, the call returns
 `toolset.first_invoke_approval_required` with the approval nonce; once a grant exists,
-the per-action payment approval is still forced on for the commit. A gated commit
-without `approval_nonce` and `approval_attestation` queues that approval and answers
-`policy.approval_required` without the nonce. The operator reads the nonce from
-`stellar-agent approve list`.
+the composed payment policies decide whether per-action approval is required. When
+they require it, a gated commit without `approval_nonce` and `approval_attestation`
+queues that approval and answers `policy.approval_required` without the nonce. The
+operator reads the nonce from `stellar-agent approve list`.

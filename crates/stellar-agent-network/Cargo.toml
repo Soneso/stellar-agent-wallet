@@ -30,9 +30,12 @@ test-loopback = []
 # `sign_payload_verifying_pubkey`, and `client::constructions_on_this_thread`,
 # the per-thread count of `StellarRpcClient` constructions that shows whether a
 # command reads and sends through one client. These items are gated on this
-# feature and never included in non-test builds. Enable only in
+# feature and never included in non-test builds. The opt-in send counter of
+# an acceptance child resolves its home through
+# `stellar_agent_core::profile::schema::sandboxed_override`, so the feature
+# enables `stellar-agent-core/test-helpers`. Enable only in
 # `[dev-dependencies]` or via `cargo test --features test-hooks`.
-test-hooks = []
+test-hooks = ["stellar-agent-core/test-helpers"]
 
 # Exposes test-only public helpers (e.g. `cache::read_cache_entry`,
 # `NoopCounterpartyResolver`) gated behind this feature so they do not appear in

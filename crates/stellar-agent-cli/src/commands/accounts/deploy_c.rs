@@ -124,8 +124,7 @@ const DEFAULT_TIMEOUT_SECONDS: u64 = 60;
     ),
 )]
 pub struct DeployCArgs {
-    /// Initial signer G-strkey to install via `__constructor` (current
-    /// default behavior).
+    /// Initial signer G-strkey to install via `__constructor`.
     ///
     /// This G-strkey becomes the `Signer::Delegated(Address)` argument in the
     /// OZ `__constructor(signers, policies)` call. Any funded ed25519 G-strkey

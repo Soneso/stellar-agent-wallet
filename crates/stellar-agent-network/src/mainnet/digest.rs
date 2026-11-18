@@ -138,11 +138,16 @@ pub struct BindingFacts {
     pub authority: [u8; 32],
     /// The audit readiness's fact digest.
     pub audit: [u8; 32],
+    /// The toolset restriction's fact digest, for a restricted payment.
+    pub restriction: Option<[u8; 32]>,
 }
 
 /// The aggregate digest over the proofs' fact digests, in the fixed order
 /// endpoint, signer, policy, enablement, witness, reservation, authority,
-/// audit.
+/// audit, then restriction.
+///
+/// A present restriction appends `0x01` and its digest; an absent one
+/// appends nothing, so every unrestricted digest keeps its earlier bytes.
 #[must_use]
 pub fn bindings_digest(facts: &BindingFacts) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -162,6 +167,10 @@ pub fn bindings_digest(facts: &BindingFacts) -> [u8; 32] {
     optional(&mut hasher, facts.reservation.as_ref());
     hasher.update(facts.authority);
     hasher.update(facts.audit);
+    if let Some(restriction) = &facts.restriction {
+        hasher.update([1]);
+        hasher.update(restriction);
+    }
     hasher.finalize().into()
 }
 
@@ -281,6 +290,7 @@ mod tests {
             reservation: Some([6; 32]),
             authority: [7; 32],
             audit: [8; 32],
+            restriction: None,
         };
         assert_eq!(
             hex(&bindings_digest(&facts)),
@@ -304,6 +314,7 @@ mod tests {
             reservation: Some([6; 32]),
             authority: [7; 32],
             audit: [8; 32],
+            restriction: None,
         };
         assert_eq!(
             hex(&bindings_digest(&facts)),

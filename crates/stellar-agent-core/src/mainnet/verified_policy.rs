@@ -219,6 +219,18 @@ impl VerifiedPolicy {
         }
     }
 
+    /// This policy's provenance and mainnet section over `engine`, for
+    /// fixtures whose rules the mainnet validator does not admit.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_engine_for_test(&self, engine: Arc<PolicyEngineV1>) -> Self {
+        Self {
+            engine,
+            ..self.clone()
+        }
+    }
+
     /// The signed policy sequence; `0` for a version 1 document.
     #[must_use]
     pub fn sequence(&self) -> i64 {

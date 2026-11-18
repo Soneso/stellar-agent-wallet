@@ -117,6 +117,7 @@ use crate::common::{render, resolve_profile_name};
 #[non_exhaustive]
 pub struct RunArgs {
     /// Print the local mainnet presence URL for the operator to open.
+    /// A testnet profile or a signed-origin policy refuses this flag.
     #[arg(long, conflicts_with = "yes")]
     pub open_by_operator: bool,
     /// Approval nonce as printed in the MCP simulate response.
@@ -1984,6 +1985,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn approve_run_recovers_an_attested_entry_without_a_ceremony() {
             for offset in [-1_i64, 5_000, 4_000_000] {

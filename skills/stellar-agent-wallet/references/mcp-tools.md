@@ -1109,7 +1109,7 @@ over TLS. Treat credentials and receipts as secrets.
 | Tool | Purpose | Gating |
 | --- | --- | --- |
 | `stellar_toolset_list` | Enumerate installed toolsets and their invocable actions. | Read-only. No `chain_id`. |
-| `stellar_toolset_invoke` | Invoke a named action of an installed toolset, routed to a registered tool through capability enforcement. | Dispatcher. Destructive; refused on mainnet. The toolset signs nothing directly; the dispatcher's and the routed tool's policy gates apply. |
+| `stellar_toolset_invoke` | Invoke a named action of an installed toolset, routed to a registered tool through capability enforcement. | Destructive dispatcher. Enabled mainnet setup admits exact payment preparation and commit actions; outer and routed policies apply. |
 
 Arguments:
 
@@ -1123,7 +1123,7 @@ authenticated install record (an HMAC under an installation key in the platform
 keyring, carrying the `TOOLSET.md` digest both resolvers check). Its ungated
 routes never reach a signing tool regardless of those declarations; the signing
 actions route to the commit tools only behind the first-invoke gate and the
-per-action approval. A toolset narrows what this dispatcher routes, not the
+payment policy or rule approval. A toolset narrows what this dispatcher routes, not the
 native tools this server registers; the caller chooses the `toolset` argument,
 and the operator policy and approvals bound native and routed calls alike. A
 record that does not verify refuses with `toolset.pin_unverifiable`.

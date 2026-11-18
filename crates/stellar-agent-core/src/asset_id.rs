@@ -117,6 +117,18 @@ impl CanonicalAsset {
         Err(AssetIdError::Form)
     }
 
+    /// Parses the asset of an authoritative payment decode: `XLM` and
+    /// `native` name the native asset, and any other text is a threshold key.
+    ///
+    /// # Errors
+    /// Returns the threshold-key error of any other text.
+    pub fn parse_payment_asset(text: &str) -> Result<Self, AssetIdError> {
+        match text {
+            "XLM" | "native" => Ok(Self::Native),
+            key => Self::parse_threshold_key(key),
+        }
+    }
+
     /// Derives the Stellar Asset Contract address on the supplied network.
     /// Returns `None` for a contract identity or an invalid directly constructed asset.
     #[must_use]

@@ -390,6 +390,7 @@ mod authorized {
     /// no release row. Its resend under a fresh grant is refused before any
     /// send or row.
     #[tokio::test]
+    #[serial(mainnet_clock)]
     #[serial]
     async fn an_authorized_original_past_ledger_retention_refuses_its_resend() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -438,6 +439,7 @@ mod authorized {
     /// ledger record protects it. Its resend under a fresh grant is refused
     /// before any send or row.
     #[tokio::test]
+    #[serial(mainnet_clock)]
     #[serial]
     async fn an_aged_original_in_the_oldest_archive_refuses_an_authorized_resend() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -450,6 +452,7 @@ mod authorized {
     /// keeps past [`MAX_ROTATED_FILES`], and its resend is refused the same
     /// way.
     #[tokio::test]
+    #[serial(mainnet_clock)]
     #[serial]
     async fn an_aged_original_past_stopped_pruning_refuses_an_authorized_resend() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -501,6 +504,7 @@ mod authorized {
     /// a lost receipt: the lookup reports the original settled, so the
     /// precheck lets the resend through and it is sent once.
     #[tokio::test]
+    #[serial(mainnet_clock)]
     #[serial]
     async fn a_settled_original_with_a_lost_receipt_lets_the_resend_through() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -537,6 +541,7 @@ mod authorized {
     /// only to its tip: a failed row appended past the tip, outside the
     /// writer, leaves the owed original refusing its resend.
     #[tokio::test]
+    #[serial(mainnet_clock)]
     #[serial]
     async fn a_lazily_indexed_writer_reads_only_to_its_tip_on_the_authorized_path() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -573,6 +578,7 @@ mod authorized {
     /// The fixture's ledger inspection fails on a window store it cannot
     /// read or decode, rather than reporting no record and no hold.
     #[tokio::test]
+    #[serial(mainnet_clock)]
     #[serial]
     async fn ledger_inspection_fails_on_an_unreadable_window_store() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();

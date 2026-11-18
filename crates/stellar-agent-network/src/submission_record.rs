@@ -512,6 +512,9 @@ pub struct WalletSubmissionRecorder<'a> {
     now_ms: u64,
     sequence_floor: Option<&'a dyn SequenceFloorHook>,
     approval: Option<ApprovalTombstone>,
+    /// The envelope hash whose approval consumption a restricted submission
+    /// owes, recorded by its outcome; `None` when consumption is not deferred.
+    owed_approval: Option<std::sync::Mutex<Option<String>>>,
     provenance: Option<stellar_agent_core::mainnet::decision::MainnetProvenance>,
     operation: Option<OperationAttempt>,
     pre_exposure_ledger: Option<u32>,
@@ -614,6 +617,7 @@ impl<'a> WalletSubmissionRecorder<'a> {
             now_ms,
             sequence_floor: None,
             approval: None,
+            owed_approval: None,
             witness: None,
             provenance: None,
             operation: None,
@@ -674,6 +678,29 @@ impl<'a> WalletSubmissionRecorder<'a> {
     pub fn with_approval(mut self, approval: Option<ApprovalTombstone>) -> Self {
         self.approval = approval;
         self
+    }
+
+    /// Defers the approval consumption of a restricted submission: its
+    /// outcome leaves the consumption owed in the receipt, and
+    /// [`Self::complete_owed_approval`] completes it after the grant lease
+    /// drops.
+    #[must_use]
+    pub fn with_deferred_approval(mut self, deferred: bool) -> Self {
+        self.owed_approval = deferred.then(std::sync::Mutex::default);
+        self
+    }
+
+    /// Completes the approval consumption a deferred outcome left owed.
+    ///
+    /// A failure leaves the obligation in the receipt for the status repair.
+    pub fn complete_owed_approval(&self) {
+        let owed = self
+            .owed_approval
+            .as_ref()
+            .and_then(|owed| owed.lock().ok()?.take());
+        if let Some(envelope_hash) = owed {
+            self.repair_owed_approval(&envelope_hash);
+        }
     }
 
     /// Attaches the operation attempt this submission sends.
@@ -923,13 +950,27 @@ impl<'a> WalletSubmissionRecorder<'a> {
     }
 
     /// Completes the receipt's durable approval-consumption obligation.
+    ///
+    /// A restricted submission holds the grant lease here, so it records the
+    /// obligation as owed and leaves the approval store unopened.
     fn tombstone_approval(&self, intent: &SubmissionIntent) {
+        if let Some(owed) = &self.owed_approval {
+            if let Ok(mut owed) = owed.lock() {
+                *owed = Some(intent.envelope_hash.clone());
+            }
+            return;
+        }
+        self.repair_owed_approval(&intent.envelope_hash);
+    }
+
+    /// Repairs the receipt's owed approval consumption, logging a refusal.
+    fn repair_owed_approval(&self, envelope_hash: &str) {
         let Some(approval) = self.approval.as_ref() else {
             return;
         };
         if let Err(error) = repair_approval_consumption(
             &self.receipts,
-            &intent.envelope_hash,
+            envelope_hash,
             &approval.store_dir,
             &approval.profile_name,
         ) {
@@ -2232,6 +2273,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn bound_mismatch_refuses_at_gate_and_bind() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -2342,6 +2384,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn entryless_admission_commits_progress() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -2447,6 +2490,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn final_submission_links_and_charges_once() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -3886,6 +3930,7 @@ mod tests {
         /// written, the receipt is claimed and marked submitted, and the proof
         /// names the envelope, its content, and the authorization.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_grant_is_consumed_with_the_submission() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -3928,6 +3973,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_mainnet_consumption_carries_destinations() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4015,6 +4061,7 @@ mod tests {
         /// `Always` release row in the same commit. Once the pre-send hook
         /// was entered the stage-marked recorder leaves the end to the hook.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn sign_failure_records_not_sent_with_an_always_row() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4060,6 +4107,7 @@ mod tests {
         /// unsent cleanup through the stage-marked wrapper and a sent
         /// outcome through the callback, and each drain moves them out once.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn submission_recorder_drain_includes_unsent_cleanup() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4122,6 +4170,7 @@ mod tests {
         /// an `Always` release row. Every other arm ends it as
         /// `SentOutcomeUnknown` with the transaction hash.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn outcome_maps_not_sent_and_every_other_arm() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4209,6 +4258,7 @@ mod tests {
         /// the exposure with the attempt still `Sending`, and the outcome then
         /// records `SentOutcomeUnknown`.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn zero_entry_path_records_both_stages() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4251,6 +4301,7 @@ mod tests {
         /// An authorization minted without holds is consumed by a recorder
         /// that sizes no window entries, and nothing is reserved.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn an_empty_entries_grant_still_consumes() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4275,6 +4326,7 @@ mod tests {
         /// record stays used, the second stays open, and the first pending
         /// row stays open for its own settlement.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_second_grant_after_a_lost_receipt_refuses_at_the_window_check() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4324,6 +4376,7 @@ mod tests {
         /// released.
         #[cfg(feature = "test-hooks")]
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_duplicate_at_the_consumption_takes_the_receipt_stage() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4416,6 +4469,7 @@ mod tests {
         /// A recorder with no entries still checks the original reservation.
         #[cfg(feature = "test-hooks")]
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn an_empty_recorder_preserves_a_lost_receipts_open_row() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4427,6 +4481,7 @@ mod tests {
         /// A duplicate refuses before a mismatched entries digest can close a row.
         #[cfg(feature = "test-hooks")]
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn duplicate_reservation_precedes_the_entries_comparison() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4438,6 +4493,7 @@ mod tests {
         /// A grant without holds still refuses bytes with an existing reservation.
         #[cfg(feature = "test-hooks")]
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn duplicate_reservation_refuses_an_authorization_without_holds() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4448,6 +4504,7 @@ mod tests {
 
         /// Fresh bytes consume with a fresh grant after another receipt is lost.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn an_empty_recorder_consumes_unheld_bytes_after_a_lost_receipt() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4532,6 +4589,7 @@ mod tests {
         /// Retained audit ownership protects a consumed envelope without holds.
         #[cfg(feature = "test-hooks")]
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn stateless_duplicate_refuses_before_a_new_row() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4543,6 +4601,7 @@ mod tests {
         /// An uncovered later tip cannot close the original stateless submission.
         #[cfg(feature = "test-hooks")]
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn stateless_duplicate_refuses_before_an_uncovered_tip() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4554,6 +4613,7 @@ mod tests {
         /// A later tip read error cannot close the original stateless submission.
         #[cfg(feature = "test-hooks")]
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn stateless_duplicate_refuses_before_a_tip_error() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4565,6 +4625,7 @@ mod tests {
         /// An endpoint report with a lost receipt refuses resend and preserves
         /// the original pending audit row.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn endpoint_outcomes_keep_stateless_consumption_open() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4635,6 +4696,7 @@ mod tests {
         /// A settlement read error removes only the receipt and preserves the
         /// open grant without appending a pending or closing row.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_settlement_lookup_error_takes_the_receipt_stage() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4668,6 +4730,7 @@ mod tests {
         /// appended past the writer's verified tip does not settle the owed
         /// pending row, so the precheck refuses the bytes as submitted.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn the_precheck_reads_through_the_held_guard() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4710,6 +4773,7 @@ mod tests {
         /// it: the precheck refuses the bytes as submitted, as it does without
         /// the planted row.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_quarantined_forged_quarantine_row_leaves_the_precheck_refusing() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4768,6 +4832,7 @@ mod tests {
         /// The row-writing step acquires the writer guard before looking up an
         /// owed row, so a lock refusal wins over that row's duplicate refusal.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn the_settlement_lookup_requires_the_writer_guard() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4820,6 +4885,7 @@ mod tests {
 
         /// Fresh bytes and a fresh grant consume after a stateless receipt loss.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn stateless_fresh_bytes_consume_after_a_lost_receipt() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4861,6 +4927,7 @@ mod tests {
         /// An uncovered tip for fresh bytes closes only that submission's row.
         #[cfg(feature = "test-hooks")]
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn an_uncovered_tip_closes_a_fresh_submissions_row() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4888,6 +4955,7 @@ mod tests {
         /// used.
         #[cfg(feature = "test-hooks")]
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_failed_mark_submitted_releases_the_converted_holds() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4949,6 +5017,7 @@ mod tests {
         /// Nothing is released, and a second admission of 10 refuses.
         #[cfg(feature = "test-hooks")]
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_public_not_sent_report_after_the_receipt_mark_releases_nothing() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4994,6 +5063,7 @@ mod tests {
         /// byte, so its unwind releases the total debit of that attempt.
         #[cfg(feature = "test-hooks")]
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_failed_mark_submitted_releases_the_total_debit() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5033,6 +5103,7 @@ mod tests {
         /// A consumed grant whose submission is reported unsent after
         /// `pre_send_authorized` returned keeps its total debit.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_reported_non_send_keeps_the_authorized_total_debit() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5069,6 +5140,7 @@ mod tests {
         /// A receipt for the same source and sequence refuses the claim,
         /// before anything of this submission is written or consumed.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_duplicate_sequence_refuses_before_the_consumption() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5104,6 +5176,7 @@ mod tests {
         /// Without an audit writer the grant is refused before the receipt,
         /// the row, or the consumption.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_missing_audit_writer_refuses_before_anything_is_recorded() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5131,6 +5204,7 @@ mod tests {
         /// consumption and closes the row; every hold stays with the open
         /// record.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn an_anchor_that_does_not_cover_the_row_refuses_before_the_consumption() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5166,6 +5240,7 @@ mod tests {
         /// capability. Once `pre_send` returns, a not-sent report keeps the
         /// total charged.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn the_unsent_capability_releases_the_total_only_before_the_send() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5229,6 +5304,7 @@ mod tests {
         /// refuses the send under `policy.total_epoch_stale`, and a retired
         /// or unreadable epoch keeps its own code through the same adapter.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_reservation_epoch_refusal_keeps_its_code() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5286,6 +5362,7 @@ mod tests {
         /// total-budget denial, reserves nothing, and the rendered envelope
         /// keeps that code.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_total_overflow_refuses_as_budget_exhausted() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5337,6 +5414,7 @@ mod tests {
         /// does not parse, refuses before the consumption: no row exists, and
         /// the record stays open.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_pending_row_that_cannot_be_appended_refuses_before_the_consumption() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5373,6 +5451,7 @@ mod tests {
         /// itself still appends.
         #[cfg(feature = "test-hooks")]
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_pending_row_append_failure_takes_the_receipt_stage() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5410,6 +5489,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn authorized_branch_hashes_grant_entries() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5449,6 +5529,7 @@ mod tests {
         /// A recorder built from an authorization writes the policy
         /// provenance it carries into the pending row its consume appends.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn authorized_pending_row_carries_the_provenance() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5488,6 +5569,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn authorized_recorder_retains_minted_exposure() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5539,6 +5621,7 @@ mod tests {
         /// A reported refusal retains converted exposure, leaves the authorization
         /// used and the audit row pending, and tombstones the consumed approval.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_reported_rejection_retains_the_converted_rows() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5607,6 +5690,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn used_authorization_is_not_consumed_twice() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5700,6 +5784,7 @@ mod tests {
 
         /// The audit facts of a writer over another log are refused.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn audit_facts_of_another_log_are_refused() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5725,6 +5810,7 @@ mod tests {
         /// An authorization whose audit proof names another segment of the
         /// log than the recorder's writer is refused.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn audit_facts_of_another_segment_are_refused() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();

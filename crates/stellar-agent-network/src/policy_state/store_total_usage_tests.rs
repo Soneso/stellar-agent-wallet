@@ -20,7 +20,11 @@ fn usage_wire() -> WireFile {
 /// The file bytes, the committed counter, and the window key.
 fn usage_state(f: &Fx) -> (Option<Vec<u8>>, Option<String>, Option<String>) {
     let (file, counter) = f.state();
-    (file, counter, get_raw(&f.profile.policy_window_state_key_id))
+    (
+        file,
+        counter,
+        get_raw(&f.profile.policy_window_state_key_id),
+    )
 }
 
 /// A settled sum of 3, a row of 2, a persisted hold of 1, and a closed
@@ -29,6 +33,7 @@ fn usage_state(f: &Fx) -> (Option<Vec<u8>>, Option<String>, Option<String>) {
 /// settled sum of 4 reports under its own contract bucket. Another scope and
 /// digest stay apart.
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn total_usage_counts_every_persisted_source() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -105,6 +110,7 @@ fn total_usage_counts_every_persisted_source() {
 /// images; usage reads the committed side, and the successor once the
 /// counter names it, so one debit counts exactly once.
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn total_usage_reads_the_committed_side() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -135,6 +141,7 @@ fn total_usage_reads_the_committed_side() {
 
 /// A sum that overflows reports no use, typed, never zero.
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn total_usage_overflow_is_unavailable() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -163,6 +170,7 @@ fn total_usage_overflow_is_unavailable() {
 /// bytes each refuse typed. Only a pin with no store reports no use. No read
 /// creates or changes a file, a key, or the counter.
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn total_usage_refuses_unknown_history() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();

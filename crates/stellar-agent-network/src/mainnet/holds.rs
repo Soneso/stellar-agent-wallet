@@ -5,6 +5,16 @@ use stellar_agent_core::policy::v1::{PolicyEngineV1, ValueClass};
 use stellar_agent_core::policy::{Evaluation, PolicyError, ToolDescriptor};
 use stellar_agent_core::profile::schema::Profile;
 
+/// The value an evaluation permits: its evaluated effects, or read-only
+/// when it carries none. Checking and sizing both read it.
+#[must_use]
+pub fn value_class(evaluation: &Evaluation) -> ValueClass {
+    evaluation
+        .value_effects
+        .clone()
+        .map_or(ValueClass::ReadOnly, ValueClass::Value)
+}
+
 /// Sizes each descriptor with its own evaluated effects before composing holds.
 ///
 /// The caller must check that each evaluation permits the same payment and
@@ -22,11 +32,7 @@ pub fn size_evaluated_holds(
     now_ms: u64,
 ) -> Result<Vec<WindowEntry>, PolicyError> {
     let size = |(tool, evaluation): (&ToolDescriptor, &Evaluation)| {
-        let value = evaluation
-            .value_effects
-            .clone()
-            .map_or(ValueClass::ReadOnly, ValueClass::Value);
-        engine.size_window_entries(tool, profile, &value, now_ms)
+        engine.size_window_entries(tool, profile, &value_class(evaluation), now_ms)
     };
     let routed = size(routed)?;
     let outer = outer.map(size).transpose()?;

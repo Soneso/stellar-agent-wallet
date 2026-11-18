@@ -1,20 +1,17 @@
 //! Integration tests for the `sign-payment` gated toolset path.
 //!
-//! Exercises the first-invoke gate, per-action forced approval, and the
-//! permissive-policy non-vacuous proof.
+//! Exercises first-invoke grants, policy-required consent, and unattended
+//! payment submission under a composed Allow decision.
 //!
 //! ## Test inventory
 //!
 //! 1. **first_invoke_returns_approval_required** — first invoke (no grant) returns
 //!    `toolset.first_invoke_approval_required` with a nonce.
-//! 2. **permissive_policy_forces_per_action_approval** — under an `Allow`-returning
-//!    policy, a toolset with a current grant AND absent/invented attestation STILL
-//!    returns `policy.approval_required`. This proves the per-action approval is
-//!    not vacuous under a permissive policy. It then completes the approved
-//!    payment and checks that its audit rows record the approval decision and nonce.
-//! 3. **grant_present_creates_per_action_queue_entry** — after a grant is in
-//!    place, re-invoke with no attestation creates a `PaymentSimulated` pending
-//!    approval entry in the queue AND the invoke returns `policy.approval_required`.
+//! 2. **permissive_policy_submits_without_payment_consent**: a current grant
+//!    and Allow submit once with a real protocol nonce; irrelevant invented
+//!    consent does not change the policy decision recorded in the audit.
+//! 3. **grant_present_policy_requirement_creates_payment_queue_entry**:
+//!    a current grant plus RequireApproval queues one payment consent.
 //! 4. **without_sign_payment_capability_refused** — a toolset without `sign-payment`
 //!    declared cannot reach the gated tool (four-part check refuses).
 //! 5. **grant_store_empty_after_synthetic_install** — installing (writing a pin)
@@ -33,7 +30,7 @@
 //! 10. **gated_tool_only_via_both_gates** — `stellar_pay_commit` is unreachable
 //!     via the ungated `resolve_action` path (structural invariant).
 //! 11. **mainnet_sign_payment_refuses_before_any_approval_is_queued**: on a
-//!     mainnet context the sign-payment action answers
+//!     mainnet profile without complete signed setup the payment action answers
 //!     `network.mainnet_write_forbidden`, queues no approval, writes no grant,
 //!     and sends no request. It runs on the Noop engine, an allow-all engine,
 //!     and a denying engine. The denying engine pins that the refusal precedes
@@ -272,9 +269,11 @@ async fn mainnet_sign_payment_refuses_at_entry() {
         toolsets.path(),
         CaseEngine::Noop,
     );
-    let mut args = payment_invoke("stellar_pay_commit", DEST_G, 10);
-    args.chain_id = Some("stellar:mainnet".into());
-    assert_mainnet_write_forbidden(&server.call_stellar_toolset_invoke(args).await.unwrap());
+    for action in ["stellar_pay", "stellar_pay_commit"] {
+        let mut args = payment_invoke(action, DEST_G, 10);
+        args.chain_id = Some("stellar:mainnet".into());
+        assert_mainnet_write_forbidden(&server.call_stellar_toolset_invoke(args).await.unwrap());
+    }
     assert_eq!(
         count_pending_approvals(approval.path(), TEST_PROFILE_NAME),
         0
@@ -284,6 +283,20 @@ fn single_rule_engine(
     profile: &str,
     tool: &str,
     criteria: Vec<Box<dyn stellar_agent_core::policy::v1::criteria::Criterion>>,
+) -> stellar_agent_core::PolicyEngineV1 {
+    rule_engine(
+        profile,
+        tool,
+        criteria,
+        stellar_agent_core::policy::Decision::Allow,
+    )
+}
+
+fn rule_engine(
+    profile: &str,
+    tool: &str,
+    criteria: Vec<Box<dyn stellar_agent_core::policy::v1::criteria::Criterion>>,
+    decision: stellar_agent_core::policy::Decision,
 ) -> stellar_agent_core::PolicyEngineV1 {
     use stellar_agent_core::{PolicyDocument, PolicyEngineV1, PolicyRule, RuleMatch, ScopeId};
     PolicyEngineV1::new(
@@ -297,7 +310,7 @@ fn single_rule_engine(
                     chain: "*".into(),
                 },
                 criteria,
-                decision: stellar_agent_core::policy::Decision::Allow,
+                decision,
                 allow_opaque_signing: false,
             }],
         },
@@ -342,9 +355,118 @@ fn payment_invoke(action: &str, destination: &str, amount: i64) -> StellarToolse
     }
 }
 
+/// A funded local endpoint and a real signing identity for public-route tests.
+async fn live_payment_server(
+    approval: &std::path::Path,
+    grants: &std::path::Path,
+    toolsets: &std::path::Path,
+) -> (WalletServer, wiremock::MockServer, String) {
+    use stellar_agent_test_support::xdr_fixtures::{
+        account_entry_xdr_with_seq, account_ledger_key_xdr,
+    };
+    let signer = ed25519_dalek::SigningKey::from_bytes(&[0x61; 32]);
+    let source = stellar_strkey::ed25519::PublicKey(signer.verifying_key().to_bytes())
+        .to_string()
+        .to_string();
+    keyring_core::Entry::new("svc", "acct")
+        .unwrap()
+        .set_password(
+            stellar_strkey::ed25519::PrivateKey(signer.to_bytes())
+                .as_unredacted()
+                .to_string()
+                .as_ref(),
+        )
+        .unwrap();
+    crate::common::store_signer_identity("svc", "acct", [0x61; 32]);
+    let rpc = wiremock::MockServer::start().await;
+    let sequence = std::sync::atomic::AtomicI64::new(42);
+    let rpc_source = source.clone();
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(move |request: &wiremock::Request| {
+            use std::sync::atomic::Ordering;
+            use wiremock::Respond;
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            if body["method"] == "getTransaction" {
+                sequence.fetch_add(1, Ordering::SeqCst);
+            }
+            crate::common::TimeoutRpc::new(vec![
+                (
+                    account_ledger_key_xdr(&rpc_source),
+                    account_entry_xdr_with_seq(
+                        &rpc_source,
+                        1_000_000_000,
+                        0,
+                        sequence.load(Ordering::SeqCst),
+                    ),
+                ),
+                (
+                    account_ledger_key_xdr(DEST_G),
+                    account_entry_xdr_with_seq(DEST_G, 1_000_000_000, 0, 42),
+                ),
+            ])
+            .confirming_in(1001)
+            .respond(request)
+        })
+        .mount(&rpc)
+        .await;
+    let mut profile = testnet_profile();
+    profile.rpc_url = rpc.uri();
+    profile.submit_timeout_seconds = Some(30);
+    crate::common::install_test_audit_key(&mut profile);
+    let server = allow_server_for(profile, approval, grants, toolsets);
+    (server, rpc, source)
+}
+
+async fn prepared_invoke(server: &WalletServer, source: &str) -> StellarToolsetInvokeArgs {
+    prepared_invoke_to(server, source, DEST_G).await
+}
+
+async fn prepared_invoke_to(
+    server: &WalletServer,
+    source: &str,
+    destination: &str,
+) -> StellarToolsetInvokeArgs {
+    let mut args = serde_json::json!({
+        "chain_id": "stellar:testnet", "source": source, "destination": destination,
+        "asset": "native", "amount_in_stroops": "10000000", "fee": "100"
+    });
+    let result = server
+        .call_stellar_pay(serde_json::from_value(args.clone()).unwrap())
+        .await
+        .unwrap();
+    let result: serde_json::Value =
+        serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap();
+    assert_eq!(result["ok"], true, "valid preparation: {result}");
+    for field in ["envelope_xdr", "nonce", "expires_at_unix_ms"] {
+        args[field] = result["data"][field].clone();
+    }
+    StellarToolsetInvokeArgs {
+        toolset: TOOLSET_NAME.into(),
+        action: "stellar_pay_commit".into(),
+        chain_id: Some("stellar:testnet".into()),
+        args,
+    }
+}
+
+fn payment_result(result: &rmcp::model::CallToolResult) -> serde_json::Value {
+    serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap()
+}
+
+async fn sent_count(rpc: &wiremock::MockServer) -> usize {
+    rpc.received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|request| {
+            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["method"]
+                == "sendTransaction"
+        })
+        .count()
+}
+
 #[tokio::test]
 #[serial]
-async fn payment_outer_gate_reaches_routed_approval_and_denies_unlisted() {
+async fn payment_outer_gate_allows_listed_and_requires_unlisted_consent() {
     let _root = crate::common::isolated_data_root();
     let key = setup_mock_keyring();
     let approval = TempDir::new().unwrap();
@@ -362,19 +484,20 @@ async fn payment_outer_gate_reaches_routed_approval_and_denies_unlisted() {
         10_000_000,
         &key,
     );
-    let mut server = build_allow_server(approval.path(), &grant_file, toolsets.path());
+    let (mut server, rpc, source) =
+        live_payment_server(approval.path(), &grant_file, toolsets.path()).await;
+    let invoke = prepared_invoke(&server, &source).await;
     server.set_policy_engine_for_test(Arc::new(single_rule_engine(
         TEST_PROFILE_NAME,
         "*",
         vec![g_counterparty(vec![DEST_G.into()], false)],
     )));
-    let result = server
-        .call_stellar_toolset_invoke(payment_invoke("stellar_pay_commit", DEST_G, 10_000_000))
-        .await
-        .unwrap();
+    let result = server.call_stellar_toolset_invoke(invoke).await.unwrap();
+    assert_eq!(payment_result(&result)["ok"], true, "{result:?}");
+    assert_eq!(sent_count(&rpc).await, 1);
     assert_eq!(
-        crate::common::assert_business_envelope(&result).0,
-        "policy.approval_required"
+        count_pending_approvals(approval.path(), TEST_PROFILE_NAME),
+        0
     );
     for action in ["stellar_pay_commit", "stellar_pay"] {
         let result = server
@@ -390,6 +513,10 @@ async fn payment_outer_gate_reaches_routed_approval_and_denies_unlisted() {
         use stellar_agent_core::policy::v1::criteria::counterparty_allowlist::{
             CounterpartyAllowlistCriterion, CounterpartyKind, UnlistedMode,
         };
+        server.set_policy_engine_for_test(Arc::new(
+            crate::common::policy_mock::MockPolicyEngine::allow(),
+        ));
+        let invoke = prepared_invoke(&server, &source).await;
         let criterion = if budget {
             g_counterparty(vec![], true)
         } else {
@@ -398,18 +525,23 @@ async fn payment_outer_gate_reaches_routed_approval_and_denies_unlisted() {
                     .with_unlisted(UnlistedMode::Approval),
             )
         };
-        server.set_policy_engine_for_test(Arc::new(single_rule_engine(
+        server.set_policy_engine_for_test(Arc::new(rule_engine(
             TEST_PROFILE_NAME,
             "*",
             vec![criterion],
+            stellar_agent_core::policy::Decision::RequireApproval(
+                stellar_agent_core::policy::ApprovalRequest::new(String::new(), 120),
+            ),
         )));
-        let result = server
-            .call_stellar_toolset_invoke(payment_invoke("stellar_pay_commit", DEST_G, 10_000_000))
-            .await
-            .unwrap();
+        let result = server.call_stellar_toolset_invoke(invoke).await.unwrap();
         assert_eq!(
             crate::common::assert_business_envelope(&result).0,
             "policy.approval_required"
+        );
+        assert_eq!(
+            sent_count(&rpc).await,
+            1,
+            "consent queues before a second send"
         );
     }
 }
@@ -444,7 +576,6 @@ async fn display_aliases_of_toolset_and_action_names_reach_no_route() {
     use crate::common::policy_mock::CapturingPolicyEngine;
     let _root = crate::common::isolated_data_root();
     let key = setup_mock_keyring();
-    let rpc = wiremock::MockServer::start().await;
     let approval = TempDir::new().unwrap();
     let grants = TempDir::new().unwrap();
     let toolsets = TempDir::new().unwrap();
@@ -464,11 +595,8 @@ async fn display_aliases_of_toolset_and_action_names_reach_no_route() {
         10_000_000,
         &key,
     );
-    let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
-        .rpc_url(rpc.uri())
-        .with_noop_engine()
-        .build();
-    let mut server = allow_server_for(profile, approval.path(), &grant_file, toolsets.path());
+    let (mut server, rpc, source) =
+        live_payment_server(approval.path(), &grant_file, toolsets.path()).await;
     let capture = CapturingPolicyEngine::new();
     server.set_policy_engine_for_test(Arc::new(capture.clone()));
 
@@ -513,19 +641,14 @@ async fn display_aliases_of_toolset_and_action_names_reach_no_route() {
     );
     assert!(rpc.received_requests().await.unwrap().is_empty());
 
-    // The exact names route: the payment reaches its forced approval and the
-    // read-only action reaches its handler's RPC request.
-    let result = server
-        .call_stellar_toolset_invoke(payment_invoke("stellar_pay_commit", DEST_G, 10_000_000))
-        .await
-        .unwrap();
-    assert_eq!(
-        crate::common::assert_business_envelope(&result).0,
-        "policy.approval_required"
-    );
+    // Exact payment names reach a real unattended send under Allow.
+    let invoke = prepared_invoke(&server, &source).await;
+    let result = server.call_stellar_toolset_invoke(invoke).await.unwrap();
+    assert_eq!(payment_result(&result)["ok"], true, "{result:?}");
+    assert_eq!(sent_count(&rpc).await, 1);
     assert_eq!(
         count_pending_approvals(approval.path(), TEST_PROFILE_NAME),
-        1
+        0
     );
     rpc.reset().await;
     let mut balances = payment_invoke("stellar_balances", DEST_G, 1);
@@ -536,7 +659,7 @@ async fn display_aliases_of_toolset_and_action_names_reach_no_route() {
 
 /// A permissive testnet server with a valid payment grant for [`DEST_G`],
 /// and the toolsets directory it reads.
-fn forced_payment_server(approval_dir: &std::path::Path) -> (WalletServer, TempDir) {
+fn granted_payment_server(approval_dir: &std::path::Path) -> (WalletServer, TempDir) {
     let key = setup_mock_keyring();
     let toolsets_dir = TempDir::new().unwrap();
     let grant_file = approval_dir.join("grants.toml");
@@ -555,19 +678,29 @@ fn forced_payment_server(approval_dir: &std::path::Path) -> (WalletServer, TempD
     (server, toolsets_dir)
 }
 
-/// A profile without a verified policy queues the forced payment approval
+/// A profile without a verified policy queues policy-required payment consent
 /// as an unbound entry: the call answers `policy.approval_required`, and the
 /// approval file holds one payment and no recovery binding.
 #[tokio::test]
 #[serial]
-async fn forced_approval_without_verified_policy_queues_unbound() {
+async fn policy_approval_without_verified_policy_queues_unbound() {
     let _root = crate::common::isolated_data_root();
     let approval_dir = TempDir::new().unwrap();
-    let (server, _toolsets) = forced_payment_server(approval_dir.path());
+    let (_server, toolsets) = granted_payment_server(approval_dir.path());
+    let (mut server, rpc, source) = live_payment_server(
+        approval_dir.path(),
+        &approval_dir.path().join("grants.toml"),
+        toolsets.path(),
+    )
+    .await;
+    let invoke = prepared_invoke(&server, &source).await;
+    server.set_policy_engine_for_test(Arc::new(
+        crate::common::policy_mock::MockPolicyEngine::require_approval(),
+    ));
     let result = server
-        .call_stellar_toolset_invoke(payment_invoke("stellar_pay_commit", DEST_G, 10_000_000))
+        .call_stellar_toolset_invoke(invoke)
         .await
-        .expect("a forced approval without a verified policy queues");
+        .expect("policy-required consent without a verified policy queues");
     assert_eq!(
         crate::common::assert_business_envelope(&result).0,
         "policy.approval_required"
@@ -585,14 +718,15 @@ async fn forced_approval_without_verified_policy_queues_unbound() {
         !text.contains("payment_recovery"),
         "the unbound entry has no recovery binding"
     );
+    assert_eq!(sent_count(&rpc).await, 0);
 }
 
-/// The forced approval refuses an envelope the decoder accepts but a
+/// The gated payment route refuses an envelope the decoder accepts but a
 /// pending payment cannot hold, a path payment, with the decode refusal's
 /// business code and prefix, and queues nothing.
 #[tokio::test]
 #[serial]
-async fn forced_approval_refuses_a_path_payment_envelope() {
+async fn gated_payment_refuses_a_path_payment_envelope() {
     use stellar_xdr::{
         Asset, Limits, Memo, MuxedAccount, Operation, OperationBody, PathPaymentStrictSendOp,
         Preconditions, SequenceNumber, Transaction, TransactionEnvelope, TransactionExt,
@@ -600,9 +734,15 @@ async fn forced_approval_refuses_a_path_payment_envelope() {
     };
     let _root = crate::common::isolated_data_root();
     let approval_dir = TempDir::new().unwrap();
-    let (server, _toolsets) = forced_payment_server(approval_dir.path());
+    let (_server, toolsets) = granted_payment_server(approval_dir.path());
+    let (server, rpc, source) = live_payment_server(
+        approval_dir.path(),
+        &approval_dir.path().join("grants.toml"),
+        toolsets.path(),
+    )
+    .await;
     let tx = Transaction {
-        source_account: MuxedAccount::Ed25519(Uint256(g_bytes(SOURCE_G))),
+        source_account: MuxedAccount::Ed25519(Uint256(g_bytes(&source))),
         fee: 100,
         seq_num: SequenceNumber(101),
         cond: Preconditions::None,
@@ -642,6 +782,7 @@ async fn forced_approval_refuses_a_path_payment_envelope() {
         message.starts_with("toolset_gated envelope_xdr decode:"),
         "{message}"
     );
+    assert_eq!(sent_count(&rpc).await, 0);
     assert_eq!(
         count_pending_approvals(approval_dir.path(), TEST_PROFILE_NAME),
         0
@@ -835,18 +976,43 @@ async fn payment_outer_gate_defers_reserve_check() {
         10_000_000,
         &key,
     );
-    let mut server = build_allow_server(approval.path(), &grant_file, toolsets.path());
+    let (mut server, rpc, source) =
+        live_payment_server(approval.path(), &grant_file, toolsets.path()).await;
+    let funded = prepared_invoke(&server, &source).await;
+    let unfunded = prepared_invoke(&server, &source).await;
     server.set_policy_engine_for_test(Arc::new(single_rule_engine(TEST_PROFILE_NAME, "*", vec![
         Box::new(stellar_agent_core::policy::v1::criteria::minimum_reserve::MinimumReserveCriterion::new(0)),
         g_counterparty(vec![DEST_G.into()], false),
     ])));
-    let result = server
-        .call_stellar_toolset_invoke(payment_invoke("stellar_pay_commit", DEST_G, 10_000_000))
-        .await
-        .unwrap();
+    let result = server.call_stellar_toolset_invoke(funded).await.unwrap();
+    assert_eq!(payment_result(&result)["ok"], true, "{result:?}");
+    assert_eq!(sent_count(&rpc).await, 1);
+    use stellar_agent_test_support::xdr_fixtures::{
+        account_entry_xdr_with_seq, account_ledger_key_xdr,
+    };
+    rpc.reset().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(crate::common::TimeoutRpc::new(vec![
+            (
+                account_ledger_key_xdr(&source),
+                account_entry_xdr_with_seq(&source, 10_000_000, 0, 43),
+            ),
+            (
+                account_ledger_key_xdr(DEST_G),
+                account_entry_xdr_with_seq(DEST_G, 1_000_000_000, 0, 42),
+            ),
+        ]))
+        .mount(&rpc)
+        .await;
+    let result = server.call_stellar_toolset_invoke(unfunded).await.unwrap();
     assert_eq!(
         crate::common::assert_business_envelope(&result).0,
-        "policy.approval_required"
+        "policy.deny.minimum_reserve_breached"
+    );
+    assert_eq!(sent_count(&rpc).await, 0);
+    assert_eq!(
+        count_pending_approvals(approval.path(), TEST_PROFILE_NAME),
+        0
     );
 }
 
@@ -975,7 +1141,7 @@ fn allow_server_for(
     server
 }
 
-/// Completes an approved forced-approval payment and checks that its pending and submitted
+/// Completes a policy-governed payment and checks that its pending and submitted
 /// rows record `require_approval` and the attested nonce.
 async fn assert_approved_submission_audit(
     name: &str,
@@ -1090,44 +1256,60 @@ async fn assert_approved_submission_audit(
         chain_id: Some("stellar:testnet".to_owned()),
         args,
     };
-    let queued = server
-        .call_stellar_toolset_invoke(invoke(payload.clone()))
-        .await
-        .unwrap();
-    assert_eq!(
-        crate::common::assert_business_envelope(&queued).0,
-        "policy.approval_required"
-    );
-    let (approval_nonce, attestation) = {
-        let mut store =
-            PendingApprovalStore::open(approval_dir.join(format!("{name}.toml"))).unwrap();
-        let pending = store.snapshot(now_unix_ms().unwrap());
-        assert_eq!(pending.len(), 1);
-        let nonce = pending[0].approval_nonce.clone();
-        let stored = store.get(&nonce).unwrap().clone();
-        let blob = compute_attestation_v4(
-            key,
-            &stellar_agent_core::approval::AttestationBinding::new(
-                name,
-                profile.chain_id.caip2_str(),
+    let approval_nonce = if unlisted_budget {
+        server.set_policy_engine_for_test(Arc::new(rule_engine(
+            name,
+            "*",
+            vec![g_counterparty(vec![], true)],
+            stellar_agent_core::policy::Decision::RequireApproval(
+                stellar_agent_core::policy::ApprovalRequest::new(String::new(), 120),
             ),
-            &nonce,
-            &envelope_sha256(data["envelope_xdr"].as_str().unwrap().as_bytes()),
-            &process_uid_for_attestation().unwrap(),
-            &stored.attested_lifetime(),
-            &stellar_agent_core::approval::AttestedApprover::Local,
-        );
-        store
-            .record_attestation(
-                &nonce,
-                blob,
-                stellar_agent_core::approval::AttestedApprover::Local,
-            )
+        )));
+        let queued = server
+            .call_stellar_toolset_invoke(invoke(payload.clone()))
+            .await
             .unwrap();
-        (nonce, URL_SAFE_NO_PAD.encode(blob))
+        assert_eq!(
+            crate::common::assert_business_envelope(&queued).0,
+            "policy.approval_required"
+        );
+        let (approval_nonce, attestation) = {
+            let mut store =
+                PendingApprovalStore::open(approval_dir.join(format!("{name}.toml"))).unwrap();
+            let pending = store.snapshot(now_unix_ms().unwrap());
+            assert_eq!(pending.len(), 1);
+            let nonce = pending[0].approval_nonce.clone();
+            let stored = store.get(&nonce).unwrap().clone();
+            let blob = compute_attestation_v4(
+                key,
+                &stellar_agent_core::approval::AttestationBinding::new(
+                    name,
+                    profile.chain_id.caip2_str(),
+                ),
+                &nonce,
+                &envelope_sha256(data["envelope_xdr"].as_str().unwrap().as_bytes()),
+                &process_uid_for_attestation().unwrap(),
+                &stored.attested_lifetime(),
+                &stellar_agent_core::approval::AttestedApprover::Local,
+            );
+            store
+                .record_attestation(
+                    &nonce,
+                    blob,
+                    stellar_agent_core::approval::AttestedApprover::Local,
+                )
+                .unwrap();
+            (nonce, URL_SAFE_NO_PAD.encode(blob))
+        };
+        payload["approval_nonce"] = serde_json::json!(&approval_nonce);
+        payload["approval_attestation"] = serde_json::json!(attestation);
+        Some(approval_nonce)
+    } else {
+        assert_eq!(count_pending_approvals(approval_dir, name), 0);
+        payload["approval_nonce"] = "invented-nonce".into();
+        payload["approval_attestation"] = "forged".into();
+        None
     };
-    payload["approval_nonce"] = serde_json::json!(approval_nonce);
-    payload["approval_attestation"] = serde_json::json!(attestation);
     let submitted = server
         .call_stellar_toolset_invoke(invoke(payload))
         .await
@@ -1160,12 +1342,18 @@ async fn assert_approved_submission_audit(
         let matching = crate::common::rows_of_kind(&rows, kind);
         assert_eq!(matching.len(), 1, "{kind}: {rows:?}");
         assert_eq!(
-            matching[0]["policy_decision"], "require_approval",
-            "{kind} must record forced approval"
+            matching[0]["policy_decision"],
+            if unlisted_budget {
+                "require_approval"
+            } else {
+                "allow"
+            },
+            "{kind} records the actual policy decision"
         );
         assert_eq!(
-            matching[0]["approval_nonce"], approval_nonce,
-            "{kind} must retain the attested nonce"
+            matching[0]["approval_nonce"],
+            serde_json::json!(approval_nonce),
+            "{kind} retains consent only when policy requires it"
         );
     }
 }
@@ -1501,16 +1689,16 @@ async fn first_invoke_returns_approval_required() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Test 3: grant present + no attestation → forced per-action PaymentSimulated
+// Test 3: a grant plus required consent queues PaymentSimulated
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// After a grant is in place, re-invoke with no attestation creates a
 /// `PaymentSimulated` pending approval and returns `policy.approval_required`.
 ///
-/// This verifies the forced per-action approval fires.
+/// A signing grant does not suppress the policy's approval requirement.
 #[tokio::test]
 #[serial]
-async fn grant_present_creates_per_action_queue_entry() {
+async fn grant_present_policy_requirement_creates_payment_queue_entry() {
     let _root = crate::common::isolated_data_root();
     let key = setup_mock_keyring();
     let toolsets_dir = TempDir::new().unwrap();
@@ -1532,42 +1720,29 @@ async fn grant_present_creates_per_action_queue_entry() {
         &key,
     );
 
-    let envelope_xdr = payment_envelope_xdr(SOURCE_G, DEST_G, amount_stroops);
-    let server = build_allow_server(approval_dir.path(), &grant_file, toolsets_dir.path());
-
-    // No approval_nonce/approval_attestation → forced per-action approval must fire.
-    let args = StellarToolsetInvokeArgs {
-        toolset: TOOLSET_NAME.to_owned(),
-        action: "stellar_pay_commit".to_owned(),
-        chain_id: Some("stellar:testnet".to_owned()),
-        args: serde_json::json!({
-            "envelope_xdr": envelope_xdr,
-            "source": SOURCE_G,
-            "destination": DEST_G,
-            "nonce": "fake-nonce",
-            "expires_at_unix_ms": 9_999_999_999_u64,
-            "asset": "native",
-            "amount": "1 XLM",
-            "chain_id": "stellar:testnet"
-        }),
-    };
-
+    let (mut server, rpc, source) =
+        live_payment_server(approval_dir.path(), &grant_file, toolsets_dir.path()).await;
+    let args = prepared_invoke(&server, &source).await;
+    server.set_policy_engine_for_test(Arc::new(
+        crate::common::policy_mock::MockPolicyEngine::require_approval(),
+    ));
     let result = server
         .call_stellar_toolset_invoke(args)
         .await
         .expect("per-action approval required must return Ok(is_error) envelope");
     let (code, message, _text) = crate::common::assert_business_envelope(&result);
 
-    // Must be policy.approval_required (forced per-action approval), not first-invoke gate.
+    // The policy requires payment consent after the first-invoke grant.
     assert_eq!(
         code, "policy.approval_required",
-        "expected policy.approval_required (forced per-action); got: {code}"
+        "expected policy.approval_required; got: {code}"
     );
     assert!(
         !message.contains("first_invoke_approval_required"),
         "must NOT re-trigger first-invoke gate when grant exists; got: {message}"
     );
 
+    assert_eq!(sent_count(&rpc).await, 0);
     // A PaymentSimulated pending approval was queued (not ToolsetFirstInvokeGate).
     let pending_count = count_pending_approvals(approval_dir.path(), TEST_PROFILE_NAME);
     assert_eq!(
@@ -1738,87 +1913,24 @@ async fn missing_envelope_and_asset_reports_missing_envelope_without_pending_ent
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Test 2: permissive policy + invented attestation → REFUSED
+// Test 2: Allow submits with irrelevant invented consent
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Under an `Allow`-returning policy, a toolset with a current grant AND
-/// invented nonce/attestation strings STILL returns `policy.approval_required`.
-///
-/// This is the non-vacuous proof that the per-action attestation gate is
-/// enforced even under a permissive policy.
-///
-/// `stellar_pay_commit_impl` forces `RequireApproval` regardless of policy, so
-/// `verify_attestation_gate` ALWAYS checks the HMAC.  Since the invented
-/// attestation fails HMAC verification against the stored entry, the gate
-/// returns `policy.approval_required`.
+/// Under Allow, a current grant and genuine protocol nonce submit without
+/// consent. Irrelevant invented consent fields have the direct route's behavior.
 #[tokio::test]
 #[serial]
-async fn permissive_policy_forces_per_action_approval() {
+async fn permissive_policy_submits_without_payment_consent() {
     let _root = crate::common::isolated_data_root();
     let key = setup_mock_keyring();
-    let toolsets_dir = TempDir::new().unwrap();
-    let approval_dir = TempDir::new().unwrap();
-    let grant_file = approval_dir.path().join("grants.toml");
-
-    write_pin_with_sign_payment(toolsets_dir.path(), TOOLSET_NAME);
-
-    let amount_stroops: i64 = 10_000_000;
-    // Pre-populate a valid grant (first-invoke gate cleared).
-    insert_valid_grant(
-        &grant_file,
-        TOOLSET_NAME,
-        CAPABILITY,
-        DEST_G,
-        ASSET_XLM,
-        0,
-        amount_stroops,
-        &key,
-    );
-
-    let envelope_xdr = payment_envelope_xdr(SOURCE_G, DEST_G, amount_stroops);
-    let server = build_allow_server(approval_dir.path(), &grant_file, toolsets_dir.path());
-
-    // Provide INVENTED (forged) approval_nonce and approval_attestation.
-    // The forced RequireApproval override causes verify_attestation_gate to check
-    // the store, find no matching entry for "invented-nonce", and refuse — even
-    // under an Allow policy.
-    let args = StellarToolsetInvokeArgs {
-        toolset: TOOLSET_NAME.to_owned(),
-        action: "stellar_pay_commit".to_owned(),
-        chain_id: Some("stellar:testnet".to_owned()),
-        // Use a syntactically valid nonce format (parseable 48-byte base64) so
-        // the code reaches `verify_attestation_gate` before the nonce HMAC step.
-        // The approval_nonce + approval_attestation are invented and not in the store.
-        args: serde_json::json!({
-            "envelope_xdr": envelope_xdr,
-            "source": SOURCE_G,
-            "destination": DEST_G,
-            "nonce": FAKE_VALID_NONCE,
-            "expires_at_unix_ms": 9_999_999_999_u64,
-            "asset": "native",
-            "amount": "1 XLM",
-            "chain_id": "stellar:testnet",
-            "approval_nonce": "invented-nonce-that-does-not-exist-in-store",
-            "approval_attestation": "aGVsbG8gd29ybGQ"
-        }),
-    };
-
-    let result = server.call_stellar_toolset_invoke(args).await.expect(
-        "invented attestation under permissive policy MUST be refused via an Ok(is_error) \
-             envelope; this assertion failing means an attestation bypass is active",
-    );
-    let (code, _message, _text) = crate::common::assert_business_envelope(&result);
-
-    // Must be policy.approval_required (forged attestation rejected).
-    assert_eq!(
-        code, "policy.approval_required",
-        "must return policy.approval_required for forged attestation; got: {code}"
-    );
+    let toolsets = TempDir::new().unwrap();
+    let approval = TempDir::new().unwrap();
+    write_pin_with_sign_payment(toolsets.path(), TOOLSET_NAME);
     assert_approved_submission_audit(
-        "forced-audit-permissive",
-        approval_dir.path(),
-        &grant_file,
-        toolsets_dir.path(),
+        "allow-audit",
+        approval.path(),
+        &approval.path().join("grants.toml"),
+        toolsets.path(),
         &key,
         false,
     )
@@ -2209,8 +2321,7 @@ async fn adversarial_different_destination_reprompts() {
 
 /// A G grant covers the M addresses of its own account only: an envelope
 /// paying an M address of another account re-prompts the first-invoke gate,
-/// and one paying an M address of the granted account reaches the forced
-/// per-action approval.
+/// and one paying an M address of the granted account submits under Allow.
 #[tokio::test]
 #[serial]
 async fn adversarial_muxed_destination_reprompts() {
@@ -2235,7 +2346,8 @@ async fn adversarial_muxed_destination_reprompts() {
         &key,
     );
 
-    let server = build_allow_server(approval_dir.path(), &grant_file, toolsets_dir.path());
+    let (server, rpc, source) =
+        live_payment_server(approval_dir.path(), &grant_file, toolsets_dir.path()).await;
     let invoke = |(destination, envelope_xdr): (String, String)| StellarToolsetInvokeArgs {
         toolset: TOOLSET_NAME.to_owned(),
         action: "stellar_pay_commit".to_owned(),
@@ -2282,13 +2394,18 @@ async fn adversarial_muxed_destination_reprompts() {
     drop(store);
 
     let same_base = muxed_payment(DEST_G, 7, amount_stroops);
+    let prepared = prepared_invoke_to(&server, &source, &same_base.0).await;
     let result = server
-        .call_stellar_toolset_invoke(invoke(same_base))
+        .call_stellar_toolset_invoke(prepared)
         .await
         .expect("an M address of the granted account is covered");
+    assert_eq!(payment_result(&result)["ok"], true, "{result:?}");
+    assert_eq!(payment_result(&result)["data"]["destination"], same_base.0);
+    assert_eq!(sent_count(&rpc).await, 1);
     assert_eq!(
-        crate::common::assert_business_envelope(&result).0,
-        "policy.approval_required"
+        count_pending_approvals(approval_dir.path(), TEST_PROFILE_NAME),
+        1,
+        "only the other-base first-invoke consent remains"
     );
 }
 

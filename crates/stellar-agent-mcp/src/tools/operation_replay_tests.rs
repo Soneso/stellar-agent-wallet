@@ -579,7 +579,7 @@ async fn a_claim_retry_after_its_balance_left_replays_the_stored_claim() {
 /// runs once the stored attempt is due, so the recovery driver reserves one
 /// automatic run for it and stores a stop with an automatic retry time.
 #[tokio::test]
-#[serial_test::serial(keyring)]
+#[serial_test::serial(keyring, mainnet_clock)]
 #[serial_test::serial]
 async fn a_retained_claim_replays_after_its_predicate_expires() {
     let id = fresh_business_id();
@@ -1187,7 +1187,7 @@ async fn compacted_run(
 /// envelope's identity is not that digest. Nothing is read past the probe and
 /// nothing mints.
 #[tokio::test]
-#[serial_test::serial(keyring)]
+#[serial_test::serial(keyring, mainnet_clock)]
 #[serial_test::serial]
 async fn a_commit_of_other_facts_under_a_tombstone_conflicts() {
     for tool in Tool::ALL {
@@ -1212,7 +1212,7 @@ async fn a_commit_of_other_facts_under_a_tombstone_conflicts() {
 /// tombstone answers a classic commit. Nothing is read past the probe and
 /// nothing mints.
 #[tokio::test]
-#[serial_test::serial(keyring)]
+#[serial_test::serial(keyring, mainnet_clock)]
 #[serial_test::serial]
 async fn a_commit_under_a_tombstone_of_another_slot_kind_conflicts() {
     use stellar_agent_network::policy_state::{
@@ -1255,7 +1255,7 @@ async fn a_commit_under_a_tombstone_of_another_slot_kind_conflicts() {
 /// does so before the approval is verified, and nothing is read past the
 /// probe, minted or sent.
 #[tokio::test]
-#[serial_test::serial(keyring)]
+#[serial_test::serial(keyring, mainnet_clock)]
 #[serial_test::serial]
 async fn a_commit_retried_under_its_tombstone_replays() {
     for tool in Tool::ALL {
@@ -1280,7 +1280,7 @@ async fn a_commit_retried_under_its_tombstone_replays() {
 /// differs from the cap bound, so only the identity under the envelope's own
 /// fee per operation matches the tombstone. A claim names no fee.
 #[tokio::test]
-#[serial_test::serial(keyring)]
+#[serial_test::serial(keyring, mainnet_clock)]
 #[serial_test::serial]
 async fn a_commit_retried_under_a_tombstone_of_an_explicit_fee_replays() {
     use stellar_agent_network::fees::ClassicFeeChoice;
@@ -1668,7 +1668,7 @@ async fn testnet_echoes_the_business_id_and_creates_no_record() {
 /// refuses another chain, and `retry_recovery` starts one bounded evidence
 /// run that sends no transaction.
 #[tokio::test]
-#[serial_test::serial(keyring)]
+#[serial_test::serial(keyring, mainnet_clock)]
 #[serial_test::serial]
 async fn transaction_status_forwards_retry_on_a_managed_attempt() {
     let id = fresh_business_id();

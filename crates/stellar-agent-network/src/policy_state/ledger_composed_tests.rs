@@ -32,6 +32,8 @@ mod composed {
 
     impl Rules {
         fn new(l: &Ledger, kind: &str, listed: (bool, bool)) -> Self {
+            let wide = kind == "unlisted_wide";
+            let kind = if wide { "unlisted" } else { kind };
             let criterion = |cap, listed| match kind {
                 "count" => {
                     format!("{{ kind = \"rate_limit\", window = \"1d\", max_calls = {cap} }}")
@@ -52,8 +54,24 @@ mod composed {
                 ),
             };
             // Signed policies require every unlisted table to be identical.
-            let routed = criterion(if kind == "unlisted" { 100 } else { 200 }, listed.0);
-            let mut outer = criterion(if kind == "count" { 42 } else { 100 }, listed.1);
+            let routed = criterion(
+                if wide {
+                    200
+                } else if matches!(kind, "unlisted" | "repeated_tight") {
+                    100
+                } else {
+                    200
+                },
+                listed.0,
+            );
+            let mut outer = criterion(
+                match kind {
+                    "count" => 42,
+                    _ if wide => 200,
+                    _ => 100,
+                },
+                listed.1,
+            );
             if kind == "amount" {
                 outer = outer.replace("asset = \"native\"", "asset = \"XLM\"");
             } else if kind == "total" {
@@ -62,7 +80,7 @@ mod composed {
                     .unwrap();
                 outer = outer.replace("asset = \"native\"", &format!("asset = \"{contract}\""));
             }
-            let routed = if kind == "repeated" {
+            let routed = if kind.starts_with("repeated") {
                 format!("{routed}, {routed}")
             } else {
                 routed
@@ -240,6 +258,7 @@ mod composed {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn classified_union_reaches_real_mint_with_tighter_caps() {
         let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -331,7 +350,12 @@ mod composed {
                 } else {
                     assert!(
                         matches!(result, Err(WindowStoreError::PolicyDenied { .. })),
-                        "outer cap refuses excess: {kind}"
+                        "{}: {kind}",
+                        if kind == "unlisted" {
+                            "shared unlisted budget refuses excess"
+                        } else {
+                            "outer cap refuses excess"
+                        }
                     );
                     assert_eq!(l.bytes(), before, "refusal writes no partial holds");
                 }
@@ -340,6 +364,7 @@ mod composed {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn classified_union_keeps_outer_unlisted_and_distinct_windows() {
         let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -415,17 +440,191 @@ mod composed {
         );
         assert_eq!(singleton[0], singleton[1]);
         let composed = rules.holds(&l, &snapshot, 50, true);
+        let cap = |max_stroops| WindowLimit::Amount {
+            asset: "native".to_owned(),
+            window: "1d".to_owned(),
+            max_stroops,
+        };
         assert_eq!(
-            composed.len(),
-            2,
-            "explicit composition coalesces the shared payment key"
+            composed
+                .iter()
+                .map(|e| (e.key().clone(), e.amount(), e.limit().clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (StateKey::new("ledger", 1, "native", 86_400), 50, cap(100)),
+                (StateKey::new("ledger", 1, "native", 86_400), 50, cap(200)),
+                (
+                    StateKey::new("ledger", 1, "rate_limit", 3_600),
+                    1,
+                    WindowLimit::Count {
+                        window: "1h".to_owned(),
+                        max_calls: 100,
+                    }
+                ),
+            ],
+            "composition keeps both repeated payment debits and the outer-only entry"
         );
-        assert_eq!(composed[0].amount(), 50);
         let minted = l.mint(&rules.request(&l, 1, singleton.clone())).unwrap();
         assert_holds(&l, minted.id, &singleton);
+        let l = Ledger::new();
+        let rules = Rules::new(&l, "repeated", (false, false));
+        let minted = l
+            .mint(&rules.request(&l, 1, composed.clone()))
+            .expect("two debits of 50 fit the tighter cap of 100");
+        assert_holds(&l, minted.id, &composed);
+    }
+
+    /// The mint bounds an authorization by the restricting grant's end on
+    /// its own clock: an end at or before that instant refuses, and an end
+    /// past every other term changes nothing. An overflowing lifetime refuses.
+    #[test]
+    #[serial(mainnet_clock)]
+    #[serial]
+    fn restriction_end_bounds_the_mint_on_its_own_clock() {
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        for (end, expected) in [
+            (T0 + 1, Some(T0 + 1)),
+            (T0 + TTL_MS - 1, Some(T0 + TTL_MS - 1)),
+            (u64::MAX, Some(T0 + TTL_MS)),
+            (T0, None),
+            (0, None),
+        ] {
+            let l = Ledger::new();
+            let mut request = l.request(tx(1), vec![]);
+            request.restriction_end_ms = Some(end);
+            let before = std::fs::read(l.store.path()).ok();
+            let result = l.mint(&request);
+            match expected {
+                Some(expires) => {
+                    let minted = result.unwrap();
+                    assert_eq!(minted.expires_at_ms, expires, "end {end}");
+                    assert_eq!(l.record(minted.id).expires_ms, expires, "end {end}");
+                }
+                None => {
+                    assert_eq!(refusal(result), MainnetPrecondition::LifetimeInvalid);
+                    assert_eq!(std::fs::read(l.store.path()).ok(), before, "end {end}");
+                }
+            }
+        }
+        let l = Ledger::new();
+        let mut request = l.request(tx(1), vec![]);
+        request.authorization_ttl_ms = u64::MAX;
+        assert_eq!(
+            refusal(l.mint(&request)),
+            MainnetPrecondition::LifetimeInvalid,
+            "an overflowing lifetime refuses"
+        );
+    }
+
+    /// Two separately signed policies can each load a different unlisted
+    /// table. Each descriptor is sized through its own policy's engine, and
+    /// the composition keeps the tighter cap of 100, not the routed 200. A
+    /// policy authority beyond that cap needs approval.
+    #[test]
+    #[serial(mainnet_clock)]
+    #[serial]
+    fn unequal_unlisted_tables_compose_to_the_tighter_cap() {
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        for next in [10, 11] {
+            let l = Ledger::new();
+            let wide = Rules::new(&l, "unlisted_wide", (false, false));
+            let tight = Rules::new(&l, "unlisted", (false, false));
+            let size = |rules: &Rules, tool: &ToolDescriptor, amount| {
+                let snapshot = rules.snapshot(&l);
+                let evaluation = rules.evaluate(&l, &snapshot, tool, amount);
+                crate::mainnet::holds::size_evaluated_holds(
+                    &rules.engine,
+                    &l.profile,
+                    (tool, &evaluation),
+                    None,
+                    T0,
+                )
+                .unwrap()
+            };
+            let compose = |amount| {
+                stellar_agent_core::policy::v1::criteria::state_store::compose_window_entries(
+                    &size(&wide, &wide.routed, amount),
+                    Some(&size(&tight, &tight.outer, amount)),
+                )
+                .unwrap()
+            };
+            l.store
+                .record_authorized(&l.profile, &size(&tight, &tight.outer, 40))
+                .unwrap();
+            let first = compose(50);
+            assert_eq!(
+                first[0].limit(),
+                &WindowLimit::Unlisted {
+                    asset: "native".to_owned(),
+                    window: "1d".to_owned(),
+                    max_stroops: 100,
+                },
+                "the tighter table's cap holds the shared unlisted key"
+            );
+            l.mint(&tight.request(&l, 1, first))
+                .expect("40 plus 50 fits the cap of 100");
+            let before = l.bytes();
+            if next == 10 {
+                l.mint(&tight.request(&l, 2, compose(next)))
+                    .expect("exact remaining headroom is permitted");
+            } else {
+                // A policy authority beyond the unlisted allowance needs approval.
+                let mut policy = tight.request(&l, 2, compose(next));
+                policy.authority = MintAuthority::Policy(PolicyAuthorityBinding {
+                    policy_digest: tight.digest,
+                    ..policy_binding(T0 + APPROVAL_MS)
+                });
+                assert!(
+                    matches!(
+                        l.mint(&policy),
+                        Err(WindowStoreError::UnlistedApprovalRequired)
+                    ),
+                    "the routed cap of 200 lends no headroom"
+                );
+                assert_eq!(l.bytes(), before);
+            }
+        }
+    }
+
+    /// A routed rule that repeats a cap of 100 debits a payment of 50 twice;
+    /// over 40 spent its own admission needs 140 and refuses, and an outer
+    /// evaluation sharing the key cannot collapse the debits into headroom.
+    #[test]
+    #[serial(mainnet_clock)]
+    #[serial]
+    fn composed_repeated_debits_cannot_gain_headroom() {
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        for composed in [false, true] {
+            let l = Ledger::new();
+            let rules = Rules::new(&l, "repeated_tight", (false, false));
+            let seed = rules.holds(&l, &rules.snapshot(&l), 40, false);
+            l.store.record_authorized(&l.profile, &seed[..1]).unwrap();
+            let entries = rules.holds(&l, &rules.snapshot(&l), 50, composed);
+            assert_eq!(
+                entries.len(),
+                if composed { 3 } else { 2 },
+                "both routed debits stay in the composition"
+            );
+            let before = l.bytes();
+            assert!(
+                matches!(
+                    l.mint(&rules.request(&l, 1, entries)),
+                    Err(WindowStoreError::PolicyDenied { .. })
+                ),
+                "repeated debits refuse over the cap of 100: composed {composed}"
+            );
+            assert_eq!(l.bytes(), before, "refusal writes no partial holds");
+            let entries = rules.holds(&l, &rules.snapshot(&l), 5, composed);
+            l.mint(&rules.request(&l, 2, entries))
+                .expect("two debits of 5 over 40 spent fit the cap of 100");
+        }
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn composed_mint_recovers_every_commit_boundary_once() {
         use super::super::super::store::{
@@ -475,8 +674,9 @@ mod composed {
                 assert_holds(&l, minted.id, &entries);
             }
             let before = l.bytes();
-            assert!(
-                reopened.mint_authorization(&l.profile, &request).is_err(),
+            assert_eq!(
+                refusal(reopened.mint_authorization(&l.profile, &request)),
+                MainnetPrecondition::DuplicateOpen,
                 "committed retry cannot mint twice"
             );
             assert_eq!(l.bytes(), before);
@@ -493,6 +693,7 @@ mod composed {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn composed_expiry_releases_only_unused_holds_and_keeps_epochs() {
         let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -583,6 +784,7 @@ mod composed {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn composed_epochs_refuse_missing_stale_retired_and_survive_reset() {
         let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -742,6 +944,7 @@ mod composed {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn composed_two_process_snapshots_admit_only_available_budget() {
         let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -793,7 +996,67 @@ mod composed {
         assert_holds(&l, minted.id, &entries);
     }
 
+    /// A second process mints while the first holds the window lock inside
+    /// its commit: the loser refuses on the lock with unchanged bytes, then
+    /// its retry reads the committed spend and refuses on the budget.
     #[test]
+    #[serial(mainnet_clock)]
+    #[serial]
+    fn composed_mint_contending_for_the_window_lock_refuses_then_rereads() {
+        use super::super::super::store::{COMMIT_FAULT_AFTER_PREPARED, COMMIT_STEP_OBSERVER};
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        if let Some(dir) = std::env::var_os("STELLAR_AGENT_COMPOSED_DIRECTORY") {
+            let l = process_ledger(std::path::Path::new(&dir));
+            let rules = Rules::new(&l, "total", (false, false));
+            l.nonces.set(100);
+            let entries = rules.holds(&l, &rules.snapshot(&l), 50, true);
+            COMMIT_STEP_OBSERVER.with_borrow_mut(|observer| {
+                *observer = Some(Box::new(|point| {
+                    if point == COMMIT_FAULT_AFTER_PREPARED {
+                        handshake();
+                    }
+                }))
+            });
+            l.mint(&rules.request(&l, 2, entries))
+                .expect("the lock holder commits after the handshake");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let l = process_ledger(dir.path());
+        let rules = Rules::new(&l, "total", (false, false));
+        let seed = rules.holds(&l, &rules.snapshot(&l), 40, false);
+        l.store.record_authorized(&l.profile, &seed).unwrap();
+        let entries = rules.holds(&l, &rules.snapshot(&l), 50, true);
+        let request = rules.request(&l, 1, entries);
+        let child = child_at_boundary(
+            dir.path(),
+            "hold",
+            "policy_state::ledger::tests::composed::composed_mint_contending_for_the_window_lock_refuses_then_rereads",
+        );
+        let before = l.bytes();
+        assert!(
+            matches!(l.mint(&request), Err(WindowStoreError::WriterLocked)),
+            "a held window lock refuses the contending mint"
+        );
+        assert_eq!(l.bytes(), before, "the lock refusal writes nothing");
+        let output = release_child(child);
+        assert!(
+            output.status.success(),
+            "lock holder commits: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(l.wire().authorizations.len(), 1);
+        let before = l.bytes();
+        assert!(
+            matches!(l.mint(&request), Err(WindowStoreError::PolicyDenied { .. })),
+            "the retry reads 40 plus the committed 50 and refuses 50 more"
+        );
+        assert_eq!(l.bytes(), before);
+    }
+
+    #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn composed_process_exit_recovers_complete_generation() {
         use super::super::super::store::{
@@ -860,8 +1123,9 @@ mod composed {
                 assert_holds(&l, minted.id, &entries);
             }
             let before = l.bytes();
-            assert!(
-                reopened.mint_authorization(&l.profile, &request).is_err(),
+            assert_eq!(
+                refusal(reopened.mint_authorization(&l.profile, &request)),
+                MainnetPrecondition::DuplicateOpen,
                 "restart retry cannot debit twice"
             );
             assert_eq!(l.bytes(), before);

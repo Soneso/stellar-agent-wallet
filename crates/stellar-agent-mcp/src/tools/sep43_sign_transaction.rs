@@ -145,7 +145,8 @@ impl WalletServer {
     #[tool(
         name = "stellar_sep43_sign_transaction",
         description = "Sign a TransactionEnvelope XDR (SEP-43 signTransaction). \
-                       Does NOT submit — signing only. \
+                       Does NOT submit; signing only. Testnet only. A mainnet profile refuses \
+                       with network.mainnet_write_forbidden before signing. \
                        Returns { signedTxXdr: string, signerAddress: string }. \
                        An approval requirement returns { approval } instead; the repeat \
                        passes approval_nonce and approval_attestation. \

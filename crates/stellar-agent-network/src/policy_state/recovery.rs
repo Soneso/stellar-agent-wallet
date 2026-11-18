@@ -3135,6 +3135,7 @@ mod tests {
     /// close time and zeroes the other amount. Both write a settled row at
     /// the inclusion ledger and keep the stored observation's clock out.
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn recovery_success_keeps_debit_and_failure_keeps_only_fee_and_counts() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -3252,6 +3253,7 @@ mod tests {
     /// native amount counted and name the evidenced release code on the
     /// audit row.
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn recovery_non_inclusion_releases_all_holds_and_native_amounts() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -3713,6 +3715,7 @@ mod tests {
     /// Recorded history loss disables complete history across restart and
     /// eviction, and account non-inclusion still decides.
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn recovery_history_loss_disables_only_complete_history() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -3853,6 +3856,7 @@ mod tests {
     /// answers leave it. The committed state survives restart, and an
     /// evaluation that is never committed changes nothing.
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn recovery_counter_and_pass_state_follow_evidence_classification() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -3961,6 +3965,7 @@ mod tests {
     /// across restart for an attempt whose sequence release is already
     /// recorded, and complete-history non-inclusion stays undecided.
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn recovery_transaction_pruning_sets_sticky_history_loss() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4021,6 +4026,7 @@ mod tests {
     /// A pruned transaction answer read from one endpoint persists the
     /// sticky history loss when the other endpoint's read fails.
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn recovery_partial_pruned_answer_sets_sticky_history_loss() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4210,6 +4216,7 @@ mod tests {
 
     /// A success after accounting expiry commits and resurrects no charge.
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn recovery_success_after_accounting_expiry_commits() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4225,6 +4232,7 @@ mod tests {
 
     /// A failure after accounting expiry commits and charges no fee again.
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn recovery_failure_after_accounting_expiry_commits() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4244,6 +4252,7 @@ mod tests {
     /// An account non-inclusion after accounting expiry commits and
     /// releases no expired row twice.
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn recovery_account_non_inclusion_after_accounting_expiry_commits() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4260,6 +4269,7 @@ mod tests {
     /// A complete-history non-inclusion after accounting expiry commits and
     /// releases no expired row twice.
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn recovery_history_non_inclusion_after_accounting_expiry_commits() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4286,6 +4296,7 @@ mod tests {
     /// outcome stays unknown, the attempt stays selected for recovery, and
     /// its native reservation keeps counting without a release row.
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn recovery_bucket_horizon_keeps_classic_outcome_and_native_obligation_open() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4574,6 +4585,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn recovery_partial_sequence_failure_reports_verified_progress() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4674,6 +4686,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn recovery_sequence_failure_keeps_unavailable_state_unknown() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4717,6 +4730,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn recovery_sequence_failure_reads_the_commit_point() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4781,6 +4795,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn recovery_entry_reports_progress_after_counter_commit() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4849,6 +4864,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn recovery_dispatch_store_context_precedes_repair_refusal() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4902,6 +4918,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn recovery_progress_counts_only_matched_stored_releases() {
         let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4942,6 +4959,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn recovery_stale_snapshot_cannot_replace_a_newer_commit() {
         let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5010,6 +5028,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn recovery_interrupted_batch_keeps_the_latest_observation() {
         let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5074,6 +5093,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn recovery_sequence_release_audited_without_new_rows() {
         let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5144,6 +5164,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn recovery_state_only_update_appends_nothing() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5184,6 +5205,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn recovery_release_append_failure_commits_nothing() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5202,6 +5224,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn recovery_outcome_classes_and_pass_time_survive_restart() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5342,6 +5365,7 @@ mod tests {
 
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn recovery_submission_readiness_persists_last_observation() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5382,6 +5406,7 @@ mod tests {
 
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn recovery_sequence_reuse_keeps_replay_approval_and_hold_guards() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5498,6 +5523,7 @@ mod tests {
 
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn recovery_claim_takes_window_then_receipt_and_one_claim_wins() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5581,6 +5607,7 @@ mod tests {
 
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn recovery_pass_persists_last_observation() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5639,6 +5666,7 @@ mod tests {
 
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn recovery_legacy_stage_runs_unchanged_before_recovery() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5765,6 +5793,7 @@ mod tests {
 
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn recovery_idle_stage_sends_no_request() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5823,6 +5852,7 @@ mod tests {
 
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn recovery_refused_stage_keeps_the_legacy_report() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5945,6 +5975,7 @@ mod tests {
 
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn recovery_empty_pass_acquires_one_writer() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5999,6 +6030,7 @@ mod tests {
 
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn recovery_targeted_status_evaluates_only_the_requested_attempt() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -6129,6 +6161,7 @@ mod tests {
     /// result stays durable.
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn recovery_status_shares_one_writer_and_keeps_committed_recovery() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -6241,6 +6274,7 @@ mod tests {
     /// to the caller's batch.
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn flow_batches_keep_dispatch_decisions() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -6290,6 +6324,7 @@ mod tests {
     /// verified progress, and the status lookup still answers.
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn recovery_status_logs_a_driver_refusal_and_answers() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -6369,6 +6404,7 @@ mod tests {
     /// again, recovery sends nothing, and the status lookup still answers.
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn recovery_status_caches_a_writer_refusal() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -6442,6 +6478,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn recovery_status_labels_missing_sequence_evidence() {
         let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -6596,6 +6633,7 @@ mod tests {
 
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn recovery_interrupted_attempt_keeps_its_state() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -6718,6 +6756,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn run_records_preserve_driver_requests_and_evidence_bytes() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -6876,6 +6915,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn recovery_pair_construction_sends_nothing_and_verifies_each_identity_once() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -6999,6 +7039,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn singleton_history_cannot_grant_complete_history_proof() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -7085,6 +7126,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn recovery_unadmissible_health_reports_lagging() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -7184,6 +7226,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn recovery_unmatched_stored_release_keeps_debit_when_target_unreadable() {
         let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -7267,6 +7310,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn recovery_unmatched_stored_release_reads_target_once_then_decides() {
         let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -7374,6 +7418,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn recovery_not_found_without_latest_records_missing_field() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -7470,6 +7515,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn recovery_account_read_below_its_health_tip_refuses() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -7508,6 +7554,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn recovery_missing_and_undecodable_accounts_keep_their_reasons() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -7649,6 +7696,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn recovery_reads_one_measured_ledger() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -7831,6 +7879,7 @@ mod tests {
 
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn recovery_released_attempts_free_their_slots() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -7956,6 +8005,7 @@ mod tests {
 
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn recovery_endpoint_identity_refusal_refuses_the_pass() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -8000,6 +8050,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn recovery_oracle_behind_the_primary_keeps_its_bound() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -8074,6 +8125,7 @@ mod tests {
 
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn recovery_release_admits_a_second_envelope_through_the_recorder() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -8157,6 +8209,7 @@ mod tests {
 
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn recovery_status_keeps_its_answer_when_recovery_refuses() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();

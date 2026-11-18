@@ -69,6 +69,7 @@ pub(crate) struct ListArgs {
     /// Profile name whose counterparty cache should be listed.
     ///
     /// Defaults to the `STELLAR_AGENT_PROFILE` env var, then `"default"`.
+    /// A mainnet profile must be named with this flag.
     #[arg(long = "profile", value_name = "NAME")]
     pub(crate) profile: Option<String>,
 }

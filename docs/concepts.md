@@ -27,7 +27,7 @@ A fifth control addresses a different risk: which tool definitions the agent may
 
 A sixth control stops an agent outright. The per-profile **emergency stop**, `stellar-agent profile halt`, refuses every action on the profile that signs or submits until the operator runs `stellar-agent profile resume`, with no server restart and no key or policy change. See [Emergency stop](#emergency-stop).
 
-The default network is `stellar:testnet`. A command with no named profile and no `default.toml` uses the zero-config testnet profile. Default builds enable the `mainnet-write` feature. Only a typed authorization issued for the action can satisfy the mainnet-write guard, and each binary attests its feature state. These builds admit only the scope-table operations, after setup and per-action approval. Policy evaluation, sealed authorization, signing checks, and submission checks are separate boundaries. The endpoint determines the network, and each envelope signature must verify under it. Read-only commands retain mainnet selection and key-scope requirements.
+The default network is `stellar:testnet`. A command with no named profile and no `default.toml` uses the zero-config testnet profile. Default builds enable the `mainnet-write` feature. Only a typed authorization issued for the action can satisfy the mainnet-write guard, and each binary attests its feature state. These builds admit only the scope-table operations, after setup and any consent the governing policy requires. Policy evaluation, sealed authorization, signing checks, and submission checks are separate boundaries. The endpoint determines the network, and each envelope signature must verify under it. Read-only commands retain mainnet selection and key-scope requirements.
 
 ## Two account models
 
@@ -534,7 +534,7 @@ Toolset-routed payments use two distinct controls, and only one of them is suppr
 
 A matching grant requires a version 3 HMAC that verifies under the profile's attestation key and profile/chain binding. It must be unexpired, with a lifetime of at most 30 days, and issued no later than the current time and at or after the second following the current installation. An invalid install time honors no grant. Consent issued in the install second re-prompts once. A forged or edited grant suppresses nothing.
 
-The **per-action payment approval** (`PaymentSimulated`) fires on every toolset-routed payment and binds the actual executed envelope. See [Toolsets](toolsets.md) for how toolsets route payments.
+The **per-action payment approval** (`PaymentSimulated`) is required when the routed payment or outer toolset policy requires consent, and binds the actual executed envelope. A composed `Allow` uses a current first-invoke grant without another payment approval. See [Toolsets](toolsets.md) for how toolsets route payments.
 
 ## The hash-chained audit log
 
@@ -720,7 +720,7 @@ states. See [Agent payments with MPP](agent-payments.md).
 | Weighted-threshold policy | A context-rule policy assigning each signer an independent weight and requiring the sum of the WEIGHTS of the signers present in an authorization to meet a configured threshold. Retuned via `smart-account signers set-weighted-threshold` / `set-signer-weight`: see [Agent delegation](agent-delegation.md#weighted-quorums-for-multiple-agents). |
 | Halt marker | The file `profiles/<name>.halt` that `profile halt` writes and `profile resume` removes. While it exists, every action that signs or submits, and every MCP tool that is not read-only, refuses with `profile.halted`; the CLI verbs that only record or reconcile local state stay usable. `stellar_toolset_invoke` applies the check to the tool its action routes to, so a read-only routed action answers. See [Emergency stop](#emergency-stop). |
 | First-invoke gate | A one-time gate on a toolset's first use of a signing-adjacent capability; once approved, a time-boxed grant suppresses only that re-prompt. |
-| Per-action payment approval | The payment approval that fires unconditionally on every toolset-routed payment and binds the actual executed envelope. |
+| Per-action payment approval | Policy-required consent bound to the actual executed payment envelope. |
 
 ## Retained smart-account charges
 

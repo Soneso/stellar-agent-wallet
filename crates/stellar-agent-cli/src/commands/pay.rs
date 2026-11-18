@@ -341,7 +341,7 @@ pub struct PayArgs {
     #[arg(long = "profile", value_name = "NAME")]
     pub profile: Option<String>,
 
-    /// Destination account G-strkey.
+    /// Destination G account or M address. An M address keeps its mux ID in the payment.
     #[arg(value_name = "DESTINATION")]
     pub destination: String,
 
@@ -7159,6 +7159,7 @@ pub(crate) mod tests {
         /// mainnet payload, consumes its authorization, tombstones its
         /// confirmation entry and never reaches the oracle.
         #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial(mainnet_clock)]
         #[serial_test::serial]
         async fn mainnet_time_bounds_pay() {
             let fixture = Spec::new("mainnet-pay-accept-memo").build().await;
@@ -7947,6 +7948,7 @@ pub(crate) mod tests {
 
         /// A confirmation beyond the envelope deadline refuses before signing.
         #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial(mainnet_clock)]
         #[serial_test::serial]
         async fn a_confirmation_slower_than_the_deadline_refuses_before_signing() {
             let mut fixture = Spec::new("mainnet-pay-slow-confirm").build().await;
@@ -8282,6 +8284,7 @@ pub(crate) mod tests {
         /// the record already swept to expired, and the store releases its
         /// holds.
         #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial(mainnet_clock)]
         #[serial_test::serial]
         async fn an_expired_authorization_refuses_at_the_attach() {
             let fixture = Spec::new("mainnet-pay-expired-attach").build().await;
@@ -8347,6 +8350,7 @@ pub(crate) mod tests {
 
         /// An expiry inside the signer discards its late signature at the attach.
         #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial(mainnet_clock)]
         #[serial_test::serial]
         async fn an_expiry_inside_the_signer_is_the_attach_refusal() {
             let fixture = Spec::new("mainnet-pay-gate-expiry")
@@ -8393,6 +8397,7 @@ pub(crate) mod tests {
         /// Same-code submit stages: an expiry inside the pre-send hook is the
         /// hook's refusal.
         #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial(mainnet_clock)]
         #[serial_test::serial]
         async fn an_expiry_inside_the_pre_send_hook_is_the_hooks_refusal() {
             let clock = Arc::new(stellar_agent_network::mainnet::clock::set_now_ms_for_test(
@@ -9100,6 +9105,63 @@ pub(crate) mod tests {
             );
         }
 
+        async fn assert_sent_payment_terms(
+            fixture: &MainnetFixture,
+            result: &Value,
+            destination: &str,
+            asset: &str,
+        ) {
+            use stellar_agent_core::envelope_decode::{
+                ClassicOperation, ClassicTransactionKind, classic_summary,
+            };
+            use stellar_agent_core::profile::receipt::{
+                PaymentDestinations, ReceiptStatus, ReceiptStore,
+            };
+            let sent = fixture.sent_envelopes().await;
+            assert_eq!(sent.len(), 1, "one endpoint send");
+            assert_eq!(
+                classic_summary(&sent[0], ClassicTransactionKind::Payment)
+                    .unwrap()
+                    .operation,
+                ClassicOperation::Payment {
+                    destination: destination.to_owned(),
+                    asset: if asset == "native" { "XLM" } else { asset }.to_owned(),
+                    amount_stroops: 10_000_000,
+                },
+                "the sent XDR retains the complete payment terms"
+            );
+            assert_eq!(result["data"]["envelope_xdr"], sent[0]);
+            let receipts = ReceiptStore::open(fixture.name).unwrap().all().unwrap();
+            assert_eq!(receipts.len(), 1);
+            assert_eq!(receipts[0].status, ReceiptStatus::Success);
+            assert_eq!(
+                receipts[0].ledger.map(u64::from),
+                result["data"]["ledger"].as_u64()
+            );
+            assert_eq!(
+                receipts[0].tx_hash,
+                result["data"]["tx_hash"].as_str().unwrap()
+            );
+            assert_eq!(
+                receipts[0].destinations,
+                if destination.starts_with('M') {
+                    PaymentDestinations::Single(destination.to_owned())
+                } else {
+                    PaymentDestinations::None
+                }
+            );
+            let body = fixture.window_body();
+            let debits: Vec<_> = body["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|bucket| bucket["records"].as_array().unwrap())
+                .filter(|record| record["amount"] == "10000000")
+                .collect();
+            assert_eq!(debits.len(), 1, "one persisted payment debit: {body}");
+            assert_eq!(debits[0]["status"], "exposure");
+        }
+
         /// The CLI staged submit and the full run each record a payment leg
         /// hashing the complete G, M0, and maximum-ID destination, native
         /// and issued, with the literal digest and redaction.
@@ -9161,6 +9223,7 @@ pub(crate) mod tests {
                         .to_owned(),
                 );
                 let submitted = run(&fixture, &submit).await;
+                assert_sent_payment_terms(&fixture, &submitted.envelope, destination, asset).await;
                 assert_eq!(submitted.code, 0, "{staged_name}: {}", submitted.envelope);
                 assert_eq!(
                     submitted.envelope["data"]["destination"],
@@ -9170,32 +9233,60 @@ pub(crate) mod tests {
 
                 let fixture = testnet_fixture(full_name, rules).await;
                 let full = run(&fixture, &with_destination(&fixture)).await;
+                assert_sent_payment_terms(&fixture, &full.envelope, destination, asset).await;
                 assert_eq!(full.code, 0, "{full_name}: {}", full.envelope);
                 assert_eq!(full.envelope["data"]["destination"], destination.as_str());
                 assert_hashed_leg(&fixture, full_name, destination, "10000000", asset);
             }
         }
 
-        /// The mainnet stage carries the complete G, M0, and maximum-ID
-        /// destination its sent envelope pays.
+        /// Native and issued mainnet payments retain the complete G, M0 and
+        /// maximum-ID destination in sent terms, results, receipts and audit.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
         async fn pay_results_carry_the_complete_destination_on_mainnet() {
-            for (name, destination) in [
-                ("mainnet-pay-result-g", DESTINATION),
-                ("mainnet-pay-result-m0", DESTINATION_M0),
-                ("mainnet-pay-result-mmax", DESTINATION_MMAX),
+            for (name, destination, issued) in [
+                ("mainnet-pay-result-g", DESTINATION, false),
+                ("mainnet-pay-result-m0", DESTINATION_M0, false),
+                ("mainnet-pay-result-mmax", DESTINATION_MMAX, false),
+                ("mainnet-pay-result-g-issued", DESTINATION, true),
+                ("mainnet-pay-result-m0-issued", DESTINATION_M0, true),
+                ("mainnet-pay-result-mmax-issued", DESTINATION_MMAX, true),
             ] {
-                let fixture = Spec::new(name)
-                    .rules(vec![pay_rule("allow", "")])
-                    .build()
-                    .await;
+                let asset = if issued { TRUSTLINE_ASSET } else { "native" };
+                let mut spec = Spec::new(name).rules(vec![if issued {
+                    issued_pay_rule()
+                } else {
+                    pay_rule("allow", "")
+                }]);
+                if issued {
+                    let agent = stellar_agent_test_support::signed_envelope::account_id_for_seed(
+                        AGENT_SEED,
+                    );
+                    let (code, issuer) = TRUSTLINE_ASSET.split_once(':').unwrap();
+                    let (key, entry) = crate::test_rpc::trustline_xdr(
+                        &agent,
+                        code,
+                        issuer,
+                        500_000_000,
+                        i64::MAX,
+                        1,
+                    );
+                    let rpc =
+                        ClassicRpc::mainnet(&[&agent, DESTINATION, issuer]).with_entry(key, entry);
+                    spec = spec.primary(rpc.clone()).oracle(rpc);
+                }
+                let fixture = spec.build().await;
                 let mut args = mainnet_args(&fixture);
                 args.destination = destination.to_owned();
+                args.asset = asset.to_owned();
+                args.amount = if issued { "1 USDC" } else { "1 XLM" }.to_owned();
                 let run = run(&fixture, &args).await;
+                assert_sent_payment_terms(&fixture, &run.envelope, destination, asset).await;
                 assert_eq!(run.code, 0, "{name}: {}", run.envelope);
                 assert_eq!(fixture.sent_envelopes().await.len(), 1, "{name}");
                 super::muxed_destination::assert_result_destination(&run.envelope, destination);
+                assert_hashed_leg(&fixture, name, destination, "10000000", asset);
             }
         }
 
@@ -9419,6 +9510,7 @@ pub(crate) mod tests {
         }
     }
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn early_observation_precedes_window_gate() {
         use crate::commands::submission_record::intent_gate_fixture::{IntentGateState, home};

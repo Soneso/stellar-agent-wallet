@@ -379,9 +379,10 @@ impl TxSigningPayload {
     /// mainnet clock: issued at or before now and not yet expired.
     ///
     /// Each terminal signer calls it once its key or device is ready and
-    /// immediately before it produces the signature, so a slow key read or
-    /// device exchange cannot carry the signature past the authorization's
-    /// end. An unbound payload passes without reading the clock.
+    /// immediately before it starts signing. The check runs after key or
+    /// public-key access and before starting signing; the envelope path
+    /// discards late results. An unbound payload passes without reading the
+    /// clock.
     ///
     /// # Errors
     ///

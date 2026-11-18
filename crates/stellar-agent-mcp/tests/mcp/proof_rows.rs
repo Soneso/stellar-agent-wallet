@@ -121,6 +121,21 @@ pub(crate) const MCP_PROOF_ROWS: &[McpProofRow] = &[
     },
 ];
 
+/// Payment routes through the registered toolset dispatcher. The suffix
+/// identifies the routed action; it is not a separately registered tool.
+const TOOLSET_PROOF_ROWS: &[McpProofRow] = &[
+    McpProofRow {
+        id: "mcp.toolset_pay",
+        tool: "stellar_toolset_invoke/stellar_pay",
+        phase: Phase::Prepare,
+    },
+    McpProofRow {
+        id: "mcp.toolset_pay_commit",
+        tool: "stellar_toolset_invoke/stellar_pay_commit",
+        phase: Phase::Commit,
+    },
+];
+
 /// The source account of every row. The mock endpoint holds it funded.
 pub(crate) const SOURCE_G: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
 
@@ -155,6 +170,15 @@ const CLAIM_AMOUNT_STROOPS: i64 = 50_000_000;
 pub(crate) fn invocation(row: &McpProofRow) -> Value {
     let chain_id = "stellar:testnet";
     match row.tool {
+        "stellar_toolset_invoke/stellar_pay" | "stellar_toolset_invoke/stellar_pay_commit" => {
+            let action = row.tool.strip_prefix("stellar_toolset_invoke/").unwrap();
+            json!({
+                "toolset": "proof-payments",
+                "action": action,
+                "chain_id": chain_id,
+                "args": invocation(&McpProofRow { tool: action, ..*row }),
+            })
+        }
         "stellar_pay" => json!({
             "chain_id": chain_id,
             "source": SOURCE_G,
@@ -517,7 +541,7 @@ impl ProofClient {
     pub(crate) async fn call_row(&mut self, row: &McpProofRow) -> Value {
         self.request(
             "tools/call",
-            json!({ "name": row.tool, "arguments": invocation(row) }),
+            json!({ "name": row.tool.split('/').next().unwrap(), "arguments": invocation(row) }),
         )
         .await
     }
@@ -548,7 +572,7 @@ pub(crate) fn business_code(response: &Value) -> Result<String, String> {
 #[serial]
 async fn every_mcp_proof_row_reaches_the_policy_gate() {
     let mut failures = Vec::new();
-    for row in MCP_PROOF_ROWS {
+    for row in MCP_PROOF_ROWS.iter().chain(TOOLSET_PROOF_ROWS) {
         let environment = ProofEnvironment::start().await;
         let server = testnet_server_with_engine_and_rpc(
             MockPolicyEngine::deny_no_matching_rule(),
@@ -639,9 +663,9 @@ fn text(entry: &toml_edit::Table, field: &str) -> String {
         .to_owned()
 }
 
-/// [`MCP_PROOF_ROWS`] equals the MCP rows of the matrix, and the rows and the
-/// excluded MCP entries together are the registered value-moving tools,
-/// disjoint, each name registered.
+/// Direct tools and toolset payment routes equal the matrix rows. Direct
+/// rows and exclusions partition the registered value-moving tools; the
+/// two payment routes use the separately registered dispatcher.
 #[test]
 fn mcp_proof_rows_match_the_matrix_and_the_value_registry() {
     use std::collections::BTreeSet;
@@ -654,6 +678,7 @@ fn mcp_proof_rows_match_the_matrix_and_the_value_registry() {
         .collect();
     let table_rows: BTreeSet<(String, String, String)> = MCP_PROOF_ROWS
         .iter()
+        .chain(TOOLSET_PROOF_ROWS)
         .map(|row| {
             (
                 row.id.to_owned(),
@@ -664,7 +689,7 @@ fn mcp_proof_rows_match_the_matrix_and_the_value_registry() {
         .collect();
     assert_eq!(
         table_rows.len(),
-        MCP_PROOF_ROWS.len(),
+        MCP_PROOF_ROWS.len() + TOOLSET_PROOF_ROWS.len(),
         "the table names a row twice"
     );
     assert_eq!(
@@ -687,6 +712,7 @@ fn mcp_proof_rows_match_the_matrix_and_the_value_registry() {
         .into_iter()
         .map(|registration| registration.name)
         .collect();
+    assert!(registered.contains("stellar_toolset_invoke"));
     let named: BTreeSet<String> = row_tools.union(&excluded).cloned().collect();
     let unregistered: Vec<&String> = named
         .iter()

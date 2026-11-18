@@ -17,8 +17,8 @@ manifest plus a capability declaration), never executes toolset-supplied code, a
 never routes a toolset to a signing, key, or policy tool through its ungated
 capabilities. The only signing tools a toolset reaches are `stellar_pay_commit`
 and `stellar_rule_create_commit`, through the gated `sign-payment` and
-`sign-rule-create` capabilities, each behind a first-invoke grant and a
-per-action approval.
+`sign-rule-create` capabilities, each behind a first-invoke grant. Payment
+consent follows the composed policies; rule creation requires approval.
 
 What a toolset does not do: it does not narrow the native tools the same MCP
 server registers, which an agent connected to the server can call directly. The
@@ -115,7 +115,7 @@ A separate table for the two signing-adjacent capabilities:
 
 | Capability | Tool | Admission |
 |---|---|---|
-| `sign-payment` | `stellar_pay_commit` | First-invoke gate plus unconditional per-action approval only |
+| `sign-payment` | `stellar_pay_commit` | First-invoke grant plus composed payment policy |
 | `sign-rule-create` | `stellar_rule_create_commit` | First-invoke gate plus unconditional per-proposal operator attestation only |
 
 ### Signing denylist
@@ -219,8 +219,9 @@ An absent or empty auditor trust set fails closed for a key-touching toolset. Th
 only sanctioned bypass is `--override-attestation`, which logs a structured
 warning and proceeds; no environment variable or config default skips the gate.
 Under override, a key-touching capability (`sign-payment` or `sign-rule-create`)
-is persisted inert, and the
-runtime first-invoke and per-action approval gates still fire at signing time.
+is persisted inert, and its runtime first-invoke grant still applies at signing
+time. A `sign-payment` commit still meets the payment policy gates. A
+`sign-rule-create` commit still requires the per-proposal operator attestation.
 
 The install records its result as one of `attested`, `overridden`, or
 `not-required`, reflecting what the gate actually did rather than what flags were
@@ -250,7 +251,7 @@ file. As additional tamper-evidence, both resolver tiers re-read the on-disk
 `TOOLSET.md`, recompute its digest, and refuse dispatch with
 `toolset.content_digest_mismatch` on a mismatch or an unreadable file.
 
-## First-invoke gate and per-action payment approval
+## First-invoke grants and payment policy
 
 Through the dispatcher, `stellar_pay_commit` is reachable only through the gated
 resolver, never the ungated path. The gated resolver enforces, in order:
@@ -288,13 +289,20 @@ surfaces show the version, the first 12 shasum characters and the install identi
 A pending request without these fields cannot be approved; invoke again to request
 fresh consent.
 
-A matching grant suppresses only the first-invoke re-prompt. Per-action payment
-approval fires on every toolset-routed payment: a policy-engine `Allow` becomes
-`RequireApproval`, and the approval binds the actual executed envelope.
+A matching grant suppresses the first-invoke re-prompt. The routed payment and
+outer invocation policies compose: `Allow` submits unattended, while either
+policy's `RequireApproval` requires consent bound to the executed envelope.
+Preparation requires `propose-transaction` without a signing grant. Commit
+checks its own grant, retains its lease through submission, and stops at the
+earliest policy or grant end. Limits from both policies account for one payment.
+Direct and toolset retries retain the same bound consent and original interval.
+Keep the same business ID for recovery; reconcile an uncertain send by its hash.
 
-A gated call that meets an install, uninstall, or grant write in progress
-answers an internal error. Its message starts `toolset.enforcement_error:` and
-holds the nested `toolset.coordination_busy`. Retry the call once that write ends.
+A gated payment call that meets an install, uninstall, or grant write in
+progress answers the business code `toolset.coordination_busy`. A gated
+rule-creation call in that state answers an internal error. Its message starts
+`toolset.enforcement_error:` and holds the nested `toolset.coordination_busy`.
+Retry the call once that write ends.
 
 ## How an agent invokes a toolset action
 
@@ -324,9 +332,9 @@ non-destructive.
 ### `stellar_toolset_invoke`
 
 Annotated destructive (`destructiveHint = true`, `readOnlyHint = false`): its
-signing actions route to the signing commit tools. On a mainnet profile it is
-refused, because the default engine refuses a destructive tool and a mainnet policy
-rule cannot name it.
+signing actions route to the signing commit tools. Enabled mainnet setup admits
+only exact `stellar_pay` and `stellar_pay_commit` actions. The signed outer rule
+must meet payment minimums; incomplete setup and other actions refuse.
 
 | Field | Meaning |
 |---|---|
@@ -353,7 +361,7 @@ carry the `envelope_xdr` produced by a prior `stellar_pay` simulate call, and it
 are decoded authoritatively from that envelope.
 If the first-invoke gate fires, the call returns
 `toolset.first_invoke_approval_required` with the approval nonce; once a grant
-exists, the per-action payment approval is still forced on for the commit. For a
+exists, the composed payment policies determine whether consent is required. For a
 `sign-rule-create` toolset, `action: "stellar_rule_create_commit"` takes the same
 gated route, and the operator attestation over the proposal is always required.
 That route requires `args.approval_nonce` from `stellar_rule_create` and refuses

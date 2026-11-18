@@ -328,7 +328,8 @@ the toolset dispatcher routes for an agent. It is the opposite of this skill: it
 narrows what the dispatcher routes rather than teaching. It does not restrict the
 other tools the server exposes; the operator policy and approvals bound every call.
 Drive installed toolsets with `stellar_toolset_list` and `stellar_toolset_invoke`
-(a destructive tool, refused on mainnet). See `references/toolsets-feature.md`.
+(a destructive tool). Enabled mainnet setup admits exact payment preparation and
+commit actions. See `references/toolsets-feature.md`.
 
 ## 9. Safety model
 
@@ -352,7 +353,8 @@ Drive installed toolsets with `stellar_toolset_list` and `stellar_toolset_invoke
   Noop refuses destructive mainnet decisions with `policy.engine_required`.
   Policy evaluation alone grants no signing authority. Signing and submission
   independently check sealed authorization. Smart-account writes, DeFi, pool
-  submission, MPP, generic signing, and toolset signing are excluded on mainnet.
+  submission, MPP, generic signing, and toolset rule creation are excluded on
+  mainnet.
   Mainnet writes move real funds, and the operator uses the wallet at their
   own risk. Before the first mainnet write of a session, confirm that
   the operator intends mainnet, and suggest a testnet run and a small amount.
@@ -408,16 +410,15 @@ Drive installed toolsets with `stellar_toolset_list` and `stellar_toolset_invoke
   - the sign-only tools: the SEP-43 sign verbs, SEP-53 `sign_message`, and the
     two x402 payment tools;
   - `stellar_sep43_sign_and_submit_transaction` and the DeFi tools;
-  - the commit tools, `stellar_rule_create_commit`, and the toolset signing
-    actions.
+  - the commit tools and `stellar_rule_create_commit`.
 
   Both x402 payment tools, `stellar_x402_create_payment` and
   `stellar_x402_authenticated_payment`, and the four classic commits depend on
   the feature. With the feature off, they refuse at entry with the same code.
   Builds with the feature on admit them after setup, as
   [classic MCP authorization](references/mcp-tools.md#classic-mainnet-authorization)
-  describes. With the feature enabled, both x402 tools use the approved two-call
-  flow.
+  describes. Enabled setup also admits the exact toolset payment pair; toolset
+  rule creation remains excluded. Both x402 tools use the approved two-call flow.
 - Every MPP tool refuses `stellar:mainnet` at handler entry with
   `mpp.network_forbidden`. Branch on all three codes,
   `network.mainnet_write_forbidden`, `policy.engine_required`, and

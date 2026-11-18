@@ -1563,6 +1563,7 @@ async fn repeated_signed_resimulation_failure_cannot_exceed_cap() {
 
 #[cfg(feature = "test-hooks")]
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn the_entry_guard_is_free_at_every_signer_rpc_and_writer_call() {
     use stellar_agent_core::policy::state_lock::WindowStoreLock;
@@ -1893,6 +1894,7 @@ async fn seed_observable_intent(
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[serial(mainnet_clock)]
 #[serial]
 async fn early_observation_precedes_window_gate() {
     use stellar_agent_core::policy::v1::criteria::rate_limit::RateLimitCriterion;
