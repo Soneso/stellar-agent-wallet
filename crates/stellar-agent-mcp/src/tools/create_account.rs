@@ -134,8 +134,9 @@ pub struct StellarCreateAccountArgs {
 /// - The envelope is re-built from `source` / `destination` /
 ///   `starting_balance` / current sequence; a divergence between the re-built
 ///   and the presented `envelope_xdr` returns `simulation.divergence`.
-/// - This tool has `destructive_hint = true` so `NoopPolicyEngine` refuses
-///   mainnet profiles.
+/// - A mainnet commit needs the V1 engine, a verified mainnet policy, and
+///   verified enablement. A missing requirement refuses with
+///   `network.mainnet_write_forbidden`.
 ///
 /// # Examples
 ///
@@ -188,8 +189,8 @@ pub struct StellarCreateAccountCommitArgs {
 
     /// Wallet-issued approval nonce from the simulate-step `approval` block.
     ///
-    /// Required only when the simulate step returned a `policy.approval_required`
-    /// outcome (i.e. the policy engine emitted `Decision::RequireApproval`).
+    /// Required when the simulate step returned an `approval` block. On
+    /// mainnet a supplied nonce is verified under `Allow` too.
     /// When present, the commit handler verifies the HMAC-SHA256 attestation blob
     /// and confirms the envelope hash matches before proceeding.
     #[serde(default)]
@@ -198,13 +199,17 @@ pub struct StellarCreateAccountCommitArgs {
     /// HMAC-SHA256 attestation blob, URL-safe base64 no-pad encoded (32 bytes).
     ///
     /// Written to the pending-approvals store by `stellar-agent approve --id
-    /// <approval_nonce> --profile <name>` after the user confirms on their own tty.  The commit
+    /// <approval_nonce> --profile <name>` after the operator approves. On
+    /// testnet the operator confirms at a terminal or in the `approve serve`
+    /// page. On mainnet the operator approves with a verified passkey
+    /// assertion, in the local browser or at the signed approval origin. The commit
     /// handler re-computes and constant-time-compares the HMAC against the stored
     /// attestation key before proceeding to signing.
     ///
     /// Required alongside `approval_nonce` when the policy engine requires
-    /// approval.  Absent or invalid → `policy.approval_required` (byte-identical
-    /// wire code for all failure modes, for indistinguishability).
+    /// approval. An absent, invalid, or expired proof returns
+    /// `policy.approval_required`. A rejected, consumed, or inconsistent
+    /// approval returns its own code.
     #[serde(default)]
     pub approval_attestation: Option<String>,
     /// The business id the preparation named. Required on
@@ -384,6 +389,8 @@ impl WalletServer {
                        The result carries operational {latest_ledger, close_time_unix, \
                        close_lag_seconds}, the endpoint ledger the readiness check observed. \
                        The approval response includes profile and chain_id. \
+                       On mainnet, a matching balance_floor rule adds an endpoint readiness \
+                       check and an operating account read. \
                        Pass all three to stellar_create_account_commit to sign \
                        and submit. destructive_hint=false; read_only_hint=false.",
         annotations(read_only_hint = false, destructive_hint = false)
@@ -801,9 +808,9 @@ impl WalletServer {
     ///    recorded in the in-memory `ReplayWindow` after successful
     ///    verification; a second call with the same nonce returns
     ///    `nonce.replayed`.
-    /// 4. **Mainnet refusal:** `destructive_hint = true` causes
-    ///    `NoopPolicyEngine` to return `Err(NotImplemented)` for mainnet
-    ///    profiles.
+    /// 4. **Mainnet admission:** a mainnet commit needs the V1 engine, a
+    ///    verified mainnet policy, and verified enablement. A missing
+    ///    requirement refuses with `network.mainnet_write_forbidden`.
     ///
     /// # Security
     ///
@@ -897,8 +904,12 @@ impl WalletServer {
         name = "stellar_create_account_commit",
         description = "Sign and submit a CreateAccount transaction (commit step). \
                        Requires the nonce, expires_at_unix_ms, and envelope_xdr returned \
-                       by stellar_create_account. Verifies the nonce, re-builds the envelope, \
+                       by stellar_create_account. Also pass approval_nonce and \
+                       approval_attestation when the simulate step returned an approval \
+                       block. Pass business_id on mainnet. Verifies the nonce, re-builds the envelope, \
                        obtains the cross-check witness, signs via keyring, and submits. \
+                       On mainnet, a matching balance_floor rule adds an endpoint readiness \
+                       check and an operating account read. \
                        Returns {tx_hash, ledger, cross_check}. \
                        On submission.tx_timeout the outcome is unknown: pass \
                        error.details.tx_hash to stellar_transaction_status, and never \

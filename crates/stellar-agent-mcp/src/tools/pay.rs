@@ -89,8 +89,9 @@ pub struct StellarPayArgs {
 
     /// G-strkey of the source (funding) account.
     ///
-    /// Must exist on the network and hold sufficient XLM to cover the payment
-    /// amount plus the transaction fee.
+    /// Must exist on the network. For a native payment, the source holds the
+    /// amount plus the fee above its reserve. For an issued asset, it holds
+    /// the fee above its reserve and a trustline balance that covers the amount.
     pub source: String,
 
     /// G-strkey or M-strkey of the recipient account.
@@ -111,9 +112,9 @@ pub struct StellarPayArgs {
     /// Payment amount as a raw stroop integer, decimal-string encoded.
     ///
     /// Mutually exclusive with `amount`. When set, the value is a decimal
-    /// string of a non-negative stroop-typed integer with no unit suffix
-    /// (e.g. `"10000000"`). Stellar wire amounts are i64 stroops; this value
-    /// is rejected if it is negative, malformed, or exceeds `i64::MAX`. A raw
+    /// string of a positive stroop integer with no unit suffix, such as
+    /// `"10000000"`. Stellar wire amounts are i64 stroops. Zero, a negative
+    /// value, a malformed value, and a value above `i64::MAX` are rejected. A raw
     /// JSON number is rejected by the schema: a JSON number backed by `f64`
     /// cannot represent a stroop amount exactly once it exceeds `2^53`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -177,7 +178,9 @@ pub struct StellarPayArgs {
 ///    `simulation.divergence`.
 /// 3. **Replay prevention:** the full 48-byte nonce (salt and tag) is
 ///    recorded in the in-memory `ReplayWindow` after verification.
-/// 4. **Mainnet refusal:** `destructive_hint = true`.
+/// 4. **Mainnet admission:** a mainnet commit needs the V1 engine, a verified
+///    mainnet policy, and verified enablement. A missing requirement refuses
+///    with `network.mainnet_write_forbidden`.
 ///
 /// # SEP-29 re-check at commit time
 ///
@@ -219,9 +222,9 @@ pub struct StellarPayCommitArgs {
     /// Payment amount as a raw stroop integer (same as simulate step).
     ///
     /// Mutually exclusive with `amount`. When set, the value is a decimal
-    /// string of a non-negative stroop-typed integer with no unit suffix.
-    /// Stellar wire amounts are i64 stroops; this value is rejected if it is
-    /// negative, malformed, or exceeds `i64::MAX`.
+    /// string of a positive stroop integer with no unit suffix.
+    /// Stellar wire amounts are i64 stroops. Zero, a negative value, a
+    /// malformed value, and a value above `i64::MAX` are rejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub amount_in_stroops: Option<String>,
 
@@ -263,8 +266,8 @@ pub struct StellarPayCommitArgs {
 
     /// Wallet-issued approval nonce from the simulate-step `approval` block.
     ///
-    /// Required only when the simulate step returned a `policy.approval_required`
-    /// outcome (i.e. the policy engine emitted `Decision::RequireApproval`).
+    /// Required when the simulate step returned an `approval` block. On
+    /// mainnet a supplied nonce is verified under `Allow` too.
     /// When present, the commit handler verifies the HMAC-SHA256 attestation blob
     /// and confirms the envelope hash matches before proceeding.
     #[serde(default)]
@@ -273,13 +276,17 @@ pub struct StellarPayCommitArgs {
     /// HMAC-SHA256 attestation blob, URL-safe base64 no-pad encoded (32 bytes).
     ///
     /// Written to the pending-approvals store by `stellar-agent approve --id
-    /// <approval_nonce> --profile <name>` after the user confirms on their own tty.  The commit
+    /// <approval_nonce> --profile <name>` after the operator approves. On
+    /// testnet the operator confirms at a terminal or in the `approve serve`
+    /// page. On mainnet the operator approves with a verified passkey
+    /// assertion, in the local browser or at the signed approval origin. The commit
     /// handler re-computes and constant-time-compares the HMAC against the stored
     /// attestation key before proceeding to signing.
     ///
     /// Required alongside `approval_nonce` when the policy engine requires
-    /// approval.  Absent or invalid → `policy.approval_required` (byte-identical
-    /// wire code for all failure modes, for indistinguishability).
+    /// approval. An absent, invalid, or expired proof returns
+    /// `policy.approval_required`. A rejected, consumed, or inconsistent
+    /// approval returns its own code.
     #[serde(default)]
     pub approval_attestation: Option<String>,
     /// The business id the preparation named. Required on
@@ -1264,7 +1271,9 @@ impl WalletServer {
     ///    `simulation.divergence`.
     /// 4. **Replay prevention:** the full 48-byte nonce (salt and tag) is
     ///    recorded in the in-memory `ReplayWindow` after verification.
-    /// 5. **Mainnet refusal:** `destructive_hint = true`.
+    /// 5. **Mainnet admission:** a mainnet commit needs the V1 engine, a
+    ///    verified mainnet policy, and verified enablement. A missing
+    ///    requirement refuses with `network.mainnet_write_forbidden`.
     ///
     /// # Policy-evaluation order
     ///
@@ -1331,7 +1340,9 @@ impl WalletServer {
         name = "stellar_pay_commit",
         description = "Sign and submit a Payment transaction (commit step). \
                        Requires the nonce, expires_at_unix_ms, and envelope_xdr returned \
-                       by stellar_pay. Verifies the nonce, re-builds the envelope, \
+                       by stellar_pay. Also pass approval_nonce and approval_attestation \
+                       when the simulate step returned an approval block. Pass business_id \
+                       on mainnet. Verifies the nonce, re-builds the envelope, \
                        re-checks SEP-29, \
                        obtains the cross-check witness, signs via keyring, and submits. \
                        Returns {tx_hash, ledger, cross_check}. \

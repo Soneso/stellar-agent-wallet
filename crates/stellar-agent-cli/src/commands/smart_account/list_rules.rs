@@ -176,8 +176,7 @@ pub struct ListRulesArgs {
 
     /// Output format: `json` (default) or `table`.
     ///
-    /// Table mode is deferred (`table` accepted by the flag parser but renders
-    /// the same JSON envelope until the human-readable table renderer ships).
+    /// `--output table` is accepted and renders the same JSON envelope.
     #[arg(long, default_value = "json", value_name = "FORMAT")]
     pub output: OutputFormat,
 }

@@ -121,8 +121,8 @@ pub struct StellarClaimCommitArgs {
 
     /// Wallet-issued approval nonce from the simulate-step `approval` block.
     ///
-    /// Required only when the simulate step returned a `policy.approval_required`
-    /// outcome.
+    /// Required when the simulate step returned an `approval` block. On
+    /// mainnet a supplied nonce is verified under `Allow` too.
     #[serde(default)]
     pub approval_nonce: Option<String>,
 
@@ -322,6 +322,8 @@ impl WalletServer {
                        The result carries operational {latest_ledger, close_time_unix, \
                        close_lag_seconds}, the endpoint ledger the readiness check observed. \
                        The approval response includes profile and chain_id. \
+                       On mainnet, a matching balance_floor rule adds an endpoint readiness \
+                       check and an operating account read. \
                        Pass all three to \
                        stellar_claim_commit to sign and submit. \
                        destructive_hint=false; read_only_hint=false.",
@@ -753,10 +755,14 @@ impl WalletServer {
         name = "stellar_claim_commit",
         description = "Sign and submit a ClaimClaimableBalance transaction (commit step). \
                        Requires the nonce, expires_at_unix_ms, and envelope_xdr returned by \
-                       stellar_claim. Re-derives authoritative args from the envelope, \
+                       stellar_claim. Also pass approval_nonce and approval_attestation \
+                       when the simulate step returned an approval block. Pass business_id \
+                       on mainnet. Re-derives authoritative args from the envelope, \
                        re-fetches and re-checks the entry, re-builds the envelope, \
                        obtains the cross-check witness, verifies the nonce, signs via \
                        keyring, and submits. \
+                       On mainnet, a matching balance_floor rule adds an endpoint readiness \
+                       check and an operating account read. \
                        Returns {tx_hash, ledger, cross_check}. \
                        On submission.tx_timeout the outcome is unknown: pass \
                        error.details.tx_hash to stellar_transaction_status, and never \

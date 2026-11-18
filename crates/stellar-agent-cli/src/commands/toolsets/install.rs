@@ -98,8 +98,9 @@ pub struct ToolsetInstallArgs {
     /// `"attestation": "overridden"`.
     ///
     /// This is the ONLY sanctioned bypass — no other input skips the gate.
-    /// The toolset is still installed with `sign-payment` capability INERT in the
-    /// pin; the first-invoke and per-action approval gates still fire at runtime.
+    /// The toolset installs with its key-touching capability (`sign-payment` or
+    /// `sign-rule-create`) inert in the pin. The first-invoke and per-action
+    /// approval gates still fire at runtime.
     #[arg(long)]
     pub override_attestation: bool,
 }

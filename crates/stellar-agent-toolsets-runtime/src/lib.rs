@@ -57,7 +57,7 @@
 //!
 //! The MCP server crate consumes `stellar_toolset_list`, `stellar_toolset_invoke`,
 //! and the gated `stellar_toolset_invoke` path routing to `stellar_pay_commit`.
-//! The CLI crate consumes `toolset list` and `toolset run <name> <action>`.
+//! The CLI crate consumes `toolsets list` and `toolsets run <name> <action>`.
 //!
 //! ## What this crate does NOT do
 //!

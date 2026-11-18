@@ -188,7 +188,8 @@ impl WalletServer {
         description = "Swap tokens via Soroswap ROUTER-DIRECT path. Enforces ordered trust gate: \
                        venue allowlist, router WASM-hash pin, on-chain slippage re-verify. \
                        Requires absolute qty_out_min floor (not a percent). Signs and submits \
-                       via smart-account. destructive_hint=true, read_only_hint=false.",
+                       via smart-account. Testnet only. A mainnet profile refuses with \
+                       network.mainnet_write_forbidden at entry. destructive_hint=true, read_only_hint=false.",
         annotations(destructive_hint = true, read_only_hint = false)
     )]
     async fn stellar_dex_trade(

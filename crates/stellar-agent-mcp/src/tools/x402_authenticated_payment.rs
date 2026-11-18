@@ -177,9 +177,9 @@ fn compute_payto_anchored(pay_to: &str, accounts: &[String]) -> PaytoAnchored {
 /// - `home_domain` — operator-supplied home domain for SEP-10 identity
 ///   verification (e.g. `"testanchor.stellar.org"`).
 /// - `address` — optional signer address (G-strkey).
-/// - `approval_nonce`, `approval_attestation`: on mainnet, the approval of
-///   the preparation call; both absent for the preparation call, both present
-///   for the payment.
+/// - `approval_nonce`, `approval_attestation`: the approval of the queueing
+///   call, on either network. Both are absent for the queueing call and
+///   present for the payment.
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(crate = "rmcp::serde")]
 pub struct X402AuthenticatedPaymentArgs {
@@ -225,14 +225,18 @@ pub struct X402AuthenticatedPaymentArgs {
     /// HMAC-SHA256 attestation blob, URL-safe base64 no-pad encoded (32 bytes).
     ///
     /// Written to the pending-approvals store by `stellar-agent approve --id
-    /// <approval_nonce> --profile <name>` after the user confirms on their own tty.  The payment
-    /// call re-computes and constant-time-compares the HMAC against the stored
-    /// attestation key before the SEP-10 authentication.
+    /// <approval_nonce> --profile <name>` after the operator approves. On
+    /// testnet the operator confirms at a terminal or in the `approve serve`
+    /// page. On mainnet the operator approves with a verified passkey
+    /// assertion, in the local browser or at the signed approval origin. The payment call verifies the proof before the SEP-10
+    /// authentication. On testnet it compares the HMAC under the attestation
+    /// key. On mainnet it verifies the passkey approval witness.
     ///
     /// Required alongside `approval_nonce` when the policy requires approval.
-    /// An absent or invalid
-    /// attestation returns `policy.approval_required`, the same wire code for
-    /// every failure mode, so the modes stay indistinguishable.
+    /// An absent, invalid, or expired attestation returns
+    /// `policy.approval_required`. A rejected approval returns
+    /// `policy.approval_rejected`, and a spent one returns
+    /// `policy.approval_consumed`.
     #[serde(default)]
     pub approval_attestation: Option<String>,
     /// Business id naming this value operation: 1 to 64 printable ASCII
@@ -407,6 +411,10 @@ impl WalletServer {
                        ephemeral challenge/response → JWT) then calls create_payment, which \
                        obtains the cross-check witness before signing. Any gate failure aborts \
                        BEFORE the payment is built. \
+                       When policy requires approval, the first call returns an approval block, \
+                       signs nothing, and runs no SEP-10. \
+                       Repeat the call with approval_nonce and approval_attestation. \
+                       Mainnet calls need business_id. \
                        Returns { paymentSignature, authorization (Bearer JWT for Authorization header), \
                        payer, asset, amount, payTo, home_domain, network, payto_anchored, \
                        cross_check }. \

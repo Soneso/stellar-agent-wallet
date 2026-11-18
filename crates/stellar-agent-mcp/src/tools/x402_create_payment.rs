@@ -97,6 +97,10 @@ use crate::tools::value_audit::{
 ///   payment requirements are validated.
 /// - `address` — optional signer address (G-strkey); when provided must match
 ///   the active signer enrolled in the profile.
+/// - `approval_nonce`, `approval_attestation`: the owner approval pair of the
+///   queueing call. Both are absent for the queueing call and present for the
+///   payment.
+/// - `business_id`: names the value operation; required on `stellar:mainnet`.
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(crate = "rmcp::serde")]
 pub struct X402CreatePaymentArgs {
@@ -257,6 +261,9 @@ impl WalletServer {
                        transfer auth-entry, re-simulates, and returns { paymentSignature: string, \
                        payer: string, asset: string, amount: string, payTo: string, \
                        network: string, cross_check: object }. \
+                       When policy requires approval, the first call returns an approval block \
+                       and signs nothing. The repeat call passes approval_nonce and \
+                       approval_attestation. \
                        RPC URL and passphrase come from the active profile (never from input). \
                        The wallet is a payer; the MCP host performs the HTTP 402 request. \
                        read_only_hint=false; destructive_hint=false.",

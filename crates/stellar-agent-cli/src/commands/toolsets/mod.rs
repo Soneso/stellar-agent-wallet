@@ -48,12 +48,12 @@ pub enum ToolsetsSubcommand {
     /// without recompiling the binary.
     List(list::ToolsetListArgs),
 
-    /// Invoke a toolset action through the four-part capability enforcement check.
+    /// Check a toolset action against the capability enforcement gates.
     ///
     /// Resolves the action to a trusted registry tool via the capability→tool
     /// matrix, verifies the toolset's declared capabilities, and applies the
-    /// `allowed_tools` intersective narrowing.  Returns the resolved trusted
-    /// tool name on success.
+    /// `allowed_tools` intersective narrowing. The routed tool is not
+    /// executed; the result names it under `data.routed_to`.
     ///
     /// The enforcement check is ADDITIVE: operator policy + chain gates of the
     /// routed tool also apply.

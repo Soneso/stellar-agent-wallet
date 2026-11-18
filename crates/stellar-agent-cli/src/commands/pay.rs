@@ -341,7 +341,7 @@ pub struct PayArgs {
     #[arg(long = "profile", value_name = "NAME")]
     pub profile: Option<String>,
 
-    /// Destination account G-strkey.
+    /// Destination G account or M address. An M address keeps its mux ID in the payment.
     #[arg(value_name = "DESTINATION")]
     pub destination: String,
 

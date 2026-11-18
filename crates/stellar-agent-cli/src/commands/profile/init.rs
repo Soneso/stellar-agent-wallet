@@ -289,7 +289,8 @@ pub(crate) struct InitArgs {
     /// budget; api presets only.
     ///
     /// No default: an api preset asks at a terminal and refuses without
-    /// one. Other presets default to no.
+    /// one. Other presets default to no. A payment beyond either budget bound
+    /// requests a per-payment approval.
     #[arg(long, value_enum, value_name = "yes|no")]
     pub(crate) unlisted_budget: Option<YesNo>,
 

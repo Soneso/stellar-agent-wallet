@@ -247,7 +247,9 @@ impl WalletServer {
         name = "stellar_toolset_list",
         description = "List all installed toolsets and their invocable actions. \
                        Returns a JSON array with name, capabilities, allowed_tools, \
-                       version, and actions for each installed toolset. \
+                       version, and actions for each installed toolset. actions lists the \
+                       tools reachable without a grant; the gated signing commit tools are \
+                       not listed. \
                        read_only_hint=true; destructive_hint=false.",
         annotations(read_only_hint = true, destructive_hint = false)
     )]
