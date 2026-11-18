@@ -120,3 +120,63 @@ pub(crate) fn open_record(
         .unwrap()
         .record
 }
+
+/// A writer over the audit log of `profile` with the keyed, anchored access
+/// of profile `name`.
+#[allow(
+    dead_code,
+    reason = "the CLI integration target includes this file and uses only open_record"
+)]
+pub(crate) fn keyed_writer(
+    profile: &stellar_agent_core::profile::Profile,
+    name: &str,
+) -> stellar_agent_core::audit_log::AuditWriter {
+    stellar_agent_core::audit_log::AuditWriter::open(
+        profile.audit_log_path.clone(),
+        Some(
+            stellar_agent_network::keyring::keyed_audit_access(
+                profile,
+                name,
+                stellar_agent_core::audit_log::BindingCheck::Enforce,
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap()
+}
+
+/// Seeds `count` reserved evidence slots of foreign identities, each
+/// beginning with the byte `tag`, in the keyed audit log of `profile`.
+#[allow(
+    dead_code,
+    reason = "the CLI integration target includes this file and uses only open_record"
+)]
+pub(crate) fn seed_foreign_evidence(
+    profile: &stellar_agent_core::profile::Profile,
+    name: &str,
+    tag: u8,
+    count: usize,
+) {
+    let (key, anchor) = stellar_agent_network::keyring::keyed_audit_access(
+        profile,
+        name,
+        stellar_agent_core::audit_log::BindingCheck::Enforce,
+    )
+    .unwrap()
+    .into_parts();
+    let identities: Vec<_> = (0..count)
+        .map(|i| {
+            let mut identity = [tag; 32];
+            identity[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            identity
+        })
+        .collect();
+    stellar_agent_core::audit_log::test_helpers::seed_reserved_evidence(
+        &profile.audit_log_path,
+        anchor.as_ref(),
+        &key,
+        &identities,
+        u64::MAX,
+    )
+    .unwrap();
+}

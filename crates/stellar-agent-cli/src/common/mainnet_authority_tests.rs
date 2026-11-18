@@ -632,12 +632,10 @@ async fn cli_policy_refusals_render_once_at_the_boundary() {
 mod publication {
     use super::*;
     use stellar_agent_core::approval::witness::ApprovedKind;
-    use stellar_agent_core::audit_log::{
-        BindingCheck, MAX_EVIDENCE_ENTRIES, test_helpers::seed_reserved_evidence,
-    };
+    use stellar_agent_core::audit_log::MAX_EVIDENCE_ENTRIES;
     use stellar_agent_network::policy_state::PersistedWindowStore;
     use stellar_agent_network::policy_state::approvals::{
-        ApprovalStatus, ConsentEvidenceEnforcementGuard, ConsentEvidenceInventoryGuard,
+        ApprovalStatus, ConsentEvidenceEnforcementGuard, UnreadableSiblingProfile,
     };
 
     fn fill_scope(fixture: &MainnetFixture) {
@@ -650,28 +648,12 @@ mod publication {
             .unwrap()
             .initialize_consent_evidence()
             .unwrap();
-        let (key, anchor) = stellar_agent_network::keyring::keyed_audit_access(
+        crate::common::approval_fixture::seed_foreign_evidence(
             &profile,
             fixture.name,
-            BindingCheck::Enforce,
-        )
-        .unwrap()
-        .into_parts();
-        let identities: Vec<_> = (0..MAX_EVIDENCE_ENTRIES)
-            .map(|i| {
-                let mut identity = [0xdd; 32];
-                identity[..8].copy_from_slice(&(i as u64).to_be_bytes());
-                identity
-            })
-            .collect();
-        seed_reserved_evidence(
-            &profile.audit_log_path,
-            anchor.as_ref(),
-            &key,
-            &identities,
-            u64::MAX,
-        )
-        .unwrap();
+            0xdd,
+            MAX_EVIDENCE_ENTRIES,
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -715,7 +697,7 @@ mod publication {
                 let fixture = verb.spec(name).build().await;
                 let _enabled =
                     (mode != 3).then(|| ConsentEvidenceEnforcementGuard::new(name, kind));
-                let _ready = (mode != 1).then(|| ConsentEvidenceInventoryGuard::new(name));
+                let _unready = (mode == 1).then(UnreadableSiblingProfile::plant);
                 if mode == 0 || mode == 3 {
                     fill_scope(&fixture);
                 }
