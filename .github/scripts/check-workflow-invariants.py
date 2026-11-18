@@ -230,7 +230,13 @@ runs the function.
   ``RUSTUP_TOOLCHAIN`` between the install and the build or packaging.
 - ``ci-feature-jobs``: a job of ``CI_FEATURE_JOBS`` is missing, it or one of
   its steps sets ``if`` or ``continue-on-error``, or it does not run each of
-  its commands unconditionally; a job of ``CONDITIONED_FEATURE_JOBS`` is
+  its commands unconditionally. A job of ``DOCS_ONLY_SKIPPED_JOBS`` instead
+  needs exactly ``changes`` and sets ``if`` to ``DOCS_ONLY_CONDITION`` within
+  at most one enclosing ``${{ }}``. The ``docs-tests`` job is missing, does
+  not need exactly ``changes``, sets ``if`` to anything but
+  ``DOCS_TESTS_CONDITION``, it or one of its steps sets ``continue-on-error``
+  or a step sets ``if``, or it does not run each of ``DOCS_TESTS_COMMANDS``
+  unconditionally; a job of ``CONDITIONED_FEATURE_JOBS`` is
   missing, its ``if`` differs from its documented condition after the check
   strips the surrounding whitespace and one enclosing ``${{ }}``, it sets
   ``continue-on-error``, one of its steps sets ``if`` or
@@ -570,6 +576,24 @@ CI_FEATURE_JOBS = {
         '"$RUNNER_TEMP/feature-check/bin/python" .github/scripts/test-check-provenance.py --mutations'),
     "release-shape": ("bash .github/scripts/release/check-host.sh",),
 }
+# The feature jobs of ci.yml that skip a pull request into mainnet-write that
+# changes only documentation. Each needs only the changes job and runs under
+# DOCS_ONLY_CONDITION. On such a pull request the docs-tests job runs under
+# DOCS_TESTS_CONDITION instead and runs DOCS_TESTS_COMMANDS: the documentation
+# read check and the registry tests in the feature states of test and
+# feature-on-test.
+DOCS_ONLY_SKIPPED_JOBS = ("clippy", "doc", "test", "feature-on-clippy", "feature-on-doc", "feature-on-test",
+                          "release-shape")
+DOCS_ONLY_CONDITION = "!cancelled() && needs.changes.outputs.docs_only != 'true'"
+DOCS_TESTS_JOB = "docs-tests"
+DOCS_TESTS_CONDITION = "!cancelled() && needs.changes.outputs.docs_only == 'true'"
+DOCS_TESTS_COMMANDS = (
+    "python3 .github/scripts/check-docs-reads.py",
+    "python3 .github/scripts/run-docs-tests.py --no-default-features "
+    "--features test-helpers,test-hooks,test-loopback,verifier-registry",
+    "python3 .github/scripts/run-docs-tests.py "
+    "--features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry",
+)
 # The feature jobs of other workflows that run under a documented job
 # condition: for each workflow and job, that condition and the commands that
 # define the job.
@@ -1816,7 +1840,14 @@ class Checker:
             if job is None:
                 self.report("ci.yml", "ci-feature-jobs", f"missing {name}")
                 continue
-            if "if" in job or "continue-on-error" in job:
+            if name in DOCS_ONLY_SKIPPED_JOBS:
+                needs = job.get("needs")
+                documented = (isinstance(job.get("if"), str)
+                              and self.unwrap_expression(job["if"]) == DOCS_ONLY_CONDITION
+                              and needs in ("changes", ["changes"]))
+                if not documented or "continue-on-error" in job:
+                    self.report("ci.yml", "ci-feature-jobs", f"{name} can be bypassed")
+            elif "if" in job or "continue-on-error" in job:
                 self.report("ci.yml", "ci-feature-jobs", f"{name} can be bypassed")
             for step in job.get("steps", []):
                 if "if" in step or "continue-on-error" in step:
@@ -1824,6 +1855,22 @@ class Checker:
             for command in commands:
                 if self.runs_in_job("ci.yml", name, command, "ci-feature-jobs") < 0:
                     self.report("ci.yml", "ci-feature-jobs", f"{name} does not run unconditionally: {command}")
+        job = self.job("ci.yml", DOCS_TESTS_JOB)
+        if job is None:
+            self.report("ci.yml", "ci-feature-jobs", f"missing {DOCS_TESTS_JOB}")
+        else:
+            documented = (isinstance(job.get("if"), str)
+                          and self.unwrap_expression(job["if"]) == DOCS_TESTS_CONDITION
+                          and job.get("needs") in ("changes", ["changes"]))
+            if not documented or "continue-on-error" in job:
+                self.report("ci.yml", "ci-feature-jobs", f"{DOCS_TESTS_JOB} can be bypassed")
+            for step in job.get("steps", []):
+                if "if" in step or "continue-on-error" in step:
+                    self.report("ci.yml", "ci-feature-jobs", f"{DOCS_TESTS_JOB} step can be bypassed")
+            for command in DOCS_TESTS_COMMANDS:
+                if self.runs_in_job("ci.yml", DOCS_TESTS_JOB, command, "ci-feature-jobs") < 0:
+                    self.report("ci.yml", "ci-feature-jobs",
+                                f"{DOCS_TESTS_JOB} does not run unconditionally: {command}")
         for (workflow, name), (condition, commands) in CONDITIONED_FEATURE_JOBS.items():
             job = self.job(workflow, name)
             if job is None:

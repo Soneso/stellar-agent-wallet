@@ -74,7 +74,9 @@ request description. Issue-specific acceptance commands still apply.
 including coverage. Local coverage, `cargo machete`, and `cargo deny check` are
 optional reproductions of CI checks.
 
-CI runs the offline workspace suite on every pull request. Pull-request
+CI runs the offline gates on every pull request; a docs-only pull request into
+`mainnet-write` runs the reduced set that
+[docs/maintainers/building.md](docs/maintainers/building.md) describes. Pull-request
 coverage requires the `coverage` label; live acceptance uses its separate
 workflow. The exact commands, gate-tool installation, and test tiers are in
 [docs/maintainers/building.md](docs/maintainers/building.md).
