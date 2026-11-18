@@ -42,7 +42,14 @@ fn read_json(path: &Path) -> Value {
     serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
 }
 
-fn child_server(root: &Path) -> crate::server::WalletServer {
+/// The child process's server, with opt-outs of every kind for its profile:
+/// each child legacy-attests, so it runs unenforced, as its parent does.
+fn child_server(
+    root: &Path,
+) -> (
+    crate::server::WalletServer,
+    Vec<stellar_agent_network::policy_state::approvals::ConsentEvidenceDisableGuard>,
+) {
     let config = read_json(&root.join("process.json"));
     let profiles = stellar_agent_core::profile::loader::default_profile_dir().unwrap();
     let profile = loader::load_from_dir("operator", &profiles, None).unwrap();
@@ -67,7 +74,11 @@ fn child_server(root: &Path) -> crate::server::WalletServer {
     server.set_toolsets_root_for_test(config["toolsets"].as_str().unwrap().into());
     server.set_grant_store_path_for_test(config["grants"].as_str().unwrap().into());
     server.set_toolset_pin_key_for_test(PinKey::from_bytes(zeroize::Zeroizing::new([0x63; 32])));
-    server
+    let unenforced =
+        stellar_agent_network::policy_state::approvals::ConsentEvidenceDisableGuard::every_kind(
+            &server.profile_name_for_approval(),
+        );
+    (server, unenforced)
 }
 
 async fn fixture() -> (Run, Value) {
@@ -134,7 +145,7 @@ async fn public_payment_crashes_preserve_recovery_at_every_durable_write() {
         );
         let _home = StellarAgentHomeGuard::new(&root);
         let changes = restore_process_keyring(&root.join("keys.json"));
-        let server = child_server(&root);
+        let (server, _unenforced) = child_server(&root);
         let cut = std::env::var("TOOLSET_PAYMENT_PROCESS_CUT")
             .unwrap()
             .parse::<usize>()
@@ -470,7 +481,7 @@ async fn public_stale_process_gate_cannot_overwrite_a_competing_payment() {
         );
         let _home = StellarAgentHomeGuard::new(&root);
         let changes = restore_process_keyring(&root.join("keys.json"));
-        let mut server = child_server(&root);
+        let (mut server, _unenforced) = child_server(&root);
         let mut args = read_json(&root.join("request.json"));
         let prepared = call(&server, "stellar_pay", args.clone(), true).await;
         assert_eq!(prepared["ok"], true, "{prepared}");
@@ -690,7 +701,7 @@ async fn public_noninclusion_after_restart_releases_only_the_original_payment() 
         );
         let _home = StellarAgentHomeGuard::new(&root);
         let changes = restore_process_keyring(&root.join("keys.json"));
-        let server = child_server(&root);
+        let (server, _unenforced) = child_server(&root);
         let info = read_json(&root.join("absence.json"));
         let _clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(
             info["now"].as_u64().unwrap(),
@@ -979,7 +990,7 @@ async fn public_proofless_commit_in_a_fresh_process_refuses_before_queueing() {
         );
         let _home = StellarAgentHomeGuard::new(&root);
         let changes = restore_process_keyring(&root.join("keys.json"));
-        let server = child_server(&root);
+        let (server, _unenforced) = child_server(&root);
         let prepared = call(
             &server,
             "stellar_pay",

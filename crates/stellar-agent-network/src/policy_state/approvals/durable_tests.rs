@@ -599,6 +599,8 @@ pub(crate) struct IntentFx {
         allow(dead_code, reason = "only the mainnet resolver tests move this clock")
     )]
     pub(crate) clock: crate::mainnet::clock::TestClockGuard,
+    /// Keeps the legacy-consented payment unenforced.
+    _unpublished: ConsentEvidenceDisableGuard,
 }
 
 impl IntentFx {
@@ -609,6 +611,7 @@ impl IntentFx {
         let fixture = stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture::new(
             "durable-intent",
         );
+        let unpublished = ConsentEvidenceDisableGuard::new(fixture.name(), ApprovedKind::Payment);
         let policy = fixture.current_policy();
         let (mut entry, intent) = fixture.intent_payment(ttl);
         entry.created_at_unix_ms -= 60_000;
@@ -702,6 +705,7 @@ impl IntentFx {
             policy,
             blob,
             clock,
+            _unpublished: unpublished,
         }
     }
 

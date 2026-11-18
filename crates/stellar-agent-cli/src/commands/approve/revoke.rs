@@ -412,13 +412,36 @@ pub(super) mod tests {
         /// Serve through a writer over the keyed log, as a published consent
         /// needs; otherwise through the fixture's unkeyed writer.
         pub(in crate::commands::approve) keyed: bool,
+        /// The kind of the fixture's entry and record.
+        pub(in crate::commands::approve) kind: ApprovedKind,
+        /// Keeps the unkeyed fixture's kind unenforced; a later enforcement
+        /// guard of a published consent decides over it, and
+        /// [`Self::enforce_listed`] drops it.
+        unpublished:
+            Option<stellar_agent_network::policy_state::approvals::ConsentEvidenceDisableGuard>,
     }
     impl Fixture {
+        /// Drops the opt-out, so the compiled kind capabilities decide.
+        pub(in crate::commands::approve) fn enforce_listed(&mut self) {
+            self.unpublished = None;
+        }
         pub(in crate::commands::approve) fn new() -> Self {
-            Self::from_core(MainnetConsentFixture::new("revocation"))
+            Self::of(ApprovedKind::Payment)
+        }
+        /// A fixture whose entry and record are of `kind`.
+        pub(in crate::commands::approve) fn of(kind: ApprovedKind) -> Self {
+            Self::from_core_of(MainnetConsentFixture::new("revocation"), kind)
         }
         fn from_core(core: MainnetConsentFixture) -> Self {
-            let entry = core.payment(300_000);
+            Self::from_core_of(core, ApprovedKind::Payment)
+        }
+        fn from_core_of(core: MainnetConsentFixture, kind: ApprovedKind) -> Self {
+            let unpublished =
+                stellar_agent_network::policy_state::approvals::ConsentEvidenceDisableGuard::new(
+                    core.name(),
+                    kind,
+                );
+            let entry = core.entry(kind, 300_000);
             let clock = set_now_ms_for_test(entry.created_at_unix_ms);
             let store = PersistedWindowStore::for_profile(core.name());
             let handle = open_record(&store, core.profile(), &entry, "revocation-order");
@@ -433,6 +456,8 @@ pub(super) mod tests {
                 entry,
                 handle,
                 keyed: false,
+                kind,
+                unpublished: Some(unpublished),
             }
         }
     }
@@ -445,18 +470,79 @@ pub(super) mod tests {
         entry: &PendingApproval,
         business: &str,
     ) -> OperationHandle {
-        let mut rows = Rows::default();
-        let opened = OperationRecorder::new(store, profile, &mut rows, "open")
-            .open(&OpenRequest {
-                business_id: BusinessId::parse(business).unwrap(),
-                tool: OperationTool::CliPay,
-                kind: OperationKind::Pay,
-                intent: IntentSlot::Envelope {
+        use stellar_agent_core::approval::ApprovalKind;
+        let envelope = |tool, operation_kind, kind, envelope_xdr_b64: &String| {
+            (
+                tool,
+                operation_kind,
+                kind,
+                approval_subject_classic(envelope_xdr_b64),
+                IntentSlot::Envelope {
                     intent_digest: [1; 32],
                     unsigned_envelope_sha256: [1; 32],
                     max_time: 0,
                 },
-                envelope_xdr: Some("AAAA".to_owned()),
+            )
+        };
+        let (tool, operation_kind, kind, subject, intent) = match &entry.kind {
+            ApprovalKind::PaymentSimulated {
+                envelope_xdr_b64, ..
+            } => envelope(
+                OperationTool::CliPay,
+                OperationKind::Pay,
+                ApprovedKind::Payment,
+                envelope_xdr_b64,
+            ),
+            ApprovalKind::ClaimSimulated {
+                envelope_xdr_b64, ..
+            } => envelope(
+                OperationTool::CliClaim,
+                OperationKind::Claim,
+                ApprovedKind::Claim,
+                envelope_xdr_b64,
+            ),
+            ApprovalKind::TrustlineSimulated {
+                envelope_xdr_b64, ..
+            } => envelope(
+                OperationTool::CliTrustline,
+                OperationKind::Trustline,
+                ApprovedKind::Trustline,
+                envelope_xdr_b64,
+            ),
+            ApprovalKind::X402Payment {
+                intent_digest,
+                payee,
+                amount,
+                asset,
+                ..
+            } => (
+                OperationTool::X402CreatePayment,
+                OperationKind::X402Payment,
+                ApprovedKind::X402Payment,
+                stellar_agent_core::approval::subject::approval_subject_x402(intent_digest),
+                IntentSlot::X402 {
+                    intent_digest: *intent_digest,
+                    intent: stellar_agent_network::policy_state::X402Intent {
+                        network: profile.chain_id.to_string(),
+                        asset: asset.clone(),
+                        payer: MainnetConsentFixture::x402_payer(),
+                        pay_to: payee.clone(),
+                        amount: amount.clone(),
+                    },
+                },
+            ),
+            _ => panic!("a classic envelope or x402 entry"),
+        };
+        let x402 = kind == ApprovedKind::X402Payment;
+        let intent_digest = intent.intent_digest();
+        let mut rows = Rows::default();
+        let opened = OperationRecorder::new(store, profile, &mut rows, "open")
+            .open(&OpenRequest {
+                business_id: BusinessId::parse(business).unwrap(),
+                tool,
+                kind: operation_kind,
+                intent,
+                envelope_xdr: (!x402).then(|| "AAAA".to_owned()),
                 prepared_decision: None,
                 rule_ttl_ms: Some(300_000),
             })
@@ -464,21 +550,15 @@ pub(super) mod tests {
         let OpenOutcome::New(handle) = opened else {
             panic!("new operation")
         };
-        let stellar_agent_core::approval::ApprovalKind::PaymentSimulated {
-            envelope_xdr_b64, ..
-        } = &entry.kind
-        else {
-            panic!("payment")
-        };
         ApprovalRecorder::new(store, profile, &mut rows, "pending")
             .open_pending(
                 handle.id(),
                 &PendingApprovalFacts {
                     nonce: entry.approval_nonce.clone(),
-                    kind: ApprovedKind::Payment,
+                    kind,
                     subject_kind: SubjectKind::EnvelopeText,
-                    subject: approval_subject_classic(envelope_xdr_b64),
-                    intent_digest: [1; 32],
+                    subject,
+                    intent_digest,
                     created_at_ms: entry.created_at_unix_ms,
                     waiting_expires_at_ms: entry.expires_at_unix_ms,
                     rule_ttl_ms: 300_000,
@@ -598,7 +678,7 @@ pub(super) mod tests {
                 &self.entry.approval_nonce,
                 &attestation,
                 &ApprovalExpectation {
-                    kind: ApprovedKind::Payment,
+                    kind: self.kind,
                     subject: view.record.subject,
                 },
                 &policy,
@@ -1432,6 +1512,13 @@ pub(super) mod tests {
 
     /// A signed-origin fixture whose listener binds an OS-assigned port.
     pub(in crate::commands::approve) fn signed_fixture() -> (Fixture, tempfile::TempDir) {
+        signed_fixture_of(ApprovedKind::Payment)
+    }
+
+    /// [`signed_fixture`] whose entry and record are of `kind`.
+    pub(in crate::commands::approve) fn signed_fixture_of(
+        kind: ApprovedKind,
+    ) -> (Fixture, tempfile::TempDir) {
         use stellar_agent_core::approval::mainnet_fixtures::SIGNED_RP_ID;
         let files = tempfile::tempdir().unwrap();
         let leaf = stellar_agent_approval_remote::signed_origin_test_leaf(SIGNED_RP_ID);
@@ -1454,7 +1541,7 @@ pub(super) mod tests {
             &[&stellar_agent_test_support::webauthn::fixture_authenticator()],
             &leaf.pin,
         );
-        (Fixture::from_core(core), files)
+        (Fixture::from_core_of(core, kind), files)
     }
 
     #[test]

@@ -71,6 +71,8 @@ pub(crate) mod spending_preview;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub(crate) mod tty;
+#[cfg(test)]
+pub(crate) mod unenforced_fixture;
 
 /// Returns `true` when a graphical display is available for a browser launch.
 ///

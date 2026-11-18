@@ -1661,8 +1661,9 @@ impl ConsentAdmission<'_> {
     ///
     /// # Errors
     /// Returns readiness, adoption, evidence and authenticated record
-    /// refusals, including `approval.evidence_capacity`. A migration pin that
-    /// no grant adopts refuses with `unresolved migration pin`.
+    /// refusals, including `approval.evidence_capacity`. Absent evidence
+    /// refuses with `consent evidence not initialized`, and a migration pin
+    /// that no grant adopts refuses with `unresolved migration pin`.
     pub fn reacquire(
         store: &PersistedWindowStore,
         profile: &Profile,
@@ -1674,13 +1675,14 @@ impl ConsentAdmission<'_> {
         require_consent_evidence_inventory(store, profile, outbox)?;
         adopt_consent_evidence_pins(store, profile, outbox)?;
         let evidence_refusal = |error: WriterError| audit_writer_refusal(&name, &error);
-        if outbox
-            .evidence()
-            .map_err(evidence_refusal)?
-            .is_none_or(|evidence| evidence.holds_migration_pins())
-        {
+        let reason = match outbox.evidence().map_err(evidence_refusal)? {
+            None => Some("consent evidence not initialized"),
+            Some(evidence) if evidence.holds_migration_pins() => Some("unresolved migration pin"),
+            Some(_) => None,
+        };
+        if let Some(reason) = reason {
             return Err(evidence_refusal(WriterError::OutboxEvidenceUnusable {
-                reason: "unresolved migration pin",
+                reason,
             }));
         }
         let reservation = ApprovalRecorder::new(

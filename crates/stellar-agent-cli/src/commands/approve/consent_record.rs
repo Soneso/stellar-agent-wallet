@@ -154,16 +154,19 @@ mod tests {
     };
     use stellar_agent_network::policy_state::{RowProvenance, WindowStoreError};
 
-    use super::super::revoke::tests::{Browser, Fixture, island, mint_audit_key, signed_fixture};
+    use super::super::revoke::tests::{
+        Browser, Fixture, island, mint_audit_key, signed_fixture, signed_fixture_of,
+    };
     use super::{ConsentRecording as _, DurableConsents};
+    use crate::common::unenforced_fixture::listed_kinds;
 
-    /// The guards of a published payment consent.
+    /// The guards of a published consent.
     type Published = (
         ConsentEvidenceEnforcementGuard,
         Option<UnreadableSiblingProfile>,
     );
 
-    /// Publishes `f`'s payment consents: the scoped kind capability, an
+    /// Publishes `f`'s consents of its kind: the scoped kind capability, an
     /// unreadable sibling profile unless the scope is `ready`, a keyed log
     /// with initialized evidence, and a keyed serving writer.
     async fn publish(f: &mut Fixture, ready: bool) -> Published {
@@ -171,7 +174,7 @@ mod tests {
         f.keyed_writer().initialize_consent_evidence().unwrap();
         f.keyed = true;
         (
-            ConsentEvidenceEnforcementGuard::new(f.core.name(), ApprovedKind::Payment),
+            ConsentEvidenceEnforcementGuard::new(f.core.name(), f.kind),
             (!ready).then(UnreadableSiblingProfile::plant),
         )
     }
@@ -429,13 +432,14 @@ mod tests {
         }
     }
 
-    /// A value entry that no durable record names keeps the inbox path of an
-    /// approval prepared before records existed: it attests and the window
-    /// file keeps its bytes.
+    /// Under the fixture's test opt-out of payment, a value entry that no
+    /// durable record names keeps the inbox path: it attests and the window
+    /// file keeps its bytes. Every kind is listed, so production never runs
+    /// this path; the test covers the opt-out path.
     #[test]
     #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
-    fn inbox_consent_without_a_record_keeps_todays_path() {
+    fn opt_out_inbox_consent_without_a_record_keeps_the_inbox_path() {
         let f = Fixture::new();
         let entry = f.core.payment(300_000);
         PendingApprovalStore::open(f.core.store_path())
@@ -701,12 +705,14 @@ mod tests {
         listener.shutdown().await;
     }
 
-    /// The inbox's own consent is a compatibility consent and stores no
-    /// publication handoff, while its recording commits consent.
+    /// Under the fixture's test opt-out of payment, the inbox's own consent
+    /// is a compatibility consent and stores no publication handoff, while
+    /// its recording commits consent without delivery facts. Every kind is
+    /// listed, so the test covers the opt-out path, not a production state.
     #[test]
     #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
-    fn an_inbox_consent_stores_no_publication_handoff() {
+    fn opt_out_inbox_consent_stores_no_publication_handoff() {
         let f = Fixture::new();
         let outcome = approve(&f, &f.entry);
         assert!(matches!(outcome, Outcome::Attested { .. }), "{outcome:?}");
@@ -720,14 +726,16 @@ mod tests {
         assert!(f.view().record.consent.unwrap().delivery.is_none());
     }
 
-    /// A strict consent attested without its durable commit keeps the
-    /// publication handoff it stored beside the blob and receipt. A repeated
-    /// approve and the stored page complete the consent as `recovered`
-    /// without delivery facts, and leave the inbox file's bytes unchanged.
+    /// Under the fixture's test opt-out of payment, a strict consent attested
+    /// without its durable commit keeps the publication handoff it stored
+    /// beside the blob and receipt. A repeated approve and the stored page
+    /// complete the consent as `recovered` without delivery facts, and leave
+    /// the inbox file's bytes unchanged. Every kind is listed, so the test
+    /// covers the opt-out path, not a production state.
     #[tokio::test]
     #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
-    async fn inbox_recovery_keeps_a_stored_publication_handoff() {
+    async fn opt_out_inbox_recovery_keeps_a_stored_publication_handoff() {
         let f = Fixture::new();
         let stored = strictly_attested_without_consent(&f);
         assert!(stored.consent_publication.is_some());
@@ -904,15 +912,21 @@ mod tests {
     #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn inbox_challenge_requires_reservation_in_both_listeners() {
+        for kind in listed_kinds() {
+            inbox_challenge_requires_reservation_for(kind).await;
+        }
+    }
+
+    async fn inbox_challenge_requires_reservation_for(kind: ApprovedKind) {
         for signed in [false, true] {
-            for mode in ["inventory", "capacity", "reserved"] {
+            for mode in ["unready", "capacity", "reserved"] {
                 let (mut f, _files) = if signed {
-                    let (f, files) = signed_fixture();
+                    let (f, files) = signed_fixture_of(kind);
                     (f, Some(files))
                 } else {
-                    (Fixture::new(), None)
+                    (Fixture::of(kind), None)
                 };
-                let _published = publish(&mut f, mode != "inventory").await;
+                let _published = publish(&mut f, mode != "unready").await;
                 let max = stellar_agent_core::audit_log::MAX_EVIDENCE_ENTRIES;
                 fill(&f, if mode == "capacity" { max } else { max - 1 });
                 let before = window(&f);
@@ -955,6 +969,63 @@ mod tests {
         }
     }
 
+    /// The listener rows of the activation matrix: each listed kind runs
+    /// under the compiled kind list with no enforcement guard. An unready
+    /// scope answers the challenge `unavailable` and writes no attested row;
+    /// a ready scope issues it, the consent answers `attested`, and its
+    /// record holds direct delivery.
+    #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
+    #[serial_test::serial]
+    async fn activation_matrix_listener_rows() {
+        use stellar_agent_network::policy_state::approvals::delivery_enforced;
+        for kind in listed_kinds() {
+            for ready in [false, true] {
+                let mut f = Fixture::of(kind);
+                f.enforce_listed();
+                assert!(
+                    delivery_enforced(f.core.name(), kind),
+                    "{kind:?}: the compiled kind list enforces"
+                );
+                mint_audit_key(f.core.name()).await;
+                f.keyed_writer().initialize_consent_evidence().unwrap();
+                f.keyed = true;
+                let _unready = (!ready).then(UnreadableSiblingProfile::plant);
+                let nonce = f.entry.approval_nonce.clone();
+                let (listener, browser) = Browser::start(&f, false).await;
+                if ready {
+                    let (options, csrf) = challenge(&browser, &nonce).await;
+                    let (_, body, _) = assert_once(&browser, &nonce, &options, &csrf).await;
+                    assert_eq!(body["status"], "attested", "{kind:?}: {body}");
+                    assert_eq!(
+                        f.view().record.consent.unwrap().delivery,
+                        direct(&f),
+                        "{kind:?}: the consent answers with its delivery"
+                    );
+                } else {
+                    let page = island(&browser.page(&nonce).await, "presence-data");
+                    let response = browser
+                        .action(
+                            &nonce,
+                            page["csrf"].as_str().unwrap(),
+                            "challenge",
+                            &json!({"consent_view_digest": page["consent_view_digest"]}),
+                        )
+                        .send()
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        response.status(),
+                        503,
+                        "{kind:?}: an unready scope refuses the challenge"
+                    );
+                    assert_eq!(attested_rows(&f), 0, "{kind:?}");
+                }
+                listener.shutdown().await;
+            }
+        }
+    }
+
     /// A fresh published consent in either listener attests strictly and
     /// answers `attested` only after its direct delivery commits. A failed
     /// publication answers without the blob and commits no consent, while
@@ -964,20 +1035,26 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn inbox_fresh_publication_precedes_blob() {
+        for kind in listed_kinds() {
+            inbox_fresh_publication_for(kind).await;
+        }
+    }
+
+    async fn inbox_fresh_publication_for(kind: ApprovedKind) {
         for signed in [false, true] {
-            for mode in ["published", "fault", "inventory"] {
+            for mode in ["published", "fault", "unready"] {
                 let fail = mode == "fault";
                 let (mut f, _files) = if signed {
-                    let (f, files) = signed_fixture();
+                    let (f, files) = signed_fixture_of(kind);
                     (f, Some(files))
                 } else {
-                    (Fixture::new(), None)
+                    (Fixture::of(kind), None)
                 };
                 let _published = publish(&mut f, true).await;
                 let nonce = f.entry.approval_nonce.clone();
                 let (listener, browser) = Browser::start(&f, signed).await;
                 let (options, csrf) = challenge(&browser, &nonce).await;
-                let _unready = (mode == "inventory").then(UnreadableSiblingProfile::plant);
+                let _unready = (mode == "unready").then(UnreadableSiblingProfile::plant);
                 let fault = fail.then(|| arm_accounting_fault(COMMIT_FAULT_AFTER_PREPARED));
                 let (_, body, _) = assert_once(&browser, &nonce, &options, &csrf).await;
                 drop(fault);
@@ -987,7 +1064,7 @@ mod tests {
                     .get(&nonce)
                     .unwrap()
                     .clone();
-                if mode == "inventory" {
+                if mode == "unready" {
                     assert_ne!(body["status"], "attested", "{signed}: {body}");
                     assert!(
                         stored.attestation_blob_b64.is_none(),
@@ -1027,7 +1104,13 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn inbox_repeat_publishes_before_consumed() {
-        let mut f = Fixture::new();
+        for kind in listed_kinds() {
+            inbox_repeat_publishes_for(kind).await;
+        }
+    }
+
+    async fn inbox_repeat_publishes_for(kind: ApprovedKind) {
+        let mut f = Fixture::of(kind);
         let _published = publish(&mut f, true).await;
         let stored = strictly_attested_without_consent(&f);
         let unready = UnreadableSiblingProfile::plant();
@@ -1042,7 +1125,7 @@ mod tests {
         assert!(matches!(outcome, Outcome::Unavailable), "{outcome:?}");
         assert!(
             f.view().record.consent.is_none(),
-            "inventory: the repeat reacquires before it publishes"
+            "unready: the repeat reacquires before it publishes"
         );
         assert_eq!(attested_rows(&f), 1);
         drop(unready);
@@ -1076,12 +1159,18 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn inbox_consumed_retry_publishes_once() {
+        for kind in listed_kinds() {
+            inbox_consumed_retry_for(kind).await;
+        }
+    }
+
+    async fn inbox_consumed_retry_for(kind: ApprovedKind) {
         for signed in [false, true] {
             let (mut f, _files) = if signed {
-                let (f, files) = signed_fixture();
+                let (f, files) = signed_fixture_of(kind);
                 (f, Some(files))
             } else {
-                (Fixture::new(), None)
+                (Fixture::of(kind), None)
             };
             let _published = publish(&mut f, true).await;
             let nonce = f.entry.approval_nonce.clone();
@@ -1121,21 +1210,27 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn stored_page_requires_exact_publication() {
+        for kind in listed_kinds() {
+            stored_page_publication_for(kind).await;
+        }
+    }
+
+    async fn stored_page_publication_for(kind: ApprovedKind) {
         for signed in [false, true] {
             for mode in [
                 "authentic",
                 "missing",
                 "edited",
                 "fault",
-                "inventory",
+                "unready",
                 "committed",
             ] {
                 let commits = matches!(mode, "authentic" | "committed");
                 let (mut f, _files) = if signed {
-                    let (f, files) = signed_fixture();
+                    let (f, files) = signed_fixture_of(kind);
                     (f, Some(files))
                 } else {
-                    (Fixture::new(), None)
+                    (Fixture::of(kind), None)
                 };
                 let _published = publish(&mut f, true).await;
                 let authentic = strictly_attested_without_consent(&f);
@@ -1157,7 +1252,7 @@ mod tests {
                     _ => {}
                 }
                 replace(changed);
-                let mut unready = (mode == "inventory").then(UnreadableSiblingProfile::plant);
+                let mut unready = (mode == "unready").then(UnreadableSiblingProfile::plant);
                 let (listener, browser) = Browser::start(&f, signed).await;
                 let fault =
                     (mode == "fault").then(|| arm_accounting_fault(COMMIT_FAULT_AFTER_PREPARED));

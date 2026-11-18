@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use super::super::*;
+    use crate::common::unenforced_fixture::listed_kinds;
     use stellar_agent_core::audit_log::{
         BindingCheck, MAX_EVIDENCE_ENTRIES, test_helpers::seed_reserved_evidence,
     };
@@ -27,13 +28,18 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn approve_reacquires_before_presence() {
-        for mode in ["inventory", "capacity", "corrupt", "mismatch"] {
-            let fixture = fixture(&format!("approve-reserve-{mode}"));
-            let entry = fixture.payment(300_000);
+        for kind in listed_kinds() {
+            approve_reacquires_for(kind).await;
+        }
+    }
+
+    async fn approve_reacquires_for(kind: ApprovedKind) {
+        for mode in ["unready", "capacity", "corrupt", "mismatch"] {
+            let fixture = fixture(&format!("approve-reserve-{mode}-{}", kind.tag()));
+            let entry = fixture.entry(kind, 300_000);
             park(&fixture, &entry);
-            let _enabled =
-                ConsentEvidenceEnforcementGuard::new(fixture.name(), ApprovedKind::Payment);
-            let _unready = (mode == "inventory").then(UnreadableSiblingProfile::plant);
+            let _enabled = ConsentEvidenceEnforcementGuard::new(fixture.name(), kind);
+            let _unready = (mode == "unready").then(UnreadableSiblingProfile::plant);
             initialize(&fixture);
             if mode == "capacity" {
                 let access = stellar_agent_network::keyring::keyed_audit_access(
@@ -103,10 +109,16 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn approve_publication_failure_recovers_the_original_grant() {
-        let fixture = fixture("approve-publication-recovery");
-        let entry = fixture.payment(300_000);
+        for kind in listed_kinds() {
+            approve_publication_failure_for(kind).await;
+        }
+    }
+
+    async fn approve_publication_failure_for(kind: ApprovedKind) {
+        let fixture = fixture(&format!("approve-publication-recovery-{}", kind.tag()));
+        let entry = fixture.entry(kind, 300_000);
         let pending = park(&fixture, &entry);
-        let _enabled = ConsentEvidenceEnforcementGuard::new(fixture.name(), ApprovedKind::Payment);
+        let _enabled = ConsentEvidenceEnforcementGuard::new(fixture.name(), kind);
         initialize(&fixture);
         let _presence = driver::install(driver::fixture_credential());
         let fault = arm_accounting_fault(COMMIT_FAULT_AFTER_PREPARED);
@@ -142,12 +154,17 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn approve_recovery_reacquires_before_publication() {
-        for mode in ["inventory", "corrupt"] {
-            let fixture = fixture(&format!("approve-recovery-reacquire-{mode}"));
-            let entry = fixture.payment(300_000);
+        for kind in listed_kinds() {
+            approve_recovery_reacquires_for(kind).await;
+        }
+    }
+
+    async fn approve_recovery_reacquires_for(kind: ApprovedKind) {
+        for mode in ["unready", "corrupt"] {
+            let fixture = fixture(&format!("approve-recovery-reacquire-{mode}-{}", kind.tag()));
+            let entry = fixture.entry(kind, 300_000);
             park(&fixture, &entry);
-            let _enabled =
-                ConsentEvidenceEnforcementGuard::new(fixture.name(), ApprovedKind::Payment);
+            let _enabled = ConsentEvidenceEnforcementGuard::new(fixture.name(), kind);
             initialize(&fixture);
             let _presence = driver::install(driver::fixture_credential());
             let fault = arm_accounting_fault(COMMIT_FAULT_AFTER_PREPARED);
@@ -159,7 +176,7 @@ mod tests {
                     .consent_publication
                     .is_some()
             );
-            let _unready = (mode == "inventory").then(UnreadableSiblingProfile::plant);
+            let _unready = (mode == "unready").then(UnreadableSiblingProfile::plant);
             if mode == "corrupt" {
                 for suffix in [".evidence.0", ".evidence.1"] {
                     let mut path =
@@ -183,10 +200,16 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn published_approve_repeat_does_no_proof_or_commit_work() {
-        let fixture = fixture("approve-publication-repeat");
-        let entry = fixture.payment(300_000);
+        for kind in listed_kinds() {
+            published_approve_repeat_for(kind).await;
+        }
+    }
+
+    async fn published_approve_repeat_for(kind: ApprovedKind) {
+        let fixture = fixture(&format!("approve-publication-repeat-{}", kind.tag()));
+        let entry = fixture.entry(kind, 300_000);
         park(&fixture, &entry);
-        let _enabled = ConsentEvidenceEnforcementGuard::new(fixture.name(), ApprovedKind::Payment);
+        let _enabled = ConsentEvidenceEnforcementGuard::new(fixture.name(), kind);
         initialize(&fixture);
         let _presence = driver::install(driver::fixture_credential());
         assert_eq!(
@@ -211,5 +234,52 @@ mod tests {
         assert_eq!(std::fs::read(window.path()).unwrap(), before);
         assert_eq!(driver::ceremonies().len(), 1);
         assert_eq!(consent_rows(fixture.profile()).len(), 1);
+    }
+
+    /// The `approve --id` rows of the activation matrix: each listed kind
+    /// runs under the compiled kind list, with the fixture's opt-outs
+    /// dropped and no enforcement guard. An unready scope refuses before
+    /// presence; a ready scope publishes the consent with direct delivery.
+    #[tokio::test]
+    #[serial]
+    async fn activation_matrix_approve_rows() {
+        use stellar_agent_network::policy_state::approvals::delivery_enforced;
+        for kind in listed_kinds() {
+            for ready in [false, true] {
+                let mut fixture = fixture(&format!(
+                    "approve-matrix-{}-{}",
+                    kind.tag(),
+                    u8::from(ready)
+                ));
+                fixture.enforce_listed();
+                assert!(
+                    delivery_enforced(fixture.name(), kind),
+                    "{kind:?}: the compiled kind list enforces"
+                );
+                let entry = fixture.entry(kind, 300_000);
+                park(&fixture, &entry);
+                initialize(&fixture);
+                let _unready = (!ready).then(UnreadableSiblingProfile::plant);
+                let _presence = driver::install(driver::fixture_credential());
+                let (code, result) = invoke(fixture.name(), &entry.approval_nonce, false).await;
+                let record = record(&fixture, &entry.approval_nonce);
+                if ready {
+                    assert_eq!(code, 0, "{kind:?}: {result}");
+                    assert_eq!(
+                        record.consent.unwrap().delivery,
+                        Some(ConsentDeliveryV1::direct_anchored(record.id)),
+                        "{kind:?}: the published consent holds its delivery"
+                    );
+                } else {
+                    assert_eq!(code, 1, "{kind:?}: {result}");
+                    assert_eq!(
+                        result["error"]["code"], "audit.outbox_evidence_unusable",
+                        "{kind:?}: an unready scope refuses"
+                    );
+                    assert!(driver::ceremonies().is_empty(), "{kind:?}");
+                    assert!(record.consent.is_none(), "{kind:?}");
+                }
+            }
+        }
     }
 }

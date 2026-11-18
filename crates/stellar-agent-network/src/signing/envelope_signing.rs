@@ -1001,11 +1001,13 @@ mod tests {
         const OTHER_SEED: [u8; 32] = [0x3b; 32];
 
         /// An unsigned mainnet envelope and an audit writer the authorization's
-        /// proof holds.
+        /// proof holds. The unkeyed log holds no consent evidence, so the
+        /// fixture profile opts out of every kind's enforcement.
         struct Case {
             _dir: TempDir,
             writer: AuditWriterHandle,
             unsigned: SignedTestEnvelope,
+            _unenforced: Vec<crate::policy_state::approvals::ConsentEvidenceDisableGuard>,
         }
 
         impl Case {
@@ -1018,6 +1020,10 @@ mod tests {
                     _dir: dir,
                     writer,
                     unsigned: fixtures::unsigned_envelope(),
+                    _unenforced:
+                        crate::policy_state::approvals::ConsentEvidenceDisableGuard::every_kind(
+                            "fixture",
+                        ),
                 }
             }
 

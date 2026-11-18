@@ -103,7 +103,9 @@ fn put(entry: &KeyringEntryRef, text: &str) {
 /// The unsigned version 2 policy body of the mainnet profile `name` at
 /// `sequence`, bound to `endpoint_host` and the digest of
 /// [`ENABLEMENT_NONCE`], admitting `credentials` as approval credentials,
-/// with one require-approval payment rule to [`ALLOWED_DESTINATION`].
+/// with one require-approval payment rule to [`ALLOWED_DESTINATION`], then
+/// one require-approval claim rule and one trust line rule for `USD` of
+/// that issuer.
 #[must_use]
 pub fn policy_body_for(
     name: &str,
@@ -156,6 +158,20 @@ pub fn policy_body_with_origin(
         "]".to_owned(),
         "decision = \"require_approval\"".to_owned(),
         "allow_opaque_signing = false".to_owned(),
+        "ttl_secs = 3600".to_owned(),
+        String::new(),
+        "[[rules]]".to_owned(),
+        "match = { tool = \"stellar_claim\", chain = \"stellar:mainnet\" }".to_owned(),
+        "criteria = [{ kind = \"rate_limit\", window = \"1d\", max_calls = 10 }]".to_owned(),
+        "decision = \"require_approval\"".to_owned(),
+        "ttl_secs = 3600".to_owned(),
+        String::new(),
+        "[[rules]]".to_owned(),
+        "match = { tool = \"stellar_trustline\", chain = \"stellar:mainnet\" }".to_owned(),
+        format!(
+            "criteria = [{{ kind = \"asset_allowlist\", assets = [\"USD:{ALLOWED_DESTINATION}\"] }}, {{ kind = \"rate_limit\", window = \"1d\", max_calls = 10 }}]"
+        ),
+        "decision = \"require_approval\"".to_owned(),
         "ttl_secs = 3600".to_owned(),
     ]
     .join("\n");
@@ -438,6 +454,92 @@ impl MainnetConsentFixture {
             super::process_uid_for_attestation().expect("process uid"),
             ttl_ms,
         )
+    }
+
+    /// An unattested approval of `kind` that lives `ttl_ms` from now: the
+    /// payment of [`Self::payment`], a claim of a 10-stroop XLM balance, a
+    /// trust line of 10 stroops to `USD` issued by [`ALLOWED_DESTINATION`],
+    /// or the x402 transfer of [`Self::x402`]. The policy body holds a
+    /// require-approval rule for each classic kind.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the process UID cannot be read.
+    #[must_use]
+    pub fn entry(&self, kind: super::witness::ApprovedKind, ttl_ms: u64) -> PendingApproval {
+        use super::witness::ApprovedKind;
+        let source = stellar_strkey::ed25519::PublicKey([1; 32]).to_string();
+        let uid = || super::process_uid_for_attestation().expect("process uid");
+        match kind {
+            ApprovedKind::Payment => self.payment(ttl_ms),
+            ApprovedKind::Claim => super::fixtures::claim_pending(
+                &source,
+                [3; 32],
+                Some(("XLM", 10)),
+                100,
+                7,
+                uid(),
+                ttl_ms,
+            ),
+            ApprovedKind::Trustline => super::fixtures::trustline_pending(
+                &source,
+                "USD",
+                ALLOWED_DESTINATION,
+                Some(10),
+                100,
+                7,
+                uid(),
+                ttl_ms,
+            ),
+            ApprovedKind::X402Payment => Self::x402(ttl_ms),
+        }
+    }
+
+    /// An unattested mainnet x402 approval without a home domain that lives
+    /// `ttl_ms` from now: a transfer of 10 units of the asset contract
+    /// `[3; 32]` from [`Self::x402_payer`] to the contract `[5; 32]`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the process UID cannot be read.
+    #[must_use]
+    pub fn x402(ttl_ms: u64) -> PendingApproval {
+        use stellar_xdr::{
+            ContractId, Hash, Int128Parts, InvokeContractArgs, ScAddress, ScVal,
+            SorobanAuthorizedFunction, SorobanAuthorizedInvocation,
+        };
+        let contract = |byte| ScVal::Address(ScAddress::Contract(ContractId(Hash([byte; 32]))));
+        let root = SorobanAuthorizedInvocation {
+            function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+                contract_address: ScAddress::Contract(ContractId(Hash([3; 32]))),
+                function_name: "transfer".try_into().expect("function name"),
+                args: vec![
+                    contract(4),
+                    contract(5),
+                    ScVal::I128(Int128Parts { hi: 0, lo: 10 }),
+                ]
+                .try_into()
+                .expect("arguments"),
+            }),
+            sub_invocations: vec![].try_into().expect("no sub-invocations"),
+        };
+        PendingApproval::new_x402_pending(
+            &sha2::Sha256::digest(crate::profile::caip2::MAINNET_PASSPHRASE.as_bytes()).into(),
+            &root,
+            None,
+            super::process_uid_for_attestation().expect("process uid"),
+            ttl_ms,
+        )
+        .expect("x402 entry")
+    }
+
+    /// The paying contract of [`Self::x402`].
+    #[must_use]
+    pub fn x402_payer() -> String {
+        stellar_strkey::Contract([4; 32])
+            .to_string()
+            .as_str()
+            .to_owned()
     }
 
     /// An unattested intent-digest payment of 10 stroops to

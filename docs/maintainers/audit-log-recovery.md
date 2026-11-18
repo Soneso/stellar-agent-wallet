@@ -577,10 +577,11 @@ Unreserved compatibility rows audit without creating live evidence.
 
 **Integrated admission and publication.** An integrated request is presented only after its committed pending record holds a reservation.
 Admission requires a readiness proof of the whole owner scope from stored state, then explicit owner initialization, then the reservation.
-Readiness refuses with `owner scope shared or unreadable` when a sibling profile names an audit scope coordinate or a profile file cannot be read.
+Readiness refuses with `owner scope shared or unreadable` when a sibling profile names an audit scope coordinate, or a profile file or the profiles directory cannot be read.
 It refuses with `live grant without delivery facts` while the verified window holds a live consent of an enforced kind without delivery facts.
-Such a grant ends at its execution expiry, or at once with `stellar-agent approve revoke --id <NONCE> --profile <NAME>`; readiness never revokes it.
-Readiness takes no window lock and writes nothing, so a concurrent older binary on the same store can still record such a grant.
+Such a grant ends at its execution expiry against the greater of wall time and the evidence floor, or at the end of its operation.
+It also ends at once with `stellar-agent approve revoke --id <NONCE> --profile <NAME>`; readiness never revokes it.
+Readiness takes no window lock and writes nothing to the window, so a concurrent older binary on the same store can still record such a grant.
 A grant held only in the inbox, without a window record, is outside the proof and refuses at use for an enforced kind.
 A retry reuses the committed record's nonce, signed clocks, and facts; a refused presentation keeps the record and its slot.
 Integrated consent succeeds only after the window commit holds the receipt, the authenticated sink, and the exact queued reference.
@@ -593,8 +594,8 @@ Queued success reports `audit.outbox_queued` at once and never waits for deliver
 The CLI confirmation routes for payment, account creation, claim, and trustline use the shared kind capability.
 When enabled, they reserve before inbox insertion, summary display, and presence.
 The audited pending open borrows the held writer; an existing request reacquires its slot through the keyed outbox without that writer.
-Both paths refuse an unready scope, uninitialized evidence, and unresolved migration pins.
-Every production kind capability remains disabled.
+Both paths refuse an unready scope, uninitialized evidence with `consent evidence not initialized`, and unresolved migration pins with `unresolved migration pin`.
+All four production kind capabilities are enabled: payment, which covers account creation, claim, trustline, and x402 payment.
 
 CLI publication verifies the original receipt and handoff under policy admission.
 It releases the writer, inbox, and admission before the window commit, and returns a witness or success only after that commit.
@@ -608,6 +609,7 @@ These are the fresh, repeated, raced, consumed-assertion retry, and stored-page 
 Before the handoff of an uncommitted consent, the listener reacquires the reservation and checks the inventory, and a failure refuses and commits no consent.
 
 The MCP payment, account creation, claim, trustline, and both x402 producers select publication through the same kind capability.
+The x402 payment capability is enabled, so both x402 tools reserve, publish, and consume through the integrated route.
 When enabled, an MCP producer opens or selects the committed record and reserves before it stores the inbox entry or returns an approval block.
 The audited open borrows the held value audit writer, and the entry is stored only after that writer is released.
 A conflicting open answers with the committed winner's entry and never stores the loser.
@@ -723,7 +725,7 @@ The consumer requires `consent_at <= max(wall_time, evidence_floor) < execution_
 MCP verifies proof before reading delivery status and hides integrity refusals behind its uniform approval-required response.
 Only proven missing membership exposes `approval.consent_undelivered` and its generation and row.
 Witness-free Allow performs no delivery-status or evidence query.
-All four production kind capabilities are disabled; metadata never enables enforcement.
+All four production kind capabilities are enabled, and metadata never enables enforcement.
 Activation requires every producer to reserve before ceremony and publish authenticated sink metadata before exposing a grant, plus complete lifecycle and inventory integration.
 Recoverable storage and publication errors retry the existing grant without another ceremony.
 

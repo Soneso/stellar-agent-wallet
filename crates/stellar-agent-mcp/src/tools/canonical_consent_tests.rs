@@ -8,6 +8,11 @@ fn canonical_shared_producer_consent_uses_full_subject() {
     use stellar_agent_core::approval::{IntentAsset, IntentPayload, MemoFact, fixtures};
     let f = Fixture::new(|raw| raw);
     let server = &f.server;
+    // The legacy-attested shared producer runs unenforced for every kind.
+    let _unenforced =
+        stellar_agent_network::policy_state::approvals::ConsentEvidenceDisableGuard::every_kind(
+            &server.profile_name_for_approval(),
+        );
     for kind in 1..4 {
         let source = f.envelope.source();
         let destination = f.envelope.destination();

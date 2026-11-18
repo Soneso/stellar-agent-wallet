@@ -2626,8 +2626,9 @@ adopts only migration pins that a live grant's queued reference matches
 exactly; any other pin refuses.
 
 The CLI confirmation and existing-record `approve --id` routes select integrated
-publication through the same kind capability as consumption. All capabilities
-remain disabled. Enabled confirmations reserve before inserting or showing a
+publication through the same kind capability as consumption. All four kind
+capabilities are enabled: payment, claim, trustline, and x402 payment.
+Enabled confirmations reserve before inserting or showing a
 request; existing-record approval reacquires through the keyed outbox before
 presence. Strict consent carries its reservation into a queued append.
 Verification uses the held policy admission, then releases writer, inbox, and

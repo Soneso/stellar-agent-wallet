@@ -814,6 +814,11 @@ mod tests {
             PendingApprovalStore, mainnet_fixtures::MainnetConsentFixture,
         };
         let fixture = MainnetConsentFixture::new("main");
+        // The unkeyed log serves the operator-open flag, not a published consent.
+        let _unpublished =
+            stellar_agent_network::policy_state::approvals::ConsentEvidenceDisableGuard::every_kind(
+                fixture.name(),
+            );
         let entry = fixture.payment(600_000);
         let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
         store

@@ -277,9 +277,12 @@ mod authorized {
     const EXPIRATION_LEDGER: u32 = 1_000;
     const OTHER_SEED: [u8; 32] = [0x3b; 32];
 
+    /// A fixture profile whose unkeyed log holds no consent evidence; it
+    /// opts out of every kind's enforcement, so no evidence floor is read.
     struct Case {
         _dir: TempDir,
         writer: AuditWriterHandle,
+        _unenforced: Vec<crate::policy_state::approvals::ConsentEvidenceDisableGuard>,
     }
 
     impl Case {
@@ -288,7 +291,14 @@ mod authorized {
             let writer = Arc::new(Mutex::new(
                 AuditWriter::open(dir.path().join("audit.jsonl"), None).unwrap(),
             ));
-            Self { _dir: dir, writer }
+            Self {
+                _dir: dir,
+                writer,
+                _unenforced:
+                    crate::policy_state::approvals::ConsentEvidenceDisableGuard::every_kind(
+                        "fixture",
+                    ),
+            }
         }
 
         /// A Soroban intent authorization over the `transfer` invocation

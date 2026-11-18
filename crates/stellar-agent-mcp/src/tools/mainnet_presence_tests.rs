@@ -174,6 +174,13 @@ mod producers {
         }
     }
 
+    /// Both x402 producers run under the compiled kind capabilities. A
+    /// commit fault removes the unattested inbox orphan of the intent. A
+    /// fault before the record commits answers `submission.record_unavailable`
+    /// and stores no record. A fault after the counter leaves the committed
+    /// record, and admission continues with it: the call answers `ok` with
+    /// that record's nonce and keeps its inbox entry. A retry answers with
+    /// the same record and leaves one inbox entry.
     #[tokio::test]
     #[serial_test::serial(keyring)]
     #[serial_test::serial]
@@ -182,7 +189,7 @@ mod producers {
         use super::super::x402_authenticated_mainnet_tests::{authenticated_policy, call_muxed};
         for authenticated in [false, true] {
             for fault in [COMMIT_FAULT_AFTER_PREPARED, COMMIT_FAULT_AFTER_COUNTER] {
-                let run = AuthenticatedRun::build(|raw| {
+                let run = AuthenticatedRun::production(|raw| {
                     require_approval_rules(
                         &authenticated_policy(&raw),
                         &[
@@ -228,10 +235,6 @@ mod producers {
                 first.business_id = args.business_id.clone();
                 let failed = call_muxed(&run, authenticated, first).await;
                 drop(crash);
-                assert_eq!(
-                    failed["error"]["code"], "submission.record_unavailable",
-                    "durable x402 errors retain their code: {failed}"
-                );
                 assert!(
                     stored_approval(&run.f, &orphan.approval_nonce).is_none(),
                     "x402 orphans are removed by intent digest"
@@ -243,9 +246,22 @@ mod producers {
                 let committed = status.find_by_operation(handle.id()).unwrap();
                 assert_eq!(committed.is_some(), fault == COMMIT_FAULT_AFTER_COUNTER);
                 if let Some(view) = &committed {
+                    assert_eq!(
+                        failed["ok"], true,
+                        "admission continues with the committed record: {failed}"
+                    );
+                    assert_eq!(
+                        failed["data"]["approval"]["approval_nonce"], view.record.nonce,
+                        "the answer names the committed record: {failed}"
+                    );
                     assert!(
                         stored_approval(&run.f, &view.record.nonce).is_some(),
                         "a committed open retains its inbox entry"
+                    );
+                } else {
+                    assert_eq!(
+                        failed["error"]["code"], "submission.record_unavailable",
+                        "an uncommitted open keeps the durable error code: {failed}"
                     );
                 }
                 let retry = call_muxed(&run, authenticated, args).await;
@@ -935,7 +951,7 @@ mod producers {
     #[serial_test::serial]
     async fn mcp_classic_requests_reserve_before_exposure() {
         for tool in [Tool::CreateAccount, Tool::Pay, Tool::Trustline, Tool::Claim] {
-            for mode in ["inventory", "legacy", "capacity", "reserved"] {
+            for mode in ["unready", "legacy", "capacity", "reserved"] {
                 let run = if mode == "legacy" {
                     ClassicRun::new(tool).await
                 } else {
@@ -944,7 +960,7 @@ mod producers {
                 let _published = publish_scope(
                     &run.f.server,
                     kind(tool),
-                    mode != "inventory",
+                    mode != "unready",
                     if mode == "capacity" {
                         MAX_SLOTS
                     } else {
@@ -1021,6 +1037,113 @@ mod producers {
                         "{tool:?} {mode}: only the open precedes the reservation"
                     );
                 }
+            }
+        }
+    }
+
+    /// Every approval kind is listed, and each enforces consent delivery at
+    /// every MCP route with no fixture override, so unlisting a kind fails
+    /// the first assertion by name. After each preparation, the scope's evidence holds
+    /// the record's slot. A legacy consent without delivery facts refuses
+    /// at commit and blocks the next request's readiness. A directly
+    /// delivered consent commits, and a dropped queued row refuses as
+    /// undelivered. Both x402 tools pay a delivered consent through the
+    /// Soroban continuation under the same rules.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn activation_matrix_requires_complete_paths() {
+        use stellar_agent_network::policy_state::approvals::{
+            ConsentEvidenceDisableGuard, consent_evidence_enforced, consent_evidence_outbox,
+        };
+        assert!(
+            !ConsentEvidenceDisableGuard::any_active(),
+            "the matrix runs with no disable guard"
+        );
+        for kind in [
+            ApprovedKind::Payment,
+            ApprovedKind::Claim,
+            ApprovedKind::Trustline,
+            ApprovedKind::X402Payment,
+        ] {
+            assert!(
+                consent_evidence_enforced(kind),
+                "{kind:?}: the kind is listed and enforces"
+            );
+        }
+        for tool in [Tool::Pay, Tool::CreateAccount, Tool::Claim, Tool::Trustline] {
+            for case in ["legacy", "direct", "dropped"] {
+                let run = ClassicRun::production(tool, case == "legacy").await;
+                let server = &run.f.server;
+                let record = status(&run)
+                    .find_by_nonce(&run.entry.approval_nonce)
+                    .unwrap()
+                    .expect("the preparation opens the record")
+                    .record;
+                let outbox = consent_evidence_outbox(
+                    server.security_profile(),
+                    &server.profile_name_for_approval(),
+                    server.audit_binding,
+                )
+                .unwrap();
+                assert!(
+                    outbox.evidence().unwrap().unwrap().holds_record(&record.id),
+                    "{tool:?} {case}: the producer reserves the record's slot"
+                );
+                if case == "legacy" {
+                    assert!(record.consent.unwrap().delivery.is_none(), "{tool:?}");
+                    let result = run.commit().await;
+                    assert_eq!(
+                        result["error"]["code"], "policy.approval_required",
+                        "{tool:?}: legacy consent refuses: {result}"
+                    );
+                    assert_eq!(run.seed_reads(), 0, "{tool:?}");
+                    assert!(run.control.sent().is_empty(), "{tool:?}");
+                    let (args, _) = fresh(&run);
+                    let refused = wire(&tool.prepare(server, &args).await);
+                    assert_eq!(
+                        refused["error"]["code"], "audit.outbox_evidence_unusable",
+                        "{tool:?}: {refused}"
+                    );
+                    assert!(
+                        refused["error"]["message"]
+                            .as_str()
+                            .unwrap()
+                            .contains("live grant without delivery facts"),
+                        "{tool:?}: readiness names the legacy grant: {refused}"
+                    );
+                } else {
+                    let dropped = case == "dropped";
+                    run.delivery_fixture(dropped, dropped);
+                    let result = run.commit().await;
+                    if dropped {
+                        assert_eq!(
+                            result["error"]["code"], "approval.consent_undelivered",
+                            "{tool:?}: {result}"
+                        );
+                        assert_eq!(run.seed_reads(), 0, "{tool:?}");
+                    } else {
+                        assert_eq!(result["ok"], true, "{tool:?}: {result}");
+                        assert!(run.seed_reads() > 0, "{tool:?}");
+                    }
+                }
+            }
+        }
+        for authenticated in [true, false] {
+            for case in ["legacy", "direct", "dropped"] {
+                let run = AuthenticatedRun::production(|raw| x402_approval_policy(&raw)).await;
+                let server = &run.f.server;
+                crate::tools::value_audit::require_value_audit_writer(
+                    server.security_profile(),
+                    &server.profile_name_for_approval(),
+                    server.audit_binding,
+                )
+                .unwrap()
+                .lock()
+                .unwrap()
+                .initialize_consent_evidence()
+                .unwrap();
+                x402_consent_route(&run, authenticated, case).await;
             }
         }
     }
@@ -1257,8 +1380,9 @@ mod producers {
     /// nothing. A reserved request keeps the home-domain subject, a dispatch
     /// under another home domain reserves another subject, and a retry at
     /// capacity answers with the same approval. The production capability
-    /// stays closed. The D5 message
-    /// path consumes the reserved record for its own operation.
+    /// is on for payment, claim, trustline, and x402 payment. The
+    /// authenticated message mint consumes the reserved record's delivered
+    /// consent for its own operation under enforcement.
     #[tokio::test]
     #[serial_test::serial(keyring)]
     #[serial_test::serial]
@@ -1273,12 +1397,12 @@ mod producers {
             ApprovedKind::X402Payment,
         ] {
             assert!(
-                !stellar_agent_network::policy_state::approvals::consent_evidence_enforced(kind),
-                "{kind:?}: the production capability stays closed"
+                stellar_agent_network::policy_state::approvals::consent_evidence_enforced(kind),
+                "{kind:?}: the production capability is on"
             );
         }
         for authenticated in [true, false] {
-            for mode in ["inventory", "capacity", "reserved"] {
+            for mode in ["unready", "capacity", "reserved"] {
                 let run = AuthenticatedRun::build(|raw| {
                     require_approval_rules(
                         &authenticated_policy(&raw),
@@ -1290,10 +1414,10 @@ mod producers {
                     )
                 })
                 .await;
-                let published = publish_scope(
+                let _published = publish_scope(
                     &run.f.server,
                     ApprovedKind::X402Payment,
-                    mode != "inventory",
+                    mode != "unready",
                     match mode {
                         "capacity" => MAX_SLOTS,
                         // The other home domain's dispatch takes one more slot.
@@ -1368,9 +1492,19 @@ mod producers {
                 if !authenticated {
                     continue;
                 }
-                // The message mint names the reserved record's operation.
-                drop(published);
-                let attestation = run.f.attest(&entry);
+                // The message mint names the reserved record's operation and
+                // runs under the scope's enforcement with a delivered consent.
+                let attestation = run.f.attest_unrecorded(&entry);
+                ClassicRun::deliver_consent(
+                    &run.f,
+                    &super::super::common::tests::mainnet::approval_business_id(&run.f, &nonce)
+                        .unwrap(),
+                    &nonce,
+                    ApprovedKind::X402Payment,
+                    "stellar_x402_authenticated_payment",
+                    false,
+                    false,
+                );
                 run.oracle_control
                     .latest_ledger_behind
                     .store(3, std::sync::atomic::Ordering::SeqCst);
@@ -1384,6 +1518,169 @@ mod producers {
                 );
             }
         }
+    }
+
+    /// Both x402 tools run their whole route under enforcement: the gate
+    /// accepts a directly delivered consent, the Soroban intent is used, and
+    /// the continuation derives the used final payload authorization from
+    /// it before the approval is tombstoned. A legacy consent without
+    /// delivery facts refuses before any intent, and a dropped queued row
+    /// refuses as undelivered.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn x402_soroban_continuation_runs_under_enforcement() {
+        for authenticated in [true, false] {
+            for case in ["direct", "legacy", "dropped"] {
+                let run = AuthenticatedRun::build(|raw| x402_approval_policy(&raw)).await;
+                let _published = publish_scope(&run.f.server, ApprovedKind::X402Payment, true, 0);
+                x402_consent_route(&run, authenticated, case).await;
+            }
+        }
+    }
+
+    /// Both x402 tool names require approval for 300 seconds.
+    fn x402_approval_policy(raw: &str) -> String {
+        super::super::common::tests::mainnet::require_approval_rules(
+            &super::super::x402_authenticated_mainnet_tests::authenticated_policy(raw),
+            &[
+                "stellar_x402_create_payment",
+                "stellar_x402_authenticated_payment",
+            ],
+            300,
+        )
+    }
+
+    /// Prepares an x402 request of `run` through the authenticated tool or
+    /// the plain one, checks that the scope's evidence holds the record's
+    /// slot, gives it a `case` consent, and pays. A `direct`
+    /// delivered consent pays through the used intent and its used Soroban
+    /// continuation. A `legacy` consent refuses before any intent and blocks
+    /// the next request's readiness; a `dropped` queued row refuses as
+    /// undelivered.
+    async fn x402_consent_route(run: &AuthenticatedRun, authenticated: bool, case: &str) {
+        use super::super::common::tests::mainnet::approval_business_id;
+        use super::super::x402_authenticated_mainnet_tests::{
+            assert_accepted, call_muxed, records,
+        };
+        let prepared = call_muxed(run, authenticated, run.args(HOME, None)).await;
+        assert_eq!(prepared["ok"], true, "{authenticated} {case}: {prepared}");
+        let nonce = prepared["data"]["approval"]["approval_nonce"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let entry = stored_approval(&run.f, &nonce).unwrap();
+        let server = &run.f.server;
+        let record = ApprovalStatus::new(&server.window_store, server.security_profile())
+            .find_by_nonce(&nonce)
+            .unwrap()
+            .expect("the preparation opens the record")
+            .record;
+        assert!(
+            stellar_agent_network::policy_state::approvals::consent_evidence_outbox(
+                server.security_profile(),
+                &server.profile_name_for_approval(),
+                server.audit_binding,
+            )
+            .unwrap()
+            .evidence()
+            .unwrap()
+            .unwrap()
+            .holds_record(&record.id),
+            "{authenticated} {case}: the producer reserves the record's slot"
+        );
+        let attestation = if case == "legacy" {
+            run.f.attest(&entry)
+        } else {
+            let attestation = run.f.attest_unrecorded(&entry);
+            ClassicRun::deliver_consent(
+                &run.f,
+                &approval_business_id(&run.f, &nonce).unwrap(),
+                &nonce,
+                ApprovedKind::X402Payment,
+                if authenticated {
+                    "stellar_x402_authenticated_payment"
+                } else {
+                    "stellar_x402_create_payment"
+                },
+                case == "dropped",
+                case == "dropped",
+            );
+            attestation
+        };
+        let approval = (nonce, attestation);
+        run.control.clear();
+        run.oracle_control.clear();
+        let paid = call_muxed(
+            run,
+            authenticated,
+            run.args(HOME, Some((&approval.0, &approval.1))),
+        )
+        .await;
+        if case != "direct" {
+            assert_eq!(
+                paid["error"]["code"],
+                if case == "legacy" {
+                    "policy.approval_required"
+                } else {
+                    "approval.consent_undelivered"
+                },
+                "{authenticated} {case}: {paid}"
+            );
+            assert!(
+                records(&run.f, "soroban").is_empty(),
+                "{authenticated} {case}: a refused consent mints no intent"
+            );
+            assert!(signings().is_empty(), "{authenticated} {case}");
+            if case == "legacy" {
+                let refused = call_muxed(run, authenticated, run.args(HOME, None)).await;
+                assert_eq!(
+                    refused["error"]["code"], "audit.outbox_evidence_unusable",
+                    "{authenticated}: {refused}"
+                );
+                assert!(
+                    refused["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("live grant without delivery facts"),
+                    "{authenticated}: readiness names the legacy grant: {refused}"
+                );
+            }
+            return;
+        }
+        if authenticated {
+            assert_accepted(run, &approval, &paid).await;
+            return;
+        }
+        assert_eq!(paid["ok"], true, "{paid}");
+        let intents = records(&run.f, "soroban");
+        assert_eq!(intents.len(), 1, "{intents:?}");
+        assert_eq!(intents[0]["state"], "used");
+        let submits = records(&run.f, "x402_submit");
+        assert_eq!(submits.len(), 1, "{submits:?}");
+        assert_eq!(submits[0]["state"], "used");
+        assert_eq!(
+            submits[0]["parent"], intents[0]["id"],
+            "the continuation names the used intent"
+        );
+        assert!(
+            is_consumed(&stored_approval(&run.f, &approval.0).unwrap()),
+            "the approval is tombstoned"
+        );
+        // The ended payment released the record's consent payload, so the
+        // durable verifier refuses the replayed proof as outside its execution
+        // window; the inbox tombstone does not answer a mainnet proof.
+        let minted = authorizations(&run.f).len();
+        let replay = call_muxed(run, false, run.args(HOME, Some((&approval.0, &approval.1)))).await;
+        assert_eq!(
+            replay["error"]["code"], "policy.approval_required",
+            "{replay}"
+        );
+        assert_eq!(
+            authorizations(&run.f).len(),
+            minted,
+            "the replay mints nothing"
+        );
     }
 
     /// Tears both evidence slots of `server`'s audit log and returns their

@@ -418,6 +418,7 @@ fn maintenance_keeps_live_outcomes_and_reads_nothing_unenforced() {
         );
         tombstone(&mut fx);
         drop(enabled);
+        let _unenforced = ConsentEvidenceDisableGuard::every_kind(fx.fixture.name());
         assert_eq!(
             consent_evidence_maintenance(&fx.store, fx.fixture.profile()).unwrap(),
             0,
@@ -433,9 +434,15 @@ fn maintenance_keeps_live_outcomes_and_reads_nothing_unenforced() {
     }
     // Without enforcement, maintenance reads no keyring entry at all.
     let fx = Fx::new(300_000);
+    let unenforced = ConsentEvidenceDisableGuard::every_kind(fx.fixture.name());
     assert_eq!(
         consent_evidence_maintenance(&fx.store, fx.fixture.profile()).unwrap(),
         0
+    );
+    drop(unenforced);
+    assert!(
+        consent_evidence_maintenance(&fx.store, fx.fixture.profile()).is_err(),
+        "the listed kinds enforce a profile without fixtures"
     );
     let _enabled = ConsentEvidenceEnforcementGuard::new(fx.fixture.name(), ApprovedKind::Payment);
     assert!(
@@ -714,11 +721,10 @@ fn continuation_after_floor(offset: i64) -> Result<MintedRecord, WindowStoreErro
     minted
 }
 
-/// Each approval kind, enabled by its production capability or by a
-/// fixture, makes the profile read the evidence floor: an Approval header
+/// Each approval kind is listed, and its production capability makes a
+/// profile without an override read the evidence floor: an Approval header
 /// on a record of that kind decides at a floor above wall time, and
-/// maintenance reads the evidence. A kind the production capability
-/// enables does so for a profile without fixtures.
+/// maintenance reads the evidence.
 #[test]
 #[serial]
 fn every_enforced_kind_reads_the_floor() {
@@ -731,14 +737,17 @@ fn every_enforced_kind_reads_the_floor() {
         ApprovedKind::X402Payment,
     ] {
         let mut fx = Fx::new(300_000);
+        fx.unpublished = None;
         let name = fx.fixture.name().to_owned();
         let _evidence = keyed_evidence(fx.fixture.profile(), &name);
         fx.open();
         fx.edit(|wire| wire.approvals.as_mut().unwrap().records[0].kind = kind);
         let now = fx.witness.consent_at_ms();
         advance_floor(fx.fixture.profile(), &name, now + 1_000);
-        let _enabled = (!consent_evidence_enforced(kind))
-            .then(|| ConsentEvidenceEnforcementGuard::new(&name, kind));
+        assert!(
+            consent_evidence_enforced(kind),
+            "{kind:?}: the kind is listed"
+        );
         assert!(enforces_any_kind(&name), "{kind:?}");
         #[cfg(feature = "mainnet-write")]
         assert_eq!(
@@ -778,7 +787,9 @@ fn lifecycle_protocol_states_activation_limits() {
 }
 
 /// A claim or consumption under a minted x402 authorization after another
-/// actor moves the floor to its expiry plus `offset`.
+/// actor moves the floor to its expiry plus `offset`. With `enforced` false
+/// the enable guard is dropped, so the x402 fixture's test opt-out decides
+/// and the use reads wall time instead of the floor.
 fn use_after_floor(
     step: &str,
     offset: i64,
@@ -870,6 +881,11 @@ fn use_after_floor(
     result
 }
 
+/// Under x402 enforcement, a claim or consumption of a minted authorization
+/// succeeds before the floor reaches its expiry and refuses at the expiry
+/// and after it. An unreadable floor is a storage error. The unenforced use
+/// past the floor succeeds; X402Payment is listed, so that half covers the
+/// x402 fixture's test opt-out, not a production state.
 #[test]
 #[serial]
 fn issued_authorization_cannot_outlive_the_floor() {

@@ -139,16 +139,32 @@ pub(crate) fn park_staged(
     stellar_agent_network::operation_entry::stage_pending(&mut entry, Some(intent), 120_000)
         .unwrap();
     let facts = pending_approval_facts(&entry, handle, intent.approved_kind(), [0; 32], 120_000);
-    match start_durable(
-        context,
-        &fixture.store_path(),
-        handle,
-        entry,
-        &facts,
-        PolicyDecision::RequireApproval,
-    )
-    .unwrap()
-    {
+    // An enforced kind parks as its integrated producer does: initialized
+    // evidence and a reservation before the inbox entry.
+    let start = if stellar_agent_network::policy_state::approvals::delivery_enforced(
+        context.profile_name(),
+        intent.approved_kind(),
+    ) {
+        start_integrated(
+            context,
+            &fixture.store_path(),
+            handle,
+            entry,
+            &facts,
+            PolicyDecision::RequireApproval,
+        )
+        .map(|(start, _)| start)
+    } else {
+        start_durable(
+            context,
+            &fixture.store_path(),
+            handle,
+            entry,
+            &facts,
+            PolicyDecision::RequireApproval,
+        )
+    };
+    match start.unwrap() {
         DurableStart::Ceremony(entry) => *entry,
         _ => panic!("fresh preparation"),
     }
@@ -163,8 +179,10 @@ async fn canonical_recovery_keeps_signed_clocks() {
     };
     for kind in 0..4 {
         for approve in [false, true] {
-            let (fixture, context, _) =
+            let (mut fixture, context, _) =
                 confirmation_fixture(&format!("canonical-clocks-{kind}-{approve}"));
+            // The listed kinds take the integrated route.
+            fixture.enforce_listed();
             let time = Arc::new(AtomicU64::new(clock_now().unwrap()));
             let read = time.clone();
             let _clock = stellar_agent_core::timefmt::test_clock::install(Arc::new(
@@ -184,20 +202,39 @@ async fn canonical_recovery_keeps_signed_clocks() {
             else {
                 panic!("fixture writer")
             };
-            stellar_agent_core::approval::attest_and_persist(
-                &mut store,
-                &entry,
-                &stellar_agent_core::approval::mainnet_fixtures::ATTESTATION_KEY,
-                &fixture.binding(),
-                stellar_agent_core::approval::Surface::Cli,
-                ConsentAudit::Writer(&mut writer.lock().unwrap()),
-                stellar_agent_core::approval::ConsentAuthorization::Mainnet {
-                    presence,
-                    policy: &policy,
-                },
-                |_, _| unreachable!(),
-            )
-            .unwrap();
+            // A listed kind is attested as its integrated producer attests,
+            // with the publication handoff its recovery requires.
+            let auth = stellar_agent_core::approval::ConsentAuthorization::Mainnet {
+                presence,
+                policy: &policy,
+            };
+            if stellar_agent_network::policy_state::approvals::consent_evidence_enforced(
+                intent.approved_kind(),
+            ) {
+                stellar_agent_core::approval::attest::attest_and_persist_with_row(
+                    &mut store,
+                    &entry,
+                    &stellar_agent_core::approval::mainnet_fixtures::ATTESTATION_KEY,
+                    &fixture.binding(),
+                    stellar_agent_core::approval::Surface::Cli,
+                    ConsentAudit::Writer(&mut writer.lock().unwrap()),
+                    auth,
+                    |_, _| unreachable!(),
+                )
+                .unwrap();
+            } else {
+                stellar_agent_core::approval::attest_and_persist(
+                    &mut store,
+                    &entry,
+                    &stellar_agent_core::approval::mainnet_fixtures::ATTESTATION_KEY,
+                    &fixture.binding(),
+                    stellar_agent_core::approval::Surface::Cli,
+                    ConsentAudit::Writer(&mut writer.lock().unwrap()),
+                    auth,
+                    |_, _| unreachable!(),
+                )
+                .unwrap();
+            }
             drop(store);
             if approve {
                 time.store(entry.expires_at_unix_ms + 1, Ordering::SeqCst);
@@ -222,9 +259,22 @@ async fn canonical_recovery_keeps_signed_clocks() {
                     .consent
                     .expect("approve recovery records canonical consent for every kind");
                 assert_eq!(consent.consent_at_ms, consent_at);
+                // Published recovery keeps the original sink from the
+                // verified handoff; compatibility recovery records it as
+                // recovered.
+                let enforced =
+                    stellar_agent_network::policy_state::approvals::consent_evidence_enforced(
+                        intent.approved_kind(),
+                    );
+                assert_eq!(consent.delivery.is_some(), enforced, "kind {kind}");
                 assert_eq!(
                     consent.payload.unwrap().row_provenance,
-                    Some(RowProvenance::Recovered)
+                    Some(if enforced {
+                        RowProvenance::Written
+                    } else {
+                        RowProvenance::Recovered
+                    }),
+                    "kind {kind}"
                 );
                 assert_eq!(
                     consent_rows(&context),
@@ -361,8 +411,10 @@ async fn canonical_consent_summary_and_completion() {
         .into_iter()
         .enumerate()
         {
-            let (fixture, context, _) =
+            let (mut fixture, context, _) =
                 confirmation_fixture(&format!("canonical-cli-{kind}-{memo_index}"));
+            // The listed kinds take the integrated route.
+            fixture.enforce_listed();
             let limit = if matches!(memo, MemoFact::None) {
                 0
             } else {
@@ -414,6 +466,13 @@ async fn canonical_consent_summary_and_completion() {
             assert_eq!(witness.subject(), *intent.digest().as_bytes());
             assert_eq!(witness.subject_kind(), SubjectKind::IntentDigest);
             let record = durable_record(&context, &handle).unwrap();
+            assert_eq!(
+                record.consent.as_ref().unwrap().delivery.is_some(),
+                stellar_agent_network::policy_state::approvals::consent_evidence_enforced(
+                    intent.approved_kind()
+                ),
+                "kind {kind}: the listed kind publishes delivery"
+            );
             assert_eq!(record.subject, *intent.digest().as_bytes());
             let consent = record.consent.expect("success follows durable consent");
             assert_eq!(
@@ -430,7 +489,10 @@ async fn canonical_consent_summary_and_completion() {
         }
     }
     for kind in 0..4 {
-        let (fixture, context, _) = confirmation_fixture(&format!("canonical-approve-{kind}"));
+        let (mut fixture, context, _) =
+            confirmation_fixture(&format!("canonical-approve-{kind}"));
+        // The listed kinds take the integrated route.
+        fixture.enforce_listed();
         let (intent, summary, handle) = staged(&fixture, &context, kind, MemoFact::Id(17), 0);
         let entry = park_staged(&fixture, &context, &intent, &summary, &handle);
         let _driver = driver::install(driver::fixture_credential());
@@ -444,9 +506,14 @@ async fn canonical_consent_summary_and_completion() {
         .await;
         let output = crate::common::render::take_rendered_for_test();
         assert_eq!(code, 0, "approve canonical stored subject: {output:?}");
-        assert!(
-            durable_record(&context, &handle).unwrap().consent.is_some(),
-            "approve success follows durable consent"
+        let consent = durable_record(&context, &handle).unwrap().consent;
+        assert!(consent.is_some(), "approve success follows durable consent");
+        assert_eq!(
+            consent.unwrap().delivery.is_some(),
+            stellar_agent_network::policy_state::approvals::consent_evidence_enforced(
+                intent.approved_kind()
+            ),
+            "kind {kind}: the listed kind publishes delivery"
         );
         assert_eq!(inbox(&fixture)[0].attestation_version, 6);
     }

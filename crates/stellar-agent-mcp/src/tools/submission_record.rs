@@ -1521,6 +1521,11 @@ mod tests {
             "window_chain",
         ] {
             let f = Fixture::new(|raw| raw);
+            // The legacy-attested witness runs unenforced for every kind.
+            let _unenforced =
+                stellar_agent_network::policy_state::approvals::ConsentEvidenceDisableGuard::every_kind(
+                    &f.server.profile_name_for_approval(),
+                );
             let witness = payment_witness(&f).await;
             let outcome = f
                 .server
