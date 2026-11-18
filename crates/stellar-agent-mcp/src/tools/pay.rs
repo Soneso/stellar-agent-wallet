@@ -428,7 +428,52 @@ pub(crate) fn parse_asset_and_amount(
     Ok((asset, amount))
 }
 
+/// Refuses a payment to a canonical C contract before any account read,
+/// approval, nonce, hold, or signing.
+///
+/// A contract transfer `envelope_xdr` refuses first, proven for `asset` on
+/// `chain`: `validation.contract_payment_invalid` without a valid `asset`,
+/// otherwise `validation.contract_payment_memo_unsupported` for an envelope
+/// memo, `validation.contract_payment_unavailable` once proven, and
+/// `validation.contract_payment_invalid` when not proven. A C `destination`
+/// then refuses with
+/// `validation.contract_payment_memo_unsupported` when `memo` is set, and
+/// otherwise with `validation.contract_payment_unavailable`.
+pub(crate) fn contract_payment_refusal(
+    chain: stellar_agent_core::profile::caip2::Caip2,
+    destination: &str,
+    memo: bool,
+    envelope_xdr: Option<&str>,
+    asset: Option<&Asset>,
+) -> Option<CallToolResult> {
+    use stellar_agent_core::sac_payment::{
+        SacPaymentContext, refuse_contract_destination, refuse_contract_transfer,
+    };
+    let context = asset.and_then(|asset| {
+        SacPaymentContext::new(
+            chain,
+            stellar_agent_network::operation_entry::intent_asset(asset),
+        )
+        .ok()
+    });
+    envelope_xdr
+        .map_or(Ok(()), |envelope| {
+            refuse_contract_transfer(envelope, context.as_ref())
+        })
+        .and_then(|()| refuse_contract_destination(destination, memo))
+        .err()
+        .map(|reason| super::common::ledger_err_result(&reason.into()))
+}
+
 impl StellarPayCommitArgs {
+    /// Whether the caller supplied any memo argument.
+    fn has_memo(&self) -> bool {
+        self.memo_text.is_some()
+            || self.memo_id.is_some()
+            || self.memo_hash_hex.is_some()
+            || self.memo_return_hex.is_some()
+    }
+
     /// Validates the caller's asset and amount through [`parse_asset_and_amount`].
     fn parse_asset_and_amount(&self) -> Result<(Asset, StellarAmount), rmcp::ErrorData> {
         parse_asset_and_amount(
@@ -857,6 +902,8 @@ impl WalletServer {
     /// - `chain_id` does not match the profile's configured chain.
     /// - `source` is not a valid G-strkey or `destination` is not a valid G or
     ///   M strkey.
+    /// - `destination` is a C contract (`validation.contract_payment_unavailable`,
+    ///   or `validation.contract_payment_memo_unsupported` with a memo).
     /// - `asset` cannot be parsed.
     /// - Multiple memo variants are provided simultaneously.
     /// - The SEP-29 check fails (`validation.memo_required`).
@@ -896,6 +943,10 @@ impl WalletServer {
                        (simulate step). Supports native XLM and non-native assets. \
                        The destination is a G or M address; an M address keeps its mux ID \
                        and ledger reads use its G base account. \
+                       A C contract destination refuses with \
+                       validation.contract_payment_unavailable, or \
+                       validation.contract_payment_memo_unsupported with any memo, before any \
+                       request; on mainnet the commit's admission refusals come first. \
                        Runs SEP-29 memo-required enforcement at simulate time on the primary RPC \
                        for a G destination; an M destination skips it. \
                        Returns {envelope_xdr, nonce, expires_at_unix_ms, simulation}. \
@@ -944,6 +995,19 @@ impl WalletServer {
         });
         // ── Validate strkeys: a G source and a G or M destination ────────────
         validate_g_strkey(&args.source, "source")?;
+        let memo_argument = args.memo_text.is_some()
+            || args.memo_id.is_some()
+            || args.memo_hash_hex.is_some()
+            || args.memo_return_hex.is_some();
+        if let Some(refusal) = contract_payment_refusal(
+            self.context.chain_id,
+            &args.destination,
+            memo_argument,
+            None,
+            None,
+        ) {
+            return Ok(refusal);
+        }
         let destination = validate_payment_destination(&args.destination, "destination")?;
 
         // ── Parse memo (mutual exclusivity check) ─────────────────────────────
@@ -1588,6 +1652,10 @@ impl WalletServer {
     /// - `chain_id` does not match the profile.
     /// - `source` is not a valid G-strkey or `destination` is not a valid G or
     ///   M strkey.
+    /// - `envelope_xdr` is a contract transfer or `destination` a C contract
+    ///   (`validation.contract_payment_unavailable`,
+    ///   `validation.contract_payment_memo_unsupported`, or
+    ///   `validation.contract_payment_invalid`; see `contract_payment_refusal`).
     /// - The nonce is expired, replayed, or HMAC-mismatched.
     /// - The re-built envelope diverges from `envelope_xdr`.
     /// - The signing key does not match the source account.
@@ -1657,6 +1725,15 @@ impl WalletServer {
             && let Err(result) = self.verify_mainnet_freshness(guard)
         {
             return Ok(result);
+        }
+        if let Some(refusal) = contract_payment_refusal(
+            self.context.chain_id,
+            &args.destination,
+            args.has_memo(),
+            Some(&args.envelope_xdr),
+            Some(&asset),
+        ) {
+            return Ok(refusal);
         }
 
         // ── Re-derive authoritative args from HMAC-bound envelope_xdr ────────
@@ -2231,28 +2308,6 @@ impl WalletServer {
             }
             Err(result) => Ok(result),
         }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Toolset-dispatch helper
-// ─────────────────────────────────────────────────────────────────────────────
-
-impl WalletServer {
-    /// Invoke `stellar_pay` (simulate step) by value, bypassing the rmcp
-    /// transport layer.
-    ///
-    /// Used by the toolset-invocation routing path (`tools/toolsets.rs`).
-    ///
-    /// # Errors
-    ///
-    /// Same as [`WalletServer::stellar_pay`].
-    pub(crate) async fn invoke_stellar_pay(
-        &self,
-        args: StellarPayArgs,
-        toolset: Option<ToolsetPreparationContext>,
-    ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.stellar_pay_impl(args, toolset).await
     }
 }
 

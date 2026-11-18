@@ -349,6 +349,23 @@ that limit refuses with `approval.store_error`. Run
 retained-expired consent cannot authorize another send. Retry with the same
 business ID to recover the stored result; an uncertain submission needs status
 reconciliation by its transaction hash, not a replacement payment.
+A crash between the mainnet window preparation and the spend of the
+authorization leaves the operation authorized and unsent. Retries and repeats
+then refuse `network.mainnet_authorization_refused` and send nothing until the
+authorization expires.
+
+A payment action to a C contract recipient refuses before the outer gate, the
+first-invoke grant, and any approval, nonce, or request. Its code is
+`validation.contract_payment_unavailable`, or
+`validation.contract_payment_memo_unsupported` when a memo is present. A
+`stellar_pay_commit` envelope holding one `transfer(Account, Contract, I128)`
+invocation is a payment. Without a valid `asset` argument it refuses with
+`validation.contract_payment_invalid`. Otherwise it refuses with
+`validation.contract_payment_memo_unsupported` when it carries a memo,
+`validation.contract_payment_unavailable` once proven for `asset`, and
+`validation.contract_payment_invalid` when not proven. On mainnet the
+admission, freshness, and chain refusals of the payment action come first; the
+contract refusal follows them.
 
 ### Grant and installation locks
 

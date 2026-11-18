@@ -120,6 +120,9 @@ fn store_error(error: ApprovalError) -> WalletError {
 }
 
 impl MainnetWriteSummary {
+    /// Summarizes a classic envelope for confirmation. A contract transfer
+    /// never reaches it: the payment verb refuses a contract recipient
+    /// before confirmation, and the classic decoder refuses its envelope.
     pub(crate) fn from_envelope(
         envelope_xdr: &str,
         consumer: MainnetConsumer,
@@ -2035,6 +2038,7 @@ pub(crate) mod tests {
                 &operation,
             )),
             restriction: None,
+            sac_payment_context: None,
         };
         assert_eq!(
             resolve_tx_sign(request(None))

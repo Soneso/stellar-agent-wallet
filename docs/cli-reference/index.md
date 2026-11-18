@@ -225,7 +225,7 @@ Read-only commands, `pay --build-only`, `claim --build-only`, `smart-account mig
 
 - The full pipeline and `--submit-only` check before the reservation reconcile. The full payment pipeline validates the asset and amount before endpoint identity and reservation reconciliation. Fee validation follows reconciliation.
 - `--build-only` checks before the fee and sequence reads.
-- `--sign-only` checks before the account reads of an envelope it decodes. It signs an envelope it cannot decode without any request.
+- `--sign-only` checks before the account reads of an envelope it decodes. It signs an envelope it cannot decode without any request. A contract transfer envelope refuses before any request instead.
 - `pool init --resume` makes no request when the profile already holds the pool or the checkpoint records its completion. Every other resume checks before its first read, whether or not it sends.
 
 Checks that need no request come first: argument, keyring, and profile validation, the structural mainnet refusal, and the relayer refusal. `pool init` also runs its audit pre-flight before the check. An endpoint refusal precedes every refusal that follows a read. These include a missing account or claim entry, a policy denial, the audit pre-flight of the other commands, and the amount, asset, and fee checks. It also precedes the reservation reconcile and its settlement. A `claim` or `trustline` refused at this early check carries no preview.

@@ -613,6 +613,51 @@ mod tests {
         );
     }
 
+    /// A third-party contract transfer keeps the opaque policy decision: a
+    /// denial refuses with the policy code, and an allowance reaches the
+    /// audit pre-flight. No contract payment refusal applies to this tool.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn contract_transfer_keeps_the_opaque_policy_decision() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().ok();
+        let transfer = crate::tools::sep43_effects::tests::contract_transfer();
+        for (deny, expected) in [
+            (true, "policy.deny.no_matching_rule"),
+            (false, "audit.chain_key_unavailable"),
+        ] {
+            let profile = Profile::builder_testnet(
+                "svc-s43tx-transfer",
+                "acct-s43tx-transfer",
+                "n-svc",
+                "n-acct",
+            )
+            .with_noop_engine()
+            .build();
+            let mut server =
+                crate::server::WalletServer::new(profile).expect("WalletServer::new in tests");
+            if deny {
+                server.policy_engine = std::sync::Arc::new(DenyEngine);
+            }
+            let result = server
+                .call_stellar_sep43_sign_transaction(Sep43SignTransactionArgs {
+                    chain_id: "stellar:testnet".to_owned(),
+                    transaction_xdr: transfer.clone(),
+                    network_passphrase: None,
+                    address: None,
+                    approval_nonce: None,
+                    approval_attestation: None,
+                })
+                .await
+                .expect("a business envelope");
+            let (code, _message, text) = crate::tools::common::assert_business_envelope(&result);
+            assert_eq!(code, expected, "{text}");
+        }
+    }
+
     /// An unminted audit chain key refuses BEFORE any signing: after the
     /// dispatch gate allows, the pre-flight fires ahead of the signer load,
     /// so no signature is ever produced and the wire code matches every

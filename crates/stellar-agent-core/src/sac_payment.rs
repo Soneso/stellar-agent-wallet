@@ -368,6 +368,47 @@ pub(crate) fn is_transfer_shaped(envelope_xdr: &str) -> bool {
     )
 }
 
+/// Refuses a payment request whose destination is a canonical C contract.
+///
+/// No payment surface executes a contract payment. Other destinations pass,
+/// and their own checks still apply.
+///
+/// # Errors
+/// `validation.contract_payment_memo_unsupported` when `memo` is set,
+/// otherwise `validation.contract_payment_unavailable`.
+pub fn refuse_contract_destination(destination: &str, memo: bool) -> Result<(), SacPaymentError> {
+    if !is_canonical_contract(destination) {
+        return Ok(());
+    }
+    Err(if memo {
+        SacPaymentError::MemoUnsupported
+    } else {
+        SacPaymentError::Unavailable
+    })
+}
+
+/// Refuses an envelope a payment surface evaluates as a contract transfer.
+///
+/// An envelope that is not one `transfer(Account, Contract, I128)`
+/// invocation passes. Such a transfer never falls back to opaque signing: it
+/// refuses with the verifier's reason, or once proven for `context`, with
+/// `Unavailable`.
+///
+/// # Errors
+/// The closed reason of [`verify_sac_payment`],
+/// `validation.contract_payment_invalid` without a context, and
+/// `validation.contract_payment_unavailable` for a verified transfer.
+pub fn refuse_contract_transfer(
+    envelope_xdr: &str,
+    context: Option<&SacPaymentContext>,
+) -> Result<(), SacPaymentError> {
+    if !is_transfer_shaped(envelope_xdr) {
+        return Ok(());
+    }
+    verify(envelope_xdr, context.ok_or(SacPaymentError::Invalid)?)?;
+    Err(SacPaymentError::Unavailable)
+}
+
 /// Proves a single classic-asset transfer from a G payer to a C recipient.
 ///
 /// This bounded offline inspection accepts signed or unsigned v1 envelopes.
@@ -380,31 +421,38 @@ pub fn verify_sac_payment(
     envelope_xdr: &str,
     context: &SacPaymentContext,
 ) -> Result<VerifiedSacPayment, WalletError> {
+    Ok(verify(envelope_xdr, context)?)
+}
+
+fn verify(
+    envelope_xdr: &str,
+    context: &SacPaymentContext,
+) -> Result<VerifiedSacPayment, SacPaymentError> {
     let TransactionEnvelope::Tx(envelope) = crate::envelope_decode::read_envelope(envelope_xdr)
         .map_err(|_| SacPaymentError::Invalid)?
     else {
-        return Err(SacPaymentError::Invalid.into());
+        return Err(SacPaymentError::Invalid);
     };
     let tx = envelope.tx;
     if tx.memo != Memo::None {
-        return Err(SacPaymentError::MemoUnsupported.into());
+        return Err(SacPaymentError::MemoUnsupported);
     }
     let (op, host, invoke, payer, recipient, amount) =
         transfer_parts(&tx).ok_or(SacPaymentError::Invalid)?;
     let AccountId(PublicKey::PublicKeyTypeEd25519(payer_key)) = payer;
     if tx.source_account != MuxedAccount::Ed25519(payer_key.clone()) {
-        return Err(SacPaymentError::Invalid.into());
+        return Err(SacPaymentError::Invalid);
     }
     if op
         .source_account
         .as_ref()
         .is_some_and(|source| source != &tx.source_account)
     {
-        return Err(SacPaymentError::Invalid.into());
+        return Err(SacPaymentError::Invalid);
     }
     let amount = i64::try_from(i128::from(amount)).map_err(|_| SacPaymentError::Invalid)?;
     if amount <= 0 {
-        return Err(SacPaymentError::Invalid.into());
+        return Err(SacPaymentError::Invalid);
     }
     let sac = context
         .canonical_asset()
@@ -413,16 +461,16 @@ pub fn verify_sac_payment(
     let invoked = crate::sc_address::scaddress_to_strkey(&invoke.contract_address)
         .map_err(|_| SacPaymentError::Invalid)?;
     if invoked != sac {
-        return Err(SacPaymentError::Invalid.into());
+        return Err(SacPaymentError::Invalid);
     }
     let [auth] = host.auth.as_slice() else {
-        return Err(SacPaymentError::Invalid.into());
+        return Err(SacPaymentError::Invalid);
     };
     if auth.credentials != SorobanCredentials::SourceAccount
         || auth.root_invocation.function != SorobanAuthorizedFunction::ContractFn(invoke.clone())
         || !auth.root_invocation.sub_invocations.is_empty()
     {
-        return Err(SacPaymentError::Invalid.into());
+        return Err(SacPaymentError::Invalid);
     }
     Ok(VerifiedSacPayment {
         context: context.clone(),

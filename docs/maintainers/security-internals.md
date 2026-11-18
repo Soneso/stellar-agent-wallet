@@ -20,9 +20,19 @@ reporting, and the default's measurement basis.
 
 `stellar_agent_core::sac_payment` provides offline inspection of a classic
 asset transfer from an unmuxed G source to a C recipient. These primitives
-grant no execution or signing authority. CLI and MCP payment routes retain
-their current admission rules. Offline approval records retain the context
-needed to verify the envelope again when they are displayed or used.
+grant no execution or signing authority. Offline approval records retain the
+context needed to verify the envelope again when they are displayed or used.
+
+Every payment surface refuses a contract payment before any account read,
+approval, grant, nonce, hold, signer, or request. A canonical C destination
+argument refuses through `refuse_contract_destination`. An envelope holding
+one `transfer(Account, Contract, I128)` invocation refuses through
+`refuse_contract_transfer`. The covered entries are MCP preparation, commit,
+the paired commit evaluation, both toolset payment actions, CLI full and
+build-only payments, CLI staged signing and submission, and the mainnet
+resolver for payment consumers. Mainnet mode and feature refusals keep their
+precedence. A staged transfer never reaches the opaque-signing posture. The
+SEP-43 transaction tools keep their own policy decision for the same envelope.
 
 | Interface | Contract |
 |---|---|
@@ -42,6 +52,9 @@ needed to verify the envelope again when they are displayed or used.
 | `ContractTransferFeeLimits { total: ContractTransferFeeCap }` | Holds the single supplied bound. |
 | `validate_sac_payment_data(payment: &VerifiedSacPayment, explicit_inclusion_bid_stroops: Option<u32>, limits: ContractTransferFeeLimits) -> Result<SacTransferFee, WalletError>` | Checks forward key allowances, restoration indices and fee arithmetic without simulation evidence. |
 | `SacTransferFee { total_stroops: u32, inclusion_bid_stroops: u32, resource_stroops: u32 }` | Returns the checked decomposition of the envelope fee. |
+| `refuse_contract_destination(destination: &str, memo: bool) -> Result<(), SacPaymentError>` | Refuses a canonical C destination: `MemoUnsupported` with a memo, otherwise `Unavailable`. Other text passes to its own checks. |
+| `refuse_contract_transfer(envelope_xdr: &str, context: Option<&SacPaymentContext>) -> Result<(), SacPaymentError>` | Passes envelopes that are not one transfer invocation. Otherwise returns the verifier's reason, `Invalid` without context, or `Unavailable` once verified. |
+| `TxSignRequest<'a>::sac_payment_context: Option<&'a SacPaymentContext>` | Proves a contract transfer for a payment consumer before the endpoint probe. `MainnetAuthorizationError::ContractPayment` keeps the closed code through the wallet and signing-path errors. Current callers pass `None`. |
 
 `VerifiedSacPayment` has private construction and no deserializer. It accepts
 signed envelopes for inspection without authenticating their signatures.
@@ -92,8 +105,9 @@ Compatibility covers existing G/M records read by this reader.
 Approval JSON, local and remote pages, and CLI summaries show the full C
 recipient. Available resource and inclusion fees accompany the total fee.
 An intent supplies its total cap; an envelope-only record supplies no cap or
-signed-policy origin. The mainnet transaction confirmation entry still requires
-a classic envelope. These offline primitives do not enable contract execution.
+signed-policy origin. The mainnet transaction confirmation entry requires a
+classic envelope because the payment verb refuses a contract recipient before
+confirmation. These offline primitives do not enable contract execution.
 
 Policy evaluation sees a Payment value leg. A G-only deny list does not list
 a C recipient; a mixed G/C list can. C recipients supply no account home-domain
@@ -1436,7 +1450,7 @@ The submit layer's check covers the bytes it sends, but the values in those byte
 
 - CLI `pay` and `claim` in every stage that reads, sponsored `accounts create`, `trustline`, and `pool init` build one `StellarRpcClient` per run. Its endpoint check runs immediately before the first request whose answer feeds a signature or a policy decision, and the send goes through it.
 - The MCP prepare tools `stellar_pay`, `stellar_create_account`, `stellar_trustline`, and `stellar_claim` check their client before its first read. The commit tools check the client they submit with before the sequence read, so the check is the first request on it.
-- `--sign-only` checks only when it decodes the envelope and reads the accounts its gate needs. An envelope it cannot decode is signed with no request.
+- `--sign-only` checks only when it decodes the envelope and reads the accounts its gate needs. An envelope it cannot decode is signed with no request. A `pay` envelope holding one `transfer(Account, Contract, I128)` invocation is refused instead, before any request. Without a valid `ASSET` the code is `validation.contract_payment_invalid`. Otherwise it is `validation.contract_payment_memo_unsupported` for an envelope memo, `validation.contract_payment_unavailable` once proven for `ASSET`, and `validation.contract_payment_invalid` when not proven.
 - A `pool init` resume makes no request when the profile already holds the pool or the checkpoint records its completion. Every other resume checks before its first read, whether or not it sends.
 
 Checks that need no request keep their place ahead of the endpoint check: argument, keyring, and profile validation, envelope decoding, the structural mainnet refusal, and the relayer refusal. The `pool init` audit pre-flight and the forced approval of a toolset-gated MCP pay commit without approval fields need no request either and come first. The payment asset and amount are validated before any request on the full CLI `pay` pipeline, on `stellar_pay`, and on every `stellar_pay_commit` route. On the full CLI `pay` pipeline, `--fee` is checked after the reconcile.

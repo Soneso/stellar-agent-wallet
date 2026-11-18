@@ -12,8 +12,8 @@
 //! Native 0 and Issued 1. Memo tags are None 0, Text 1, Id 2, Hash 3, Return 4.
 //! Integers occupy eight big-endian bytes, with signed values in two's
 //! complement and each u32 (the fee bound and an explicit inclusion bid)
-//! zero-extended. UTF-8 strings and byte
-//! arrays carry a four-byte big-endian byte length followed by their bytes.
+//! zero-extended. UTF-8 strings and byte arrays carry a four-byte big-endian
+//! byte length followed by their bytes.
 //! An option carries tag 0 for absence or tag 1 followed by its value.
 //!
 //! [`IntentDigest`] is SHA-256 of [`CLASSIC_INTENT_DIGEST_LABEL`] followed by

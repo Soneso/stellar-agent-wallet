@@ -417,6 +417,9 @@ pub enum MainnetAuthorizationError {
     /// authorization.
     #[error("{0}")]
     Accounting(AccountingRefusal),
+    /// A contract transfer refuses with its closed reason and wire code.
+    #[error("{0}")]
+    ContractPayment(stellar_agent_core::sac_payment::SacPaymentError),
 }
 
 /// A refusal of durable unlisted-recipient or native accounting, kept apart from
@@ -539,7 +542,9 @@ impl From<MainnetAuthorizationError> for WalletError {
     /// writes, `policy.total_epoch_*` for a total-budget epoch refusal,
     /// `policy.approval_required`, `policy.accounting_overflow` or
     /// `policy.accounting_invalid` for an unlisted or native accounting
-    /// refusal, and `network.mainnet_authorization_refused` for every refused
+    /// refusal, the closed `validation.contract_*` or
+    /// `validation.asset_contract_not_deployed` code for a contract transfer,
+    /// and `network.mainnet_authorization_refused` for every refused
     /// precondition. The precondition does not cross into the error: the
     /// caller logs it.
     fn from(error: MainnetAuthorizationError) -> Self {
@@ -553,6 +558,7 @@ impl From<MainnetAuthorizationError> for WalletError {
             }
             MainnetAuthorizationError::TotalEpoch(refusal) => refusal.validation_error().into(),
             MainnetAuthorizationError::Accounting(refusal) => refusal.validation_error().into(),
+            MainnetAuthorizationError::ContractPayment(reason) => reason.into(),
         }
     }
 }
@@ -602,6 +608,7 @@ impl From<MainnetAuthorizationError> for AuthorizedPathError {
             MainnetAuthorizationError::Accounting(refusal) => {
                 Self::Wallet(refusal.validation_error().into())
             }
+            MainnetAuthorizationError::ContractPayment(reason) => Self::Wallet(reason.into()),
         }
     }
 }

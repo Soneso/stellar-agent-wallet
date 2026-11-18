@@ -453,6 +453,7 @@ pub(crate) async fn sign_and_submit_classic(
                 store: &prepared.window,
                 operation: operation.map(stellar_agent_network::operation_entry::next_attempt_link),
                 restriction,
+                sac_payment_context: None,
             },
         )
         .await

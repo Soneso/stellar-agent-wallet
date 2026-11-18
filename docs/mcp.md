@@ -843,6 +843,20 @@ For `stellar_pay` and `stellar_pay_commit`:
 | `amount` | Use `"10 XLM"` for native or the exact, case-sensitive asset code for issued assets, such as `"10.5 USDC"` with `USDC:<issuer>`. |
 | `amount_in_stroops` | Raw base units without a unit label; mutually exclusive with `amount`. |
 
+A C contract destination refuses with `validation.contract_payment_unavailable`
+before any request, approval, or nonce; with a memo it refuses with
+`validation.contract_payment_memo_unsupported`. A commit envelope holding one
+`transfer(Account, Contract, I128)` invocation is a payment, not an unknown
+envelope. Without a valid `asset` argument it refuses with
+`validation.contract_payment_invalid`. Otherwise it refuses with
+`validation.contract_payment_memo_unsupported` when it carries a memo, with
+the unavailable code once proven for `asset` on the server's network, and with
+`validation.contract_payment_invalid` when not proven. On mainnet,
+`stellar_pay_commit` and the toolset payment actions answer the admission and freshness refusals
+(`network.mainnet_write_forbidden`) first; the contract refusal follows them.
+The SEP-43 transaction tools keep their own policy decision for such an
+envelope.
+
 | Tool | Purpose | Gating |
 | --- | --- | --- |
 | `stellar_pay` | Simulate a payment: build the Payment envelope, run the SEP-29 memo-required check, mint a single-use nonce. | No signing; no submission. Not annotated read-only (mints the single-use nonce the commit step consumes). |

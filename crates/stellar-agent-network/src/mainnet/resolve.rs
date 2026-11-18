@@ -176,6 +176,11 @@ pub struct TxSignRequest<'a> {
     /// end. The minted authorization owns it until submission starts;
     /// submission retains it until it returns.
     pub restriction: Option<super::restriction::ToolsetRestriction>,
+    /// The asset and network a contract transfer envelope is proven for.
+    /// Such an envelope refuses before any request: verified with
+    /// `validation.contract_payment_unavailable`, otherwise with its closed
+    /// contract payment reason. It carries no authority.
+    pub sac_payment_context: Option<&'a stellar_agent_core::sac_payment::SacPaymentContext>,
 }
 
 /// The network-bound invocation a Soroban payment authorizes.
@@ -1330,6 +1335,13 @@ mod enabled {
             TransactionEnvelope::TxFeeBump(_) => return Err(refused(P::FeeBumpRefused)),
             _ => return Err(refused(P::EnvelopeShape)),
         };
+        if decoder_tool == "stellar_pay_commit" {
+            stellar_agent_core::sac_payment::refuse_contract_transfer(
+                req.unsigned_envelope_xdr,
+                req.sac_payment_context,
+            )
+            .map_err(MainnetAuthorizationError::ContractPayment)?;
+        }
         let args = decode_authoritative_args(req.unsigned_envelope_xdr, decoder_tool).map_err(
             |error| {
                 *detail = Some(error.to_string());
@@ -2100,6 +2112,7 @@ mod tests {
             store: &f.window,
             operation: None,
             restriction: None,
+            sac_payment_context: None,
         }
     }
 
@@ -2434,6 +2447,88 @@ mod tests {
     );
     envelope_case!(operation_source_refuses, "operation_source", SourceAccount);
     envelope_case!(fee_above_cap_refuses, "fee", FeeAboveCap);
+
+    /// A contract transfer for a payment consumer refuses with its closed
+    /// reason before the endpoint, a record, a hold, or the signer, and the
+    /// reason keeps its wire code through both error adapters. A trustline
+    /// consumer keeps its shape refusal for the same envelope.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn contract_transfer_refuses_before_the_endpoint() {
+        use stellar_agent_core::approval::IntentAsset;
+        use stellar_agent_core::profile::caip2::Caip2;
+        use stellar_agent_core::sac_payment::{SacPaymentContext, SacPaymentError};
+        let f = ResolverFixture::new();
+        let server = f.server().await;
+        let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
+        let client = context.primary_client().unwrap();
+        let native = SacPaymentContext::new(Caip2::Mainnet, IntentAsset::Native).unwrap();
+        let envelope = TransactionEnvelope::Tx(
+            stellar_agent_core::approval::fixtures::sac_transfer(&native),
+        )
+        .to_xdr_base64(Limits::none())
+        .unwrap();
+        let approval = f.approval(&f.envelope, f.now, 600_000);
+        let authority = f.approval_authority(&approval);
+        for (sac_context, consumer, expected) in [
+            (
+                Some(&native),
+                MainnetConsumer::CliPay,
+                MainnetAuthorizationError::ContractPayment(SacPaymentError::Unavailable),
+            ),
+            (
+                None,
+                MainnetConsumer::McpPay,
+                MainnetAuthorizationError::ContractPayment(SacPaymentError::Invalid),
+            ),
+            (
+                Some(&native),
+                MainnetConsumer::CliTrustline,
+                MainnetAuthorizationError::Refused(P::EnvelopeShape),
+            ),
+        ] {
+            let before = f.wire();
+            let mut req = request(&f, &context, &client, &authority);
+            req.unsigned_envelope_xdr = &envelope;
+            req.consumer = consumer;
+            req.sac_payment_context = sac_context;
+            let error = resolve_tx_sign(req).await.unwrap_err();
+            assert_eq!(error, expected, "{consumer:?}");
+            assert_eq!(f.wire(), before, "{consumer:?} changed no record");
+        }
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "no endpoint request"
+        );
+        let reasons = [
+            SacPaymentError::Unavailable,
+            SacPaymentError::WitnessUnavailable,
+            SacPaymentError::AssetContractNotDeployed { context: native },
+            SacPaymentError::ArchivedEntry {
+                key_sha256: [7; 32],
+            },
+            SacPaymentError::MemoUnsupported,
+            SacPaymentError::FeeConsentRequired,
+            SacPaymentError::FeeExceeded,
+            SacPaymentError::Footprint,
+            SacPaymentError::Invalid,
+            SacPaymentError::SimulationInvalid,
+        ];
+        for reason in reasons {
+            let refusal = MainnetAuthorizationError::ContractPayment(reason.clone());
+            assert_eq!(
+                stellar_agent_core::WalletError::from(refusal.clone()).code(),
+                reason.code(),
+                "agent error"
+            );
+            let super::super::refusal::AuthorizedPathError::Wallet(path) =
+                super::super::refusal::AuthorizedPathError::from(refusal)
+            else {
+                panic!("{reason:?} is a wallet error on the signing path");
+            };
+            assert_eq!(path.code(), reason.code(), "signing path error");
+        }
+    }
 
     async fn endpoint_refusal(case: &str, expected: P) {
         use stellar_agent_test_support::{EchoIdResponder, signed_envelope::get_network_result};

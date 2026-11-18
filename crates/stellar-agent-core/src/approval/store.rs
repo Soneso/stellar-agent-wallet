@@ -1780,11 +1780,13 @@ where
     match opt {
         None => Ok(None),
         Some(s) if strkey_shaped(&s, b"GC", 56) || strkey_shaped(&s, b"M", 69) => Ok(Some(s)),
-        Some(_) => Err(serde::de::Error::custom(
-            "summary_to must have the shape of a G account, M address or C contract.",
-        )),
+        Some(_) => Err(serde::de::Error::custom(SUMMARY_TO_SHAPE_REASON)),
     }
 }
+
+/// Why a stored payment summary's destination does not load.
+const SUMMARY_TO_SHAPE_REASON: &str = "summary_to must have the shape of a G account, M address \
+     or C contract; repair the pending approval record.";
 
 /// Why a payment summary's destination refuses.
 const SUMMARY_TO_REASON: &str =
@@ -11563,7 +11565,8 @@ amount_max_stroops = 1000000
         let value = || serde_json::Value::String(format!("{MARKER}!"));
         assert_reason_exact(
             &deserialize_opt_summary_to(value()).unwrap_err().to_string(),
-            "summary_to must have the shape of a G account, M address or C contract.",
+            "summary_to must have the shape of a G account, M address or C contract; repair the \
+             pending approval record.",
             &[MARKER],
         );
         assert_reason_exact(

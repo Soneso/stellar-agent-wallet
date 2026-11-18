@@ -514,6 +514,7 @@ pub(super) async fn commit(f: &Fixture) {
         store: &window,
         operation: None,
         restriction: None,
+        sac_payment_context: None,
     })
     .await
     .unwrap();

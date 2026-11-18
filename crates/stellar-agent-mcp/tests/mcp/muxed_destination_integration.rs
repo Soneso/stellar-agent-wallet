@@ -27,7 +27,7 @@ use stellar_agent_test_support::xdr_fixtures::{
     account_entry_xdr_with_balance, account_ledger_key_xdr,
 };
 use stellar_xdr::{
-    Limits, MuxedAccount, MuxedAccountMed25519, OperationBody, PaymentOp, ReadXdr,
+    Limits, Memo, MuxedAccount, MuxedAccountMed25519, OperationBody, PaymentOp, ReadXdr,
     TransactionEnvelope, Uint256,
 };
 use wiremock::matchers::method;
@@ -706,6 +706,225 @@ async fn gated_route_keeps_the_full_id(fx: &Fixture, key: [u8; 32]) {
             (expected, other) => panic!("grant {granted}, first invoke {expected}: {other:?}"),
         }
     }
+}
+
+/// The base64 testnet transfer of one stroop of `asset` from the G account
+/// of key `[1; 32]` to the C contract of key `[2; 32]`, with `memo`.
+fn contract_transfer(asset: stellar_agent_core::approval::IntentAsset, memo: Memo) -> String {
+    let context = stellar_agent_core::sac_payment::SacPaymentContext::new(
+        stellar_agent_core::profile::caip2::Caip2::Testnet,
+        asset,
+    )
+    .unwrap();
+    let mut envelope = stellar_agent_core::approval::fixtures::sac_transfer(&context);
+    envelope.tx.memo = memo;
+    stellar_xdr::WriteXdr::to_xdr_base64(&TransactionEnvelope::Tx(envelope), Limits::none())
+        .unwrap()
+}
+
+/// The four memo arguments of the payment tools.
+const MEMO_FORMS: [&str; 4] = ["text", "id", "hash", "return"];
+
+/// Sets exactly the memo argument `form` names.
+fn with_memo(
+    form: &str,
+    text: &mut Option<stellar_agent_core::amount::McpMemoTextArgument>,
+    id: &mut Option<u64>,
+    hash: &mut Option<String>,
+    ret: &mut Option<String>,
+) {
+    match form {
+        "text" => *text = Some(serde_json::from_str(r#""note""#).unwrap()),
+        "id" => *id = Some(3),
+        "hash" => *hash = Some("ab".repeat(32)),
+        _ => *ret = Some("cd".repeat(32)),
+    }
+}
+
+/// The JSON memo argument of `form`, for toolset arguments.
+fn memo_json(form: &str) -> (&'static str, serde_json::Value) {
+    match form {
+        "text" => ("memo_text", "note".into()),
+        "id" => ("memo_id", 3.into()),
+        "hash" => ("memo_hash_hex", "ab".repeat(32).into()),
+        _ => ("memo_return_hex", "cd".repeat(32).into()),
+    }
+}
+
+/// The wire code of a business refusal, `ok` for a success, or the message
+/// of a protocol error.
+fn refusal_code(result: Result<rmcp::model::CallToolResult, rmcp::ErrorData>) -> String {
+    match result {
+        Ok(result) if result.is_error == Some(true) => json_of(&result)["error"]["code"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+        Ok(_) => "ok".to_owned(),
+        Err(error) => format!("protocol error: {}", error.message),
+    }
+}
+
+/// Every MCP payment route refuses a C recipient with its fixed code before
+/// any request, approval, grant, nonce, or send: direct preparation and
+/// commit, and both toolset payment actions. Invalid assets and non-C
+/// destinations keep their own refusals; a G preparation still succeeds.
+#[tokio::test]
+#[serial]
+async fn contract_recipients_refuse_on_every_mcp_payment_route() {
+    use stellar_agent_core::approval::IntentAsset;
+    const UNAVAILABLE: &str = "validation.contract_payment_unavailable";
+    const MEMO: &str = "validation.contract_payment_memo_unsupported";
+    const INVALID: &str = "validation.contract_payment_invalid";
+    let fx = Fixture::new();
+    let contract = format!("{}", stellar_strkey::Contract([2; 32]));
+    let issuer = g([0x77; 32]);
+    let usd = IntentAsset::Issued {
+        code: "USD".to_owned(),
+        issuer: issuer.clone(),
+    };
+    let toolsets = tempfile::TempDir::new().unwrap();
+    let approvals = tempfile::TempDir::new().unwrap();
+    let grants = approvals.path().join("grants.toml");
+    let rpc = endpoint(&[], Vec::new(), &[]).await;
+    let server = gated_server(&fx, &rpc, approvals.path(), &grants, toolsets.path());
+
+    let mut usd_args = pay_args(&contract);
+    usd_args.asset = format!("USD:{issuer}");
+    usd_args.amount = Some(serde_json::from_str(r#""1 USD""#).unwrap());
+    for (args, code) in [(pay_args(&contract), UNAVAILABLE), (usd_args, UNAVAILABLE)] {
+        let result = server.call_stellar_pay(args).await;
+        assert_eq!(refusal_code(result), code, "direct preparation");
+    }
+    for form in MEMO_FORMS {
+        let mut args = pay_args(&contract);
+        with_memo(
+            form,
+            &mut args.memo_text,
+            &mut args.memo_id,
+            &mut args.memo_hash_hex,
+            &mut args.memo_return_hex,
+        );
+        let result = server.call_stellar_pay(args).await;
+        assert_eq!(
+            refusal_code(result),
+            MEMO,
+            "direct preparation, {form} memo"
+        );
+    }
+    let mut bad_asset = pay_args(&contract);
+    bad_asset.asset = "USD:NOTANISSUER".to_owned();
+    assert!(
+        server.call_stellar_pay(bad_asset).await.is_err(),
+        "asset first"
+    );
+    for other in [contract.to_lowercase(), format!("{contract}A")] {
+        assert!(
+            server.call_stellar_pay(pay_args(&other)).await.is_err(),
+            "{other} keeps the address refusal"
+        );
+    }
+
+    let commit = |envelope: String, asset: &str| {
+        let mut args = commit_args(
+            &pay_args(&contract),
+            &serde_json::json!({
+                "nonce": "A".repeat(64), "expires_at_unix_ms": 9_999_999_999_u64,
+                "envelope_xdr": envelope,
+            }),
+        );
+        args.asset = asset.to_owned();
+        args.amount = None;
+        args.amount_in_stroops = Some("1".to_owned());
+        args
+    };
+    for (envelope, asset, code) in [
+        (
+            contract_transfer(IntentAsset::Native, Memo::None),
+            "native",
+            UNAVAILABLE,
+        ),
+        (
+            contract_transfer(usd.clone(), Memo::None),
+            &format!("USD:{issuer}") as &str,
+            UNAVAILABLE,
+        ),
+        (
+            contract_transfer(usd.clone(), Memo::None),
+            "native",
+            INVALID,
+        ),
+        (
+            contract_transfer(IntentAsset::Native, Memo::Id(7)),
+            "native",
+            MEMO,
+        ),
+    ] {
+        let result = server
+            .call_stellar_pay_commit(commit(envelope, asset))
+            .await;
+        assert_eq!(refusal_code(result), code, "direct commit {asset}");
+    }
+    // A classic envelope does not refuse first, so the memo argument decides.
+    let classic = envelope_to(MuxedAccount::Ed25519(Uint256([3; 32])));
+    for form in MEMO_FORMS {
+        let mut args = commit(classic.clone(), "native");
+        with_memo(
+            form,
+            &mut args.memo_text,
+            &mut args.memo_id,
+            &mut args.memo_hash_hex,
+            &mut args.memo_return_hex,
+        );
+        let result = server.call_stellar_pay_commit(args).await;
+        assert_eq!(refusal_code(result), MEMO, "direct commit, {form} memo");
+
+        let (key, value) = memo_json(form);
+        let mut proposal = gated("", &contract);
+        proposal.action = "stellar_pay".to_owned();
+        proposal.args = serde_json::json!({
+            "source": source_g(), "destination": contract, "asset": "native",
+            "amount": "1 XLM",
+        });
+        proposal.args[key] = value.clone();
+        let result = server.call_stellar_toolset_invoke(proposal).await;
+        assert_eq!(refusal_code(result), MEMO, "toolset proposal, {form} memo");
+
+        let mut sign = gated(&classic, &contract);
+        sign.args[key] = value;
+        let result = server.call_stellar_toolset_invoke(sign).await;
+        assert_eq!(
+            refusal_code(result),
+            MEMO,
+            "toolset sign-payment, {form} memo"
+        );
+    }
+    for (envelope, code) in [
+        (
+            contract_transfer(IntentAsset::Native, Memo::None),
+            UNAVAILABLE,
+        ),
+        (contract_transfer(usd, Memo::None), INVALID),
+    ] {
+        let result = server
+            .call_stellar_toolset_invoke(gated(&envelope, &contract))
+            .await;
+        assert_eq!(refusal_code(result), code, "toolset sign-payment");
+    }
+
+    assert!(
+        rpc.received_requests().await.unwrap().is_empty(),
+        "no request precedes a contract refusal"
+    );
+    assert!(
+        !approvals.path().join(format!("{}.toml", fx.name)).exists(),
+        "no approval or first-invoke gate is queued"
+    );
+    assert!(!grants.exists(), "no grant is read or written");
+
+    let key = [0xA8; 32];
+    let rpc = endpoint(&[g(key)], Vec::new(), &[]).await;
+    let server = gated_server(&fx, &rpc, approvals.path(), &grants, toolsets.path());
+    prepare(&server, &pay_args(&g(key))).await;
 }
 
 /// Destination reads use the base. Prepare and commit read

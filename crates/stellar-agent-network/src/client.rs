@@ -1446,6 +1446,38 @@ mod tests {
         ECHOED_URL, ENDPOINT, ENDPOINT_AUTHORITY, ERROR_OBJECTS, assert_scrubbed, call_error,
     };
 
+    /// The enabled send observer counts in a marked home and panics with its
+    /// message in an unmarked one, which then holds no counter file.
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    #[serial_test::serial]
+    fn send_observer_counts_in_a_marked_home_and_panics_in_an_unmarked_one() {
+        use stellar_agent_test_support::env_guard::ScopedEnvVar;
+        let _enabled = ScopedEnvVar::new("STELLAR_AGENT_TEST_COUNT_SENDS", Some("1".as_ref()));
+        let home = tempfile::tempdir().unwrap();
+        let counter = home.path().join("payment-send-attempts");
+        let _home = ScopedEnvVar::new("STELLAR_AGENT_HOME", Some(home.path().as_os_str()));
+        let payload = std::panic::catch_unwind(record_send_attempt_for_test)
+            .expect_err("an unmarked home panics");
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied());
+        assert_eq!(
+            message,
+            Some("the send observer requires an isolated acceptance home"),
+            "unmarked home panic message"
+        );
+        assert!(!counter.exists(), "unmarked home holds no counter");
+        stellar_agent_test_support::sandbox::mark_sandbox(home.path()).unwrap();
+        record_send_attempt_for_test();
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap(),
+            "send\n",
+            "marked home counts the send"
+        );
+    }
+
     #[tokio::test]
     async fn wallet_simulate_retries_busy() {
         use stellar_baselib::{

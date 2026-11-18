@@ -110,6 +110,23 @@ pub(crate) fn bump_sequence(source: [u8; 32]) -> String {
     ))
 }
 
+/// The testnet native asset contract transfer of one stroop from the G
+/// account of key `[1; 32]` to the C contract of key `[2; 32]`, the
+/// envelope the payment tools refuse.
+pub(crate) fn contract_transfer() -> String {
+    use stellar_xdr::WriteXdr as _;
+    let context = stellar_agent_core::sac_payment::SacPaymentContext::new(
+        stellar_agent_core::profile::caip2::Caip2::Testnet,
+        stellar_agent_core::approval::IntentAsset::Native,
+    )
+    .unwrap();
+    stellar_xdr::TransactionEnvelope::Tx(stellar_agent_core::approval::fixtures::sac_transfer(
+        &context,
+    ))
+    .to_xdr_base64(stellar_xdr::Limits::none())
+    .unwrap()
+}
+
 /// An approval proof: the nonce and the attestation.
 pub(crate) type Proof = (Option<String>, Option<String>);
 

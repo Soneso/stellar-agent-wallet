@@ -32,6 +32,21 @@ MPP is separate from the wallet's x402 v2 support. x402 accepts an x402
 Payment challenge bound to the request context and returns an HTTP or native MCP
 Payment credential. Neither path sends the merchant request.
 
+The classic payment tools are separate from both. `stellar_pay`,
+`stellar_pay_commit`, the toolset payment actions, and CLI `pay` refuse a C
+contract recipient with `validation.contract_payment_unavailable`, or with
+`validation.contract_payment_memo_unsupported` when a memo is set. An envelope
+holding one contract transfer refuses on CLI `--sign-only` and
+`--submit-only`, MCP and toolset commit, the paired commit evaluation, and the
+mainnet resolver. Without a valid asset its code is
+`validation.contract_payment_invalid`. Otherwise its code is
+`validation.contract_payment_memo_unsupported` when it carries a memo,
+`validation.contract_payment_unavailable` once proven for the asset, and
+`validation.contract_payment_invalid` when not proven. The paired evaluation
+has no asset, so it answers `validation.contract_payment_invalid`. On mainnet the mode, feature,
+admission, and freshness refusals come first; the contract refusal follows
+them and precedes any account read, approval, nonce, signing, or request.
+
 ## Request binding
 
 The host must give the wallet both the challenge and the exact request context.

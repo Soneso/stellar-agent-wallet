@@ -584,6 +584,7 @@ pub(crate) async fn authorize_and_submit(
         store: &window_store,
         operation: operation.map(next_attempt_link),
         restriction: None,
+        sac_payment_context: None,
     })
     .await
     .map_err(|e: MainnetAuthorizationError| {

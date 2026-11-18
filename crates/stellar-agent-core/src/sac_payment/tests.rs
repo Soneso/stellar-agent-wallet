@@ -980,36 +980,6 @@ fn b1_contextual_policy_facts() {
 const POLICY_NOW_MS: u64 = 1_700_000_000_000;
 
 #[test]
-#[serial_test::serial]
-fn contract_presence_binds_active_chain() {
-    use crate::approval::presence::issue_mainnet_presence;
-    use crate::approval::{AttestationBinding, fixtures, mainnet_fixtures::MainnetConsentFixture};
-    let fixture = MainnetConsentFixture::new("contract-presence");
-    let binding = AttestationBinding::new(fixture.name(), "stellar:mainnet");
-    let policy = fixture.current_policy();
-    for chain in [Caip2::Mainnet, Caip2::Testnet] {
-        let entry = fixtures::sac_payment_pending(chain, IntentAsset::Native);
-        let result = issue_mainnet_presence(
-            &entry,
-            &binding,
-            &policy,
-            "http://localhost:49152",
-            entry.created_at_unix_ms,
-            std::time::Instant::now(),
-        );
-        if chain == Caip2::Mainnet {
-            assert!(result.is_ok(), "matching presence chain: {result:?}");
-        } else {
-            assert_eq!(
-                result.unwrap_err().code(),
-                "approval.binding_mismatch",
-                "active presence chain"
-            );
-        }
-    }
-}
-
-#[test]
 fn contract_summary_wire_facts() {
     use crate::approval::{ClassicIntent, IntentBase, IntentView, MemoFact};
     let entry = crate::approval::fixtures::sac_payment_pending(Caip2::Testnet, IntentAsset::Native);
@@ -1272,4 +1242,80 @@ fn b1_contextual_reopen_refuses_tampering() {
             "{case}"
         );
     }
+}
+
+#[test]
+fn payment_surfaces_refuse_contract_payments() {
+    const UNAVAILABLE: &str = "validation.contract_payment_unavailable";
+    const MEMO: &str = "validation.contract_payment_memo_unsupported";
+    let destination = |text: &str, memo| refuse_contract_destination(text, memo).err();
+    assert_eq!(
+        destination(RECIPIENT, false),
+        Some(SacPaymentError::Unavailable),
+        "C"
+    );
+    assert_eq!(
+        destination(RECIPIENT, true),
+        Some(SacPaymentError::MemoUnsupported),
+        "C memo"
+    );
+    for other in [PAYER, &RECIPIENT.to_lowercase(), "", "W"] {
+        assert_eq!(
+            destination(other, true),
+            None,
+            "{other:?} keeps its own checks"
+        );
+    }
+    let transfer = |envelope: &str, context: Option<&SacPaymentContext>| {
+        refuse_contract_transfer(envelope, context)
+            .err()
+            .map(|reason| reason.code())
+    };
+    for asset in [IntentAsset::Native, issued("USD", 7)] {
+        let ctx = context(asset);
+        assert_eq!(
+            transfer(&b64(&fixture(&ctx)), Some(&ctx)),
+            Some(UNAVAILABLE),
+            "verified"
+        );
+        assert_eq!(
+            transfer(&b64(&fixture(&ctx)), None),
+            Some(INVALID),
+            "no context"
+        );
+        let mut memo = fixture(&ctx);
+        memo.tx.memo = Memo::Id(1);
+        assert_eq!(transfer(&b64(&memo), Some(&ctx)), Some(MEMO), "memo");
+    }
+    let native = context(IntentAsset::Native);
+    let usd = context(issued("USD", 7));
+    assert_eq!(
+        transfer(&b64(&fixture(&native)), Some(&usd)),
+        Some(INVALID),
+        "wrong asset"
+    );
+    let mut custom = fixture(&native);
+    edit_invoke(&mut custom, |invoke| {
+        invoke.contract_address = ScAddress::Contract(ContractId(Hash([9; 32])));
+    });
+    assert_eq!(
+        transfer(&b64(&custom), Some(&native)),
+        Some(INVALID),
+        "custom token"
+    );
+    let payment = classic(OperationBody::Payment(PaymentOp {
+        destination: MuxedAccount::Ed25519(Uint256([2; 32])),
+        asset: Asset::Native,
+        amount: 5,
+    }));
+    assert_eq!(
+        transfer(&payment, Some(&native)),
+        None,
+        "classic payment passes"
+    );
+    assert_eq!(
+        transfer("not xdr", None),
+        None,
+        "undecodable keeps its classic error"
+    );
 }
