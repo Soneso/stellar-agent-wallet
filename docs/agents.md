@@ -59,7 +59,7 @@ the server exposes.
 
 Every tool requires a `chain_id` argument (the CAIP-2 chain id, e.g.
 `stellar:testnet`) that must match the active profile. `stellar_x402_parse_receipt`,
-`stellar_toolset_list`, and `stellar_approval_status` take none, and the two SEP-43 read tools make it
+`stellar_toolset_list`, `stellar_approval_status`, and `stellar_signed_intents_list` take none, and the two SEP-43 read tools make it
 optional. The five `stellar_mpp_*` tools reject a `chain_id` field as unknown;
 they act on the chain of the profile the server was started with. `stellar_toolset_invoke` accepts an optional `chain_id` that it forwards
 to the routed tool, which may itself require it (a routed `stellar_balances` or
@@ -121,11 +121,13 @@ resubmits.
 
 Each tool is read-only, signs without submitting, or signs and submits; the
 [catalog](mcp.md#tool-catalog) marks every tool so the classification stays in
-one place. Only the sign-and-submit tools move funds and run the full gate: the
-two-phase payment verbs, the DeFi tools, and
-`stellar_sep43_sign_and_submit_transaction`. Read-only tools are safe to call
-freely; sign-without-submit tools (the other SEP-43 signing tools and
-`stellar_x402_create_payment`) return a signature the caller forwards elsewhere.
+one place. Every tool except `stellar_dex_quote`, `stellar_x402_parse_receipt`,
+and the three MPP record and status tools passes the policy gate. The
+sign-and-submit tools also send the transaction: the two-phase payment verbs,
+the DeFi tools, and `stellar_sep43_sign_and_submit_transaction`. Read-only
+tools change no wallet state. The sign-without-submit tools are the other
+SEP-43 signing tools, `stellar_sep53_sign_message`, and both x402 payment
+tools. They return a signature the caller forwards elsewhere.
 
 ## The two-phase signing pattern
 
@@ -153,6 +155,8 @@ with a `*_commit`).
    re-derives the authoritative destination, asset, and amount from the envelope
    (never from re-supplied arguments), verifies the nonce, signs from the
    keyring, and submits. On success `data` carries `tx_hash` and `ledger`.
+   On mainnet, pass the same `business_id` to the build call and the commit
+   call; another id refuses with `operation.business_id_mismatch`.
 
 If the policy engine allows the action outright, the commit signs and submits
 directly. If it returns `RequireApproval`, the commit is held until the operator
@@ -164,14 +168,20 @@ A `RequireApproval` verdict (a V1 policy rule or any toolset-routed payment)
 routes through the operator. The handshake:
 
 1. The build/simulate call returns an `approval` block carrying an
-   `approval_nonce` instead of executing.
+   `approval_nonce` instead of executing. For a toolset-routed payment under
+   an Allow policy, the commit queues the approval instead. It answers
+   `policy.approval_required` without the nonce, and the operator reads the
+   nonce from `stellar-agent approve list`.
 2. The operator runs `stellar-agent approve --id <approval_nonce> --profile <name>` in a trusted
-   context, reviews the wallet-rendered summary, and consents. The command
+   context and reviews the wallet-rendered summary. On testnet the operator
+   consents at the terminal. On mainnet the operator completes a passkey
+   ceremony with a credential from the owner-signed policy. The command
    returns an `approval_attestation`, an HMAC blob bound to that exact envelope.
 3. The operator relays the `approval_attestation` to the agent over a trusted
    channel. The agent re-invokes the commit with `approval_nonce` and
-   `approval_attestation` added. The wallet verifies the attestation against its
-   keyring-held key, then signs and submits.
+   `approval_attestation` added. On testnet the wallet verifies the attestation
+   with its keyring-held key. On mainnet it verifies the passkey consent under
+   the current signed policy. It then signs and submits.
 
 An agent limited to MCP cannot mint the attestation; the approval key stays in
 the operator's keyring.
@@ -180,11 +190,12 @@ A commit that reaches the gate without a valid attestation is refused with
 forged, or expired, so a caller learns nothing from the failure). Treat
 `policy.approval_required` as "ask the operator to approve, then retry the commit"
 and never as a transient error to retry blindly.
+Call `stellar_approval_status` with `approval_id` to read the approval's state.
+The call consumes nothing and grants no signing authority.
 
 ## Mainnet actions and refusal recovery
 
-Builds from this repository and releases from v0.1.0-alpha.14 on carry
-`mainnet-write`. The server admits
+Default builds enable the `mainnet-write` feature. The server admits
 `stellar_pay_commit`, `stellar_claim_commit`, `stellar_create_account_commit`,
 and `stellar_trustline_commit` after operator setup. An Allow rule signs
 without an approval, and a RequireApproval rule needs a verified approval;
@@ -201,7 +212,10 @@ CLI engine construction preserves enablement errors and
 `policy.engine_selection_unsigned`. Enrolled Noop owner discovery preserves keyring codes.
 Other failures use `policy.engine_unavailable` or `trustline.policy_engine_unavailable`.
 Evaluation failure uses `policy.engine_required`; unknown decisions use
-`policy.unexpected_decision`. Policy denials retain `policy.deny.*`.
+`policy.unexpected_decision`. On mainnet, an accounting error keeps
+`policy.accounting_invalid` or `policy.accounting_overflow`.
+Policy denials retain `policy.deny.*`. A balance floor denial retains
+`account.unread`, `account.stale`, or `account.floor_refused`.
 
 After `network.mainnet_authorization_refused`, report the refusal to the operator.
 Do not switch networks. A retry requires fresh preparation and fresh approval.
@@ -248,8 +262,10 @@ first use with no matching grant returns `toolset.first_invoke_approval_required
 with a nonce for the operator to approve. And for `sign-payment` an
 unconditional per-action approval additionally fires on every toolset-routed
 payment regardless of policy. To drive a payment, invoke `action: "stellar_pay"`
-to build the envelope, then `action: "stellar_pay_commit"` with `args` carrying
-the `envelope_xdr` (and `nonce`, `expires_at_unix_ms`) returned by that build. See
+to build the envelope, then `action: "stellar_pay_commit"`. Its `args` carry the
+same `chain_id`, `source`, `destination`, `asset`, and amount as the build. They
+also carry the `envelope_xdr`, `nonce`, and `expires_at_unix_ms` that the build
+returned. See
 [toolsets.md](toolsets.md) and the runnable [examples](../examples/toolsets/README.md).
 
 ## Agent-payments (x402)
@@ -262,6 +278,7 @@ the settlement receipt. See [protocols.md](protocols.md) for the flow.
 
 Under RequireApproval, call either payment tool without approval arguments to obtain pending approval.
 After CLI approval, repeat the same request with both approval arguments.
+On mainnet both calls carry the same `business_id`.
 Keep the authenticated home domain unchanged. Mainnet Allow without proof pays in one call.
 
 ## Sponsored MPP charges
@@ -345,7 +362,7 @@ boundary.
 
 **Deny rules.** Use MCP for agent actions and a separate operator approval
 surface. Deny rules apply in every mode. The list covers authority, keys,
-policy state, and `pool init`.
+policy state, the mainnet signer and installation bindings, and `pool init`.
 Only `pool init` signs transactions with the agent's enrolled MCP signer
 without evaluating wallet policy; it creates channel accounts with sponsored
 reserves and zero starting balances.
@@ -362,6 +379,10 @@ reserves and zero starting balances.
       "Bash(stellar agent profile enroll-signer *)",
       "Bash(stellar-agent profile enroll-owner-key *)",
       "Bash(stellar agent profile enroll-owner-key *)",
+      "Bash(stellar-agent profile bind-signer *)",
+      "Bash(stellar agent profile bind-signer *)",
+      "Bash(stellar-agent profile enable-mainnet *)",
+      "Bash(stellar agent profile enable-mainnet *)",
       "Bash(stellar-agent profile enroll-rpc-credential *)",
       "Bash(stellar agent profile enroll-rpc-credential *)",
       "Bash(stellar-agent profile sign-policy *)",
@@ -439,9 +460,9 @@ Reset refuses while an intent remains open or retained. A closed and pruned inte
 
 An open intent without an authenticated purpose permanently blocks reset for this profile. Continue with a new profile.
 
-Retained intents close only through the profile's stored secondary endpoint. Add one to the profile.
+When an intent is open and the profile stores no `secondary_rpc_url`, the intent view reports that retained intents cannot close and asks for one.
 
-The profile's stored endpoint configuration is unreadable. Retained intents close only through stored endpoints that load.
+When an intent is open and the stored endpoint configuration cannot load, the intent view reports that only stored endpoints that load close retained intents.
 
 ### x402 owner approval
 
@@ -451,5 +472,6 @@ On testnet, a clock reading before approval creation refuses the approval withou
 When the policy requires approval, the x402 tools queue the payment and return
 `data.approval`. The owner approves with `stellar-agent approve`.
 Repeat with `approval_nonce` and `approval_attestation` to pay once.
+On mainnet each x402 payment call also needs `business_id`.
 Queueing signs nothing, reads no key, and runs no SEP-10.
 On mainnet, Allow without proof pays in one call; a supplied proof must verify.

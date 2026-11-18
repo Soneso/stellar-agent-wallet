@@ -6,9 +6,10 @@
   a grant, and releases both before it queues a first-invoke approval. A held
   lock refuses outbox-loss recovery with `approval.writer_locked` before it
   revokes anything. The resolver and the grant writer return the library
-  result `toolset.coordination_busy`. MCP nests it in an internal error whose
-  message starts with `toolset.enforcement_error:`, and `approve` nests it in
-  the detail of `approval.grant_persist`.
+  result `toolset.coordination_busy`. An MCP toolset payment call answers it as
+  that business code. An MCP toolset rule-creation call nests it in an internal
+  error whose message starts with `toolset.enforcement_error:`, and `approve`
+  nests it in the detail of `approval.grant_persist`.
   Existing grants keep matching, and the resolver returns the verified grant's
   identity and stored expiry. A library recheck verifies that exact grant and
   installation under shared locks, creates no file, and never renews expiry.

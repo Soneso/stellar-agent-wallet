@@ -187,7 +187,9 @@ Install pipeline:
 9. Atomically rename staging into place and write the pin record, authenticated
    under the installation's pin key.
 
-The install and the uninstall hold the toolsets directory lock (`.toolsets.lock`).
+Install, forced reinstall, and uninstall hold the toolsets directory lock
+(`.toolsets.lock`) exclusively. The gated resolver holds the same lock shared.
+It refuses without waiting while the exclusive lock is held.
 The first install mints the pin key in the platform keyring.
 
 Verification proves origin and integrity, not content safety. The extractor and
@@ -202,8 +204,8 @@ lifetime. The restored state is one the operator installed.
 
 ### The attestation gate
 
-A toolset that declares a key-touching capability (currently `sign-payment`)
-requires a `ToolsetAttestation` signed by an auditor key in a **separate** auditor
+`sign-payment` and `sign-rule-create` are key-touching capabilities.
+A toolset that declares either one requires a `ToolsetAttestation` signed by an auditor key in a **separate** auditor
 trust set (`auditor-trust.txt`), distinct from the publisher trust set
 (`trust.txt`). The gate fires after the `name == package` identity cross-check
 and before the atomic rename. It checks the attestation's `package`, `version`,
@@ -216,8 +218,10 @@ the publisher signature tag, so neither signature can be replayed as the other.
 An absent or empty auditor trust set fails closed for a key-touching toolset. The
 only sanctioned bypass is `--override-attestation`, which logs a structured
 warning and proceeds; no environment variable or config default skips the gate.
-Even under override the `sign-payment` capability is persisted inert, and the
-runtime first-invoke grant and payment policy gates still apply at signing time.
+Under override, a key-touching capability (`sign-payment` or `sign-rule-create`)
+is persisted inert, and its runtime first-invoke grant still applies at signing
+time. A `sign-payment` commit still meets the payment policy gates. A
+`sign-rule-create` commit still requires the per-proposal operator attestation.
 
 The install records its result as one of `attested`, `overridden`, or
 `not-required`, reflecting what the gate actually did rather than what flags were
@@ -233,7 +237,7 @@ A successful install writes a pin record holding `package`, `version`, `shasum`,
 mandatory SHA-256 digest of the installed `TOOLSET.md`. The record is
 `{"v":3, <fields>, "tag":"<64 hex>"}`, the tag an HMAC-SHA256 over every field under
 the installation's pin key. A record that does not verify (edited, written under
-another key, or written by an earlier build) grants nothing and
+another key, or carrying no authentication tag) grants nothing and
 refuses with `toolset.pin_unverifiable`; the operator uninstalls the toolset and
 installs it again.
 
@@ -252,8 +256,9 @@ file. As additional tamper-evidence, both resolver tiers re-read the on-disk
 Through the dispatcher, `stellar_pay_commit` is reachable only through the gated
 resolver, never the ungated path. The gated resolver enforces, in order:
 
-1. The caller's `asset` and its `amount` or `amount_in_stroops` are validated;
-   an invalid or missing value refuses before any approval is queued.
+1. A call without `args.envelope_xdr` refuses with `toolset.gated_missing_envelope`.
+   The caller's `asset` and its `amount` or `amount_in_stroops` are then
+   validated; an invalid or missing value refuses before any approval is queued.
 2. The install record verifies, and the on-disk `TOOLSET.md` matches its digest.
 3. The four-part check against the gated matrix: the toolset declares
    `sign-payment`, the action maps to the gated `stellar_pay_commit` constant,
@@ -269,7 +274,8 @@ destination / asset / amount bucket), the gate queues a one-time
 `ToolsetFirstInvokeGate` pending approval and refuses, returning an approval
 nonce. The operator approves out of band with
 `stellar-agent approve --id <nonce> --profile <name>`, which records a time-boxed grant. The
-agent then re-invokes.
+agent then re-invokes. A `sign-payment` grant for a G account covers that account
+and its M addresses. A grant for an M address covers only that address.
 
 A matching grant requires a version 3 HMAC that verifies under the profile's
 attestation key and profile/chain binding. It names the current install identity,
@@ -291,6 +297,12 @@ checks its own grant, retains its lease through submission, and stops at the
 earliest policy or grant end. Limits from both policies account for one payment.
 Direct and toolset retries retain the same bound consent and original interval.
 Keep the same business ID for recovery; reconcile an uncertain send by its hash.
+
+A gated payment call that meets an install, uninstall, or grant write in
+progress answers the business code `toolset.coordination_busy`. A gated
+rule-creation call in that state answers an internal error. Its message starts
+`toolset.enforcement_error:` and holds the nested `toolset.coordination_busy`.
+Retry the call once that write ends.
 
 ## How an agent invokes a toolset action
 
@@ -352,6 +364,13 @@ If the first-invoke gate fires, the call returns
 exists, the composed payment policies determine whether consent is required. For a
 `sign-rule-create` toolset, `action: "stellar_rule_create_commit"` takes the same
 gated route, and the operator attestation over the proposal is always required.
+That route requires `args.approval_nonce` from `stellar_rule_create` and refuses
+with `toolset.gated_missing_approval_nonce` without it. A spent proposal answers
+`policy.approval_consumed`.
+
+The dispatcher compares `toolset` and `action` exactly as sent. A name with an
+escape sequence, a control character, or changed case answers
+`toolset.not_installed` or `toolset.unknown_action`.
 
 Wallet tool results use the envelope `{ok, data|error, request_id}`, except that
 `stellar_toolset_list` returns a bare array. The capability refusals and
@@ -471,7 +490,7 @@ stellar-agent toolsets uninstall balance-reporter
 | Code | Cause |
 |---|---|
 | `toolset.not_installed` | Named toolset has no pin record. |
-| `toolset.pin_unverifiable` | The install record does not verify under the installation's pin key (edited, written under another key, or written by an earlier build), or no pin key exists. Uninstall the toolset and install it again. |
+| `toolset.pin_unverifiable` | The install record does not verify under the installation's pin key (edited, written under another key, or carrying no authentication tag), or no pin key exists. Uninstall the toolset and install it again. |
 | `toolset.content_digest_mismatch` | The on-disk `TOOLSET.md` differs from the digest in the install record, or cannot be read. Reinstall the toolset. |
 | `toolset.unknown_action` | Action does not resolve through the matrix (includes any signing tool named directly other than the two gated tools). |
 | `toolset.capability_not_declared` | Resolved tool's capability is not in the toolset's declared set. |

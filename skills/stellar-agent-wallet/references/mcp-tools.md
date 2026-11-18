@@ -17,8 +17,8 @@ for build configuration, admitted operations, and exclusions. Per tool on
 - Every tool named above and the signing actions of `stellar_toolset_invoke`
   refuse at handler entry with `network.mainnet_write_forbidden` in every
   build, except both x402 payment tools and the four classic commits.
-  Builds from this repository and releases from v0.1.0-alpha.14 on carry
-  `mainnet-write`. These builds admit the four classic commits and both x402
+  Builds with default features carry `mainnet-write`; a
+  `--no-default-features` build omits it. These builds admit the four classic commits and both x402
   payment tools after setup. With the feature off, these tools refuse mainnet
   at entry with the same code.
 - `stellar_toolset_invoke` is annotated destructive, so its own policy gate
@@ -40,16 +40,18 @@ approval attestations) see `./approvals-and-audit.md` and `./security.md`.
 
 - One process: the `stellar-agent-mcp` binary. It serves one profile, selected
   by `--profile <NAME>`, then `STELLAR_AGENT_PROFILE`, then the name `default`,
-  and bound for the life of the process. Everything else — network, keyring
-  coordinates, policy engine — comes from that profile. Any other argument is
-  refused with a non-zero exit.
+  and bound for the life of the process. A mainnet profile loads only with
+  `--profile <NAME>`; the environment variable and the `default` fallback never
+  select it. Everything else comes from that profile: network, keyring
+  coordinates, and policy engine. The server also accepts
+  `--help` and `--version`; any other argument exits with usage code 2.
 - Transport: MCP JSON-RPC over stdio (newline-delimited). `stdout` is the
   protocol wire; logs go to `stderr` (already redacted). The transport enforces a
   1 MiB maximum line length on inbound and outbound frames. There is no HTTP or
   SSE transport.
 - Protocol version `2024-11-05`. Declared capabilities: `tools` and `resources`.
 - Server identity at `initialize`: name `stellar-agent-mcp`, version matching
-  the crate's package version (`0.1.0-alpha.13` as of this release).
+  the workspace package version, `0.1.0-alpha.13`.
 - The server refuses to start if the active profile sets `mcp_disabled = true`,
   exiting non-zero with `mcp.disabled_per_profile`.
 - The operator can halt a running server's profile with
@@ -62,14 +64,16 @@ approval attestations) see `./approvals-and-audit.md` and `./security.md`.
   `stellar_rule_create`), `stellar_mpp_charge_prepare`,
   `stellar_mpp_record_receipt`, `stellar_mpp_reconcile_transaction`,
   `stellar_transaction_status`, `stellar_friendbot`, and
-  `stellar_sep24_interactive_url`. `stellar_toolset_invoke` refuses a signing
-  action and answers a read-only one. The read-only tools (`stellar_balances`,
+  `stellar_sep24_interactive_url`. `stellar_toolset_invoke` refuses every
+  action whose routed tool is not read-only, including `stellar_pay`, and
+  answers a read-only one. The read-only tools (`stellar_balances`,
   `stellar_fee_stats`, `stellar_dex_quote`, `stellar_signed_intents_list`, `stellar_rules_list`,
   `stellar_rules_get`, `stellar_sep43_get_address`, `stellar_sep43_get_network`,
   `stellar_sep47_discover`, `stellar_sep48_preview_invocation`,
   `stellar_sep53_verify_message`, `stellar_sep6_deposit_info`,
   `stellar_sep7_parse_uri`, `stellar_x402_parse_receipt`,
-  `stellar_mpp_authorization_status`, `stellar_toolset_list`) and the resources
+  `stellar_mpp_authorization_status`, `stellar_approval_status`,
+  `stellar_toolset_list`) and the resources
   keep answering. An unreadable marker refuses with `profile.halt_unreadable`.
   Neither code is retryable by the agent: stop and report the message to the
   operator, who lifts the halt with `stellar-agent profile resume <name>`.
@@ -222,8 +226,8 @@ The policy engine returns one verdict:
 
 ### Classic mainnet authorization
 
-Builds from this repository and releases from v0.1.0-alpha.14 on carry
-`mainnet-write`. The MCP server in these builds admits `stellar_pay_commit`,
+Builds with default features carry `mainnet-write`; a `--no-default-features`
+build omits it. The MCP server in these builds admits `stellar_pay_commit`,
 `stellar_claim_commit`, `stellar_create_account_commit`, and
 `stellar_trustline_commit` after setup.
 Both prepare and commit policy names need matching rules. Under Allow, a
@@ -240,6 +244,9 @@ in one call. Under RequireApproval it takes two calls. [x402](#x402) describes
 both.
 
 Paired preparation refuses an undecodable envelope with `simulation.divergence`.
+On mainnet, a rule with `balance_floor` adds an endpoint readiness check and an
+operating account read to the preparation and commit of `stellar_claim`,
+`stellar_trustline`, and `stellar_create_account`.
 A denied rule retains its wire code, `policy.deny.*` or a balance floor's
 `account.*`; an unknown decision uses
 `policy.unexpected_decision`. None of these refusals persists an approval.
@@ -285,6 +292,8 @@ try to produce an approval yourself; report the refusal to the operator. A
 live rejection uses `policy.approval_rejected`. A
 live consumed approval or an approval held by a submission receipt uses
 `policy.approval_consumed`. Expired tombstones use `policy.approval_required`.
+`stellar_approval_status` takes `approval_id` and reports one approval's
+retained state. It consumes nothing and grants no signing authority.
 Authorization consumption followed by pre-send recording failure can leave an
 unspent pending approval. Reusing it can produce
 `network.mainnet_authorization_refused` without a tombstone.
@@ -311,7 +320,7 @@ A submission timeout has an unknown outcome and requires transaction
 reconciliation.
 
 Public SEP-43 signing, generic SEP-53 signing, DeFi, rule writes, and toolset
-signing remain excluded. Wallet guards use `network.mainnet_write_forbidden`.
+signing are excluded on mainnet. Wallet guards use `network.mainnet_write_forbidden`.
 MPP uses `mpp.network_forbidden`. Noop allows mainnet reads and refuses
 destructive policy decisions with `policy.engine_required`.
 
@@ -328,10 +337,12 @@ How `RequireApproval` is satisfied depends on tool shape:
   `stellar_trustline`, `stellar_claim`, each paired with a `*_commit`) split
   into a simulate step and a commit step. The simulate step builds an envelope
   and mints a single-use nonce. It records a pending approval when policy
-  requires approval for the simulate tool or its paired commit tool. The commit
-  step re-checks the nonce, byte-compares the envelope against a fresh rebuild,
-  verifies the HMAC-SHA256 attestation minted at approve time, signs from the
-  keyring, and submits. It re-evaluates its own tool name against current state
+  requires approval for the simulate tool or its paired commit tool. On mainnet
+  it also opens a durable approval record linked to the operation of its
+  `business_id`. The commit step re-checks the nonce and byte-compares the
+  envelope against a fresh rebuild. On testnet it verifies the HMAC-SHA256
+  attestation. On mainnet it verifies the approval witness against the current
+  signed policy. It then signs from the keyring and submits. It re-evaluates its own tool name against current state
   and can still deny. An exhausted cap returns
   `policy.deny.per_period_cap_exceeded`. The loaded policy document stays fixed
   for the server's lifetime. Missing, invalid, or expired approval uses
@@ -371,8 +382,11 @@ and must match the loaded profile. The x402 requirement `network` spells mainnet
 `stellar:pubnet`; that spelling is not a valid `chain_id`.
 
 - Required by every tool EXCEPT: `stellar_x402_parse_receipt`,
-  `stellar_toolset_list`, `stellar_toolset_invoke`, and the five
+  `stellar_toolset_list`, `stellar_toolset_invoke`,
+  `stellar_signed_intents_list`, `stellar_approval_status`, and the five
   `stellar_mpp_*` tools.
+- `stellar_signed_intents_list` and `stellar_approval_status` take no
+  `chain_id`, and they refuse one as an unknown field.
 - The five MPP tools reject a `chain_id` field as unknown and act on the chain
   of the server's profile.
 - `stellar_toolset_invoke` accepts an optional `chain_id` that it forwards to the
@@ -469,7 +483,8 @@ Returns `{ envelope_xdr, nonce, expires_at_unix_ms, simulation, operational }`.
 `operational` is `{ latest_ledger, close_time_unix, close_lag_seconds }`, the
 endpoint ledger the readiness check observed before the account read. When the
 policy requires approval for `stellar_pay` or `stellar_pay_commit`, the response
-includes an `approval` block carrying `approval_nonce` and `expires_at_unix_ms`.
+includes an `approval` block carrying `approval_nonce`, `profile`, `chain_id`,
+`expires_at_unix_ms`, `reason`, and `summary`.
 
 ### stellar_pay_commit arguments
 
@@ -483,7 +498,7 @@ the binding triple and the optional approval pair:
 | `expires_at_unix_ms` | integer (u64) | yes | Unix milliseconds at which the nonce expires. |
 | `envelope_xdr` | string | yes | Base64 envelope from simulate; byte-compared against a fresh rebuild. |
 | `approval_nonce` | string | when approval required | Wallet-issued approval nonce from the simulate-step `approval` block. |
-| `approval_attestation` | string | when approval required | HMAC-SHA256 attestation minted by the operator at approve time; constant-time verified alongside `approval_nonce`. |
+| `approval_attestation` | string | when approval required | The attestation `approve` returned, verified alongside `approval_nonce`. Testnet compares the HMAC-SHA256 tag in constant time. Mainnet verifies it through the approval witness, also when the rule allows. |
 | `business_id` | string | on mainnet | The preparation's business id; another id returns `operation.business_id_mismatch`. |
 
 Example simulate then commit:
@@ -601,7 +616,7 @@ pair:
 | `expires_at_unix_ms` | integer (u64) | yes | Unix milliseconds at which the nonce expires. |
 | `envelope_xdr` | string | yes | Base64 envelope from `stellar_claim`; byte-compared against a fresh rebuild. |
 | `approval_nonce` | string | when approval required | Wallet-issued approval nonce from the simulate-step `approval` block. |
-| `approval_attestation` | string | when approval required | HMAC-SHA256 attestation minted by the operator at approve time. |
+| `approval_attestation` | string | when approval required | The attestation `approve` returned. Mainnet verifies it through the approval witness, also when the rule allows. |
 | `business_id` | string | on mainnet | The preparation's business id. |
 
 `stellar_claim_commit` re-fetches the claimable-balance entry and re-runs the
@@ -623,7 +638,7 @@ Arguments: `chain_id`, and an optional allowlisted `rpc_url` override.
 | Tool | Purpose | Gating |
 | --- | --- | --- |
 | `stellar_rules_list` | Enumerate active context rules on a smart account: `rule_id`, `name`, `context_type_label`, `valid_until`, `signer_count`, `policy_count`, `baseline`, plus `as_of_ledger`. `baseline` is the rule's signer-set baseline in the profile's audit log (`none`, `v1`, `v2`, `unreadable`, or `unknown` when the log cannot be opened); a rule reporting `none` refuses signing until its baseline is recorded. An integrity error in the log refuses the listing with `sa.audit_log`. A rule the shared context-rule decoder refuses fails the listing, and so `stellar_rules_get` for every rule of the account, with `sa.deployment_failed` naming the rule id. | Read-only. |
-| `stellar_signed_intents_list` | List the profile's signed smart-account intents from the verified window state, with status, legs and accounting horizon. | Read-only. |
+| `stellar_signed_intents_list` | List the profile's signed smart-account intents from the verified window state, with status, legs and accounting horizon. | Read-only. The policy gate decides the call. An unreadable window store refuses with `submission.record_unavailable`. |
 | `stellar_rules_get` | Read one context rule's metadata and signer-set `baseline`, its policies (`address`, `identified_kind`), and, when exactly one policy identifies as `spending-limit`, the budget snapshot. A rule holding a signer the wallet cannot decode is refused with `sa.deployment_failed`. An integrity error in the log refuses the call with `sa.audit_log`. | Read-only. |
 
 Both tools are grantable to a toolset via the `read-rules` capability token,
@@ -715,7 +730,7 @@ the resolved definition.
 | --- | --- | --- | --- |
 | `chain_id` | string | yes | |
 | `approval_nonce` | string | yes | From `stellar_rule_create`'s response. REQUIRED (not optional, unlike the pay/claim commit pair). |
-| `approval_attestation` | string | when `requires_operator_approval` was `true` | HMAC-SHA256 attestation blob the operator's `approve` produced. |
+| `approval_attestation` | string | yes | Attestation blob the operator's `approve` produced. The commit verifies it on every call, whatever `requires_operator_approval` reports. |
 
 Returns `{ rule_id, tx_hash }` on success. A dedicated attestation gate
 recomputes the digest from the stored snapshot before installing.
@@ -820,8 +835,9 @@ pool deposits, sponsorship, wallet clawbacks and contract calls the wallet
 cannot value need `allow_opaque_signing = true` on the tool's own rule. Account
 merges and signer or threshold changes always refuse with
 `policy.deny.unsizable_value_effect`. A wallet-paid fee passes the classic
-per-operation cap, and a resource transaction's full fee passes the contract
-transfer fee cap. The usage is charged before the signer loads and stays
+per-operation cap. A resource transaction's full fee must not exceed the signed
+contract transfer fee cap, or 1,000,000 stroops without one. A larger fee
+refuses with `validation.contract_transfer_fee_exceeded`. The usage is charged before the signer loads and stays
 charged through a signer, signing or send failure; each sign-only call charges
 again.
 
@@ -1079,6 +1095,10 @@ native `challenges`, optional selection, and the server/operation/target/params
 digest context. The receipt tag is `transport: "http"` with the base64url field
 `value`, or `transport: "mcp"` with the native `receipt` object.
 
+Prepare returns `authorization`, `nonce`, and `nonce_expires_at_unix_ms`.
+Pass prepare's `nonce_expires_at_unix_ms` as commit's `expires_at_unix_ms`.
+Pass `authorization.authorization_id` and `nonce` unchanged.
+
 Commit is one-shot. After any ambiguous or lost result, use status and
 reconciliation; never call commit again or create a fallback payment. The
 trusted host, not the wallet, delivers the credential to the exact bound request
@@ -1245,7 +1265,7 @@ An open intent without an authenticated purpose permanently blocks reset for thi
 
 Retained intents close only through the profile's stored secondary endpoint. Add one to the profile.
 
-The profile's stored endpoint configuration is unreadable. Retained intents close only through stored endpoints that load.
+When the stored endpoint configuration cannot load, retained intents stay open until it loads again.
 
 ### x402 owner approval
 

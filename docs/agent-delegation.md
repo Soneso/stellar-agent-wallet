@@ -13,9 +13,8 @@ and policy machinery: a `CallContract` rule scopes what the agent's signer
 may invoke, and a spending-limit policy caps how much it may move. Nothing
 here grants the agent any new administrative capability. Creating, scoping,
 capping, and revoking a rule are all operator/CLI-side actions. The agent's
-side of the picture is unchanged in kind, only in degree: it signs with a key
-the wallet's context-rule machinery now recognizes as a first-class signer
-type.
+side of the picture is unchanged in kind, only in degree. The agent signs with
+a key that the context-rule machinery accepts as a signer type.
 
 The walkthrough below has the operator author the rule directly via the CLI.
 An agent can also PROPOSE a rule for the operator to review and consent to,
@@ -252,7 +251,7 @@ A call that clears the rule's scope and the spending cap returns
 `status: "submitted"` with the confirmed `tx_hash`. A call that does not (over budget, wrong contract, expired rule) surfaces the same typed
 on-chain error every other smart-account write verb renders (see below).
 
-There is currently no MCP tool for this verb; see
+The MCP server has no tool for this verb; see
 [MCP: why there is no agent-facing execute tool](mcp.md#why-there-is-no-agent-facing-execute-tool)
 for the reasoning and what would change it.
 

@@ -41,9 +41,10 @@ dispatch.
    .github/scripts/check-crates-exist.sh
    ```
 
-   The script exits 1 and names every publishable member missing on
-   crates.io. The publish run halts at each of them, so have the crates.io
-   token for each first upload ready, as
+   The script exits 1 when a publishable member is missing on crates.io or
+   its existence is not confirmed, and prints one line per crate. The publish
+   run halts at each missing member, so have the crates.io token for each
+   first upload ready, as
    [Publish a new crate for the first time](#publish-a-new-crate-for-the-first-time)
    describes.
 4. Tag that commit and push the tag:
@@ -59,8 +60,9 @@ The tag push starts `.github/workflows/release.yml`. Tag only a commit on
 same script with `--warn`, annotates the run with one warning per missing
 member, and the release proceeds.
 
-An eligible sync merge has exactly two parents and brings new ancestry from
-`main` through its second parent.
+The changelog guard checks pull requests into `mainnet-write`.
+An eligible sync merge there has exactly two parents and brings new ancestry
+from `main` through its second parent.
 Its `CHANGELOG.md` equals the clean three-way merge over the parents' merge
 base, preserving both sides' lines.
 The guard refuses conflicts; a maintainer resolves and merges them.
@@ -176,7 +178,8 @@ The `release-wasm-gate` rule requires `hashes` and `publish` to depend on the
 local vendored Wasm workflow call, without conditions, inputs, or secrets, so
 signing, provenance, and publication wait for the rebuild. The called
 workflow declares `workflow_call`; every cache step starts its condition with
-`github.ref_type != 'tag'`. Its rebuild runs exactly when the tree check asks
+`github.ref_type != 'tag' && !inputs.publication`, so tag and publication runs
+use no cache. Its rebuild runs exactly when the tree check asks
 for one, reads both stellar-cli artifacts of its own run, uses no cache, and
 rebuilds and compares unconditionally. No job or step of it continues on an
 error, and no step of the tree check, the rebuild, or the gate suppresses a
@@ -252,8 +255,9 @@ Apply the `release-signing` settings in this order:
 
 ## Bump the publish toolchain
 
-`publish.yml` sets `RELEASE_TOOLCHAIN` to an exact Rust release. Both publish
-jobs install that release and set `RUSTUP_TOOLCHAIN` to it. The publish job
+`publish.yml` sets `RELEASE_TOOLCHAIN` to an exact Rust release. The `verify`,
+`publish`, and `verify-install` jobs install that release and set
+`RUSTUP_TOOLCHAIN` to it. The publish job
 refuses any other `cargo` or `rustc` version, since the archive bytes can
 depend on the cargo version.
 
@@ -416,8 +420,9 @@ run uploads no signed archive.
 Release, publish and rehearsal expect `mainnet-write` to be on. The shared
 build script runs the environment guard immediately before the release recipe.
 Archive verification executes both packaged binaries and checks their embedded
-markers. Archive and host checks also refuse either test-override literal,
-`STELLAR_AGENT_HOME` or `STELLAR_AGENT_TEST_`. Hashing depends on archive
+markers. Archive and host checks also refuse three test-override literals:
+`STELLAR_AGENT_HOME`, `STELLAR_AGENT_TEST_`, and `.stellar-agent-test-sandbox`.
+Hashing depends on archive
 verification and on the vendored Wasm rebuild of the tagged commit, so
 signing and provenance wait for that rebuild. Publication depends on the
 provenance content check, the source discipline check, and the rebuild.

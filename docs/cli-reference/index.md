@@ -3,7 +3,7 @@
 See [Mainnet configurations and scope](../getting-started.md#mainnet-configurations-and-scope)
 for build configuration, admitted operations, and exclusions.
 
-`stellar-agent` is a self-custodial Stellar wallet for AI agents. It builds, signs, and submits transactions on testnet under a policy engine, an operator-approval spine, and a tamper-evident hash-chained audit log.
+`stellar-agent` is a self-custodial Stellar wallet for AI agents. It builds, signs, and submits transactions on testnet under a policy engine, an operator-approval spine, and a tamper-evident hash-chained audit log. On mainnet it admits `pay`, `claim`, sponsored `accounts create`, and `trustline` after setup.
 
 This page covers the conventions shared by every command: how the profile and network are resolved, the signer-source flags, the JSON output envelope and exit codes, and [mainnet write behavior](#mainnet-write-behavior). Each command group is documented on its own page, linked from the [command index](#command-index) below.
 
@@ -33,7 +33,7 @@ The same executable runs the MCP server as `stellar-agent mcp serve`, and under 
 
 ## Global conventions
 
-The top-level command accepts `-h`/`--help` and `-V`/`--version`. Builds from this repository and releases from v0.1.0-alpha.14 on carry `mainnet-write`. The second line of `--version` and `-V` output, `STELLAR_AGENT_BUILD_MAINNET_WRITE=off` or `=on`, reports the compiled feature state. Network selection, the profile, RPC URLs, and the signer source are declared per subcommand. The recurring flags below have the same meaning everywhere they appear; the per-group pages reference this section rather than restating them.
+The top-level command accepts `-h`/`--help` and `-V`/`--version`. A build with the `mainnet-write` feature, the default, admits the mainnet operations below. The second line of `--version` and `-V` output, `STELLAR_AGENT_BUILD_MAINNET_WRITE=off` or `=on`, reports the compiled feature state. Network selection, the profile, RPC URLs, and the signer source are declared per subcommand. The recurring flags below have the same meaning everywhere they appear; the per-group pages reference this section rather than restating them.
 
 ### Profile
 
@@ -132,8 +132,7 @@ fi
 
 ## Mainnet write behavior
 
-Builds from this repository and releases from v0.1.0-alpha.14 on carry
-`mainnet-write`. These builds admit full-mode `pay`, `claim`, sponsored
+Default builds enable the `mainnet-write` feature. These builds admit full-mode `pay`, `claim`, sponsored
 `accounts create`, and `trustline` after installation setup. CLI `Allow` signs
 without a passkey ceremony; `RequireApproval` runs one. Build-only, sign-only, submit-only,
 Friendbot creation, generated-account creation, and relayer paths remain excluded.
@@ -151,6 +150,7 @@ consent.
 
 Without a signed approval origin, mainnet consent uses the localhost passkey page.
 Headless consent, `--yes`, `--no-open` on the local inbox, and remote mainnet approval then refuse.
+Without a display, mainnet consent needs `--open-by-operator`, which prints the localhost URL for the operator to open.
 With a signed approval origin, the HTTPS listener serves consent using an owner-pinned credential.
 The CLI prints the signed approval link without opening a browser or requiring a display.
 Ledger signing also requires this passkey ceremony when the CLI policy requires approval.
@@ -260,8 +260,8 @@ Every signature must pass, and each signature set must have at least one: on a f
 
 ## Audit-key pre-flight refusal
 
-`pay`, `claim`, sponsored `accounts create`, `trustline`, `trade`, and `vault`
-require the active profile's audit chain-root key before accessing signing keys
+`pay`, `claim`, sponsored `accounts create`, `trustline`, `trade`, `vault`, and
+`pool init` require the active profile's audit chain-root key before accessing signing keys
 or submitting transactions. A profile from `profile init` has the audit-log
 keyring coordinate but no key material. `profile rotate-audit-key <name>` mints
 the key. Until it runs, these verbs refuse with `audit.chain_key_unavailable`.
@@ -289,10 +289,10 @@ The same pre-flight proves the audit log still contains the chain tip its keyrin
 
 ## Startup advisory
 
-Before dispatching any command except `profile init` and
-`profile enable-mainnet`, the CLI scans the profile's audit log for context
-rules that reference revoked or retired verifier WASM hashes. The scan reads
-without a writer and issues no network calls. The two profile commands skip
+Before dispatching any command except `profile init`, `profile enable-mainnet`,
+and the `profile policy` verbs, the CLI scans the profile's audit log for
+context rules that reference revoked or retired verifier WASM hashes. The scan
+reads without a writer and issues no network calls. These profile commands skip
 it. No startup advisory precedes the spending preview.
 
 A finding prints a stderr advisory and opens a writer to append a
@@ -331,9 +331,10 @@ Signing under a rule pinned to a revoked or retired verifier refuses with `sa.ve
 | `pool` | Initialise and inspect a channel-account pool for parallel transaction submission. | [defi-and-pool](defi-and-pool.md) |
 | `profile` | Create, list, show, migrate, and rotate the keyring-backed keys of a profile; halt and resume its agent actions. | [profile-and-governance](profile-and-governance.md) |
 | `credentials` | Register, list, show, and delete WebAuthn passkeys in the per-profile registry. | [profile-and-governance](profile-and-governance.md) |
-| `approve` | Read a pending approval, prompt y/n, and record the HMAC attestation; garbage-collect expired approvals. | [profile-and-governance](profile-and-governance.md) |
+| `approve` | Approve a pending request by terminal prompt on testnet or by passkey ceremony on mainnet. Subcommands list, inspect, revoke, serve, and collect approvals and manage approval credentials. | [profile-and-governance](profile-and-governance.md) |
 | `audit` | Walk and verify the integrity of a hash-chained audit log, and repair its tip anchor. | [profile-and-governance](profile-and-governance.md) |
 | `toolsets` | Install, list, run, and uninstall agent toolsets with cryptographic provenance verification. | [toolsets](../toolsets.md) |
+| `mcp` | Run the MCP stdio server with `stellar-agent mcp serve`. | [MCP server](../mcp.md) |
 | `mpp` | Authorize a sponsored testnet MPP charge, inspect durable state, record a host receipt, reconcile settlement, and prune old terminal replay markers. | [agent payments](../agent-payments.md) |
 
 ## Related pages

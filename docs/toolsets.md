@@ -61,7 +61,7 @@ The capability manifest is the space-separated value of
 | `read-balance` | Read native XLM + trustline balances. |
 | `propose-transaction` | Build an unsigned transaction envelope for review; not sign or submit. |
 | `suggest-destination` | Suggest a destination via read-only discovery/preview tools. |
-| `observe-event` | Observe a ledger event. No tool is wired to this capability yet, so it grants nothing. |
+| `observe-event` | Observe a ledger event. The capability maps to no tool and grants nothing. |
 | `sign-payment` | Sign and submit a classic payment. Signing-adjacent and gated; inert until the first-invoke gate converts it to a runtime grant. |
 | `read-rules` | Read the agent's own context rules (spending-limit budgets, expiry, signer/policy counts). Separately grantable from `read-balance`: rule visibility and balance visibility are distinct concerns. |
 | `sign-rule-create` | Install an agent-proposed context rule on-chain. Signing-adjacent and gated; inert until the first-invoke gate converts it to a runtime grant. The per-proposal operator attestation (`RuleProposalSimulated`) fires unconditionally regardless of the grant. |
@@ -218,9 +218,11 @@ tag, so neither signature can be replayed as the other.
 
 An absent or empty auditor trust set fails closed for a key-touching toolset. The
 only sanctioned bypass is `--override-attestation`, which logs a structured warning
-and proceeds; no environment variable or config default skips the gate. Even under
-override the `sign-payment` capability is persisted inert, and the runtime
-first-invoke grant and payment policy gates still apply at signing time.
+and proceeds; no environment variable or config default skips the gate. Under
+override a key-touching capability (`sign-payment` or `sign-rule-create`) is
+persisted inert, and its runtime first-invoke grant still applies at signing time.
+A `sign-payment` commit still meets the payment policy gates. A `sign-rule-create`
+commit still requires its per-proposal attestation.
 
 The install records its result as one of `attested`, `overridden`, or
 `not-required`, reflecting what the gate actually did rather than what flags were
@@ -255,13 +257,13 @@ The record is JSON of the form `{"v":3, <fields>, "tag":"<64 hex>"}`. The tag is
 HMAC-SHA256 under the installation's pin key, a 32-byte secret in the platform
 keyring (service `stellar-agent-toolsets`, account `pin-key`) that the first install
 mints. It covers a domain tag and every field, each length-prefixed. A record is
-trusted only when its tag verifies, so a record edited after the install, written
-under another key, or written by an earlier build grants nothing: the runtime refuses it
+trusted only when its tag verifies, so a record that is edited after the install,
+written under another key, or carries no tag grants nothing: the runtime refuses it
 with `toolset.pin_unverifiable`. A record whose verified `package` differs from the
 directory it is stored under is refused as malformed.
 
-A record written by a build before the authenticated format carries no tag and is
-refused the same way. To use such a toolset again, uninstall it and install it from
+A record in another format carries no tag and is refused the same way. To use
+such a toolset again, uninstall it and install it from
 its signed package; the install verifies the publisher signature and the attestation
 again and writes an authenticated record.
 
@@ -286,8 +288,10 @@ pin. A record that does not verify can therefore be removed.
 Through the dispatcher, `stellar_pay_commit` is reachable only through the gated
 resolver, never the ungated path. The gated resolver enforces, in order:
 
-1. The caller's `asset` and its `amount` or `amount_in_stroops` are validated; an
-   invalid or missing value refuses before any approval is queued.
+1. A call without `args.envelope_xdr` refuses first with
+   `toolset.gated_missing_envelope`. The caller's `asset` and its `amount` or
+   `amount_in_stroops` are then validated; an invalid or missing value refuses
+   before any approval is queued.
 2. The install record verifies under the installation's pin key, and the on-disk
    `TOOLSET.md` matches the digest it records.
 3. The four-part check against the gated matrix: the toolset declares `sign-payment`,
@@ -367,13 +371,17 @@ wraps:
 
 - MCP payment invocation answers the business code `toolset.coordination_busy`.
   Retry the same invocation after the writer returns.
+- MCP rule-creation invocation answers an internal error whose message is
+  `toolset.enforcement_error:` followed by the nested `toolset.coordination_busy`
+  diagnostic.
 - `approve` answers `approval.grant_persist`, whose detail is the nested
   `toolset.coordination_busy` diagnostic. Its consent audit row is already
   written, and the pending approval stays queued.
+- The approval UI answers HTTP 503 with status `unavailable` and
+  `retriable: false` when the grant write fails, a busy grant lock included.
 
-Retry once the other operation ends. The resolver creates an absent lock file
-and keeps existing grants and their expiry, so grants recorded before the lock
-files existed still match.
+Retry once the other operation ends. The resolver creates an absent lock file.
+Stored grants and their expiry stay unchanged.
 
 A resolved grant can be rechecked for the same invocation under shared locks.
 The recheck finds that exact grant and installation again; another grant with
@@ -382,8 +390,9 @@ locks, refuses at or after the stored expiry, and never renews it. It creates,
 repairs, and prunes nothing. While it holds its locks, no install, uninstall, or
 grant change proceeds.
 
-The recheck is a runtime library function that no CLI command or MCP tool calls.
-It returns these refusals as library results, with no surface wrapper:
+A `stellar_pay_commit` action of `stellar_toolset_invoke` runs the recheck
+before it uses the nonce and holds the grant lease through submission. No CLI
+command runs it. It answers these refusals as business codes:
 
 - `toolset.grant_invocation_mismatch`: the invocation differs from the one the
   grant was verified for.
@@ -393,7 +402,7 @@ It returns these refusals as library results, with no surface wrapper:
 - `toolset.grant_changed`: the installation changed, or the grant was revoked,
   replaced, or no longer verifies.
 - `toolset.grant_expired`: the clock reads at or after the stored expiry.
-- `toolset.io_error: clock_unavailable`: the clock cannot be read.
+- `toolset.io_error` with `clock_unavailable`: the clock cannot be read.
 
 Binding, install record, manifest, capability, amount, and grant store failures
 return the resolver's existing results. The locks bind only wallet processes; they do not stop
@@ -459,7 +468,8 @@ skipped with a warning; before the first install, when no pin key exists, the li
 is empty. Each entry reports `name`, `description` (always empty; the pin record stores no
 description), `capabilities`, `allowed_tools`, `version`, and `actions` (the tool names reachable
 through the ungated matrix; gated tools such as `stellar_pay_commit` are not listed
-here because they are reachable only through the gated path).
+here because they are reachable only through the gated path). A failed listing
+answers `toolsets.list_failed`.
 
 | Flag | Meaning | Req/Opt | Default |
 |---|---|---|---|
@@ -478,7 +488,8 @@ not wired in the CLI. Use the MCP surface for execution.
 
 Positionals: `<TOOLSET-NAME>`: the installed package name (e.g. `balance-reporter`);
 `<ACTION>`: the exact registry tool name granted by the toolset's capabilities
-(e.g. `stellar_balances`).
+(e.g. `stellar_balances`). The command checks only the ungated matrix, so a gated
+action such as `stellar_pay_commit` answers `toolset.unknown_action`.
 
 | Flag | Meaning | Req/Opt | Default |
 |---|---|---|---|
@@ -492,12 +503,14 @@ On enforcement failure `error.code` is one of `toolset.not_installed`,
 `toolset.pin_unverifiable`, `toolset.content_digest_mismatch`,
 `toolset.unknown_action`, `toolset.capability_not_declared`, or
 `toolset.tool_not_allowed`: the same codes the MCP `stellar_toolset_invoke`
-tool uses for the identical enforcement failures.
+tool uses for the identical enforcement failures. Other failures return
+`toolsets.dir_resolve_failed`, `toolset.io_error`, or `toolset.error`.
 
 ### `toolsets uninstall <PACKAGE>`
 
 Removes an installed toolset's directory and pin record. Refuses if the toolset is not
-installed. It reads no install record, so it also removes a toolset whose record
+installed. A refused uninstall, a held toolsets lock included, answers
+`toolsets.uninstall_failed`. It reads no install record, so it also removes a toolset whose record
 does not verify (`toolset.pin_unverifiable`); that is the first step of reinstalling
 such a toolset. Grants approved for the removed package do not apply to a later install,
 including a forced reinstall or an install after manual removal. Each install
@@ -568,16 +581,22 @@ On testnet its own gate evaluates payment effects before the routed gate runs.
 The dispatcher compares `toolset` and `action` exactly as sent. A name with an
 escape sequence, a control character, other whitespace or case, or an extra prefix
 or suffix names no installed toolset or matrix tool: it answers
-`toolset.not_installed` or `toolset.unknown_action`, queues nothing, and while the
-profile is halted it is refused as an unknown tool. The dispatcher's own policy
+`toolset.not_installed` or `toolset.unknown_action` and queues nothing. While the
+profile is halted, such a name refuses with `profile.halted`, because a name
+without a descriptor takes the halt check. The dispatcher's own policy
 gate evaluates the same original strings. Error and log text sanitizes them.
 
 No signing, key, or policy tool is reachable through an ungated capability, so an
 `action` naming a signing tool returns `toolset.unknown_action` (the tool is not in
-the matrix to resolve). The two gated tools are the exception. For a `sign-payment` toolset, `action: "stellar_pay_commit"` is routed
+the matrix to resolve). The two gated tools are the exception. For a
+`sign-rule-create` toolset, `args` must carry the `approval_nonce` of a pending rule
+proposal, or the call refuses with `toolset.gated_missing_approval_nonce`. For a `sign-payment` toolset, `action: "stellar_pay_commit"` is routed
 through the gated resolver instead: `args` must carry the `envelope_xdr` produced by
 a prior `stellar_pay` simulate call, and its `asset` with `amount` or
 `amount_in_stroops`. The destination, asset, and amount are decoded authoritatively
 from that envelope. If the first-invoke gate fires, the call returns
 `toolset.first_invoke_approval_required` with the approval nonce; once a grant exists,
-the composed payment policies decide whether per-action approval is required.
+the composed payment policies decide whether per-action approval is required. When
+they require it, a gated commit without `approval_nonce` and `approval_attestation`
+queues that approval and answers `policy.approval_required` without the nonce. The
+operator reads the nonce from `stellar-agent approve list`.

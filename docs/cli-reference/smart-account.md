@@ -463,7 +463,7 @@ Every verb waits for the rule's lock at most `--timeout-seconds`, then refuses w
 - After the transaction confirms, both endpoints are read again at or past the confirmation ledger, and the result must be exactly the intended change. It is recorded as a `SaSignerAddedV2`, `SaSignerRemovedV2` or `SaThresholdChangedV2` row. A different result writes a `SaSignerSetDiverged` row and refuses with `sa.signer_set_diverged` naming the transaction hash.
 - When the confirmed result cannot be observed within `--timeout-seconds` (stage `observe`) or its row cannot be written (stage `write`), the verb returns `sa.baseline_write_failed` with the transaction hash. The transaction stands; `signers refresh --rule-id N --accept-divergence` records the chain state. The same holds for the confirmed removal and add of a [`migrate-verifier`](#smart-account-migrate-verifier) pair. On a pinned rule, a confirmed `add` or `batch-add` writes its pin rows once. They follow the state row when the change is recorded, and precede the refusal when the result is not observed or not the intended change. The pin record then holds every verifier the transaction added. When the state row is not written, the pin rows are attempted and are usually refused too. A pin row the audit log refuses is logged as a warning, and the rule keeps its previous pin record. A record left without the added verifier's pin refuses the next signature under the rule with `sa.pinned_verifier_absent`; the same `signers refresh` pins the live verifier.
 
-**A log from an earlier release.** A rule created under an earlier release has no state row. The exception is a rule that `signers list` or `signers refresh` recorded while it held a simple-threshold policy; that row is version 1. `rules list` reports `none` or `v1` for these rules. A non-zero rule reporting `none` needs one `signers list --rule-id N` before any signature it authorizes. This includes `execute`, `multicall`, `rules set-name`, `rules set-valid-until`, and `rules delete`. A rule reporting `v1` signs through the version 1 projection. Run `signers refresh --rule-id N` once before `signers add`, `remove`, `set-threshold`, or `batch-add`. Also refresh before `rules add-policy` or `rules remove-policy` for any policy, and before a `migrate-verifier` removal. `set-weighted-threshold`, `set-signer-weight`, and `set-spending-limit` compare version 1 state through the projection. A version 1 row cannot compare a rule that lost its simple-threshold policy or gained a contract delegate, so signing refuses. `signers refresh --rule-id N --accept-divergence` records that rule's current state.
+**A rule without a version 2 row.** A rule may have no signer-set state row. The exception is a rule that `signers list` or `signers refresh` recorded while it held a simple-threshold policy; that row is version 1. `rules list` reports `none` or `v1` for these rules. A non-zero rule reporting `none` needs one `signers list --rule-id N` before any signature it authorizes. This includes `execute`, `multicall`, `rules set-name`, `rules set-valid-until`, and `rules delete`. A rule reporting `v1` signs through the version 1 projection. Run `signers refresh --rule-id N` once before `signers add`, `remove`, `set-threshold`, or `batch-add`. Also refresh before `rules add-policy` or `rules remove-policy` for any policy, and before a `migrate-verifier` removal. `set-weighted-threshold`, `set-signer-weight`, and `set-spending-limit` compare version 1 state through the projection. A version 1 row cannot compare a rule that lost its simple-threshold policy or gained a contract delegate, so signing refuses. `signers refresh --rule-id N --accept-divergence` records that rule's current state.
 
 ### `smart-account signers list`
 
@@ -691,7 +691,7 @@ stellar-agent smart-account execute \
 unset AGENT_SK
 ```
 
-There is currently no MCP tool for this verb; see [MCP: why there is no agent-facing execute tool](../mcp.md#why-there-is-no-agent-facing-execute-tool).
+No MCP tool exposes this verb; see [MCP: why there is no agent-facing execute tool](../mcp.md#why-there-is-no-agent-facing-execute-tool).
 
 ---
 
@@ -815,7 +815,7 @@ stellar-agent smart-account deploy-spending-limit-policy --deployer-secret-env D
 
 `--profile <NAME>` selects the profile, followed by `STELLAR_AGENT_PROFILE`, then `default`. An explicitly named missing profile refuses.
 
-Deploys any one of the three OpenZeppelin policy contracts through a single verb, selected by `--kind`. Same idempotency (`status: "already_deployed"` on a repeat run with the same deployer, no RPC traffic), signer modes, and shared flags as `deploy-webauthn-verifier` above. Each kind uses its OWN salt-domain prefix, so different kinds deployed by the same deployer on the same network derive DIFFERENT addresses. This is the recommended entry point for deploying any policy; `deploy-spending-limit-policy` remains for backward compatibility and delegates to the same substrate for that kind.
+Deploys any one of the three OpenZeppelin policy contracts through a single verb, selected by `--kind`. Same idempotency (`status: "already_deployed"` on a repeat run with the same deployer, no RPC traffic), signer modes, and shared flags as `deploy-webauthn-verifier` above. Each kind uses its OWN salt-domain prefix, so different kinds deployed by the same deployer on the same network derive DIFFERENT addresses. This is the recommended entry point for deploying any policy; `deploy-spending-limit-policy` deploys the same spending-limit policy as `deploy-policy --kind spending-limit`.
 
 Extra flag:
 
@@ -910,14 +910,14 @@ Enumerates the active context rules on a smart-account by scanning the on-chain 
 Flags:
 
 - `--account <C_STRKEY>` (required): smart-account to query.
-- `--source-account <G_STRKEY>` (optional): simulation source account. On testnet it defaults to a well-known funded interop deployer; on mainnet pass any funded account (it is not debited).
+- `--source-account <G_STRKEY>` (optional): simulation source account. On testnet it defaults to a well-known funded interop deployer; on mainnet it is required, and its absence refuses with `validation.address_invalid`. The account is never debited.
 - `--rpc-url <URL>`: optional testnet override; absent uses the profile endpoint. Mainnet profiles refuse the flag.
-- `--secondary-rpc-url <URL>`: optional testnet override; absent uses the profile secondary. Mainnet profiles refuse the flag.
+- `--secondary-rpc-url <URL>`: accepted, logged with a warning, and ignored; `list-rules` reads through the primary endpoint only. Mainnet profiles refuse the flag.
 - `--network <NETWORK>`: optional assertion that must match the profile chain.
 - `--profile <NAME>`.
 - `--max-scan-id <N>`: override the scan upper bound. Must be in `1..=10000`; values outside that range are rejected at parse time. When unset, the profile value is used, else `50`.
 - `--timeout-seconds <SECONDS>`: default `60`; covers the full enumeration, the baseline reads included.
-- `--output <FORMAT>`: `json` default; `table` mode is deferred (the flag is accepted but renders the JSON envelope).
+- `--output <FORMAT>`: `json` default; `--output table` is accepted, logs a warning, and renders the JSON envelope.
 
 Each entry of `rules` carries `rule_id`, `name`, `context_type_label`, `signer_count`, `policy_count`, `valid_until` (omitted for a permanent rule) and `baseline`. `baseline` is the rule's signer-set baseline in the profile's audit log: `none` (no state row), `v1`, `v2`, `unreadable` (an audit-log integrity error for that rule) or `unknown` (the log was not read). Every signature under a rule other than `0` needs the baseline: a rule reporting `none` refuses with `sa.signer_set_missing_baseline` until one `signers list --rule-id N` records it. Rule `0` reports its own state like any rule. A rule the shared context-rule decoder refuses fails the listing with `sa.deployment_failed`, and the reason names the rule id. Rule reads refuse `sa.deployment_failed` for a `Delegated` signer with more than two items or an `External` signer with more than three. They also refuse invalid `policies`/`policy_ids` lists (required, equally sized, unique addresses/`u32` ids). Migration planning also refuses these cases.
 
@@ -928,13 +928,15 @@ stellar-agent smart-account list-rules --account CABC...WXYZ
 ### `smart-account list-intents`
 
 Lists the profile's signed smart-account intents from the verified window state. It signs and sends nothing.
+An unreadable window store, or a missing one after a committed generation, refuses with `submission.record_unavailable` and exit code 1.
+A profile that never had a window store lists nothing.
 
 | Flag | Description |
 | --- | --- |
 | `--profile <NAME>` | Profile to inspect. |
-| `--output <FORMAT>` | Output format. |
+| `--output <FORMAT>` | Output format. `table` is accepted but prints JSON after a warning. |
 
-Each entry carries `intent_id`, `status`, `auth_address` redacted to its first and last five characters, `legs`, `greatest_expiration_ledger`, `admitted_at_ms`, `bound_tx_hash` when bound, and `accounting_horizon`.
+Each entry carries `intent_id`, `status`, `auth_address` redacted to its first and last five characters, `legs`, `greatest_expiration_ledger`, `admitted_at_ms`, `bound_tx_hash` when bound, and `accounting_horizon`. Each entry also carries `expiry_observed_at_ms`, `retained_until_ms`, `purpose`, `schedule_terminal`, and `reset_explanations`.
 
 The intent view reports the accounting horizon, retention boundary, operation purpose, and schedule terminal state without changing state.
 
@@ -963,9 +965,9 @@ Reset refuses while an intent remains open or retained. A closed and pruned inte
 
 An open intent without an authenticated purpose permanently blocks reset for this profile. Continue with a new profile.
 
-Retained intents close only through the profile's stored secondary endpoint. Add one to the profile.
+When an intent is open and the profile stores no `secondary_rpc_url`, `reset_explanations` reports that retained intents cannot close and asks for one.
 
-The profile's stored endpoint configuration is unreadable. Retained intents close only through stored endpoints that load.
+When an intent is open and the stored endpoint configuration cannot load, `reset_explanations` reports that only stored endpoints that load close retained intents.
 
 ### `smart-account register-multicall`
 

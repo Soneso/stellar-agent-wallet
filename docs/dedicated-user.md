@@ -8,7 +8,7 @@ The wrappers constrain delegated commands; the signed policy constrains wallet a
 
 Deployment evidence lives in the [validation record](maintainers/dedicated-user-validation.md).
 The record identifies interfaces that need an integrated deployment build.
-Every macOS deployment claim is conditional: validated by the real-host run.
+The validation record holds the macOS rows and their recorded state.
 
 ## Account and bootstrap
 
@@ -28,7 +28,7 @@ wrappers allow the same forms whichever name runs.
 
 The bootstrap takes no secret. It creates a non-admin account, disables password
 login, and selects a non-login shell.
-The macOS account is hidden, validated by the real-host run.
+The macOS account is hidden.
 Production binaries require mainnet writes and exclude test helpers.
 The wallet cannot change its root-owned executables.
 A repeated bootstrap installs upgrades and preserves files below the data root.
@@ -43,7 +43,7 @@ Leave `audit_log_path` unset; the default is `<data-root>/audit/mainnet.jsonl`.
 Linux uses home `/var/lib/stellar-agent` and data root
 `<home>/.local/share/stellar-agent`.
 macOS uses home `/Users/stellar-agent` and data root
-`<home>/Library/Application Support/Soneso.stellar-agent`, validated by the real-host run.
+`<home>/Library/Application Support/Soneso.stellar-agent`.
 The wrappers and binaries live under `/usr/local/libexec/stellar-agent`, root-owned 0755.
 The binaries occupy its `bin` directory.
 The project file `/usr/local/etc/stellar-agent/project` is root-owned 0644
@@ -84,11 +84,13 @@ The other wrappers accept exactly the following forms, with no extra suffix.
 Caller `--profile`, `--audit-log`, and unknown tokens refuse.
 An approval ID contains 1 to 64 ASCII letters, digits, underscores, or hyphens.
 Provider roles are `primary`, `secondary`, and `oracle`.
+`cli-launch` accepts `keychain-access-lists` on macOS only, in the bootstrap tier like `keychain-unlock`.
 
 | Wrapper | Caller arguments |
 |---|---|
 | `cli-launch` | `keychain-unlock` |
 | `cli-launch` | `keychain-lock` |
+| `cli-launch` | `keychain-access-lists` |
 | `cli-launch` | `profile show` |
 | `cli-launch` | `profile enable-mainnet --state` |
 | `cli-launch` | `profile enable-mainnet --check` |
@@ -115,7 +117,7 @@ Provider roles are `primary`, `secondary`, and `oracle`.
 | `provision` | `remote-cert` |
 | `provision` | `remote-key` |
 
-Unlock, profile initialization, and the state diagnostic bypass the enablement predicate.
+Unlock, the macOS keychain access-list form, profile initialization, and the state diagnostic bypass the enablement predicate.
 Other forms accept an absent or enabled nonce, except signer enrollment,
 signer binding, providers, and enablement itself, which require an absent nonce.
 An unreadable nonce refuses every non-exempt form.
@@ -224,10 +226,9 @@ Success ends stderr with `credential-roles:` and roles in `primary secondary ora
 Linux unlock starts private D-Bus and Secret Service daemons through `setsid`.
 PID files live in `<home>/run`; repeated unlock reuses live daemons.
 Lock stops those daemons through their PID files.
-macOS unlock creates and selects the login keychain when needed, validated by the real-host run.
-It uses `security unlock-keychain` without a password argument, validated by the real-host run.
-`security set-keychain-settings` removes timeout and sleep locking for that keychain only,
-validated by the real-host run.
-Explicit lock uses `security lock-keychain`, validated by the real-host run.
+macOS unlock creates and selects the login keychain when needed.
+It uses `security unlock-keychain` without a password argument.
+`security set-keychain-settings` removes timeout and sleep locking for that keychain only.
+Explicit lock uses `security lock-keychain`.
 No password is stored. Unlock lasts until reboot or explicit lock.
 After reboot, the operator unlocks again before starting the wallet.

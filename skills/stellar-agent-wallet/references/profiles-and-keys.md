@@ -26,7 +26,9 @@ Profile files live one-per-name in the OS-conventional data directory:
 
 A profile is selected by name (the file stem): an explicit `--profile <NAME>`,
 then the `STELLAR_AGENT_PROFILE` environment variable, then `default`. The MCP
-server and most CLI commands resolve it that way. `profile show`, `profile
+server and most CLI commands resolve it that way. The environment variable and
+the `default` name select testnet profiles only; a mainnet profile loads only
+through `--profile <NAME>`. `profile show`, `profile
 migrate`, the `profile rotate-*` commands, `profile reset-window-state`, and
 `profile reset-mpp-state` require an explicit positional `<NAME>` or
 `--profile <NAME>`. `fees stats` loads a profile only with `--profile`, and
@@ -51,7 +53,7 @@ one host and not on another: a write to `NUL.toml` on Windows goes to the null
 device, so the file never has content, and a name beginning with `-` is read as
 the next flag by every argument parser that has to take it. The CLI exits `1`
 with a typed refusal; `stellar-agent-mcp` exits `2` before serving. A profile
-file already carrying such a name can no longer be selected — run `profile init`
+file carrying such a name cannot be selected. Run `profile init`
 under a valid name, or rename the file, correct its
 `policy_owner_key_id.service`, and, on a `v1` profile, re-run
 `profile enroll-owner-key` and `profile sign-policy` under the new name.
@@ -227,8 +229,9 @@ CLI `pay` and `claim` check the cap in the full pipeline, `--build-only`,
 `--sign-only`, and `--submit-only`. MCP pay, create-account, trustline, and
 claim check it in both prepare and commit. CLI sponsored `accounts create`,
 `trustline`, and every sending `pool init` path also check the cap.
-Opaque, fee-bump, and multi-operation staged envelopes and the SEP-43 signing
-tools remain outside this coverage.
+Opaque, fee-bump, and multi-operation staged envelopes are outside this
+coverage. The two SEP-43 transaction tools check the fee the wallet account
+pays, rounded up per operation, against the classic cap.
 
 The cap applies to the resolved auto-selected, explicit, profile, or command
 fee, or the decoded envelope fee. A fee equal to the cap passes. A fee above
@@ -445,7 +448,8 @@ These commands send the primary credential: `pay`, `claim`, `accounts create --s
 The MCP classic tools send it too: `stellar_pay`, `stellar_create_account`, `stellar_trustline`, `stellar_claim` and their commits, `stellar_balances`, `stellar_transaction_status`, `stellar_fee_stats`, and the x402 tools.
 The cross-check witness sends the oracle credential.
 `balances` takes `--rpc-url` without a profile and sends none.
-The Friendbot path of `accounts create`, `stellar_friendbot`, `stellar_sep43_sign_and_submit_transaction`, and the smart-account, DeFi, and MPP commands and tools send none either.
+The Friendbot path of `accounts create`, `stellar_friendbot`, and the smart-account, DeFi, and MPP commands and tools send none either.
+`stellar_sep43_sign_and_submit_transaction` sends no credential with its submission, but its account reads for the payment decision send the primary credential.
 
 A missing entry reports `auth.keyring_not_found` naming `service/account`.
 A stored value that is empty, longer than 1024 bytes, or holds a control character reports `network.rpc_credential_refused`.
@@ -508,7 +512,7 @@ it. A testnet environment signer keeps it for its command.
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `mlock_required` | bool or `"warn"` | no | platform-dependent | `mlock(2)` failure posture. `true` (default on Linux/macOS): fail closed if the seed cannot be pinned in RAM. `"warn"` (default on Windows): proceed with unprotected memory and emit a warning. `false`: do not attempt memory locking. The posture is set in this file and is not overlayable. |
-| `unlock_ttl_seconds` | integer | no | `30` | Unlock-window TTL in seconds. Hard cap `600` (10 minutes); a value above the cap is refused when the window is constructed. Operators may shorten the window. |
+| `unlock_ttl_seconds` | integer | no | `30` | Unlock-window TTL in seconds. Hard cap `600` (10 minutes); zero or a value above the cap is refused when the window is constructed. Operators may shorten the window. |
 
 ### `[policy]` block
 
@@ -713,8 +717,8 @@ profile is a no-op.
 
 The counterparty cache reads and mints its HMAC key at
 `counterparty_cache_key_id`, the entry `profile rotate-counterparty-key` writes.
-With an explicit reference, previously cached entries read as absent until
-a refresh rewrites them. `counterparty refresh <domain>` rewrites the entry
+With an explicit reference, cached entries read as absent until a refresh
+rewrites them. `counterparty refresh <domain>` rewrites the entry
 for that domain. `counterparty warm-up` refreshes only the `HOME_DOMAIN`
 entries of the policy allowlist.
 
@@ -769,9 +773,8 @@ policy files via `stellar-agent profile sign-policy`. Re-enrolling a different
 owner key invalidates policy files signed by the previous one. Every symmetric
 key loader refuses a coordinate in the owner namespace and a key equal to the
 owner public key, with `validation.key_matches_owner_public_key`. Owner readers
-accept only the G-strkey. An older base64 entry stays unchanged
-and refuses until the owner public key is enrolled again. Enroll it again
-after upgrading. Symmetric-key loaders compare both forms.
+accept only the G-strkey. A base64 owner entry refuses until the owner public
+key is enrolled again. Symmetric-key loaders compare both forms.
 
 | Command | Mints into | Notes |
 |---------|------------|-------|
@@ -805,7 +808,7 @@ unset WALLET_SK
 
 Flags: `--secret-env <VAR>` (required; the variable NAME, never the secret),
 `--profile <NAME>` (resolves `--profile` -> `STELLAR_AGENT_PROFILE` ->
-`default`), `--expected-address <G_STRKEY>` (refuse
+`default`; a mainnet profile requires `--profile <NAME>`), `--expected-address <G_STRKEY>` (refuse
 unless the seed derives to it), `--force` (replace an already-enrolled entry).
 Enrollment derives the seed's public address. A profile fresh from
 `profile init` (and a v1-migrated profile that still carries it) holds the placeholder `"default"` in
@@ -840,11 +843,11 @@ engine = "v1"
 After owner enrollment, a mismatched engine selection refuses through CLI and MCP.
 Complete the signed engine ceremony above before using the profile.
 Noop refuses mainnet destructive operations with `policy.engine_required`.
-Builds from this repository and releases from v0.1.0-alpha.14 on carry
-`mainnet-write`. Mainnet writes also require enablement and a signed v2 policy.
+Default builds from this repository carry `mainnet-write`. Mainnet writes also require enablement and a signed v2 policy.
 CLI value operations follow the governing decision: `allow` grants policy
 authority without a ceremony; `require_approval` requires passkey consent.
-Every MCP mainnet write requires approval.
+An MCP mainnet write signs without an approval under `allow`. Under
+`require_approval` it needs a verified approval.
 
 ### Mainnet policy body
 
@@ -854,6 +857,7 @@ Presets and enablement insert 1,000,000 stroops when absent; rotation preserves
 explicit values. The rewritten policy requires renewed owner signing.
 The cap covers inclusion, resources, and restoration as one total.
 It does not enable contract payments or add a G/M-only policy minimum.
+It also bounds the full fee of SEP-43 transactions that carry a resource fee.
 
 Spending summaries and unsigned `profile policy-check` return
 `contract_transfer_fee_cap` with `configured_stroops`, `effective_stroops`, and
@@ -1012,7 +1016,9 @@ nothing.
    The unsigned bootstrap body supplies the origin, the RP and the certificate pin.
    The command serves the page over TLS from the explicit `[remote_approval]` paths, and the approving device must trust the certificate.
    It prints an enrollment code for the page and still asks for the page's confirmation code at the terminal.
-   The operator runs it in the provisioning tier.
+   The operator runs it in the provisioning tier, the setup step of a
+   [dedicated-user deployment](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/dedicated-user.md#provisioning-orders),
+   never as a runtime service.
 2. Review the credential and add the entry to `approval_credentials` in the
    `[mainnet]` table.
 3. Sign the policy with `profile sign-policy`, which assigns a higher sequence,
@@ -1032,7 +1038,8 @@ also when its credential stays listed. The `[remote_approval]` allowlist and
 `approve operator remove` do not change the approval credentials.
 
 Without a signed approval origin, mainnet consent uses the localhost passkey page.
-Headless consent, `--yes`, `--no-open` on the local inbox, and remote mainnet approval then refuse.
+Without a display, mainnet consent refuses unless `--open-by-operator` prints the URL.
+`--yes`, `--no-open` on the local inbox, and remote mainnet approval then refuse.
 With a signed approval origin, the HTTPS listener serves consent using an owner-pinned credential.
 The CLI prints the signed approval link without opening a browser or requiring a display.
 Ledger signing also requires this passkey ceremony.
@@ -1078,14 +1085,14 @@ inflow failures refuse in every mode. An unlisted approval keeps evaluating
 its rule, so a later failing criterion still denies; a later rule cannot
 rescue a refusal. Equal `unlisted` tables share one counter per asset and
 window. Classic and SAC spellings share that counter, including stored rows
-from earlier builds. Re-signing and restart preserve its rolling usage.
+of either spelling. Re-signing and restart preserve its rolling usage.
 Other strkey forms and malformed strings
 return evaluation errors. Raw arguments keep their denials in every mode.
 Opaque signing and exempted generic bundle inners refuse because third-party
 transactions have no evaluated effects, recipient class, or amount for a budget
 or approval threshold to bind.
 
-The two pairing requirements follow the existing table requirements.
+The two pairing requirements apply together with the `[mainnet]` table requirements.
 A singleton refuses with `policy.mainnet_minimum_unmet`, its requirement
 name, and no rule index. Both rows pass when neither field is present.
 Both rows fail with the missing-table detail when `[mainnet]` is absent.

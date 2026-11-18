@@ -57,14 +57,15 @@ In plain terms, an agent connected to the wallet can:
   pay for API access machine-to-machine, optionally verifying who it is
   paying first.
 - **Use DeFi, carefully**: swap on Soroswap, and use DeFindex
-  vaults through typed, simulation-checked verbs. The wallet refuses raw or
-  opaque contract calls outright; only recognized, decoded operations reach
-  signing.
+  vaults through typed, simulation-checked verbs. The DeFi verbs refuse raw or
+  opaque contract calls. Other opaque signing needs a policy rule with
+  `allow_opaque_signing = true`.
 - **Talk to anchors**: start deposits and withdrawals with regulated
   on/off-ramp services (the SEP-6 and SEP-24 standards), handing you the
   interactive part.
-- **Prove identity**: authenticate to services with Stellar's standard
-  web-auth flows (SEP-10, SEP-45) instead of ad-hoc credentials.
+- **Prove identity**: before an authenticated x402 payment, the identity gate
+  authenticates to the payee's server with SEP-10, using a fresh ephemeral
+  key.
 - **Operate a smart account**: for advanced setups, an on-chain
   OpenZeppelin smart account with spending rules enforced by the network
   itself, passkey signers, multi-signer quorums, and timelocked upgrades.
@@ -92,7 +93,8 @@ Nothing is asked of you on faith. The alpha is deliberately conservative:
   you learn. A mainnet write needs an explicit mainnet profile, operator
   setup, and a governing policy decision. CLI `allow` grants policy authority
   without a ceremony; `require_approval` requires passkey consent.
-  Every MCP mainnet write requires approval. [Mainnet configurations and
+  An MCP mainnet write signs under an `allow` decision and needs a verified
+  operator approval under `require_approval`. [Mainnet configurations and
   scope](getting-started.md#mainnet-configurations-and-scope) lists the
   admitted operations.
 - **Guardrails scale with you.** Running without a profile on testnet is
@@ -131,7 +133,9 @@ and other AI coding agents discover tools. A first session looks like this:
    claude mcp add stellar-agent -- /absolute/path/to/target/release/stellar-agent-mcp
    ```
 
-   The server serves the `default` profile unless you name another one:
+   The server serves the profile that `--profile` names, then
+   `STELLAR_AGENT_PROFILE`, then `default`. A mainnet profile starts only
+   when `--profile` names it:
 
    ```bash
    claude mcp add stellar-agent -- /absolute/path/to/target/release/stellar-agent-mcp --profile alice

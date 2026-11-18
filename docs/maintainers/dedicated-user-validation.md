@@ -5,12 +5,13 @@ No real-host run is recorded here. Native unit tests do not establish host isola
 Every macOS result is conditional: validated by the real-host run.
 
 Run `scripts/deploy/validate-linux.sh` or `scripts/deploy/validate-macos.sh` as the operator.
-Choose a record directory owned by that operator.
+Name a record directory that does not exist yet.
+The script creates it with mode 0700 and refuses an existing path.
 The scripts call only the installed wrappers through `sudo -n -u stellar-agent`.
 They read no secret. Keep refusal text when an interface is unavailable.
 Do not record seeds, provider values, passwords, PEM contents, or bootstrap URLs.
 
-| Measurement | Linux status | macOS status, validated by the real-host run |
+| Measurement | Linux status | macOS recorded state |
 |---|---|---|
 | Non-admin account, fixed home, disabled login | Not recorded | Not recorded |
 | Home and data-root owner and 0700 modes | Not recorded | Not recorded |
@@ -39,6 +40,12 @@ Do not record seeds, provider values, passwords, PEM contents, or bootstrap URLs
 | Signed-binary upgrade retains access | Not applicable | Not recorded |
 | Dialog counts, including zero item-access prompts | Not applicable | Not recorded |
 | Operation without a wallet desktop session | Not applicable | Not recorded |
+
+The validation scripts write no entry for the native audit writer lock race,
+approval UID binding, signed-origin provisioning, extended ACL refusal, or
+integrated-wrappers rows.
+Record those rows by hand with the binary digest, command, exit status, and
+sanitized output.
 
 Use neither `security dump-keychain -d` nor `-g` when recording access metadata.
 The macOS SSH run has no wallet desktop session, validated by the real-host run.

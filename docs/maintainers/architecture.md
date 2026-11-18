@@ -16,25 +16,25 @@ Shared dependency pins live in `[workspace.dependencies]` in the root `Cargo.tom
 The layers below order normal workspace dependencies, including optional and target-gated dependencies.
 Crate names omit the `stellar-agent-` prefix.
 A crate depends on lower layers; the listed composite exceptions depend on earlier members of their own layer.
-Neither binary depends on the other, and no published library depends on a binary.
+The CLI package depends on the MCP library. No library depends on the CLI package.
 
 | Layer | Members and rules |
 | --- | --- |
 | Foundations | `xdr-limits`, `soroban-auth`, `sep5`, `windows-identity`, `loopback-http`, `toolsets`, `mcp-macros`, and `test-support` have no normal workspace dependencies. |
-| Core | `core` uses `xdr-limits`, optional `test-support`, and `windows-identity` on Windows. `headless-keyring` uses `windows-identity` on Windows. |
-| Network and installation | `network` builds on `core`, `headless-keyring`, `soroban-auth`, and `xdr-limits`. `toolsets-install` uses `toolsets` and `core`. `sep45` uses `core` and `xdr-limits`. |
+| Core | `core` uses `xdr-limits`, `soroban-auth`, optional `test-support`, and `windows-identity` on Windows. `headless-keyring` uses `windows-identity` on Windows. |
+| Network and installation | `network` builds on `core`, `headless-keyring`, `soroban-auth`, `xdr-limits`, and optional `test-support`. `toolsets-install` uses `toolsets` and `core`. `sep45` uses `core` and `xdr-limits`. |
 | Domain libraries | `nonce`, `pool`, `claimable`, `smart-account`, `defi`, `stablecoin`, `sep7`, `sep10`, `sep48`, `sep53`, `anchor`, and `toolsets-runtime` depend only on earlier layers. |
 | Composite libraries | `sep43`, `x402`, `x402-identity`, `mpp`, `dex`, `defindex`, `webauthn-bridge`, `approval-ui`, and `approval-remote`. Within this layer, `x402` and `mpp` depend on `sep43`; `approval-remote` depends on `approval-ui`. |
-| Binaries | `cli` and `mcp` consume library crates. |
-| Acceptance | `smart-account-acceptance` is a test-only leaf above the binaries. |
+| Server library and binary | `mcp` is a library over the layers above. `cli` builds the one executable and depends on `mcp`. |
+| Acceptance | `smart-account-acceptance` is a test-only leaf above `cli` and `mcp`. |
 
 `defi` defines contract pins, typed previews, and adapter interfaces.
 `dex` and `defindex` implement its trade and vault adapters through `smart-account` submission.
-`stablecoin` supplies classic trustline helpers over `core` and `network`; the binaries wire the trustline commands.
+`stablecoin` supplies classic trustline helpers over `core` and `network`; `cli` and `mcp` wire the trustline commands.
 
 ## Workspace lints
 
-Each crate inherits `[workspace.lints]` through `[lints] workspace = true`.
+Every crate except `stellar-agent-sep7` inherits `[workspace.lints]` through `[lints] workspace = true`.
 
 ```toml
 [workspace.lints.rust]
@@ -54,7 +54,8 @@ print_stderr = "deny"
 dbg_macro = "deny"
 ```
 
-Production code has four scoped `unsafe_code` allow sites across three areas: Windows identity and DPAPI, the CLI audit verifier's POSIX user check, and MCP Linux process hardening.
+The workspace denies `unsafe_code`.
+Each production exception is a scoped `unsafe_code` allow around an operating system call.
 Tests have additional scoped allowances.
 Errors use typed results; output uses JSON envelopes and redacting logs.
 Scoped allowances document necessary exceptions.
@@ -121,8 +122,8 @@ See [Getting started](../getting-started.md) for installation and [Building](bui
 
 ## Crate kinds
 
-The workspace contains two binary packages, the `mcp-macros` procedural macro, ordinary libraries, and test helpers.
-`test-support` serves test code; `core` and the acceptance member enable it through optional dependencies.
+The workspace contains one binary package, the `mcp-macros` procedural macro, ordinary libraries, and test helpers.
+`test-support` serves test code; `core`, `network`, `defi`, and the acceptance member enable it through optional dependencies.
 `windows-identity` builds on every platform; `core` and `headless-keyring` gate their dependency to Windows.
 The acceptance member's dependencies activate through its test feature.
 
@@ -176,9 +177,10 @@ See [Two sessions on one profile](security-internals.md#two-sessions-on-one-prof
 ## CLI dispatch
 
 The CLI uses a clap `Subcommand` tree in `main.rs`, dispatching to command `run` functions over library crates.
-Its top-level commands are `approve`, `tx`, `audit`, `accounts`, `balances`, `counterparty`, `friendbot`, `fees`, `pay`, `mpp`, `pool`, `profile`, `credentials`, `vault`, `trade`, `trustline`, `claim`, `toolsets`, and `smart-account`.
+Its top-level commands are `mcp`, `approve`, `tx`, `audit`, `accounts`, `balances`, `counterparty`, `friendbot`, `fees`, `pay`, `mpp`, `pool`, `profile`, `credentials`, `vault`, `trade`, `trustline`, `claim`, `toolsets`, and `smart-account`.
 
 Before dispatch, `main` installs redacting logs and scans the active profile's audit log for context rules referencing retired verifier hashes.
+`profile init`, `profile enable-mainnet`, and the `profile policy` verbs skip the scan, and a profile that does not load skips it silently.
 This local advisory makes no network calls and never aborts startup.
 Commands render a JSON `Envelope`; success exits with `0`, and errors exit with `1`.
 

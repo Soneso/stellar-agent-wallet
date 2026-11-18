@@ -43,8 +43,7 @@ the planned work per release.
 
 - testnet (`stellar:testnet`) is the default network: a command with no
   named profile and no `default.toml` runs on the zero-config testnet profile.
-- Builds from this repository and releases from v0.1.0-alpha.14 on carry
-  `mainnet-write`. Configured CLI actions sign `Allow` without a passkey
+- Default builds enable the `mainnet-write` feature. Configured CLI actions sign `Allow` without a passkey
   ceremony; `RequireApproval` runs one. Setup, policy minimums, and sealed
   authorization remain required. Configured MCP operations sign under
   `Allow` and need a verified approval under `RequireApproval`.
@@ -58,8 +57,8 @@ the planned work per release.
 Release archives are published on the
 [releases page](https://github.com/Soneso/stellar-agent-wallet/releases) for
 each tagged release, and the workspace crates are published to
-[crates.io](https://crates.io/crates/stellar-agent-cli) with each release
-(features merged since the last tag ship from source until the next one).
+[crates.io](https://crates.io/crates/stellar-agent-cli) with each release.
+A source build of the main branch includes unreleased changes.
 
 ## Highlights
 

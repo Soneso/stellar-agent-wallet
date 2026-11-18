@@ -17,7 +17,8 @@ the review approves with no blocking findings.
 - No secret material appears in logs, `Debug` output, or error messages. Account
   identifiers and transaction hashes are redacted at info level.
 - Secret values zeroize on drop; no un-zeroized copies linger.
-- No `unsafe`. No `unwrap`, `expect`, or `panic` in library code unless provably
+- The workspace denies `unsafe_code`. Each production exception is a scoped
+  `unsafe_code` allow around an operating system call. No `unwrap`, `expect`, or `panic` in library code unless provably
   infallible with an inline justification.
 - Fail closed. A check that runs before signing or submission refuses on error
   rather than proceeds. The behaviors that deliberately differ are documented:

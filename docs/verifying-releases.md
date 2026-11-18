@@ -3,7 +3,8 @@
 `cargo binstall` checks a release download over TLS only, with no signature.
 Each release also publishes a `SHA256SUMS` manifest, a
 [cosign](https://docs.sigstore.dev/cosign/system_config/installation/) keyless
-signature bundle per archive, and SLSA build provenance. The checks on this
+signature bundle for each archive and for `SHA256SUMS`, and SLSA build
+provenance. The checks on this
 page use them to confirm that an archive is the one this repository's release
 workflow built. The commands name the `.tar.xz` archive; for the Windows
 archive, substitute `.zip`.

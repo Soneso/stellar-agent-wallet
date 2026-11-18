@@ -12,17 +12,17 @@ Protocol charge path. User behavior and host duties are documented in
 The implemented wire contract follows the released `@stellar/mpp` 0.7.1
 HTTP/native-MCP challenge, credential, and receipt shapes. Stellar execution is
 one SEP-41 token `transfer` authorization signed with the existing SEP-43
-Ed25519 preimage machinery. The Rust `mpp-rs`, `mppx`, and Stellar MPP SDK
-repositories are research references, not runtime dependencies.
+Ed25519 preimage machinery. The crate has no MPP SDK runtime dependency;
+`MPP_TYPESCRIPT_SDK_PIN` records the `@stellar/mpp` 0.7.1 wire shapes it follows.
 
 `stellar-agent-mpp` owns strict parsing and execution. It depends on core for
 policy/approval/profile types, network for signer and keyring boundaries, and
-SEP-43 for authorization signing. Shared SEP-41 transfer construction remains in
-`stellar-agent-x402::sac_transfer`/the extracted network-facing builder so x402
-and MPP do not diverge on transfer argument encoding.
+SEP-43 for authorization signing. x402 and MPP both build the transfer with
+`stellar_agent_network::sep41::build_sep41_transfer_invoke`, so their transfer
+argument encoding cannot diverge.
 
-The crate is publish tier 5: it must be published after `stellar-agent-sep43`
-and before the tier-6 CLI and MCP binaries. Validate the complete DAG with:
+The crate is publish tier 5. It is published after `stellar-agent-sep43`, before
+the tier 6 MCP library and the tier 7 CLI. Validate the complete DAG with:
 
 ```bash
 bash .github/scripts/publish-crates.sh --check
@@ -282,7 +282,7 @@ stale carry. Audit failures and keyring access failures reading either counter
 refuse before mutation. The audit row records the request even when a later step
 fails. There is no automatic reset on read failure.
 
-The recovery verb remains `profile reset-mpp-state`, and it never infers a
+The recovery verb is `profile reset-mpp-state`, and it never infers a
 trusted counter from a state file. Outside the automatic adoption and
 publication completion cases above, a missing or malformed counter needs a
 discarding reset, which loses replay history; no counter-repair verb exists.
@@ -369,9 +369,10 @@ happened.
 
 ## Audit and redaction
 
-The four typed events are `MppChargeAuthorized`,
+The four typed charge events are `MppChargeAuthorized`,
 `MppAuthorizationWithheld`, `MppReceiptObserved`, and
-`MppSettlementReconciled`. Authorization audit append is a mandatory delivery
+`MppSettlementReconciled`. State adoption and reset write `mpp_state_adopted`
+and `mpp_state_reset`. Authorization audit append is a mandatory delivery
 gate. Withheld audit is best-effort after the primary failure: the primary
 error is returned unchanged, and a withheld row that cannot be written is
 logged at `error` with its code. Receipt and

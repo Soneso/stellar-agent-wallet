@@ -18,8 +18,9 @@ Measure each channel on its own, in its own dedicated user account:
   Developer ID Application signature and one CDHash.
 - A `cargo install` build. Install the `stellar-agent-cli` package from
   crates.io as the [README](../../README.md#cargo-install-from-cratesio) shows,
-  and copy `stellar-agent` to `stellar-agent-mcp`. The copy carries the ad hoc
-  signature of the local build, with the CDHash of the original.
+  and copy `stellar-agent` to `stellar-agent-mcp`. On Apple silicon, the
+  linker gives the local build an ad hoc signature, and the byte copy keeps
+  the CDHash of the original.
 
 ## Host
 

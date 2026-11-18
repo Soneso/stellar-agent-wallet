@@ -17,8 +17,7 @@ for build configuration, admitted operations, and exclusions. Per tool on
 - Every tool named above and the signing actions of `stellar_toolset_invoke`
   refuse at handler entry with `network.mainnet_write_forbidden` in every
   build, except both x402 payment tools and the four classic commits.
-  Builds from this repository and releases from v0.1.0-alpha.14 on carry
-  `mainnet-write`. These builds admit the four classic commits and both x402
+  Default builds enable the `mainnet-write` feature. These builds admit the four classic commits and both x402
   payment tools after setup. With the feature off, these tools refuse mainnet
   at entry with the same code.
 - `stellar_toolset_invoke` admits only exact `stellar_pay` and
@@ -41,12 +40,13 @@ before signing.
 `stellar_dex_quote`, `stellar_mpp_record_receipt`,
 `stellar_mpp_reconcile_transaction`, and `stellar_mpp_authorization_status`
 run without a policy verdict. Tools with an approval flow wait for operator
-consent; single-shot signing tools refuse `RequireApproval` with
-`policy.approval_required_unsupported`. The two SEP-43 transaction tools
+consent. The SEP-43 auth-entry and message tools, `stellar_sep53_sign_message`,
+and the DeFi tools refuse `RequireApproval` with
+`policy.approval_required_unsupported`. The x402 payment tools queue an
+approval. The two SEP-43 transaction tools
 approve one payment, path payment, account creation or trustline change in two
 calls.
-Builds from this repository and releases from v0.1.0-alpha.14 on carry
-`mainnet-write`. Mainnet writes also require operator setup and per-action
+Default builds enable the `mainnet-write` feature. Mainnet writes also require operator setup and per-action
 authorization. The four classic commit tools use independent signing and
 submission checks. See
 [Concepts](./concepts.md) for the shared guardrail model.
@@ -63,7 +63,7 @@ submission checks. See
 - Protocol version: `2024-11-05`. Declared capabilities: `tools` and
   `resources`.
 - Server identity reported at initialize: name `stellar-agent-mcp`, version
-  matching the crate's package version (`0.1.0-alpha.13` as of this release).
+  equal to the crate's package version.
 
 `stdout` is reserved for the JSON-RPC wire. Structured logs go to `stderr`, and
 they pass through a redaction layer before they are written, so a client that
@@ -168,7 +168,10 @@ On startup the process, in order:
    the signed policy file, the pending-approval store, and the policy-window
    state from that field, so a mismatch would read and write another profile's
    state.
-8. Serves the MCP loop until the client disconnects.
+8. Refuses a mainnet profile whose keyring entries conflict with another
+   profile, with `profile.key_scope_conflict`. A testnet conflict logs a
+   warning.
+9. Builds the server and serves the MCP loop until the client disconnects.
 
 You normally do not launch `stellar-agent-mcp` by hand. The MCP client spawns
 it. The command above is what the client is configured to run.
@@ -307,8 +310,7 @@ Notes:
   `default`, pass one: `"args": ["--profile", "alice"]`, or set
   `STELLAR_AGENT_PROFILE` in the environment the client spawns the process with.
   Arguments other than `--profile`, `--help`, and `--version` are refused.
-- Builds from this repository and releases from v0.1.0-alpha.14 on carry
-  `mainnet-write`. The second line of `--version` and `-V` output,
+- Default builds enable the `mainnet-write` feature. The second line of `--version` and `-V` output,
   `STELLAR_AGENT_BUILD_MAINNET_WRITE=off` or `=on`, reports the compiled
   feature state.
 - The exact location and schema of the configuration file depend on the MCP
@@ -367,8 +369,8 @@ For payment approvals, `approval.summary` describes the exact retained envelope,
 including its destination, asset, amount, fee, and sequence. Its additive
 `memo_details` member is a tagged object: `{"kind":"none"}`, or a `kind` of
 `text`, `id`, `hash`, or `return` with a `value`. Text preserves UTF-8, IDs use
-decimal strings, and hash and return values are arrays of 32 bytes. The legacy
-`memo` member remains null, text, a numeric ID, or hexadecimal bytes.
+decimal strings, and hash and return values are arrays of 32 bytes. The
+`memo` member is null, text, a numeric ID, or hexadecimal bytes.
 
 Approval creation and expiry retain the policy evaluation interval in Unix
 milliseconds. Paired payment decisions and retained mainnet operation deadlines
@@ -382,6 +384,10 @@ Repeated preparation of the same envelope under the same verified policy,
 profile, chain, and retained operation returns the original approval nonce and
 interval. An attestation already recorded on that approval stays unchanged.
 The preparation may issue a new protocol nonce for committing that envelope.
+A preparation that finds the approval producer lock held refuses with
+`approval.writer_locked`; retry with the same `business_id`.
+When the operation's linked approval entry is gone, the preparation refuses
+with `approval.not_found`; prepare the operation again.
 Direct preparation needs a signed, verified policy to queue a new payment
 approval. Without one, a policy-required toolset approval queues an entry with no
 recovery binding.
@@ -430,8 +436,7 @@ looks up the tool's registry descriptor and calls
 
 ### Classic mainnet authorization
 
-Builds from this repository and releases from v0.1.0-alpha.14 on carry
-`mainnet-write`. The MCP server in these builds admits `stellar_pay_commit`,
+Default builds enable the `mainnet-write` feature. The MCP server in these builds admits `stellar_pay_commit`,
 `stellar_claim_commit`, `stellar_create_account_commit`, and
 `stellar_trustline_commit` after setup.
 Both prepare and commit policy names need matching rules. Under Allow, a
@@ -478,6 +483,8 @@ Classic mainnet previews carry an on-chain deadline 120 seconds after they are
 built, bound into consent and the protocol nonce. Commits copy this deadline
 into the rebuild. A commit whose envelope carries no valid deadline refuses
 with `simulation.deadline_invalid`; simulate again for a fresh envelope.
+A commit within 30 seconds of the deadline refuses with the same code, so
+commit within 90 seconds of the preview.
 
 | Classic commit code | Meaning |
 |---|---|
@@ -538,7 +545,7 @@ A submission timeout has an unknown outcome and requires transaction
 reconciliation.
 
 DeFi, public SEP-43 signing, generic SEP-53 signing, rule writes, and toolset
-signing actions remain excluded on mainnet. Wallet entry guards use
+signing actions are excluded on mainnet. Wallet entry guards use
 `network.mainnet_write_forbidden`; library entry points retain their namespaced
 codes. MPP refuses with `mpp.network_forbidden`. Noop permits mainnet reads and
 refuses destructive policy decisions with `policy.engine_required`.
@@ -630,10 +637,13 @@ How a `RequireApproval` verdict is satisfied depends on the tool shape:
   `stellar_trustline`, `stellar_claim`, each paired with a `*_commit`) split into a simulate step
   and a commit step. The simulate step builds an envelope and mints a single-use
   nonce. It records a pending approval when policy requires approval for either
-  the simulate tool or its paired commit tool. The commit step re-checks the
+  the simulate tool or its paired commit tool. On mainnet the simulate step
+  also opens a durable approval record linked to the operation of its
+  `business_id`. The commit step re-checks the
   nonce, byte-compares the envelope against a fresh rebuild, verifies the
-  HMAC-SHA256 [attestation](./concepts.md) minted at approve time, signs from
-  the keyring, and submits. It re-evaluates its own tool name against current
+  [attestation](./concepts.md), signs from the keyring, and submits. On testnet
+  it verifies the HMAC-SHA256 attestation minted at approve time. On mainnet it
+  verifies the approval witness against the current signed policy. It re-evaluates its own tool name against current
   state and can still deny an approved request. An exhausted cap returns
   `policy.deny.per_period_cap_exceeded`. The loaded policy document stays fixed
   for the server's lifetime. The wire error on any approval-path failure is the
@@ -648,8 +658,7 @@ How a `RequireApproval` verdict is satisfied depends on the tool shape:
   verified approval. The SEP-43 transaction tools use the two-call flow of
   [SEP-43 transaction effects](#sep-43-transaction-effects) for a transaction
   an approval surface shows.
-- `stellar_rule_create` / `stellar_rule_create_commit` (Package D, GH issue
-  #8) is a two-phase pair with a DIFFERENT approval-block contract. Unlike the
+- `stellar_rule_create` / `stellar_rule_create_commit` is a two-phase pair with a DIFFERENT approval-block contract. Unlike the
   signing verbs above, there is no envelope fallback for the commit step to
   fall back on, so `stellar_rule_create` persists the pending approval
   UNCONDITIONALLY. The `approval_nonce` in its response is always present.
@@ -707,7 +716,10 @@ chain-root key is acquirable BEFORE the signer is loaded or anything is
 submitted. `profile init` mints the audit-log keyring COORDINATE only, no key
 material, so a freshly-initialized profile refuses with
 `audit.chain_key_unavailable` until the operator runs
-`stellar-agent profile rotate-audit-key <name>`. Read-only tools and the
+`stellar-agent profile rotate-audit-key <name>`.
+`stellar_sep43_sign_transaction`, `stellar_sep43_sign_auth_entry`,
+`stellar_sep43_sign_message`, and `stellar_sep53_sign_message` run the same
+pre-flight before signing. Read-only tools and the
 simulate/build phases of the two-phase verbs above are unaffected. They
 never sign or submit, so they never reach this pre-flight; the MCP server's
 synthesized first-run fallback profile continues to serve them.
@@ -778,11 +790,11 @@ profile refuses after the acknowledgement until it restarts.
 The server registers 45 tools. For each tool below: the exact registered name,
 its purpose, and whether it is read-only, signs without submitting, or signs and
 submits. Every tool except `stellar_x402_parse_receipt`, `stellar_toolset_list`,
-`stellar_toolset_invoke`, `stellar_approval_status`, and the five
-`stellar_mpp_*` tools requires a
+`stellar_toolset_invoke`, `stellar_approval_status`, `stellar_signed_intents_list`,
+and the five `stellar_mpp_*` tools requires a
 `chain_id` argument carrying the CAIP-2 chain id, which must match the profile.
-The MPP tools reject a `chain_id` field as unknown and act on the server
-profile's chain. `stellar_toolset_invoke` accepts an optional `chain_id` and
+The MPP tools and `stellar_signed_intents_list` reject a `chain_id` field as
+unknown and act on the server profile's chain. `stellar_toolset_invoke` accepts an optional `chain_id` and
 forwards it to the routed tool. For `stellar_sep43_get_address` and
 `stellar_sep43_get_network` the `chain_id` is optional and defaults to the
 profile chain when omitted, but is still validated against the profile when
@@ -957,8 +969,8 @@ Both trustline tools take `business_id` as described under
 | Tool | Purpose | Gating |
 | --- | --- | --- |
 | `stellar_rules_list` | Enumerate active context rules on a smart account: `rule_id`, `name`, `context_type_label`, `valid_until`, `signer_count`, `policy_count`, `baseline`, plus `as_of_ledger`. `baseline` is the rule's signer-set baseline in the profile's audit log: `none`, `v1`, `v2`, `unreadable` (an audit-log integrity error for that rule), or `unknown` when the tool cannot open the log, which leaves the listing working. An integrity error in the log refuses the listing with `sa.audit_log`. A rule reporting `none` refuses signing until its baseline is recorded. Scans up to the same `max_scan_id` default as the CLI `smart-account rules list`. A rule the shared context-rule decoder refuses fails the listing, and so `stellar_rules_get` for every rule of the account, with `sa.deployment_failed` naming the rule id. | Read-only. |
-| `stellar_signed_intents_list` | List the profile's signed smart-account intents from the verified window state, with status, legs and accounting horizon. | Read-only. |
-| `stellar_approval_status` | Inspect retained consent by `approval_id`, the public approval nonce. The chain comes from the active profile; no `chain_id` argument is accepted. See [approval status](cli-reference/profile-and-governance.md#approve-status) for fields and refusals. | Read-only; no consumption, collection, repair, or retry authority. Policy evaluation uses the same verified window image as the view. |
+| `stellar_signed_intents_list` | List the profile's signed smart-account intents from the verified window state, with status, legs and accounting horizon. The policy gate decides the call first. An unreadable window store refuses with `submission.record_unavailable`. | Read-only. |
+| `stellar_approval_status` | Inspect retained consent by `approval_id`, the public approval nonce. The chain comes from the active profile; no `chain_id` argument is accepted. See [approval status](cli-reference/profile-and-governance.md#approve-status) for fields and refusals. | Read-only; no consumption, collection, repair, or retry authority. Policy evaluation uses the same verified window image as the view. The policy gate runs before the view. A V1 rule set without a rule for `stellar_approval_status` refuses it with `policy.deny.no_matching_rule`. |
 | `stellar_rules_get` | Read one context rule's metadata and its signer-set `baseline` (as `stellar_rules_list` reports it) plus its attached policies (`address`, `identified_kind`: `threshold`, `spending-limit`, or `unknown`), and, when exactly one policy identifies as `spending-limit`, the budget snapshot (`spending_limit`, `period_ledgers`, `in_window_spent`, `remaining_budget`, `as_of_ledger`). A policy whose code hash is missing or unrecognized reports `unknown`. An RPC error during the classification fails the call with `sa.deployment_failed`, and a failed budget read leaves out the snapshot. An integrity error in the log refuses the call with `sa.audit_log`. | Read-only. |
 | `stellar_rule_create` | Testnet-only. Resolve and simulate an agent-proposed `add_context_rule` installation from its signers, policies, context, name, expiry, and `auth_rule_ids`. A signer is delegated (to a G-strkey account or a C-strkey contract), raw external, or a WebAuthn passkey by credential name, resolved to bytes at propose time; a policy is raw or typed spending-limit. Mints a domain-separated digest over the resolved arguments and parks the full definition as a pending approval. Install and simulation refuse an invalid simple-threshold parameter with `sa.simple_threshold_install_refused`. A duplicate policy address or two simple-threshold policies refuse with `sa.deployment_failed` at phase `build`. An `external` entry whose `pubkey_data_hex` decodes to empty key data refuses with `sa.auth_entry_construction_failed`. A verifier or policy contract with no Wasm code returns `sa.contract_instance_unsupported` with reason `NoWasmCode` (displayed as `no Wasm code`). This covers an absent instance or a built-in executable such as the Stellar Asset Contract, neither of which has a Wasm hash to pin. Neither override flag admits it. The result carries the pins the install records: `pinned_verifier_wasm_hashes` and `pinned_policy_wasm_hashes` list each pinned contract's full code hash. When a pinned contract is an external reference, `pinned_verifier_executable_refs` / `pinned_policy_executable_refs` are aligned with those lists, an entry (`owner_redacted`, `tag`, `ref_key_hex`, `resolved_hash`) at a reference's position and `null` at a position pinned by its Wasm hash. Every hash, `resolved_hash` included, is a 64-character lowercase hex string. | No signing; no submission. Mints the pending-approval nonce the commit step consumes. |
 | `stellar_rule_create_commit` | Testnet-only. Verify the operator's attestation over the resolved definition through a dedicated gate and recompute its digest from the stored snapshot. Operator attestation is always required, regardless of the policy verdict. The commit spends the approval before the install starts, so a retry with the same approval returns `policy.approval_consumed` for every install outcome. An unusable spent record refuses with `approval.spent_record_unavailable` and installs nothing. Install and simulation refuse an invalid simple-threshold parameter with `sa.simple_threshold_install_refused`. A duplicate policy address or two simple-threshold policies refuse with `sa.deployment_failed` at phase `build`. An `external` entry whose `pubkey_data_hex` decodes to empty key data refuses with `sa.auth_entry_construction_failed`. Every non-zero `auth_rule_ids` entry first passes the pre-submission checks, and a refusal signs nothing. Baseline and comparison refusals are `sa.signer_set_missing_baseline`, `sa.signer_set_diverged`, `sa.audit_log`, and `network.rpc_divergence`. Lock timeout is `sa.auth_entry_construction_failed` at stage `rule_lock`. A deadline that elapses during the baseline read or the comparison uses that code at `baseline_read` or `signer_set_compare`. Pin refusals are `sa.verifier_hash_drift`, `sa.policy_hash_drift`, `sa.pinned_policy_absent`, `sa.pinned_verifier_absent`, `sa.verifier_wasm_revoked`, `sa.verifier_wasm_retired`, `sa.wasm_pin_incomplete` (a pin record of eight-byte hash prefixes, which no flag bypasses; reinstall the rule through rule 0), and `sa.pin_check_unavailable`. Every pin comparison covers all 32 bytes of the code hash. A version 1 authorizing rule compares through its projection. Its own refusals are `sa.threshold_policy_not_installed`, `sa.threshold_policy_identification_failed`, and `sa.deployment_failed`. After the install confirms, the observed rule's signer identities and simple threshold must equal the proposal's. That observation is recorded as the rule's signer-set baseline. The name, context, expiry, and other policy attachments are not compared. Otherwise the rule stays on chain without a baseline, and the tool returns `sa.install_state_mismatch` or `sa.baseline_write_failed` with the transaction hash. | Signs and submits. Two-phase verb; approval spine. |
@@ -1084,7 +1096,9 @@ effects decision, audit pre-flight, admission, signer, signature.
   transaction refuse with `sep43.invalid_xdr`.
 - A fee the wallet account pays passes the classic per-operation cap, rounded
   up. A transaction with a resource fee also passes its full total through the
-  contract transfer fee cap.
+  contract transfer fee cap. Without a signed cap, testnet bounds the total at
+  1,000,000 stroops. A larger total refuses with
+  `validation.contract_transfer_fee_exceeded`.
 - A transaction with a payment reads the wallet account and each recipient
   account over RPC. Each muxed recipient is read once per call at its base
   account.
@@ -1232,7 +1246,8 @@ The store, audit log, and RPC share no atomic transaction.
 A spent approval does not prove the RPC receives a signature.
 The counterparty can stop honoring requirements while the owner waits.
 Account-reserve and account-identity criteria lack account-view inputs and fail closed.
-SEP-43, SEP-53, and DeFi approval refusals keep their existing behavior.
+A matched `balance_floor` refuses with `account.unread`.
+The SEP-43 auth-entry and message tools, SEP-53 signing, and the DeFi tools refuse an approval requirement with `policy.approval_required_unsupported`.
 
 
 | Tool | Purpose | Gating |
@@ -1359,7 +1374,7 @@ stores the pending approval:
 7. The payment root and its intent digest are computed.
 8. Local policy evaluation runs without an account-reserve view. A matching
    `minimum_reserve` criterion refuses with `policy.engine_required` before
-   approval is stored.
+   approval is stored. A matching `balance_floor` refuses with `account.unread`.
 9. An Allow verdict makes this call the signing call. It continues with
    the signing call's step 2 and skips the attestation step.
 10. Under RequireApproval, the pending approval is stored and returned.
@@ -1481,7 +1496,7 @@ five tools on a mainnet profile before state, RPC, keyring, or signer access.
 | Tool | Arguments | Purpose |
 | --- | --- | --- |
 | `stellar_mpp_charge_prepare` | `profile`, tagged `challenge` | Strictly validate and context-bind an HTTP/native-MCP challenge, simulate, evaluate policy, and persist a preview plus nonce. Never signs. |
-| `stellar_mpp_charge_commit` | `authorization_id`, `nonce`, `expires_at_unix_ms` | Load only stored exact terms, verify approval/policy, sign once, re-simulate, audit, and return one sensitive credential. |
+| `stellar_mpp_charge_commit` | `authorization_id`, `nonce`, `expires_at_unix_ms` (prepare's `nonce_expires_at_unix_ms`) | Load only stored exact terms, verify approval/policy, sign once, re-simulate, audit, and return one sensitive credential. |
 | `stellar_mpp_record_receipt` | `authorization_id`, tagged `receipt` | Record a trusted-host receipt digest without claiming ledger settlement. |
 | `stellar_mpp_reconcile_transaction` | `authorization_id`, lowercase `transaction_hash` | Verify the exact final transaction, transfer, payer authorization and signature through RPC. |
 | `stellar_mpp_authorization_status` | `authorization_id` | Return redacted lifecycle, accounting, receipt, and ledger-outcome state. |
@@ -1511,14 +1526,17 @@ session to a toolset; the operator policy and the approvals bound native and
 routed calls alike. A record that does not verify refuses with
 `toolset.pin_unverifiable`. The `toolset` and `action` arguments are compared
 exactly as sent, at the halt check and in routing; a decorated or altered name
-names no tool. A gated call that meets an install or grant change in progress
-answers an internal error whose message is `toolset.enforcement_error:`
-followed by the nested `toolset.coordination_busy` diagnostic. The runtime
-library's grant recheck, which no MCP tool calls, returns its refusals as
-library results: `toolset.grant_invocation_mismatch`,
-`toolset.coordination_busy`, `toolset.coordination_unavailable`,
-`toolset.grant_changed`, `toolset.grant_expired`, and
-`toolset.io_error: clock_unavailable` for a clock failure. See
+names no tool. A gated payment call that meets an install or grant change in
+progress answers the business code `toolset.coordination_busy`. A gated
+rule-creation call in that state answers an internal error whose message is
+`toolset.enforcement_error:` followed by the nested `toolset.coordination_busy`
+diagnostic. A `stellar_pay_commit` action of `stellar_toolset_invoke` rechecks
+its grant before it uses the nonce and holds the grant lease through
+submission. That recheck answers its refusals as business codes:
+`toolset.grant_invocation_mismatch`, `toolset.coordination_busy`,
+`toolset.coordination_unavailable`, `toolset.grant_changed`,
+`toolset.grant_expired`, and `toolset.io_error` with `clock_unavailable` for a
+clock failure. See
 [Grant and installation locks](./toolsets.md#grant-and-installation-locks).
 
 ## Output and exit behavior

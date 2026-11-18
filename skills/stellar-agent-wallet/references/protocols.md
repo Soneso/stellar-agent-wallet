@@ -12,7 +12,7 @@ The supported Stellar ecosystem protocols, the wallet surface for each, and the 
 - **Never auto-submit untrusted requests.** Inbound requests (a SEP-7 URI, a contract invocation) are parsed into a preview for the operator and policy engine. The wallet does not sign or submit on a dApp's behalf without the policy engine and approval flow.
 
 The scope table defines mainnet operation admission. Public SEP-43 signing,
-generic SEP-45/53 signing, and MPP remain excluded in every build.
+generic SEP-45 and SEP-53 signing, and MPP are excluded on mainnet in every build.
 Wallet entry guards use `network.mainnet_write_forbidden`; library refusals
 retain their namespaced codes. Read-only classification grants no signing
 or transaction-write authority.
@@ -139,15 +139,17 @@ SEP-43 wire codes (`error.code` under the standard envelope, from `Sep43Error::w
 | `sep43.horizon_error`, `sep43.rpc_error` | External service error |
 | `sep43.invalid_xdr`, `sep43.invalid_address`, `sep43.invalid_network_passphrase`, `sep43.missing_address`, `sep43.malformed_auth_entry`, `sep43.invalid_message` | Client-invalid request |
 | `sep43.user_rejected` | User rejected |
+| `sep43.mainnet_signing_forbidden`, `sep43.mainnet_authorization_refused` | Library mainnet signing paths refused |
+| `sep43.unknown_error` | Unclassified error |
 
 The transaction and auth-entry tools refuse XDR containing a muxed contract
 address (W) with `sep43.invalid_xdr` before key access or storing a request.
 
-The structural mainnet refusal (sign-only tools, before any key access) carries the canonical `network.mainnet_write_forbidden` code shared with every other signing surface, not a `sep43.*` code.
+Every SEP-43 signing tool, the sign-and-submit tool included, refuses a mainnet profile before any key access. This structural refusal carries the canonical `network.mainnet_write_forbidden` code shared with every other signing surface, not a `sep43.*` code.
 
 `sign_message` refusals before key load (an overlaid or out-of-scope signer, an unavailable audit writer) carry `profile.*` and `audit.*` codes, not `sep43.*` codes.
 
-SEP-43 opens no HTTP/HTTPS connections of its own (interop is stdio via MCP); `sign_and_submit` is the only path that submits, via the profile-configured RPC. The two MCP transaction tools read accounts over that RPC for their payment decision.
+SEP-43 opens no HTTP/HTTPS connections of its own (interop is stdio via MCP); `sign_and_submit` is the only path that submits, via the profile-configured RPC. The two MCP transaction tools and the auth-entry tool read accounts over that RPC for their payment decision.
 
 ## SEP-45: Web Authentication for Contract Accounts
 
@@ -207,12 +209,13 @@ Payer-side construction and signing of a `PAYMENT-SIGNATURE` payload for the x40
 | `payment_required` | string | yes | base64 `PAYMENT-REQUIRED` or raw JSON `PaymentRequirements` |
 | `chain_id` | string | yes | CAIP-2 `stellar:testnet` or `stellar:mainnet`; validated against the profile after the requirements |
 | `address` | string | no | signer G-strkey; must match the active signer if given |
+| `business_id` | string | on mainnet | names the payment operation: 1 to 64 printable ASCII characters, no space; on mainnet a retry with the same id returns the stored operation; another chain validates and echoes it |
 | `approval_nonce` | string | no | optional in the schema; omit it with `approval_attestation` for the queueing call; under RequireApproval, supply both for call 2 |
 | `approval_attestation` | string | no | optional in the schema; under RequireApproval, the repeated call requires the CLI-issued attestation alongside its approval nonce |
 
 Testnet flow: validate the requirements and check W eligibility, then admit the payment through the policy and the spending window. Before the signer load, the cross-check rule decides whether the payment needs the witness. It uses the amount in the asset's atomic units and the profile's thresholds and oracle. A required witness builds the oracle client without a request. Check the endpoint identity with `getNetwork`, the first request on the payment's primary client. Build the SAC transfer, simulate, and check restoration, fees, exactly one result, and the simulated authorization. When the witness is required, the oracle simulates the same unsigned transfer and the answers are compared. Read `getHealth` and check the ledger bounds. Sign the auth entry and write the `x402_payment_authorized` audit row, which records the signature expiration ledger. Re-simulate, check restoration, fees, the re-simulated authorization, and the ledger bounds, then serialize. The re-simulation sends the signed authorization to the profile's RPC, so the row is written first; if it cannot be written, the tool answers the `audit.*` code and the signature never leaves the wallet. A failure after the row adds an `x402_authorization_withheld` row with the same request id. Returns `{ paymentSignature, payer, asset, amount, payTo, network, cross_check }`. The `paymentSignature` is the standard-base64 `PAYMENT-SIGNATURE` header value, and `asset` is the SAC C-strkey. The `amount` is the atomic-unit string from `PaymentRequirements`, and `cross_check` is the witness outcome. The `x402_payment_authorized` row carries a passed witness when the payment required one. Errors carry per-variant codes `x402.<reason>` (for example `x402.invalid_payment_required`, `x402.unsupported_scheme`, `x402.rpc_simulate_failed`, `x402.unexpected_auth_entries`, `x402.transmit_gate_refused`) in the standard `{ok:false, error:{code, message}, request_id}` envelope with `is_error` set. A witness refusal keeps its own code: `simulation.divergence`, `network.witness_unavailable`, `network.rpc_credential_refused`, or the oracle credential read's keyring code (`auth.keyring_*`). Header fields named in an error are escaped and cut at 200 characters. A header that does not decode reports the JSON error class and position, not its values.
 
-Mainnet calls, on an admitted server: call 1 omits both approval arguments. Supplying only one returns `policy.approval_required`. Call 1 validates the requirements and `chain_id`, loads the enrolled signer, and evaluates local policy without an account-reserve view. A matching `minimum_reserve` criterion fails closed with `policy.engine_required`. Under an Allow rule, call 1 checks startup freshness and pays as call 2 does, without an approval. Under RequireApproval, call 1 reads enrollment and local policy state. It checks W eligibility with `getNetwork`, sends no simulation or SEP-10 request, and performs no signing. It returns `data.approval` without a payment payload, with `approval_nonce`, `profile`, `chain_id`, `expires_at_unix_ms`, `reason`, `endpoint_host`, `signer`, `summary` (`payTo`, `amount`, `asset`), and `instructions`.
+Mainnet calls, on an admitted server: call 1 omits both approval arguments and names the payment with `business_id`. A call without an id refuses with `validation.business_id_required`. Supplying only one returns `policy.approval_required`. Call 1 validates the requirements and `chain_id`, loads the enrolled signer, and evaluates local policy without an account-reserve view. A matching `minimum_reserve` criterion fails closed with `policy.engine_required`. Under an Allow rule, call 1 checks startup freshness and pays as call 2 does, without an approval. Under RequireApproval, call 1 reads enrollment and local policy state. It checks W eligibility with `getNetwork`, sends no simulation or SEP-10 request, and performs no signing. It returns `data.approval` without a payment payload, with `approval_nonce`, `profile`, `chain_id`, `expires_at_unix_ms`, `reason`, `endpoint_host`, `signer`, `summary` (`payTo`, `amount`, `asset`), and `instructions`.
 
 On mainnet, the operator approves x402 payments through the local browser opened by `stellar-agent approve --id <nonce> --profile <name>` or through the local inbox. A policy with a signed approval origin uses its HTTPS listener for this consent. The signing call is call 1 under Allow, and under RequireApproval it is call 2, which repeats the request with both approval arguments. It rechecks startup freshness, verifies any presented attestation, and runs the payment build: endpoint check, simulation, witness, health, intent mint, signing, audit row, intent consumption, and signed re-simulation. On mainnet the oracle bounds the simulation's ledger for every payment.
 Below the threshold it answers `getNetwork` and `getLatestLedger` and simulates nothing.
@@ -237,6 +240,7 @@ Runs the SEP-10 counterparty-identity gate BEFORE building the payment. Any iden
 | `chain_id` | string | yes | CAIP-2, as above |
 | `home_domain` | string | yes | operator-supplied domain for SEP-10 identity verification (e.g. `"testanchor.stellar.org"`); the gate resolves its `stellar.toml`, extracts `WEB_AUTH_ENDPOINT` + `SIGNING_KEY`, verifies the SSRF bind, and runs the SEP-10 ephemeral challenge/response |
 | `address` | string | no | signer G-strkey; must match the active signer if given |
+| `business_id` | string | on mainnet | as for `stellar_x402_create_payment` |
 | `approval_nonce` | string | no | as for `stellar_x402_create_payment` |
 | `approval_attestation` | string | no | as for `stellar_x402_create_payment` |
 
@@ -253,7 +257,8 @@ Read-only. Arg `payment_response` (base64 `PAYMENT-RESPONSE` header value or raw
 ### x402 constraints
 
 Both tools preserve G, C, M and W payees in full. W requires protocol 30 or
-later and a facilitator that accepts W; `@x402/stellar` 2.30.0 accepts G, C and M.
+later and a facilitator that accepts W payees. The facilitator decides which
+payee kinds it accepts; the wallet does not check the facilitator's package version.
 The W check runs before records, approvals, spending admission and SEP-10.
 Endpoint identity and the mainnet range gate precede it. Simulation decides
 whether the asset accepts a muxed contract payee.

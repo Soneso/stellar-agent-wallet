@@ -294,8 +294,9 @@ CLI `pay` and `claim` check the cap in the full pipeline, `--build-only`,
 `--sign-only`, and `--submit-only`. MCP pay, create-account, trustline, and
 claim check it in both prepare and commit. CLI sponsored `accounts create`,
 `trustline`, and every sending `pool init` path also check the cap.
-Opaque, fee-bump, and multi-operation staged envelopes and the SEP-43 signing
-tools remain outside this coverage.
+Opaque, fee-bump, and multi-operation staged envelopes are outside this coverage.
+The two SEP-43 transaction tools check a fee the wallet account pays, rounded
+up per operation, against the cap.
 
 The cap applies to the resolved auto-selected, explicit, profile, or command
 fee, or the decoded envelope fee. A fee equal to the cap passes. A fee above
@@ -532,9 +533,11 @@ A testnet environment overlay of the role's URL keeps the credential, because th
 
 These commands send the primary credential: `pay`, `claim`, `accounts create --sponsor`, `trustline`, `pool init`, `pool list`, `tx status`, `tx receipt clear`, and `fees stats --profile`.
 The MCP classic tools send it too: `stellar_pay`, `stellar_create_account`, `stellar_trustline`, `stellar_claim` and their commits, `stellar_balances`, `stellar_transaction_status`, `stellar_fee_stats`, and the x402 tools.
+The SEP-43 transaction and auth-entry tools send the primary credential on their endpoint probe, signer-set reads, and account reads.
 The cross-check witness sends the oracle credential.
 `balances` takes `--rpc-url` without a profile and sends none.
-The Friendbot path of `accounts create`, `stellar_friendbot`, `stellar_sep43_sign_and_submit_transaction`, and the smart-account, DeFi, and MPP commands and tools send none either.
+The Friendbot path of `accounts create`, `stellar_friendbot`, and the smart-account, DeFi, and MPP commands and tools send none either.
+`stellar_sep43_sign_and_submit_transaction` sends no credential with its submission.
 
 A missing entry reports `auth.keyring_not_found`.
 A stored value that is empty, longer than 1024 bytes, or holds a control character reports `network.rpc_credential_refused`.
@@ -869,8 +872,7 @@ engine = "v1"
 After owner enrollment, a mismatched engine selection refuses through CLI and MCP.
 Complete the signed engine ceremony above before using the profile.
 Noop refuses mainnet destructive operations with `policy.engine_required`.
-Builds from this repository and releases from v0.1.0-alpha.14 on carry
-`mainnet-write`. Mainnet writes also need enablement and a signed v2 body.
+Default builds enable the `mainnet-write` feature. Mainnet writes also need enablement and a signed v2 body.
 CLI value operations follow the governing decision: `allow` grants policy
 authority without a ceremony; `require_approval` requires passkey consent.
 An MCP mainnet write signs under Allow and needs a verified approval under
@@ -1044,7 +1046,7 @@ reason = "review"
 | Policy-body element | Meaning |
 |---|---|
 | `version`, `scope`, `sequence`, `[[rules]]` | `version = 2`, profile-specific scope, a positive sequence, and explicit rules. This policy is separate from the profile document. |
-| Root `contract_transfer_max_fee_stroops` | Optional signed total transaction fee cap in policy versions 1 and 2, from 0 through 4294967295. Zero permits no positive fee. It is not required for G/M payments. |
+| Root `contract_transfer_max_fee_stroops` | Optional signed total transaction fee cap in policy versions 1 and 2, from 0 through 4294967295. Zero permits no positive fee. It is not required for G/M payments. The SEP-43 transaction tools apply it to the full fee of a transaction with a resource fee. Testnet uses 1,000,000 stroops when it is absent. |
 | Sequence allocation | Signing assigns `max(pin, body) + 1`. Signing does not advance the pin. A verified load can advance it. |
 | Pin comparison | A pin refuses v1 or a lower sequence. Equal sequence with another digest or owner is a fork. |
 | `[mainnet].profile` | Dedicated profile name. |
@@ -1098,7 +1100,9 @@ decides `allow`, and sets `allow_opaque_signing = false`.
   also covers its M addresses; an M entry covers only its own mux ID.
   `profile policy add-counterparty` adds a G, M, C, or W recipient and the
   kind a list needs. An entry admits the address under the policy; it does
-  not change which destination forms a payment command accepts. A W entry
+  not change which destination forms a payment command accepts. A C entry
+  never admits a `pay` or `stellar_pay` payment, because both refuse a
+  contract destination. A W entry
   takes effect when the wallet pays W destinations.
 - A chosen unlisted budget writes the same `unlisted` table on every payment
   rule. Equal tables share one counter per asset, so one budget of `U` per
@@ -1216,6 +1220,7 @@ also when its credential stays listed. The `[remote_approval]` allowlist and
 
 Without a signed approval origin, mainnet consent uses the localhost passkey page.
 Headless consent, `--yes`, `--no-open` on the local inbox, and remote mainnet approval then refuse.
+Without a display, mainnet consent needs `--open-by-operator`, which prints the localhost URL for the operator to open.
 With a signed approval origin, the HTTPS listener serves consent using an owner-pinned credential.
 The CLI prints the signed approval link without opening a browser or requiring a display.
 Ledger signing also requires this passkey ceremony.
@@ -1357,7 +1362,8 @@ Other build failures use `policy.engine_unavailable` or `trustline.policy_engine
 | `approve.yes_refused_on_mainnet` | On mainnet, `--yes` refuses before store access in either build. |
 | `accounts.create.generate_refused_on_mainnet` | Mainnet creation requires a destination public key. Generated-key creation is a testnet convenience. |
 
-Policy denials retain their `policy.deny.*` codes. The installed skill
+Policy denials retain their `policy.deny.*` codes, and balance floor denials
+retain their `account.*` codes. The installed skill
 [lists the denial vocabulary](../skills/stellar-agent-wallet/references/troubleshooting.md#policy-denial-codes).
 
 ## Example profile
@@ -1413,6 +1419,6 @@ Reset refuses while an intent remains open or retained. A closed and pruned inte
 
 An open intent without an authenticated purpose permanently blocks reset for this profile. Continue with a new profile.
 
-Retained intents close only through the profile's stored secondary endpoint. Add one to the profile.
+When an intent is open and the profile stores no `secondary_rpc_url`, the intent view reports that retained intents cannot close and asks for one.
 
-The profile's stored endpoint configuration is unreadable. Retained intents close only through stored endpoints that load.
+When an intent is open and the stored endpoint configuration cannot load, the intent view reports that only stored endpoints that load close retained intents.
