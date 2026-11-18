@@ -183,9 +183,9 @@ mod composed {
         }
 
         fn request(&self, l: &Ledger, id: u8, holds: Vec<WindowEntry>) -> MintRequest {
-            let mut request = l.request(tx(id), holds);
-            request.policy_digest = self.digest;
-            request
+            let request = l.request(tx(id), holds);
+            let sequence = request.policy_sequence;
+            on_policy(request, sequence, self.digest)
         }
 
         fn recovery_request(&self, l: &Ledger, holds: Vec<WindowEntry>) -> MintRequest {
@@ -265,7 +265,7 @@ mod composed {
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
         for kind in ["amount", "count", "unlisted", "total"] {
             for next in [10, 11] {
-                let l = Ledger::new();
+                let l = Ledger::with_approvals();
                 let rules = Rules::new(&l, kind, (false, false));
                 let empty = rules.snapshot(&l);
                 let seed = rules.holds(&l, &empty, 40, false);
@@ -336,7 +336,13 @@ mod composed {
                     );
                     assert_eq!(l.bytes(), before, "approval-needed writes nothing");
                 }
-                let result = l.mint(&rules.request(&l, later_id, later.clone()));
+                let mut later_request = rules.request(&l, later_id, later.clone());
+                if kind == "unlisted" && next == 11 {
+                    // The approval that satisfies the allowance holds its
+                    // durable record.
+                    l.approve(&mut later_request);
+                }
+                let result = l.mint(&later_request);
                 if next == 10 || kind == "unlisted" {
                     let minted = result.expect("remaining headroom or an approval admits it");
                     assert_holds(&l, minted.id, &later);
@@ -700,10 +706,13 @@ mod composed {
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
         for kind in ["amount", "total"] {
             for claimed in [false, true] {
-                let l = Ledger::new();
+                // The repeat refusal below is the approval's single use, so
+                // the request proceeds under a durable approval.
+                let l = Ledger::with_approvals();
                 let rules = Rules::new(&l, kind, (false, false));
                 let entries = rules.holds(&l, &rules.snapshot(&l), 50, true);
-                let request = rules.request(&l, 1, entries.clone());
+                let mut request = rules.request(&l, 1, entries.clone());
+                l.approve(&mut request);
                 let minted = l.mint(&request).unwrap();
                 if claimed {
                     l.clock.set(T0 + 7);

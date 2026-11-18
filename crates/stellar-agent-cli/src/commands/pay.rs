@@ -8300,26 +8300,74 @@ pub(crate) mod tests {
             assert!(records(&fixture).is_empty());
         }
 
-        /// After the confirmation, before the mint: a receipt directory the
-        /// recorder cannot open withholds the signature and leaves the entry
-        /// pending.
-        #[tokio::test(flavor = "current_thread")]
-        #[serial_test::serial]
-        async fn an_unavailable_receipt_store_withholds_the_signature() {
-            let fixture = Spec::new("mainnet-pay-receipts").build().await;
+        /// Replaces the receipt directory with a file, so no receipt store opens.
+        fn break_receipt_store() {
             let receipts = stellar_agent_core::profile::receipt::default_receipts_dir().unwrap();
             if receipts.exists() {
                 std::fs::remove_dir_all(&receipts).unwrap();
             }
             std::fs::create_dir_all(receipts.parent().unwrap()).unwrap();
             std::fs::write(&receipts, b"not a directory").unwrap();
+        }
+
+        /// Under an `Allow` rule, after the decision and before the mint: a
+        /// receipt directory the recorder cannot open refuses at the recorder
+        /// preparation with the withheld sentence; no ceremony runs, no entry
+        /// is parked, no authorization is recorded and nothing is sent.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn an_unavailable_receipt_store_withholds_the_signature() {
+            let fixture = Spec::new("mainnet-pay-receipts")
+                .rules(vec![pay_rule("allow", "")])
+                .build()
+                .await;
+            break_receipt_store();
+
+            let run = run(&fixture, &memo_args(&fixture)).await;
+
+            assert_eq!(run.code, 1, "{}", run.envelope);
+            assert_eq!(
+                run.code(),
+                "submission.record_unavailable",
+                "{}",
+                run.envelope
+            );
+            assert!(
+                run.message()
+                    .ends_with(" The signature was withheld and nothing was sent."),
+                "{}",
+                run.message()
+            );
+            assert!(records(&fixture).is_empty(), "no authorization record");
+            assert!(
+                fixture.pending_entries().is_empty(),
+                "no confirmation entry"
+            );
+            assert!(fixture.sent_envelopes().await.is_empty(), "nothing is sent");
+        }
+
+        /// Under an approval rule, after the consent commit and before the
+        /// consent drain and the mint: a receipt directory that cannot be read
+        /// refuses at the committed consent's receipt check, so no signature
+        /// is produced, nothing is sent and the entry stays pending.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn an_unavailable_receipt_store_refuses_the_committed_consent() {
+            let fixture = Spec::new("mainnet-pay-receipts-approval").build().await;
+            break_receipt_store();
 
             let run = run(&fixture, &memo_args(&fixture)).await;
 
             assert_withheld_before_the_mint(&fixture, &run, "submission.record_unavailable").await;
             assert!(
+                run.message().starts_with(
+                    "the submission receipt store could not be read, so nothing was sent: "
+                ),
+                "{}",
                 run.message()
-                    .ends_with(" The signature was withheld and nothing was sent."),
+            );
+            assert!(
+                !run.message().contains("could not be durably recorded"),
                 "{}",
                 run.message()
             );

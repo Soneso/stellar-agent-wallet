@@ -654,6 +654,7 @@ impl WalletServer {
                 GatedApprovalKind::X402.expectation(subject),
                 args.approval_nonce.as_deref(),
                 args.approval_attestation.as_deref(),
+                None,
                 "stellar_x402_authenticated_payment",
             )
             .await
@@ -1198,6 +1199,7 @@ impl WalletServer {
                 nonce: args.approval_nonce.clone(),
                 attestation: args.approval_attestation.clone(),
             },
+            entry.as_ref().map(|handle| handle.id()),
             TOOL,
             &mut witness,
         )

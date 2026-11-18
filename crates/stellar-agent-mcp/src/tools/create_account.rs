@@ -1047,14 +1047,15 @@ impl WalletServer {
             Ok(id) => id,
             Err(result) => return Ok(result),
         };
-        if let Err(result) = self.classic_commit_lookup(
+        let admitted_operation = match self.classic_commit_lookup(
             mainnet.as_ref().map(|guard| guard.policy),
             stellar_agent_network::policy_state::OperationKind::CreateAccount,
             business_id.as_ref(),
             &args.envelope_xdr,
         ) {
-            return Ok(result);
-        }
+            Ok(operation) => operation,
+            Err(result) => return Ok(result),
+        };
 
         let account_view = match crate::sequence_floor::fetch_account_with_sequence_catchup(
             &self.sequence_floor,
@@ -1148,6 +1149,7 @@ impl WalletServer {
                     nonce: args.approval_nonce.clone(),
                     attestation: args.approval_attestation.clone(),
                 },
+                admitted_operation,
                 "stellar_create_account_commit",
                 &mut witness,
             )

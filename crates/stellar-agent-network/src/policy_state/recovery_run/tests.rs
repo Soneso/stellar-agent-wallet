@@ -1461,7 +1461,9 @@ fn isolated_run_preserves_approval_revocation() {
     let mut fx = ApprovalFx::new(300000);
     fx.open();
     fx.consent();
-    let mint = fx.mint_request();
+    let mut mint = fx.mint_request();
+    // The operation route takes the approval identity from the handle.
+    mint.operation = None;
     let mut recorder = OperationRecorder::new(
         &fx.store,
         fx.fixture.profile(),

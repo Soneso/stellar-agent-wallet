@@ -268,6 +268,38 @@ fn the_mainnet_drain_sits_between_the_confirmation_and_the_readiness_proof() {
     );
 }
 
+/// The confirmation's durable join, where the inbox is released and the
+/// consent commits.
+const MAINNET_CONFIRM: &str = include_str!("../../src/common/mainnet_confirm.rs");
+
+#[test]
+fn the_committed_consent_is_verified_from_the_captured_proof_after_the_commit() {
+    assert_called_between(
+        "common/mainnet_confirm.rs",
+        MAINNET_CONFIRM,
+        "fn commit_durable(",
+        "persisted_attestation(&pending, nonce)",
+        "publication_completion(",
+        "drop(pending)",
+    );
+    assert_called_between(
+        "common/mainnet_confirm.rs",
+        MAINNET_CONFIRM,
+        "fn commit_durable(",
+        "commit_consent(&window, profile, &completion)",
+        "verify_committed(context, policy, nonce, &presented, check)",
+        "fn verify_committed(",
+    );
+    assert_called_between(
+        "common/mainnet_confirm.rs",
+        MAINNET_CONFIRM,
+        "fn verify_committed(",
+        "find_by_approval_nonce(nonce)",
+        "facts_by_nonce(nonce)",
+        "verify_durable_approval(",
+    );
+}
+
 #[test]
 fn the_mainnet_recorder_is_prepared_between_the_readiness_proof_and_the_mint() {
     assert_called_between(

@@ -3118,8 +3118,9 @@ impl SuppliedProof {
 /// Without a proof, an `Allow` is policy authority and an approval
 /// requirement asks for the approval of `expected`. A proof, complete or
 /// partial, runs [`verify_attestation_subject_gate`], whose step 1 refuses a
-/// partial pair. A verified witness goes into `witness`, and the authority
-/// borrows it. The wrapper never writes the approval store.
+/// partial pair. The proof's durable record must name `operation`, the
+/// operation the call continues. A verified witness goes into `witness`, and
+/// the authority borrows it. The wrapper never writes the approval store.
 ///
 /// # Errors
 ///
@@ -3136,6 +3137,7 @@ pub(crate) async fn mainnet_authority<'w>(
     outcome: &DispatchOutcome,
     expected: stellar_agent_core::approval::witness::ApprovalExpectation,
     proof: &SuppliedProof,
+    operation: Option<stellar_agent_network::policy_state::OperationId>,
     tool: &'static str,
     witness: &'w mut Option<stellar_agent_core::approval::witness::ApprovalWitness>,
 ) -> Result<
@@ -3164,6 +3166,7 @@ pub(crate) async fn mainnet_authority<'w>(
         expected,
         proof.nonce.as_deref(),
         proof.attestation.as_deref(),
+        operation,
         tool,
     )
     .await
@@ -3242,6 +3245,10 @@ pub(crate) fn authority_refusal_result(
 /// 7. Attestation key loads from the keyring.
 /// 8. HMAC-SHA256 verifies byte-for-byte (constant-time).
 ///
+/// This wrapper names no operation, so it admits no mainnet proof: on a
+/// mainnet server, after the receipt check, every supplied proof refuses.
+/// Mainnet commits obtain their authority through [`mainnet_authority`].
+///
 /// # Errors
 ///
 /// Live rejection and consumption markers retain their terminal error codes.
@@ -3250,12 +3257,8 @@ pub(crate) fn authority_refusal_result(
 /// Internal debug tracing identifies the refusal for operator forensics.
 ///
 /// Returns `Ok(None)` when `dispatch_outcome` is `DispatchOutcome::Allow` off
-/// an admitted mainnet server, where the gate is a no-op. On an admitted
-/// mainnet server a proof under `Allow` runs every step. When every step
-/// passes, an admitted mainnet
-/// server returns `Ok(Some(witness))`, the sealed approval witness core's
-/// `verify_approval` produces for the resolver, and every other server
-/// returns `Ok(None)`.
+/// an admitted mainnet server, where the gate is a no-op, and `Ok(None)` off
+/// mainnet when every step passes.
 pub(crate) async fn verify_attestation_gate(
     server: &WalletServer,
     dispatch_outcome: &DispatchOutcome,
@@ -3276,17 +3279,24 @@ pub(crate) async fn verify_attestation_gate(
         expected,
         approval_nonce,
         approval_attestation,
+        None,
         tool_name,
     )
     .await
 }
 
+/// The gate of [`verify_attestation_gate`] for the subject of `expected`.
+///
+/// On a mainnet server, after the receipt check, [`mainnet_proof_gate`]
+/// decides the proof for the call's admitted `operation`, and the approval
+/// inbox grants nothing. Off mainnet `operation` is unused.
 pub(crate) async fn verify_attestation_subject_gate(
     server: &WalletServer,
     dispatch_outcome: &DispatchOutcome,
     expected: stellar_agent_core::approval::witness::ApprovalExpectation,
     approval_nonce: Option<&str>,
     approval_attestation: Option<&str>,
+    operation: Option<stellar_agent_network::policy_state::OperationId>,
     tool_name: &'static str,
 ) -> Result<
     Option<stellar_agent_core::approval::witness::ApprovalWitness>,
@@ -3336,6 +3346,24 @@ pub(crate) async fn verify_attestation_subject_gate(
         .and_then(|receipts| receipts.find_by_approval_nonce(approval_nonce_str));
     if matches!(&receipt_hold, Ok(Some(_))) {
         return Err(approval_consumed_error());
+    }
+
+    // A mainnet approval verifies only against its durable record, so the
+    // version 4 HMAC below never admits a mainnet commit, also on a server
+    // without mainnet admission state.
+    if server.mainnet_context.is_some() || server.context.chain_id.is_mainnet() {
+        // An unreadable receipt store refuses before any approval record is read.
+        receipt_hold.map_err(|_| approval_required_indistinguishable(&profile_name))?;
+        return mainnet_proof_gate(
+            server,
+            &expected,
+            approval_nonce_str,
+            &attestation_bytes,
+            operation,
+            tool_name,
+        )
+        .await
+        .map(Some);
     }
 
     // 3. Open store and look up entry.
@@ -3454,105 +3482,6 @@ pub(crate) async fn verify_attestation_subject_gate(
     // An unreadable receipt still refuses before any approval can admit a send.
     receipt_hold.map_err(|_| approval_required_indistinguishable(&profile_name))?;
 
-    // A mainnet approval verifies only through the mainnet witness, so the
-    // version 4 HMAC below never admits a mainnet commit, also on a server
-    // without mainnet admission state.
-    if server.mainnet_context.is_some() || server.context.chain_id.is_mainnet() {
-        // Preserve the key-loader's indistinguishable rendering and operator diagnostics.
-        let _key = load_attestation_key(server.security_profile())?;
-        // The key load may wait on a keyring prompt: the startup policy must
-        // still verify as the current one before the witness, which loads the
-        // current policy again and requires it to be this one.
-        let Some(policy) = server.current_mainnet_policy() else {
-            tracing::debug!(
-                tool = tool_name,
-                code = if server.mainnet_context.is_some() {
-                    "policy.changed_before_proof"
-                } else {
-                    "mainnet.admission_absent"
-                },
-                "approval proof refused"
-            );
-            return Err(approval_required_indistinguishable(&profile_name));
-        };
-        let witness = stellar_agent_core::approval::witness::verify_approval(
-            &store,
-            server.security_profile(),
-            &profile_name,
-            approval_nonce_str,
-            &attestation_bytes,
-            &expected,
-            policy,
-            now_ms_attest,
-        )
-        .map_err(|error| {
-            // Steps 5b and 5c above already answered a rejected or consumed
-            // entry with its own code, so every refusal here is uniform.
-            tracing::debug!(
-                tool = tool_name,
-                code = error.code(),
-                "approval proof refused"
-            );
-            if error.code() == "validation.key_matches_owner_public_key" {
-                tracing::warn!(code = error.code(), "attestation owner key refused");
-            }
-            approval_required_indistinguishable(&profile_name)
-        })?;
-        drop(store);
-        #[cfg(all(test, feature = "mainnet-write"))]
-        if let Some((barrier, arrivals)) = &server.payment_proof_barrier {
-            arrivals.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            barrier.wait().await;
-        }
-        #[cfg(all(test, feature = "mainnet-write"))]
-        tests::mainnet::delivery_fault(&profile_name);
-        use stellar_agent_network::policy_state::approvals::{
-            ApprovalStatus, VerifiedConsentDelivery, require_consent_evidence_time,
-        };
-        let delivery = ApprovalStatus::new(&server.window_store, server.security_profile())
-            .consent_delivery(&witness)
-            .map_err(|_| approval_required_indistinguishable(&profile_name))?;
-        let (identity, reference) = match &delivery {
-            VerifiedConsentDelivery::Unenforced => return Ok(Some(witness)),
-            VerifiedConsentDelivery::Queued {
-                identity,
-                reference,
-            } => (identity, Some(reference)),
-            VerifiedConsentDelivery::DirectAnchored { identity }
-            | VerifiedConsentDelivery::Ended { identity } => (identity, None),
-        };
-        let checked = (|| -> Result<(), stellar_agent_core::WalletError> {
-            let (writer, _readiness) = server.write_audit()?;
-            let mut writer = writer.lock().map_err(|_| {
-                stellar_agent_core::WalletError::from(
-                    stellar_agent_core::error::ValidationError::AuditWriterOpenFailed {
-                        profile: profile_name.clone(),
-                    },
-                )
-            })?;
-            let floor = stellar_agent_core::audit_log::require_consent_delivered(
-                &mut writer,
-                identity,
-                reference,
-                &profile_name,
-            )?;
-            require_consent_evidence_time(&witness, floor)
-        })();
-        checked.map_err(|error| {
-            if matches!(
-                error,
-                stellar_agent_core::WalletError::Approval(
-                    stellar_agent_core::ApprovalFailure::ConsentUndelivered { .. }
-                )
-            ) {
-                business_error_result(error.code(), error.message())
-            } else {
-                approval_required_indistinguishable(&profile_name)
-            }
-        })?;
-        return Ok(Some(witness));
-    }
-
     // The tool accepts only its own approval kind and subject.
     let stored_sha256_hex = match &entry.kind {
         stellar_agent_core::approval::ApprovalKind::PaymentSimulated {
@@ -3654,6 +3583,214 @@ pub(crate) async fn verify_attestation_subject_gate(
     // Attestation key zeroized here on `attestation_key` drop (Zeroizing fires).
 
     Ok(None)
+}
+
+/// Decides a complete mainnet proof of `nonce` for the call's admitted
+/// `operation` and returns its witness.
+///
+/// [`durable_proof_witness`] verifies the presented bytes against the
+/// approval's durable record. The witness then passes the consent delivery
+/// checks of its kind: a kind whose capability does not enforce delivery
+/// passes at once; an enforced kind drains the audit outbox and requires
+/// strict direct anchoring or the exact Delivered evidence, then the consent
+/// window at the evidence floor.
+///
+/// # Errors
+///
+/// A revoked approval renders the redacted `approval.revoked` envelope, and
+/// a proof of another operation `policy.approval_consumed`. A live rejection
+/// in the approval inbox renders `policy.approval_rejected` for any other
+/// failed proof; that read never admits. An undelivered queued consent
+/// renders `approval.consent_undelivered`. Every other refusal is
+/// [`approval_required_indistinguishable`].
+async fn mainnet_proof_gate(
+    server: &WalletServer,
+    expected: &stellar_agent_core::approval::witness::ApprovalExpectation,
+    nonce: &str,
+    presented: &[u8; 32],
+    operation: Option<stellar_agent_network::policy_state::OperationId>,
+    tool_name: &'static str,
+) -> Result<stellar_agent_core::approval::witness::ApprovalWitness, rmcp::model::CallToolResult> {
+    use stellar_agent_network::policy_state::approvals::{
+        ApprovalStatus, VerifiedConsentDelivery, require_consent_evidence_time,
+    };
+    let profile_name = server.profile_name_for_approval();
+    // Preserve the key-loader's indistinguishable rendering and operator diagnostics.
+    let _key = load_attestation_key(server.security_profile())?;
+    // The key load may wait on a keyring prompt: the startup policy must
+    // still verify as the current one before the witness, which loads the
+    // current policy again and requires it to be this one.
+    let Some(policy) = server.current_mainnet_policy() else {
+        tracing::debug!(
+            tool = tool_name,
+            code = if server.mainnet_context.is_some() {
+                "policy.changed_before_proof"
+            } else {
+                "mainnet.admission_absent"
+            },
+            "approval proof refused"
+        );
+        return Err(approval_required_indistinguishable(&profile_name));
+    };
+    let witness = durable_proof_witness(server, nonce, presented, expected, policy, operation)
+        .map_err(|error| {
+            tracing::debug!(
+                tool = tool_name,
+                code = error.code(),
+                "approval proof refused"
+            );
+            if error.code() == "validation.key_matches_owner_public_key" {
+                tracing::warn!(code = error.code(), "attestation owner key refused");
+            }
+            match error {
+                stellar_agent_core::WalletError::Approval(
+                    stellar_agent_core::ApprovalFailure::Revoked { .. },
+                ) => ledger_err_result(&error),
+                stellar_agent_core::WalletError::Approval(
+                    stellar_agent_core::ApprovalFailure::Consumed { .. },
+                ) => approval_consumed_error(),
+                _ => live_rejection(server, nonce)
+                    .unwrap_or_else(|| approval_required_indistinguishable(&profile_name)),
+            }
+        })?;
+    #[cfg(all(test, feature = "mainnet-write"))]
+    if let Some((barrier, arrivals)) = &server.payment_proof_barrier {
+        arrivals.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        barrier.wait().await;
+    }
+    #[cfg(all(test, feature = "mainnet-write"))]
+    tests::mainnet::delivery_fault(&profile_name);
+    let delivery = ApprovalStatus::new(&server.window_store, server.security_profile())
+        .consent_delivery(&witness)
+        .map_err(|_| approval_required_indistinguishable(&profile_name))?;
+    let (identity, reference) = match &delivery {
+        VerifiedConsentDelivery::Unenforced => return Ok(witness),
+        VerifiedConsentDelivery::Queued {
+            identity,
+            reference,
+        } => (identity, Some(reference)),
+        VerifiedConsentDelivery::DirectAnchored { identity }
+        | VerifiedConsentDelivery::Ended { identity } => (identity, None),
+    };
+    let checked = (|| -> Result<(), stellar_agent_core::WalletError> {
+        let (writer, _readiness) = server.write_audit()?;
+        let mut writer = writer.lock().map_err(|_| {
+            stellar_agent_core::WalletError::from(
+                stellar_agent_core::error::ValidationError::AuditWriterOpenFailed {
+                    profile: profile_name.clone(),
+                },
+            )
+        })?;
+        let floor = stellar_agent_core::audit_log::require_consent_delivered(
+            &mut writer,
+            identity,
+            reference,
+            &profile_name,
+        )?;
+        require_consent_evidence_time(&witness, floor)
+    })();
+    checked.map_err(|error| {
+        if matches!(
+            error,
+            stellar_agent_core::WalletError::Approval(
+                stellar_agent_core::ApprovalFailure::ConsentUndelivered { .. }
+            )
+        ) {
+            business_error_result(error.code(), error.message())
+        } else {
+            approval_required_indistinguishable(&profile_name)
+        }
+    })?;
+    Ok(witness)
+}
+
+/// Verifies `presented` against the authenticated durable record of `nonce`
+/// and binds it to the call's admitted `operation`. The approval inbox is not
+/// read.
+///
+/// The decision time is the mainnet authorization clock the resolver and the
+/// mint read, raised to the consent evidence floor when the record's kind
+/// enforces delivery. The record's operation
+/// must be `operation`; a consumed record of that operation still verifies
+/// here, and the mint decides its reuse.
+///
+/// # Errors
+///
+/// The refusals of
+/// [`verify_durable_approval`](stellar_agent_core::approval::witness::verify_durable_approval),
+/// in its order. `approval.binding_mismatch` for a call without an admitted
+/// operation and `approval.consumed` for a verified proof of another
+/// operation. A store, clock or evidence floor failure refuses with its own
+/// wallet error.
+pub(crate) fn durable_proof_witness(
+    server: &WalletServer,
+    nonce: &str,
+    presented: &[u8; 32],
+    expected: &stellar_agent_core::approval::witness::ApprovalExpectation,
+    policy: &stellar_agent_core::mainnet::verified_policy::VerifiedPolicy,
+    operation: Option<stellar_agent_network::policy_state::OperationId>,
+) -> Result<stellar_agent_core::approval::witness::ApprovalWitness, stellar_agent_core::WalletError>
+{
+    use stellar_agent_core::ApprovalFailure;
+    use stellar_agent_network::policy_state::approvals::{
+        ApprovalStatus, consent_evidence_time_floor, delivery_enforced,
+    };
+    let profile = server.security_profile();
+    let profile_name = server.profile_name_for_approval();
+    let facts = ApprovalStatus::new(&server.window_store, profile)
+        .facts_by_nonce(nonce)
+        .map_err(stellar_agent_network::operation_entry::operation_refusal)?;
+    let wall = stellar_agent_network::mainnet::clock::now_ms()?;
+    let now = match &facts {
+        Some(facts) if delivery_enforced(&profile_name, facts.record().kind) => {
+            wall.max(consent_evidence_time_floor(profile, &profile_name)?)
+        }
+        _ => wall,
+    };
+    let witness = stellar_agent_core::approval::witness::verify_durable_approval(
+        facts.as_ref(),
+        presented,
+        profile,
+        &profile_name,
+        expected,
+        policy,
+        now,
+    )?;
+    let recorded = facts.as_ref().map(|facts| facts.record().operation_id);
+    match operation {
+        None => Err(stellar_agent_core::WalletError::Approval(
+            ApprovalFailure::BindingMismatch {
+                detail: "the call names no admitted operation".to_owned(),
+            },
+        )),
+        Some(operation) if recorded == Some(*operation.as_bytes()) => Ok(witness),
+        Some(_) => Err(stellar_agent_core::WalletError::Approval(
+            ApprovalFailure::Consumed {
+                detail: "this approval belongs to another operation".to_owned(),
+            },
+        )),
+    }
+}
+
+/// The `policy.approval_rejected` refusal when the approval inbox holds a
+/// live rejection of `nonce`. A missing, locked or unreadable inbox gives
+/// `None`.
+fn live_rejection(server: &WalletServer, nonce: &str) -> Option<rmcp::model::CallToolResult> {
+    use stellar_agent_core::approval::{
+        ApprovalKind, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, open_with_retry,
+    };
+    let path = server
+        .resolve_approval_dir()
+        .ok()?
+        .join(format!("{}.toml", server.profile_name_for_approval()));
+    let store = open_with_retry(&path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF).ok()?;
+    let now = stellar_agent_network::mainnet::clock::now_ms().ok()?;
+    store
+        .get(nonce)
+        .filter(|entry| {
+            !entry.is_expired(now) && matches!(entry.kind, ApprovalKind::Rejected { .. })
+        })
+        .map(|_| approval_rejected_error())
 }
 
 impl WalletServer {
@@ -7692,6 +7829,129 @@ pub(crate) mod tests {
                 self.attest_bound(entry, "operator", "stellar:mainnet")
             }
 
+            /// Records the durable consent of the inbox-attested entry
+            /// `nonce`, as the consent step after an operator ceremony does.
+            pub(crate) fn complete_consent(&self, nonce: &str) {
+                let profile = self.server.security_profile();
+                let policy =
+                    stellar_agent_core::approval::MainnetApprovalAuthority::for_profile("operator")
+                        .unwrap()
+                        .load_current()
+                        .unwrap()
+                        .into_policy();
+                let admission =
+                    stellar_agent_core::approval::MainnetApprovalAuthority::for_profile("operator")
+                        .unwrap()
+                        .admit()
+                        .unwrap();
+                let store = stellar_agent_core::approval::PendingApprovalStore::open(
+                    self.server
+                        .resolve_approval_dir()
+                        .unwrap()
+                        .join("operator.toml"),
+                )
+                .unwrap();
+                let completion = stellar_agent_network::operation_entry::consent_completion(
+                    &store,
+                    &self.server.window_store,
+                    profile,
+                    "operator",
+                    nonce,
+                    &policy,
+                    stellar_agent_network::policy_state::ConsentRow::Written,
+                    &admission,
+                )
+                .unwrap();
+                drop(store);
+                drop(admission);
+                stellar_agent_network::operation_entry::commit_consent(
+                    &self.server.window_store,
+                    profile,
+                    &completion,
+                )
+                .unwrap();
+            }
+
+            /// Opens a fresh x402 operation of `tool` for the payment
+            /// `digest` describes, and the durable record of `entry` for it
+            /// through the MCP producer, which stores the entry. A later
+            /// [`Self::attest`] consents the record. Returns the link of the
+            /// operation's first attempt.
+            pub(crate) fn x402_record(
+                &self,
+                tool: stellar_agent_network::policy_state::OperationTool,
+                kind: stellar_agent_network::policy_state::OperationKind,
+                digest: [u8; 32],
+                intent: stellar_agent_network::policy_state::X402Intent,
+                entry: &stellar_agent_core::approval::PendingApproval,
+            ) -> stellar_agent_network::policy_state::OperationLink {
+                let business_id = crate::tools::common::tests::fresh_business_id();
+                let handle = self
+                    .server
+                    .x402_entry(
+                        "stellar:mainnet",
+                        Some(&business_id),
+                        tool,
+                        kind,
+                        digest,
+                        intent,
+                    )
+                    .unwrap()
+                    .unwrap();
+                let path = self
+                    .server
+                    .resolve_approval_dir()
+                    .unwrap()
+                    .join("operator.toml");
+                self.server
+                    .x402_pending_approval(
+                        Some(&handle),
+                        stellar_agent_core::audit_log::PolicyDecision::RequireApproval,
+                        crate::tools::business_entry::Staged {
+                            build: |_: Option<&stellar_agent_core::approval::ClassicIntent>| {
+                                Ok(entry.clone())
+                            },
+                            insert: |entry: stellar_agent_core::approval::PendingApproval| {
+                                stellar_agent_core::approval::PendingApprovalStore::open(path)
+                                    .unwrap()
+                                    .insert(
+                                        entry.clone(),
+                                        stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+                                    )
+                                    .unwrap();
+                                Ok(entry)
+                            },
+                        },
+                    )
+                    .unwrap();
+                stellar_agent_network::operation_entry::next_attempt_link(&handle)
+            }
+
+            /// [`Self::x402_record`] of `entry` for the fixture's plain x402
+            /// payment, as the create tool opens it. Returns the operation id
+            /// the payment's gate names.
+            pub(crate) fn x402_plain_record(
+                &self,
+                entry: &stellar_agent_core::approval::PendingApproval,
+            ) -> stellar_agent_network::policy_state::OperationId {
+                let requirements = self.requirements();
+                self.x402_record(
+                    stellar_agent_network::policy_state::OperationTool::X402CreatePayment,
+                    stellar_agent_network::policy_state::OperationKind::X402Payment,
+                    stellar_agent_x402::exact::intent_digest(&requirements, self.envelope.source())
+                        .unwrap(),
+                    stellar_agent_network::policy_state::X402Intent {
+                        network: requirements.network.clone(),
+                        asset: requirements.asset.clone(),
+                        payer: self.envelope.source().to_owned(),
+                        pay_to: requirements.pay_to.clone(),
+                        amount: requirements.amount.clone(),
+                    },
+                    entry,
+                )
+                .operation_id
+            }
+
             /// Attests `entry` as the operator does and returns the
             /// attestation the agent presents for `profile` and `chain`.
             ///
@@ -8702,23 +8962,32 @@ pub(crate) mod tests {
             .ok()
         }
 
-        /// Runs the wrapper over every decision and proof case of the
-        /// fixture's payment commit and returns each case with its result.
-        /// Each call leaves the approval store bytes as it found them.
+        /// Runs the wrapper over every decision and proof case of a payment
+        /// commit and returns each case with its result. The complete proof
+        /// is the consent of a durable record of the commit's own
+        /// operation. Each call leaves the approval store bytes as it found
+        /// them and commits no window generation.
         async fn authority_cases() -> Vec<(String, String)> {
             use stellar_agent_core::approval::subject::approval_subject_classic;
             let mut cases = Vec::new();
             for require in [false, true] {
-                let f = Fixture::new(|raw| {
-                    if require {
-                        require_approval_rules(&raw, &["stellar_pay_commit"], 600)
-                    } else {
-                        raw
-                    }
-                });
-                let xdr = f.envelope.envelope_xdr();
-                let entry = approval_for(Tool::Pay, &f, xdr, 600_000);
-                let blob = f.attest(&entry);
+                let run = if require {
+                    ClassicRun::new(Tool::Pay).await
+                } else {
+                    ClassicRun::allowed(Tool::Pay).await
+                };
+                let blob = if require {
+                    run.args["approval_attestation"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                } else {
+                    run.record_own_approval()
+                };
+                let operation = Some(run.operation_id());
+                let f = &run.f;
+                let xdr = run.args["envelope_xdr"].as_str().unwrap();
+                let entry = &run.entry;
                 let outcome = f
                     .server
                     .dispatch_gate("stellar_pay_commit", &f.args(), "stellar:mainnet")
@@ -8749,13 +9018,15 @@ pub(crate) mod tests {
                         },
                     ),
                 ] {
-                    let before = approval_store_bytes(&f);
+                    let before = approval_store_bytes(f);
+                    let window = std::fs::read(f.server.window_store.path()).unwrap();
                     let mut witness = None;
                     let result = mainnet_authority(
                         &f.server,
                         &outcome,
                         GatedApprovalKind::Payment.expectation(approval_subject_classic(xdr)),
                         &supplied,
+                        operation,
                         "stellar_pay_commit",
                         &mut witness,
                     )
@@ -8763,9 +9034,14 @@ pub(crate) mod tests {
                     let case = authority_case(&result);
                     drop(result);
                     assert_eq!(
-                        approval_store_bytes(&f),
+                        approval_store_bytes(f),
                         before,
                         "{decision} {proof}: the store is unchanged"
+                    );
+                    assert_eq!(
+                        std::fs::read(f.server.window_store.path()).unwrap(),
+                        window,
+                        "{decision} {proof}: the window is unchanged"
                     );
                     cases.push((format!("{decision} {proof}"), case));
                 }
@@ -8792,20 +9068,21 @@ pub(crate) mod tests {
                         decision,
                         snapshot: None,
                     });
-                    let before = approval_store_bytes(&f);
+                    let before = approval_store_bytes(f);
                     let mut witness = None;
                     let result = mainnet_authority(
                         &f.server,
                         &outcome,
                         GatedApprovalKind::Payment.expectation(approval_subject_classic(xdr)),
                         &SuppliedProof::default(),
+                        operation,
                         "stellar_pay_commit",
                         &mut witness,
                     )
                     .await;
                     let case = authority_case(&result);
                     drop(result);
-                    assert_eq!(approval_store_bytes(&f), before, "{label}");
+                    assert_eq!(approval_store_bytes(f), before, "{label}");
                     if require {
                         cases.push((label.to_owned(), case));
                     }
@@ -9114,52 +9391,33 @@ pub(crate) mod tests {
         #[serial_test::serial(keyring)]
         #[serial_test::serial]
         async fn mainnet_gate_returns_a_real_classic_witness_and_checks_subject() {
-            use stellar_agent_core::approval::{PendingApproval, process_uid_for_attestation};
-            let f = Fixture::new(|raw| require_approval_rules(&raw, &["stellar_pay_commit"], 600));
-            let entry = PendingApproval::new_payment_pending(
-                f.envelope.envelope_xdr().to_owned(),
-                f.envelope.envelope_xdr().as_bytes(),
-                f.envelope.destination().to_owned(),
-                10,
-                "XLM".to_owned(),
-                None,
-                100,
-                2,
-                process_uid_for_attestation().unwrap(),
-                3_600_000,
-            )
-            .unwrap();
-            let blob = f.attest(&entry);
+            use stellar_agent_core::approval::subject::approval_subject_classic;
+            let run = ClassicRun::new(Tool::Pay).await;
+            let (args, entry) = run.recorded_approval(3_600_000);
+            let operation = Some(run.operation_of(args["business_id"].as_str().unwrap()));
+            let blob = args["approval_attestation"].as_str().unwrap();
+            let f = &run.f;
             let outcome = f
                 .server
                 .dispatch_gate("stellar_pay_commit", &f.args(), "stellar:mainnet")
                 .await
                 .unwrap();
-            let witness = verify_attestation_gate(
-                &f.server,
-                &outcome,
-                GatedApprovalKind::Payment,
-                f.envelope.envelope_xdr(),
-                Some(&entry.approval_nonce),
-                Some(&blob),
-                "stellar_pay_commit",
-            )
-            .await
-            .unwrap();
+            let gate = |subject: &str| {
+                verify_attestation_subject_gate(
+                    &f.server,
+                    &outcome,
+                    GatedApprovalKind::Payment.expectation(approval_subject_classic(subject)),
+                    Some(&entry.approval_nonce),
+                    Some(blob),
+                    operation,
+                    "stellar_pay_commit",
+                )
+            };
+            let witness = gate(args["envelope_xdr"].as_str().unwrap()).await.unwrap();
             assert!(witness.is_some());
             let witness = witness.unwrap();
             assert_eq!(witness.expires_at_ms() - witness.created_at_ms(), 3_600_000);
-            let refusal = verify_attestation_gate(
-                &f.server,
-                &outcome,
-                GatedApprovalKind::Payment,
-                "changed",
-                Some(&entry.approval_nonce),
-                Some(&blob),
-                "stellar_pay_commit",
-            )
-            .await
-            .unwrap_err();
+            let refusal = gate("changed").await.unwrap_err();
             assert_eq!(error_envelope_parts(&refusal).1, "policy.approval_required");
             assert_eq!(f.seed_reads.load(Ordering::SeqCst), 0);
         }
@@ -9223,17 +9481,11 @@ pub(crate) mod tests {
         #[serial_test::serial(keyring)]
         #[serial_test::serial]
         async fn mainnet_gate_checks_kind_age_terminal_states_and_keys() {
-            use stellar_agent_core::approval::{
-                ConsumedOutcome, PendingApproval, PendingApprovalStore, process_uid_for_attestation,
-            };
-            struct FixedClock(u64);
-            impl stellar_agent_core::timefmt::Clock for FixedClock {
-                fn now_unix_ms(
-                    &self,
-                ) -> Result<u64, stellar_agent_core::wallet::WalletLifecycleError> {
-                    Ok(self.0)
-                }
-            }
+            use stellar_agent_core::approval::{ConsumedOutcome, PendingApprovalStore};
+            // Each approval has a durable record of its own operation, so
+            // only the named change decides. An inbox rejection is reported
+            // for an approval whose proof fails; an inbox consumption marker
+            // is inbox material and leaves a verified record admitted.
             for change in [
                 "kind",
                 "attestation",
@@ -9244,40 +9496,36 @@ pub(crate) mod tests {
                 "consumed",
                 "key",
             ] {
-                let mut f =
-                    Fixture::new(|raw| require_approval_rules(&raw, &["stellar_pay_commit"], 600));
-                let entry = PendingApproval::new_payment_pending(
-                    f.envelope.envelope_xdr().to_owned(),
-                    f.envelope.envelope_xdr().as_bytes(),
-                    f.envelope.destination().to_owned(),
-                    10,
-                    "XLM".to_owned(),
-                    None,
-                    100,
-                    2,
-                    process_uid_for_attestation().unwrap(),
-                    3_600_000,
-                )
-                .unwrap();
+                let run = ClassicRun::new(Tool::Pay).await;
+                let f = &run.f;
+                let xdr = run.args["envelope_xdr"].as_str().unwrap();
+                let business_id = run.bind_new_business_id();
+                let operation = Some(run.operation_of(&business_id));
+                let entry = approval_for(Tool::Pay, f, xdr, 3_600_000);
+                run.record_pending(&business_id, &entry);
                 let mut blob = match change {
                     "profile" => f.attest_bound(&entry, "other", "stellar:mainnet"),
                     "chain" => f.attest_bound(&entry, "operator", "stellar:testnet"),
+                    "rejected" => "A".repeat(43),
                     _ => f.attest(&entry),
                 };
                 let mut kind = GatedApprovalKind::Payment;
+                let mut clock = None;
                 let expected_code = match change {
-                    "profile" | "chain" => "policy.approval_required",
+                    "profile" | "chain" => Some("policy.approval_required"),
                     "kind" => {
                         kind = GatedApprovalKind::Trustline;
-                        "policy.approval_required"
+                        Some("policy.approval_required")
                     }
                     "attestation" => {
                         blob = "A".repeat(43);
-                        "policy.approval_required"
+                        Some("policy.approval_required")
                     }
                     "age" => {
-                        f.server.clock = Arc::new(FixedClock(entry.created_at_unix_ms + 600_000));
-                        "policy.approval_required"
+                        clock = Some(stellar_agent_network::mainnet::clock::set_now_ms_for_test(
+                            entry.expires_at_unix_ms,
+                        ));
+                        Some("policy.approval_required")
                     }
                     "key" => {
                         let key = &f.server.security_profile().attestation_key_id;
@@ -9285,7 +9533,7 @@ pub(crate) mod tests {
                             .unwrap()
                             .delete_credential()
                             .unwrap();
-                        "policy.approval_required"
+                        Some("policy.approval_required")
                     }
                     terminal => {
                         let mut store = PendingApprovalStore::open(
@@ -9305,7 +9553,7 @@ pub(crate) mod tests {
                                     )
                                     .unwrap()
                             );
-                            "policy.approval_rejected"
+                            Some("policy.approval_rejected")
                         } else {
                             assert!(
                                 store
@@ -9316,7 +9564,7 @@ pub(crate) mod tests {
                                     )
                                     .unwrap()
                             );
-                            "policy.approval_consumed"
+                            None
                         }
                     }
                 };
@@ -9325,18 +9573,27 @@ pub(crate) mod tests {
                     .dispatch_gate("stellar_pay_commit", &f.args(), "stellar:mainnet")
                     .await
                     .unwrap();
-                let failure = verify_attestation_gate(
+                let result = verify_attestation_subject_gate(
                     &f.server,
                     &outcome,
-                    kind,
-                    f.envelope.envelope_xdr(),
+                    kind.expectation(
+                        stellar_agent_core::approval::subject::approval_subject_classic(xdr),
+                    ),
                     Some(&entry.approval_nonce),
                     Some(&blob),
+                    operation,
                     "stellar_pay_commit",
                 )
-                .await
-                .unwrap_err();
-                assert_eq!(error_envelope_parts(&failure).1, expected_code, "{change}");
+                .await;
+                drop(clock);
+                match expected_code {
+                    Some(code) => assert_eq!(
+                        error_envelope_parts(&result.unwrap_err()).1,
+                        code,
+                        "{change}"
+                    ),
+                    None => assert!(result.unwrap().is_some(), "{change}"),
+                }
                 assert_eq!(f.seed_reads.load(Ordering::SeqCst), 0);
             }
         }
@@ -10551,6 +10808,154 @@ pub(crate) mod tests {
                 fresh
             }
 
+            /// The operation the run's business id names, which its commit
+            /// admits before the approval gate.
+            pub(crate) fn operation_id(&self) -> stellar_agent_network::policy_state::OperationId {
+                self.operation_of(self.args["business_id"].as_str().unwrap())
+            }
+
+            /// Opens the durable record of the run's approval for the run's
+            /// own operation through the classic producer, consents it as
+            /// the operator does, and returns the proof. A run under `Allow`
+            /// thereby holds a consented record that its preparation, which
+            /// required none, did not open.
+            pub(crate) fn record_own_approval(&self) -> String {
+                self.record_approval(self.args["business_id"].as_str().unwrap(), &self.entry)
+            }
+
+            /// Opens the durable record of `entry` for the operation
+            /// `business_id` names through the classic producer, which
+            /// stores the entry, consents it as the operator does, and
+            /// returns the proof.
+            fn record_approval(
+                &self,
+                business_id: &str,
+                entry: &stellar_agent_core::approval::PendingApproval,
+            ) -> String {
+                self.record_pending(business_id, entry);
+                self.f.attest(entry)
+            }
+
+            /// The operation `business_id` names.
+            pub(crate) fn operation_of(
+                &self,
+                business_id: &str,
+            ) -> stellar_agent_network::policy_state::OperationId {
+                use stellar_agent_network::policy_state::{BusinessId, OperationStatus};
+                OperationStatus::new(
+                    &self.f.server.window_store,
+                    self.f.server.security_profile(),
+                )
+                .view(&BusinessId::parse(business_id).unwrap())
+                .unwrap()
+                .unwrap()
+                .operation_id
+            }
+
+            /// A new approval of the run's envelope whose lifetime is
+            /// `ttl_ms`, recorded and consented for a new operation that
+            /// binds the envelope. Returns the commit arguments under that
+            /// operation's business id, and the approval.
+            pub(crate) fn recorded_approval(
+                &self,
+                ttl_ms: u64,
+            ) -> (
+                serde_json::Value,
+                stellar_agent_core::approval::PendingApproval,
+            ) {
+                let xdr = self.args["envelope_xdr"].as_str().unwrap().to_owned();
+                self.approved_bound(&xdr, ttl_ms)
+            }
+
+            /// The commit arguments of a new approval of `xdr` whose
+            /// lifetime is `ttl_ms`, recorded and consented for a new
+            /// operation that binds `xdr`, under that operation's business
+            /// id; and the approval.
+            fn approved_bound(
+                &self,
+                xdr: &str,
+                ttl_ms: u64,
+            ) -> (
+                serde_json::Value,
+                stellar_agent_core::approval::PendingApproval,
+            ) {
+                let business_id = self.bind_business_id_for(xdr);
+                let entry = approval_for(self.tool, &self.f, xdr, ttl_ms);
+                let blob = self.record_approval(&business_id, &entry);
+                let mut args = self.commit_args_for(xdr, &entry.approval_nonce, &blob);
+                args["business_id"] = serde_json::json!(business_id);
+                (args, entry)
+            }
+
+            /// Opens the durable record of `entry` for the operation
+            /// `business_id` names through the classic producer, which
+            /// stores the entry. The record holds no consent.
+            pub(crate) fn record_pending(
+                &self,
+                business_id: &str,
+                entry: &stellar_agent_core::approval::PendingApproval,
+            ) {
+                use stellar_agent_network::operation_entry::{self, ClassicEntry};
+                use stellar_agent_network::policy_state::{BusinessId, OperationStatus};
+                let id = BusinessId::parse(business_id).unwrap();
+                let digest = OperationStatus::new(
+                    &self.f.server.window_store,
+                    self.f.server.security_profile(),
+                )
+                .view(&id)
+                .unwrap()
+                .unwrap()
+                .intent_digest;
+                let ClassicEntry::Resume(handle) = self
+                    .f
+                    .server
+                    .operation_step(|recorder| {
+                        operation_entry::lookup_classic(recorder, &id, &digest)
+                    })
+                    .unwrap()
+                else {
+                    panic!("the run's operation is resumable")
+                };
+                let path = self
+                    .f
+                    .server
+                    .resolve_approval_dir()
+                    .unwrap()
+                    .join("operator.toml");
+                let kind = match self.tool {
+                    Tool::Pay | Tool::CreateAccount => {
+                        stellar_agent_core::approval::witness::ApprovedKind::Payment
+                    }
+                    Tool::Claim => stellar_agent_core::approval::witness::ApprovedKind::Claim,
+                    Tool::Trustline => {
+                        stellar_agent_core::approval::witness::ApprovedKind::Trustline
+                    }
+                };
+                self.f
+                    .server
+                    .classic_pending_approval(
+                        Some(&handle),
+                        kind,
+                        stellar_agent_core::audit_log::PolicyDecision::RequireApproval,
+                        crate::tools::business_entry::Staged {
+                            build: |_: Option<&stellar_agent_core::approval::ClassicIntent>| {
+                                Ok(entry.clone())
+                            },
+                            insert: |entry: stellar_agent_core::approval::PendingApproval| {
+                                stellar_agent_core::approval::PendingApprovalStore::open(path)
+                                    .unwrap()
+                                    .insert(
+                                        entry.clone(),
+                                        stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+                                    )
+                                    .unwrap();
+                                Ok(entry)
+                            },
+                        },
+                    )
+                    .unwrap();
+            }
+
             /// A second preparation of the same action on the same fixture.
             pub(crate) async fn prepare_again(
                 &self,
@@ -10625,6 +11030,11 @@ pub(crate) mod tests {
                 &self,
                 change: impl FnOnce(&mut stellar_xdr::Transaction),
             ) -> serde_json::Value {
+                self.approved(&self.crafted_xdr(change), 600_000)
+            }
+
+            /// The run's envelope changed by `change`.
+            fn crafted_xdr(&self, change: impl FnOnce(&mut stellar_xdr::Transaction)) -> String {
                 use stellar_xdr::{Limits, ReadXdr as _, TransactionEnvelope, WriteXdr as _};
                 let TransactionEnvelope::Tx(mut envelope) = TransactionEnvelope::from_xdr_base64(
                     self.args["envelope_xdr"].as_str().unwrap(),
@@ -10634,23 +11044,20 @@ pub(crate) mod tests {
                     panic!("classic envelope expected")
                 };
                 change(&mut envelope.tx);
-                let xdr = TransactionEnvelope::Tx(envelope)
+                TransactionEnvelope::Tx(envelope)
                     .to_xdr_base64(Limits::none())
-                    .unwrap();
-                self.approved(&xdr, 600_000)
+                    .unwrap()
             }
 
-            /// The commit of [`Self::crafted`] under a new business id whose
-            /// record binds the changed envelope, so the commit meets the
-            /// checks after the envelope binding.
+            /// The commit of the changed envelope under a new business id
+            /// whose record binds it, with the approval's durable record
+            /// opened for that operation and consented, so the commit meets
+            /// the checks after the envelope binding and the approval gate.
             pub(crate) fn crafted_bound(
                 &self,
                 change: impl FnOnce(&mut stellar_xdr::Transaction),
             ) -> serde_json::Value {
-                let mut args = self.crafted(change);
-                let xdr = args["envelope_xdr"].as_str().unwrap().to_owned();
-                args["business_id"] = serde_json::json!(self.bind_business_id_for(&xdr));
-                args
+                self.approved_bound(&self.crafted_xdr(change), 600_000).0
             }
 
             /// The run's commit arguments for `xdr` with a new approval of
@@ -10741,11 +11148,6 @@ pub(crate) mod tests {
                 let reference = run.delivery_fixture(case != "direct", case == "dropped");
                 let name = run.f.server.profile_name_for_approval();
                 let _enabled = ConsentEvidenceEnforcementGuard::new(&name, ApprovedKind::Payment);
-                let lookups = Arc::new(AtomicU32::new(0));
-                let count = lookups.clone();
-                observe(&run.f.on_window_key_read, move || {
-                    count.fetch_add(1, Ordering::SeqCst);
-                });
                 let mut args = run.args.clone();
                 if case == "invalid" {
                     args["approval_attestation"] = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -10802,14 +11204,28 @@ pub(crate) mod tests {
                         .dispatch_gate("stellar_pay_commit", &run.f.args(), "stellar:mainnet")
                         .await
                         .unwrap();
-                    let before = lookups.load(Ordering::SeqCst);
-                    let refused = verify_attestation_gate(
+                    // The durable verifier reads the record before it can
+                    // refuse the proof; the delivery query never runs.
+                    let queries = Arc::new(AtomicU32::new(0));
+                    let count = queries.clone();
+                    let _query_hook =
+                        stellar_agent_core::audit_log::outbox::test_seam::on_delivery_query(
+                            &run.f.server.security_profile().audit_log_path,
+                            move || {
+                                count.fetch_add(1, Ordering::SeqCst);
+                            },
+                        );
+                    let refused = verify_attestation_subject_gate(
                         &run.f.server,
                         &outcome,
-                        GatedApprovalKind::Payment,
-                        args["envelope_xdr"].as_str().unwrap(),
+                        GatedApprovalKind::Payment.expectation(
+                            stellar_agent_core::approval::subject::approval_subject_classic(
+                                args["envelope_xdr"].as_str().unwrap(),
+                            ),
+                        ),
                         args["approval_nonce"].as_str(),
                         args["approval_attestation"].as_str(),
+                        Some(run.operation_id()),
                         "stellar_pay_commit",
                     )
                     .await
@@ -10819,9 +11235,9 @@ pub(crate) mod tests {
                         wire(&approval_required_indistinguishable(&name))["error"]
                     );
                     assert_eq!(
-                        lookups.load(Ordering::SeqCst),
-                        before,
-                        "invalid proof performs no delivery lookup"
+                        queries.load(Ordering::SeqCst),
+                        0,
+                        "invalid proof performs no delivery query"
                     );
                 }
                 let result = run.commit_with(args).await;
@@ -10864,6 +11280,120 @@ pub(crate) mod tests {
                     );
                 }
             }
+            // A supplied proof under `Allow` and a proof of another kind take
+            // the same delivery checks: a queued consent commits once
+            // delivered and refuses as undelivered when its row is dropped.
+            for (case, tool, kind, allowed, dropped) in [
+                (
+                    "allow delivered",
+                    Tool::Pay,
+                    ApprovedKind::Payment,
+                    true,
+                    false,
+                ),
+                (
+                    "allow dropped",
+                    Tool::Pay,
+                    ApprovedKind::Payment,
+                    true,
+                    true,
+                ),
+                (
+                    "trustline delivered",
+                    Tool::Trustline,
+                    ApprovedKind::Trustline,
+                    false,
+                    false,
+                ),
+                (
+                    "trustline dropped",
+                    Tool::Trustline,
+                    ApprovedKind::Trustline,
+                    false,
+                    true,
+                ),
+            ] {
+                let run = if allowed {
+                    ClassicRun::allowed(tool).await
+                } else {
+                    ClassicRun::unconsented(tool).await
+                };
+                let mut args = run.args.clone();
+                if allowed {
+                    // The allowed preparation opened no record; the producer
+                    // opens one for the run's operation and the inbox entry is
+                    // attested, leaving the record without consent.
+                    run.record_pending(run.args["business_id"].as_str().unwrap(), &run.entry);
+                    args["approval_nonce"] = serde_json::json!(run.entry.approval_nonce);
+                    args["approval_attestation"] =
+                        serde_json::json!(run.f.attest_unrecorded(&run.entry));
+                }
+                let reference = run.delivery_fixture(true, dropped);
+                let name = run.f.server.profile_name_for_approval();
+                let _enabled = ConsentEvidenceEnforcementGuard::new(&name, kind);
+                let result = run.commit_with(args).await;
+                if dropped {
+                    assert_eq!(
+                        result["error"]["code"], "approval.consent_undelivered",
+                        "{case}: {result}"
+                    );
+                    let row = reference.unwrap();
+                    assert!(
+                        result["error"]["message"]
+                            .as_str()
+                            .unwrap()
+                            .contains(&format!(
+                                "generation {}, row {}",
+                                row.generation(),
+                                row.sequence()
+                            )),
+                        "{case}: {result}"
+                    );
+                    assert_eq!(run.seed_reads(), 0, "{case}");
+                    assert!(run.control.sent().is_empty(), "{case}");
+                } else {
+                    assert_eq!(result["ok"], true, "{case}: {result}");
+                    assert!(run.seed_reads() > 0, "{case}");
+                }
+            }
+
+            // A mainnet clock set back before the approval's creation is
+            // raised to the evidence floor, so the delivered proof is decided
+            // at the floor, inside its consent window.
+            let run = ClassicRun::unconsented(Tool::Pay).await;
+            run.delivery_fixture(true, false);
+            let name = run.f.server.profile_name_for_approval();
+            let _enabled = ConsentEvidenceEnforcementGuard::new(&name, ApprovedKind::Payment);
+            let outcome = run
+                .f
+                .server
+                .dispatch_gate("stellar_pay_commit", &run.f.args(), "stellar:mainnet")
+                .await
+                .unwrap();
+            let reversed = stellar_agent_network::mainnet::clock::set_now_ms_for_test(
+                run.entry.created_at_unix_ms - 60_000,
+            );
+            let witness = verify_attestation_subject_gate(
+                &run.f.server,
+                &outcome,
+                GatedApprovalKind::Payment.expectation(
+                    stellar_agent_core::approval::subject::approval_subject_classic(
+                        run.args["envelope_xdr"].as_str().unwrap(),
+                    ),
+                ),
+                run.args["approval_nonce"].as_str(),
+                run.args["approval_attestation"].as_str(),
+                Some(run.operation_id()),
+                "stellar_pay_commit",
+            )
+            .await;
+            drop(reversed);
+            assert!(
+                matches!(witness, Ok(Some(_))),
+                "reversed clock: the evidence floor decides"
+            );
+            drop(_enabled);
+
             let run = ClassicRun::allowed(Tool::Pay).await;
             let name = run.f.server.profile_name_for_approval();
             let _enabled = ConsentEvidenceEnforcementGuard::new(&name, ApprovedKind::Payment);
@@ -10928,6 +11458,7 @@ pub(crate) mod tests {
                         )
                     ),
                     &SuppliedProof::default(),
+                    None,
                     "stellar_pay_commit",
                     &mut witness,
                 )
@@ -11001,31 +11532,40 @@ pub(crate) mod tests {
             .unwrap()
         }
 
-        /// The verified witness of an attested approval of the fixture's
-        /// payment envelope, from the commit's gate.
+        /// The witness the producer's verifier gives an attested approval of
+        /// the fixture's payment envelope. The approval has no durable
+        /// record; callers that need one use a [`ClassicRun`].
         pub(crate) async fn payment_witness(
             f: &Fixture,
         ) -> stellar_agent_core::approval::witness::ApprovalWitness {
+            use base64::Engine as _;
             let xdr = f.envelope.envelope_xdr();
             let entry = approval_for(Tool::Pay, f, xdr, 600_000);
             let blob = f.attest(&entry);
-            let outcome = f
-                .server
-                .dispatch_gate("stellar_pay_commit", &f.args(), "stellar:mainnet")
-                .await
-                .unwrap();
-            verify_attestation_gate(
-                &f.server,
-                &outcome,
-                GatedApprovalKind::Payment,
-                xdr,
-                Some(&entry.approval_nonce),
-                Some(&blob),
-                "stellar_pay_commit",
+            let store = stellar_agent_core::approval::PendingApprovalStore::open(
+                f.server
+                    .resolve_approval_dir()
+                    .unwrap()
+                    .join("operator.toml"),
             )
-            .await
+            .unwrap();
+            stellar_agent_core::approval::witness::verify_approval(
+                &store,
+                f.server.security_profile(),
+                "operator",
+                &entry.approval_nonce,
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(blob)
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+                &GatedApprovalKind::Payment.expectation(
+                    stellar_agent_core::approval::subject::approval_subject_classic(xdr),
+                ),
+                f.server.current_mainnet_policy().unwrap(),
+                stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+            )
             .unwrap()
-            .expect("a mainnet gate returns the witness")
         }
 
         /// Asserts that `result` refused with `code` before any authorization
@@ -11281,10 +11821,11 @@ pub(crate) mod tests {
             }
         }
 
-        /// A commit after the presented deadline has passed refuses with
-        /// `simulation.deadline_invalid` naming `deadline_elapsed`, before
+        /// A commit after the presented deadline has passed refuses before
         /// any authorization is minted: no seed read, so nothing is signed,
-        /// and nothing is sent.
+        /// and nothing is sent. Under policy authority the refusal is
+        /// `simulation.deadline_invalid` naming `deadline_elapsed`; a proven
+        /// commit refuses at the approval gate.
         #[tokio::test]
         #[serial_test::serial(keyring, mainnet_clock)]
         #[serial_test::serial]
@@ -11292,16 +11833,31 @@ pub(crate) mod tests {
             use stellar_agent_network::mainnet::resolve::MAINNET_CLASSIC_DEADLINE_SECONDS;
             let now = stellar_agent_core::timefmt::now_unix_ms().unwrap() + CLOCK_LEAD_MS;
             let clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(now);
+            // An approval's operation ends at the envelope deadline, which
+            // releases the approval's consent, so a proven commit refuses at
+            // the approval gate. A commit under policy authority reaches the
+            // deadline check itself.
+            clock.set(now);
+            let run = ClassicRun::new(Tool::Pay).await;
+            clock.set(now + (MAINNET_CLASSIC_DEADLINE_SECONDS + 1) * 1000);
+            let result = run.commit().await;
+            assert_refused_before_mint(&run, &result, "policy.approval_required");
             for tool in Tool::ALL {
                 clock.set(now);
-                let run = ClassicRun::new(tool).await;
+                let run = ClassicRun::allowed(tool).await;
                 assert_eq!(
                     presented_classic_deadline(run.args["envelope_xdr"].as_str().unwrap()).unwrap(),
                     now / 1000 + MAINNET_CLASSIC_DEADLINE_SECONDS
                 );
                 clock.set(now + (MAINNET_CLASSIC_DEADLINE_SECONDS + 1) * 1000);
                 let result = run.commit().await;
-                assert_refused_before_mint(&run, &result, "simulation.deadline_invalid");
+                assert_eq!(result["ok"], false, "{tool:?}: {result}");
+                assert_eq!(
+                    result["error"]["code"], "simulation.deadline_invalid",
+                    "{tool:?}: {result}"
+                );
+                assert!(authorizations(&run.f).is_empty(), "{tool:?}");
+                assert_eq!(run.seed_reads(), 0, "{tool:?}");
                 assert!(
                     result["error"]["message"]
                         .as_str()
@@ -11960,10 +12516,17 @@ pub(crate) mod tests {
             );
         }
 
+        /// At `end`, the payment approval's signed expiry, the preparation
+        /// refuses with `policy.approval_required` and the exported witness
+        /// refuses with `approval.expired`: the clock comparison at the signed
+        /// expiry decides, with no observation recorded before it. One
+        /// millisecond past `end` on the mainnet authorization clock, the
+        /// commit refuses with the uniform envelope, reads no seed and sends
+        /// nothing.
         #[tokio::test]
         #[serial_test::serial(keyring)]
         #[serial_test::serial]
-        async fn payment_recovery_mainnet_witness_refuses_recorded_expiry() {
+        async fn payment_recovery_mainnet_witness_refuses_at_the_signed_expiry() {
             use base64::Engine as _;
             use stellar_agent_core::approval::witness::{
                 ApprovalExpectation, ApprovedKind, verify_approval,
@@ -11991,11 +12554,6 @@ pub(crate) mod tests {
                 expired["error"]["code"], "policy.approval_required",
                 "{expired}"
             );
-            let rollback = end - 1;
-            _clock.set(rollback);
-            run.f.server.clock = Arc::new(stellar_agent_core::timefmt::MockClock::new(move || {
-                Ok(rollback)
-            }));
             let store = stellar_agent_core::approval::PendingApprovalStore::open(path).unwrap();
             let blob: [u8; 32] = base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .decode(run.args["approval_attestation"].as_str().unwrap())
@@ -12016,21 +12574,27 @@ pub(crate) mod tests {
                 &blob,
                 &expected,
                 run.f.server.verified_policy.as_deref().unwrap(),
-                rollback,
+                end,
             );
             assert!(
                 checked.is_err(),
-                "exported witness refuses recorded terminal state"
+                "exported witness refuses at the signed expiry"
             );
             assert_eq!(
                 checked.unwrap_err().code(),
                 "approval.expired",
-                "exported witness refuses recorded terminal state"
+                "exported witness refuses at the signed expiry"
             );
             drop(store);
+            // The commit decides on the mainnet authorization clock just past
+            // the signed expiry, where the consent's execution window is
+            // still open: the durable proof refuses with the uniform envelope.
+            let _mainnet_clock =
+                stellar_agent_network::mainnet::clock::set_now_ms_for_test(end + 1);
             let result = run.commit().await;
             assert_eq!(
-                result["error"]["code"], "policy.approval_required",
+                result["error"],
+                wire(&approval_required_indistinguishable("operator"))["error"],
                 "{result}"
             );
             assert_eq!(run.f.seed_reads.load(Ordering::SeqCst), 0);
@@ -12194,8 +12758,13 @@ pub(crate) mod tests {
         async fn a_held_listener_writer_refuses_a_mainnet_commit_until_it_drops() {
             let run = ClassicRun::with(Tool::Pay, |raw| raw, |_| {}, |_| {}).await;
             let xdr = run.args["envelope_xdr"].as_str().unwrap().to_owned();
-            let entry = approval_for(Tool::Pay, &run.f, &xdr, 600_000);
-            let blob = run.f.attest(&entry);
+            // The prepared entry carries the operation's consented durable
+            // record and its attestation.
+            let entry = run.entry.clone();
+            let blob = run.args["approval_attestation"]
+                .as_str()
+                .unwrap()
+                .to_owned();
             let listener_writer = listener_writer(&run);
 
             let held = run
@@ -13226,15 +13795,16 @@ pub(crate) mod tests {
                 let first = run.commit().await;
                 assert_eq!(first["ok"], false, "{tool:?}: {first}");
                 seed.set_password(&stored).unwrap();
-                // A retry under another business id that binds the same
-                // envelope reaches the nonce check, which refuses the spent
-                // protocol nonce.
+                // The failed commit ended its operation, which released the
+                // approval's consent, so a retry under another business id
+                // that binds the same envelope refuses at the approval gate,
+                // before the protocol nonce check.
                 let mut other = run.args.clone();
                 other["business_id"] = serde_json::json!(run.bind_new_business_id());
                 let replay = run.commit_with(other).await;
-                assert_eq!(replay["ok"], false, "{tool:?}: {replay}");
                 assert_eq!(
-                    replay["error"]["code"], "nonce.replayed",
+                    replay["error"],
+                    wire(&approval_required_indistinguishable("operator"))["error"],
                     "{tool:?}: {replay}"
                 );
                 assert_eq!(authorizations(&run.f).len(), 1, "{tool:?}: no second mint");
@@ -13252,6 +13822,27 @@ pub(crate) mod tests {
                     "{tool:?}: {stored}"
                 );
                 assert_eq!(authorizations(&run.f).len(), 1, "{tool:?}: no second mint");
+                assert_eq!(run.control.count("sendTransaction"), 0, "{tool:?}");
+
+                // Under policy authority no approval gate answers first: a
+                // retry of the failed commit under another business id that
+                // binds the same envelope reaches the nonce check, which
+                // refuses the spent protocol nonce.
+                let run = ClassicRun::allowed(tool).await;
+                let key = &run.f.server.security_profile().mcp_signer_default;
+                let seed = keyring_core::Entry::new(&key.service, &key.account).unwrap();
+                let stored = seed.get_password().unwrap();
+                seed.delete_credential().unwrap();
+                let first = run.commit().await;
+                assert_eq!(first["ok"], false, "{tool:?} allowed: {first}");
+                seed.set_password(&stored).unwrap();
+                let mut other = run.args.clone();
+                other["business_id"] = serde_json::json!(run.bind_new_business_id());
+                let replay = run.commit_with(other).await;
+                assert_eq!(
+                    replay["error"]["code"], "nonce.replayed",
+                    "{tool:?} allowed: {replay}"
+                );
                 assert_eq!(run.control.count("sendTransaction"), 0, "{tool:?}");
             }
         }
@@ -13351,7 +13942,7 @@ pub(crate) mod tests {
         async fn mainnet_classic_resolver_refusals_keep_their_codes() {
             for tool in Tool::ALL {
                 let run = ClassicRun::new(tool).await;
-                let overlong = run.approved(run.args["envelope_xdr"].as_str().unwrap(), 3_600_000);
+                let (overlong, _) = run.recorded_approval(3_600_000);
                 let (capture, _guard) =
                     stellar_agent_test_support::WarningCapture::capture(Some("stellar_agent"));
                 let result = run.commit_with(overlong).await;
@@ -13370,6 +13961,9 @@ pub(crate) mod tests {
                     1,
                     "{tool:?}: one log of the refusal: {refusals:?}"
                 );
+                // The overlong approval has a consented durable record of its
+                // own operation, so the gate admits it and the resolver's
+                // rule bound refuses it.
                 assert_eq!(
                     refusals[0]["precondition"].trim_matches('"'),
                     "approval_ttl_exceeds_rule",
@@ -13667,29 +14261,36 @@ pub(crate) mod tests {
                     !is_consumed(&stored_approval(&run.f, &run.entry.approval_nonce).unwrap()),
                     "{tool:?}: no tombstone without a send"
                 );
+                // The mint spent the approval nonce on its durable record
+                // although nothing was sent.
+                let record = stellar_agent_network::policy_state::ApprovalStatus::new(
+                    &run.f.server.window_store,
+                    run.f.server.security_profile(),
+                )
+                .find_by_nonce(&run.entry.approval_nonce)
+                .unwrap()
+                .unwrap()
+                .record;
+                assert_eq!(
+                    record.state,
+                    stellar_agent_network::policy_state::ApprovalState::Consumed,
+                    "{tool:?}: the approval nonce is spent"
+                );
 
                 let retry = run.approved(run.args["envelope_xdr"].as_str().unwrap(), 600_000);
                 let mut retry_args = run.args.clone();
                 retry_args["nonce"] = retry["nonce"].clone();
                 retry_args["expires_at_unix_ms"] = retry["expires_at_unix_ms"].clone();
                 retry_args["business_id"] = serde_json::json!(run.bind_new_business_id());
-                // A retry under another business id that binds the same
-                // envelope reaches the authorization, and the ledger refuses
-                // the spent approval nonce.
+                // The failed commit ended its operation, which released the
+                // approval's consent, so a retry under another business id
+                // that binds the same envelope refuses at the approval gate,
+                // before the resolver runs.
                 let result = run.commit_with(retry_args.clone()).await;
-                assert_eq!(result["ok"], false, "{tool:?}: {result}");
                 assert_eq!(
-                    result["error"]["code"], "network.mainnet_authorization_refused",
+                    result["error"],
+                    wire(&approval_required_indistinguishable("operator"))["error"],
                     "{tool:?}: {result}"
-                );
-                let reused = capture.seen().into_iter().any(|fields| {
-                    fields
-                        .get("precondition")
-                        .is_some_and(|label| label.trim_matches('"') == "approval_nonce_reused")
-                });
-                assert!(
-                    reused,
-                    "{tool:?}: the ledger refuses the spent approval nonce"
                 );
                 assert_eq!(authorizations(&run.f).len(), 1, "{tool:?}");
                 assert_eq!(run.control.count("sendTransaction"), 0, "{tool:?}");
@@ -14190,9 +14791,12 @@ pub(crate) mod tests {
                 )
             );
             assert_eq!(run.f.seed_reads.load(Ordering::SeqCst), 1);
+            // The ended payment released the record's consent payload, so
+            // the replayed proof is outside its execution window.
             let replay = run.pay().await;
-            assert_eq!(replay["error"]["code"], "policy.approval_consumed");
+            assert_eq!(replay["error"]["code"], "policy.approval_required");
             assert!(run.control.methods().is_empty());
+            assert_eq!(run.f.seed_reads.load(Ordering::SeqCst), 1);
         }
 
         /// Asserts that the one `x402_payment_authorized` row of `f` records
@@ -14379,25 +14983,14 @@ pub(crate) mod tests {
             .unwrap()
         }
 
-        /// Asserts that every authorization record of `f` binds the approval
-        /// `nonce` and no policy authority.
-        fn assert_records_bind_approval(context: &str, f: &Fixture, nonce: &str, count: usize) {
-            let records = authorizations(f);
-            assert_eq!(records.len(), count, "{context}: {records:?}");
-            for record in &records {
-                assert_eq!(record["approval_nonce"], nonce, "{context}: {record}");
-                assert!(record["policy_authority"].is_null(), "{context}: {record}");
-            }
-        }
-
         /// Under Allow, each x402 tool verifies supplied proofs. Forged
-        /// attestations refuse before requests. Genuine proofs pay under
-        /// Approval, audit allow with provenance, and are consumed. Replay
-        /// refuses.
+        /// attestations refuse before requests. A genuine proof has no
+        /// durable record, since an allowed preparation opens none, so it
+        /// refuses at the mainnet gate, repeatedly, and is never consumed.
         #[tokio::test]
         #[serial_test::serial(keyring)]
         #[serial_test::serial]
-        async fn x402_allow_with_supplied_proof_verifies_and_spends_it() {
+        async fn x402_allow_with_supplied_proof_without_a_record_refuses() {
             let run = X402Run::allowed().await;
             let forged = x402_pending_entry(&run.f, None);
             run.f.attest(&forged);
@@ -14416,35 +15009,20 @@ pub(crate) mod tests {
             assert!(!is_consumed(
                 &stored_approval(&run.f, &forged.approval_nonce).unwrap()
             ));
+            // An allowed payment opens no durable record, so a valid supplied
+            // proof stays inbox material and the mainnet gate refuses it.
             let entry = x402_pending_entry(&run.f, None);
             let blob = run.f.attest(&entry);
-            let args = x402_args(&run.f, Some((&entry.approval_nonce, &blob)));
-            let (pin, pinned) = pin_policy_clock();
-            let result = run.pay_with(args).await;
-            drop(pin);
-            assert_eq!(result["ok"], true, "x402: {result}");
-            assert!(
-                result["data"]["paymentSignature"].is_string(),
-                "x402: {result}"
-            );
-            assert_records_bind_approval("x402", &run.f, &entry.approval_nonce, 2);
-            assert_x402_row_provenance(
-                "x402",
-                &run.f,
-                "allow",
-                "stellar_x402_create_payment",
-                pinned,
-            );
-            assert!(is_consumed(
-                &stored_approval(&run.f, &entry.approval_nonce).unwrap()
-            ));
-            let replay = run
-                .pay_with(x402_args(&run.f, Some((&entry.approval_nonce, &blob))))
-                .await;
-            assert_eq!(
-                replay["error"]["code"], "policy.approval_consumed",
-                "{replay}"
-            );
+            for _ in 0..2 {
+                let result = run
+                    .pay_with(x402_args(&run.f, Some((&entry.approval_nonce, &blob))))
+                    .await;
+                assert_not_found_mapping("x402", &result, &entry.approval_nonce);
+                assert!(authorizations(&run.f).is_empty(), "x402: nothing minted");
+                assert!(!is_consumed(
+                    &stored_approval(&run.f, &entry.approval_nonce).unwrap()
+                ));
+            }
 
             use crate::tools::x402_authenticated_mainnet_tests::{
                 HOME, Run as AuthenticatedRun, signings,
@@ -14484,25 +15062,38 @@ pub(crate) mod tests {
             ));
             let entry = x402_pending_entry(&run.f, Some(HOME));
             let approval = (entry.approval_nonce.clone(), run.f.attest(&entry));
-            let (pin, pinned) = pin_policy_clock();
-            let result = run.pay(HOME, &approval).await;
-            drop(pin);
-            assert_eq!(result["ok"], true, "authenticated: {result}");
-            assert_records_bind_approval("authenticated", &run.f, &entry.approval_nonce, 3);
-            assert_x402_row_provenance(
-                "authenticated x402",
-                &run.f,
-                "allow",
-                "stellar_x402_authenticated_payment",
-                pinned,
-            );
-            assert!(is_consumed(
-                &stored_approval(&run.f, &entry.approval_nonce).unwrap()
-            ));
-            let replay = run.pay(HOME, &approval).await;
+            for _ in 0..2 {
+                let result = run.pay(HOME, &approval).await;
+                assert_not_found_mapping("authenticated", &result, &entry.approval_nonce);
+                assert!(signings().is_empty(), "authenticated: nothing signed");
+                assert!(
+                    authorizations(&run.f).is_empty(),
+                    "authenticated: nothing minted"
+                );
+                assert!(!is_consumed(
+                    &stored_approval(&run.f, &entry.approval_nonce).unwrap()
+                ));
+            }
+        }
+
+        /// Asserts the agent-facing refusal of an approval without a durable
+        /// record: the mainnet approval gate's uniform approval-required
+        /// envelope, whose text names no identifier.
+        pub(crate) fn assert_not_found_mapping(
+            context: &str,
+            result: &serde_json::Value,
+            nonce: &str,
+        ) {
+            assert_eq!(result["ok"], false, "{context}: {result}");
             assert_eq!(
-                replay["error"]["code"], "policy.approval_consumed",
-                "{replay}"
+                result["error"],
+                wire(&approval_required_indistinguishable("operator"))["error"],
+                "{context}: {result}"
+            );
+            let message = result["error"]["message"].as_str().unwrap();
+            assert!(
+                !message.contains(nonce) && !message.contains("approval_not_found"),
+                "{context}: the refusal names no identifier or precondition: {result}"
             );
         }
 
@@ -14537,9 +15128,11 @@ pub(crate) mod tests {
                 pinned,
             );
             assert!(is_consumed(&stored_approval(&run.f, &run.nonce).unwrap()));
+            // The ended payment released the record's consent payload, so the
+            // replayed proof is outside its execution window.
             let replay = run.pay().await;
             assert_eq!(
-                replay["error"]["code"], "policy.approval_consumed",
+                replay["error"]["code"], "policy.approval_required",
                 "{replay}"
             );
 
@@ -14579,7 +15172,7 @@ pub(crate) mod tests {
             assert!(is_consumed(&stored_approval(&run.f, &nonce).unwrap()));
             let replay = run.pay(HOME, &approval).await;
             assert_eq!(
-                replay["error"]["code"], "policy.approval_consumed",
+                replay["error"]["code"], "policy.approval_required",
                 "{replay}"
             );
         }
@@ -14903,6 +15496,8 @@ pub(crate) mod tests {
             store: stellar_agent_network::policy_state::PersistedWindowStore,
             root: stellar_xdr::SorobanAuthorizedInvocation,
             network_id: [u8; 32],
+            /// The first attempt of the operation the durable record binds.
+            link: stellar_agent_network::policy_state::OperationLink,
         }
 
         impl<'a> X402Approval<'a> {
@@ -14922,6 +15517,22 @@ pub(crate) mod tests {
                     600_000,
                 )
                 .unwrap();
+                let digest =
+                    stellar_agent_x402::exact::intent_digest(&requirements, f.envelope.source())
+                        .unwrap();
+                let link = f.x402_record(
+                    stellar_agent_network::policy_state::OperationTool::X402CreatePayment,
+                    stellar_agent_network::policy_state::OperationKind::X402Payment,
+                    digest,
+                    stellar_agent_network::policy_state::X402Intent {
+                        network: requirements.network.clone(),
+                        asset: requirements.asset.clone(),
+                        payer: f.envelope.source().to_owned(),
+                        pay_to: requirements.pay_to.clone(),
+                        amount: requirements.amount.clone(),
+                    },
+                    &entry,
+                );
                 let blob = f.attest(&entry);
                 let outcome = f
                     .server
@@ -14938,9 +15549,6 @@ pub(crate) mod tests {
                     )
                     .await
                     .unwrap();
-                let digest =
-                    stellar_agent_x402::exact::intent_digest(&requirements, f.envelope.source())
-                        .unwrap();
                 let approval = verify_attestation_subject_gate(
                     &f.server,
                     &outcome,
@@ -14949,6 +15557,7 @@ pub(crate) mod tests {
                     ),
                     Some(&entry.approval_nonce),
                     Some(&blob),
+                    Some(link.operation_id),
                     "stellar_x402_create_payment",
                 )
                 .await
@@ -14976,6 +15585,7 @@ pub(crate) mod tests {
                     store,
                     root,
                     network_id,
+                    link,
                 }
             }
 
@@ -15026,7 +15636,7 @@ pub(crate) mod tests {
                     audit: self.audit(),
                     store: &self.store,
                     authenticated: None,
-                    operation: None,
+                    operation: Some(self.link),
                 })
                 .await
                 .unwrap()
@@ -15384,7 +15994,8 @@ pub(crate) mod tests {
                     &approved.handle,
                     approved.audit(),
                     &approved.store,
-                ),
+                )
+                .with_operation(approved.link),
                 stellar_agent_core::cross_check::CrossCheckValue::Amount {
                     asset: &asset,
                     base_units: 10,
@@ -15536,6 +16147,7 @@ pub(crate) mod tests {
                 3_600_000,
             )
             .unwrap();
+            run.f.x402_plain_record(&entry);
             let blob = run.f.attest(&entry);
             let (capture, _guard) =
                 stellar_agent_test_support::WarningCapture::capture(Some("stellar_agent"));
@@ -15565,6 +16177,9 @@ pub(crate) mod tests {
                 })
                 .collect();
             assert_eq!(refusals.len(), 1, "one log of the refusal: {refusals:?}");
+            // The overlong approval has a consented durable record of its own
+            // operation, so the gate admits it and the resolver's rule bound
+            // refuses it.
             assert_eq!(
                 refusals[0]["precondition"].trim_matches('"'),
                 "approval_ttl_exceeds_rule"
@@ -15597,11 +16212,13 @@ pub(crate) mod tests {
             assert_eq!(run.f.seed_reads.load(Ordering::SeqCst), 0);
             assert_eq!(run.simulations(), 1);
         }
-        /// The bound witness of the fixture's payment, from the oracle the
-        /// routed fixture names, as the payment commit obtains it.
+        /// The bound witness of the fixture's payment in the envelope `xdr`,
+        /// from the oracle the routed fixture names, as the payment commit
+        /// obtains it.
         async fn bound_payment_witness(
             f: &Fixture,
             client: &stellar_agent_network::StellarRpcClient,
+            xdr: &str,
         ) -> stellar_agent_network::cross_check::CrossCheckOutcome {
             let source = f.envelope.source();
             let destination = f.envelope.destination();
@@ -15640,7 +16257,7 @@ pub(crate) mod tests {
                         base_units: 10,
                     },
                     inputs,
-                    f.envelope.envelope_xdr(),
+                    xdr,
                     "stellar_pay_commit",
                 )
                 .await
@@ -15824,7 +16441,7 @@ pub(crate) mod tests {
                 "operator",
             )
             .unwrap();
-            let witness = bound_payment_witness(&f, &client).await;
+            let witness = bound_payment_witness(&f, &client, f.envelope.envelope_xdr()).await;
             let authority =
                 MainnetAuthority::from_decision(outcome.mainnet_decision().unwrap(), None).unwrap();
             let resolved = resolve_tx_sign(TxSignRequest {
@@ -15856,43 +16473,32 @@ pub(crate) mod tests {
         #[serial_test::serial(keyring)]
         #[serial_test::serial]
         async fn mainnet_gate_preserves_overlong_approval_for_resolver_refusal() {
-            use stellar_agent_core::approval::{PendingApproval, process_uid_for_attestation};
             use stellar_agent_network::mainnet::resolve::{TxSignRequest, resolve_tx_sign};
             use stellar_agent_network::mainnet::{
                 MainnetAuthorizationError, MainnetConsumer, MainnetPrecondition,
             };
-            let rpc = wiremock::MockServer::start().await;
-            let f = routed_fixture(
-                |raw| require_approval_rules(&raw, &["stellar_pay_commit"], 600),
-                &rpc,
-            );
-            let control = mount_rpc(&f, &rpc).await;
-            let entry = PendingApproval::new_payment_pending(
-                f.envelope.envelope_xdr().to_owned(),
-                f.envelope.envelope_xdr().as_bytes(),
-                f.envelope.destination().to_owned(),
-                10,
-                "XLM".to_owned(),
-                None,
-                100,
-                2,
-                process_uid_for_attestation().unwrap(),
-                3_600_000,
-            )
-            .unwrap();
-            let blob = f.attest(&entry);
+            // A consented durable record keeps the approval's signed lifetime
+            // of one hour, longer than the 600-second rule.
+            let run = ClassicRun::new(Tool::Pay).await;
+            let (args, entry) = run.recorded_approval(3_600_000);
+            let operation = run.operation_of(args["business_id"].as_str().unwrap());
+            let xdr = args["envelope_xdr"].as_str().unwrap();
+            let f = &run.f;
+            let control = &run.control;
             let outcome = f
                 .server
                 .dispatch_gate("stellar_pay_commit", &f.args(), "stellar:mainnet")
                 .await
                 .unwrap();
-            let approval = verify_attestation_gate(
+            let approval = verify_attestation_subject_gate(
                 &f.server,
                 &outcome,
-                GatedApprovalKind::Payment,
-                f.envelope.envelope_xdr(),
+                GatedApprovalKind::Payment.expectation(
+                    stellar_agent_core::approval::subject::approval_subject_classic(xdr),
+                ),
                 Some(&entry.approval_nonce),
-                Some(&blob),
+                args["approval_attestation"].as_str(),
+                Some(operation),
                 "stellar_pay_commit",
             )
             .await
@@ -15910,11 +16516,11 @@ pub(crate) mod tests {
                 "operator",
             )
             .unwrap();
-            let witness = bound_payment_witness(&f, &client).await;
+            let witness = bound_payment_witness(f, &client, xdr).await;
             let failure = resolve_tx_sign(TxSignRequest {
                 context: guard.context,
                 consumer: MainnetConsumer::McpPay,
-                unsigned_envelope_xdr: f.envelope.envelope_xdr(),
+                unsigned_envelope_xdr: xdr,
                 client: &client,
                 probe_deadline: std::time::Duration::from_secs(5),
                 witness: witness.witness(),
@@ -15929,12 +16535,17 @@ pub(crate) mod tests {
                     .unwrap(),
                 audit,
                 store: &store,
-                operation: None,
+                operation: Some(stellar_agent_network::policy_state::OperationLink {
+                    operation_id: operation,
+                    attempt_index: 1,
+                }),
                 restriction: None,
                 sac_payment_context: None,
             })
             .await
             .unwrap_err();
+            // The gate keeps the overlong approval for the resolver, whose
+            // rule bound refuses it.
             assert!(
                 matches!(
                     failure,

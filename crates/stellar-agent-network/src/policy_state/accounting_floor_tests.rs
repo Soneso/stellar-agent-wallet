@@ -215,6 +215,14 @@ fn floor_checked_input_uses_verified_first_rule_and_operating_source() {
         .set(f.now - 5_000 - crate::policy_state::store::ESTABLISHMENT_ALLOWANCE_MS);
     f.window.record_and_persist(&f.profile, &[]).unwrap();
     f.clock.set(f.now);
+    // Each approval mint holds its durable record, written after the
+    // window's first write.
+    let held = f.approval(&f.envelope, f.now, 600_000);
+    request.authority = MintAuthority::Approval {
+        nonce: held.nonce().to_owned(),
+        expires_at_ms: f.now + 120_000,
+    };
+    request.operation = f.link(held.nonce());
     request.floor = Some(floor);
     f.window.mint_authorization(&f.profile, &request).unwrap();
     let mut second = request.clone();
@@ -224,10 +232,12 @@ fn floor_checked_input_uses_verified_first_rule_and_operating_source() {
         source: view.account_id.clone(),
         sequence: 2,
     };
+    let next = f.approval(&f.envelope, f.now, 600_000);
     second.authority = MintAuthority::Approval {
-        nonce: "floor-next".to_owned(),
+        nonce: next.nonce().to_owned(),
         expires_at_ms: f.now + 120_000,
     };
+    second.operation = f.link(next.nonce());
     second.floor = checked(&observed, &evaluation, &second).unwrap();
     assert!(
         matches!(f.window.mint_authorization(&f.profile, &second), Err(WindowStoreError::PolicyDenied { reason })

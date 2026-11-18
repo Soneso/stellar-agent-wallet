@@ -198,8 +198,8 @@ It backs duplicate source-and-sequence refusal, duplicate-envelope refusal,
 approval-nonce checks, reconciliation identity, approval-consumption repair,
 and operator-clear state. The chain refuses a reused source sequence after
 receipt loss or rollback. At the MCP gate's approval-nonce check, the receipt
-hold refuses first. The approval-store consumption tombstone refuses next, with
-the same code. The receipt covers the
+hold refuses first. On testnet the approval-store consumption tombstone refuses
+next, with the same code. The receipt covers the
 window in which a tombstone write is still owed, and the approval's lifetime,
 the single-use commit nonce and the chain bound that window. The CLI has no
 approval-nonce gate.
@@ -2359,20 +2359,55 @@ receipt digest is idempotent; another consent refuses. Retries and remints
 extend neither clock.
 
 Transaction and Soroban resolvers read authenticated approval facts before
-checking witness bounds. A retained record refuses in this order: revoked,
-consumed by another operation, unconsented while waiting, expired, then bound
-to another operation.
+checking witness bounds. A missing record refuses first with
+`approval_not_found`, so no gate admits an approval on inbox material alone.
+A retained record refuses in this order: revoked, consumed by another
+operation, unconsented while waiting, expired, then bound to another
+operation.
 Expiry includes a released payload, time before consent, and the execution
 boundary. Envelope approvals also expire at their signed pending boundary.
 Nonce, kind, subject, signed times, policy digest and receipt digest each
 have a distinct refusal. Receipt mismatches use `approval_receipt_mismatch`
 under `network.mainnet_authorization_refused`.
 
+The MCP mainnet commit gate admits a supplied proof from the durable record
+alone. A submission receipt holding the nonce refuses first, and an
+unreadable receipt store refuses before any record read. The gate then runs
+`verify_durable_approval` over the record's facts and the presented
+attestation bytes. Its decision time is the mainnet authorization clock of
+the resolver and the mint, raised to the consent evidence floor for a kind
+that enforces delivery. Expiry is decided at that time, so clock rollback can
+revive an observed expiry because no durable watermark is stored. The verified record
+must link the operation the call admitted before the gate: the classic early
+lookup's continuing record, or the operation an x402 call opens. Another
+operation refuses with `policy.approval_consumed`, and a call without an
+admitted operation refuses uniformly. A revoked record renders
+`approval.revoked` through the redacted wallet-error envelope. The inbox is
+read only after a failed proof, to report a live rejection. The delivery
+checks of the consent's kind follow the verified proof.
+
 The mint repeats the state checks under the window lock after checking the
 chain. It inspects existing authenticated state without creating a key, before
 the remaining prechecks. Failed prechecks create no window key or state file.
-Policy authority reads no approval record. An absent record keeps the inbox
-authority path for producers that create no durable record.
+Policy authority reads no approval record. An approval mint without its
+record refuses with `approval_not_found`, also in a store without a file,
+before the window key exists.
+
+The SEP-10 message signing keeps its own checks first, then compares the
+record with the operation its request names, `approval_operation`. Without
+that identity no record matches, and the mint never runs. The message
+consumes the record for that operation in the mint's generation. It stores no
+operation link and adopts no authority, so the operation keeps waiting. A
+second message under the same approval refuses with `approval_nonce_reused`.
+The authenticated payment then continues the used message record. A later
+revocation does not refuse it at the resolver when the message receipt names
+the same approval nonce, the record was consumed, and the request names the
+record's operation. Every other check still runs, expiry and a released
+payload included, and the mint caps the payment at the record bound. On the
+operation route the handle names the identity: a raw mint carrying
+`approval_operation`, or an `operation` link to another operation, refuses
+with `internal.unexpected_state` before any read. A link to the handle's own
+operation passes.
 
 The first mint consumes the approval in the authorization's generation commit.
 Only the linked operation can remint within the execution window. A missing
@@ -2386,7 +2421,6 @@ remints at the durable check with `approval_revoked`, before expiry refusal.
 Child mints under used parents retain their state exemption. Every approval
 authorization with a retained durable record, including a child, ends by the
 durable consent bound and any earlier signed envelope-approval expiry.
-An approval without a retained durable record keeps its existing bound.
 Operation adoption uses the same bound
 without renewing an earlier execution expiry. Consent alone leaves the operation
 awaiting approval until a linked mint supplies authority.
@@ -2475,6 +2509,20 @@ The witness returns only after it. A refused presence or consent keeps entry
 and record, and the waiting expiry ends both. A rerun therefore converges on
 one nonce per operation. A queued consent row's outbox reference stays in the
 payload. A payload without one names its row `written` or `recovered`.
+
+The CLI grants approval authority only from the committed record. Before the
+inbox is released, the ceremony keeps the attestation the entry presented.
+After the consent commit, a submission receipt that names the nonce refuses
+with `approval.consumed` before any durable read, and a receipt store that
+cannot be read refuses with `submission.record_unavailable`. The durable verifier then
+checks the presented attestation against the record, the requested kind and
+envelope subject, the current policy and the time. For a kind that enforces
+delivery, the time is raised to the consent evidence floor. A canonical
+intent verifies under the fresh decision. A record of another operation
+refuses with `approval.consumed`; a missing record refuses with
+`approval.not_found`, and a revoked one with `approval.revoked`. This check
+reads no inbox, so collecting or locking the inbox after the commit changes
+nothing. Each refusal exits 1 before the consent drain and the signer.
 
 MCP payment, create-account, trustline and claim preparations under an
 approval rule also open durable records. Each durable producer carries
@@ -2939,8 +2987,9 @@ immediately before the signing primitive, with no intervening I/O or await.
 
 An approval releases at most one signed authorization.
 A failed or interrupted call can spend it without returning a payment payload.
-A repeated proof with a live spent tombstone answers `policy.approval_consumed`.
+On testnet a repeated proof with a live spent tombstone answers `policy.approval_consumed`.
 An expired or pruned tombstone can answer `policy.approval_required`.
+On mainnet a repeated proof of a completed payment answers `policy.approval_required`; only a submission receipt or a proof of another operation answers `policy.approval_consumed`.
 The authorization expires within 60 ledgers of the paying call's simulation ledger.
 The protocol estimates five seconds per ledger.
 

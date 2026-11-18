@@ -1809,11 +1809,17 @@ pub(super) fn keeps_waiting(
 
 /// The consent bound, including the signed expiry for an envelope approval.
 pub(super) fn record_cap(section: &Option<ApprovalsSection>, nonce: &str) -> Option<u64> {
-    let record = section
-        .as_ref()?
-        .records
-        .iter()
-        .find(|r| r.nonce == nonce)?;
+    cap_of(
+        section
+            .as_ref()?
+            .records
+            .iter()
+            .find(|r| r.nonce == nonce)?,
+    )
+}
+
+/// The consent bound of `record`; `None` without consent.
+fn cap_of(record: &WireApproval) -> Option<u64> {
     let end = record.consent.as_ref()?.execution_expires_at_ms;
     Some(if record.subject_kind == SubjectKind::EnvelopeText {
         end.min(record.waiting_expires_at_ms)
@@ -1822,18 +1828,34 @@ pub(super) fn record_cap(section: &Option<ApprovalsSection>, nonce: &str) -> Opt
     })
 }
 
+/// The consent bound of a continuation under the approval `nonce`.
+/// A missing record refuses `ApprovalNotFound`, as for every approval mint;
+/// a used parent skips the state checks of [`check_record`].
+pub(super) fn continuation_cap(
+    wire: &WireFile,
+    nonce: &str,
+) -> Result<Option<u64>, WindowStoreError> {
+    let Some(record) = records(wire).iter().find(|r| r.nonce == nonce) else {
+        return Err(WindowStoreError::AuthorizationRefused {
+            precondition: MainnetPrecondition::ApprovalNotFound,
+        });
+    };
+    Ok(cap_of(record))
+}
+
 /// Checks retained approval state on the caller's authenticated image.
-/// An absent record keeps the inbox authority path.
+/// A missing record refuses `ApprovalNotFound`: no mint admits an approval
+/// on inbox material alone.
 pub(super) fn check_record(
     wire: &WireFile,
     nonce: &str,
     operation: Option<OperationId>,
     now: u64,
 ) -> Result<Option<u64>, WindowStoreError> {
-    let Some(record) = records(wire).iter().find(|r| r.nonce == nonce) else {
-        return Ok(None);
-    };
     let refuse = |precondition| WindowStoreError::AuthorizationRefused { precondition };
+    let Some(record) = records(wire).iter().find(|r| r.nonce == nonce) else {
+        return Err(refuse(MainnetPrecondition::ApprovalNotFound));
+    };
     if record.state == ApprovalState::Revoked {
         return Err(refuse(MainnetPrecondition::ApprovalRevoked));
     }
@@ -1847,7 +1869,7 @@ pub(super) fn check_record(
             MainnetPrecondition::ApprovalExpired
         }));
     };
-    let cap = record_cap(&wire.approvals, nonce);
+    let cap = cap_of(record);
     if consent.payload.is_none() || now < consent.consent_at_ms || cap.is_some_and(|end| now >= end)
     {
         return Err(refuse(MainnetPrecondition::ApprovalExpired));
@@ -1871,7 +1893,7 @@ pub(super) fn consume(
         .as_mut()
         .and_then(|s| s.records.iter_mut().find(|r| r.nonce == nonce))
     else {
-        return Ok(());
+        return Err(unexpected("a checked approval record is absent"));
     };
     if record.state == ApprovalState::Pending {
         record.state = ApprovalState::Consumed;
@@ -1950,7 +1972,7 @@ pub(in crate::policy_state) mod tests {
         pub(in crate::policy_state) entry: PendingApproval,
     }
 
-    pub(super) fn proof(
+    pub(in crate::policy_state) fn proof(
         fixture: &MainnetConsentFixture,
         entry: &PendingApproval,
         name: &str,
@@ -3348,6 +3370,9 @@ pub(in crate::policy_state) mod tests {
             else {
                 panic!("live operation");
             };
+            // The operation route takes the approval identity from the handle.
+            let mut raw = request.clone();
+            raw.operation = None;
             recorder
                 .begin_attempt(
                     &handle,
@@ -3356,7 +3381,7 @@ pub(in crate::policy_state) mod tests {
                             xdr: "AAAA".to_owned(),
                             unsigned_envelope_sha256: [1; 32],
                         }),
-                        authorization: AttemptAuthorization::Mint(Box::new(request.clone())),
+                        authorization: AttemptAuthorization::Mint(Box::new(raw)),
                         send_by_ms: u64::MAX,
                     },
                 )

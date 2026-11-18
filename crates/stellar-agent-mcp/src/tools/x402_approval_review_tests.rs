@@ -184,6 +184,7 @@ async fn approval_clock_bounds_refuse_without_consumption() {
                 GatedApprovalKind::X402.expectation(proof.expected_subject),
                 Some(&nonce),
                 Some(&proof.attestation),
+                None,
                 "stellar_x402_create_payment",
             )
             .await;

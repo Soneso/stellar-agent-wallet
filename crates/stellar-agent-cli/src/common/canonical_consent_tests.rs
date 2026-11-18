@@ -121,6 +121,7 @@ async fn confirm_staged(
         &fixture.store_path(),
         Some(handle),
         PolicyDecision::RequireApproval,
+        &governing(context, &fixture.current_policy(), 120_000),
     )
     .await
 }

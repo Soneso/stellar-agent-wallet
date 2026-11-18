@@ -215,7 +215,7 @@ fn request<'a>(
         authority,
         audit: f.audit(),
         store: &f.window,
-        operation: None,
+        operation: f.link_of(authority),
         restriction,
         sac_payment_context: None,
     }

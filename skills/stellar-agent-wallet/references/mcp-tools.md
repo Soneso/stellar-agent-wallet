@@ -291,14 +291,18 @@ requires a verified passkey assertion from an approval credential in the
 owner-signed policy, and the operator approves on the local passkey page or at
 the signed approval origin. Never
 try to produce an approval yourself; report the refusal to the operator. A
-live rejection uses `policy.approval_rejected`. A
-live consumed approval or an approval held by a submission receipt uses
-`policy.approval_consumed`. Expired tombstones use `policy.approval_required`.
+live rejection uses `policy.approval_rejected`. On
+testnet a live consumed approval or an approval held by a submission receipt
+uses `policy.approval_consumed`, and expired tombstones use
+`policy.approval_required`. On mainnet a repeated proof of a completed payment
+answers `policy.approval_required`; only a submission receipt or a proof of
+another operation answers `policy.approval_consumed`.
 `stellar_approval_status` takes `approval_id` and reports one approval's
 retained state. It consumes nothing and grants no signing authority.
-Authorization consumption followed by pre-send recording failure can leave an
-unspent pending approval. Reusing it can produce
-`network.mainnet_authorization_refused` without a tombstone.
+Authorization consumption followed by a pre-send recording failure consumes
+the durable approval record and ends the operation unsent. A retry under the
+same `business_id` returns that stored outcome; a retry under another
+`business_id` refuses with `policy.approval_required`.
 
 The wallet's own signing paths sign mainnet payloads only under mainnet
 authorization. The library signers enforce it too: every `Signer`, the public
@@ -1237,7 +1241,9 @@ Retry submission only when the failure is known to precede the send.
 
 `policy.approval_consumed` means the approval you presented was already spent on
 a submission. Check that transaction's status before asking for the action
-again.
+again. On mainnet it also answers a proof of another operation, such as a
+call under another `business_id`; present the approval under the
+`business_id` of the call that prepared it.
 
 ## Resources
 
@@ -1288,8 +1294,9 @@ immediately before the signing primitive, with no intervening I/O or await.
 
 An approval releases at most one signed authorization.
 A failed or interrupted call can spend it without returning a payment payload.
-A repeated proof with a live spent tombstone answers `policy.approval_consumed`.
+On testnet a repeated proof with a live spent tombstone answers `policy.approval_consumed`.
 An expired or pruned tombstone can answer `policy.approval_required`.
+On mainnet a repeated proof of a completed payment answers `policy.approval_required`; only a submission receipt or a proof of another operation answers `policy.approval_consumed`.
 The authorization expires within 60 ledgers of the paying call's simulation ledger.
 The protocol estimates five seconds per ledger.
 

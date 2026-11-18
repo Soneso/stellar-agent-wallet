@@ -2758,16 +2758,54 @@ async fn public_mainnet_terminal_consent_survives_restart_and_clock_rollback() {
             }));
             let before = std::fs::read(&path).unwrap();
             let reads = run.f.nonce_reads.load(Ordering::SeqCst);
+            let stored = || {
+                stellar_agent_network::policy_state::OperationStatus::new(
+                    &run.f.server.window_store,
+                    run.f.server.security_profile(),
+                )
+                .view(
+                    &stellar_agent_network::policy_state::BusinessId::parse(
+                        args["business_id"].as_str().unwrap(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+            };
             let retried = run.prepare_route(&args, !first_toolset).await;
             assert!(
                 refuses(&retried),
                 "{mode}: retained consent refuses after rollback: {retried}"
             );
+            let state_before = stored();
+            let window_before = std::fs::read(run.f.server.window_store.path()).unwrap();
             let refused = run.commit_route(commit, !first_toolset).await;
-            assert!(
-                refuses(&refused),
-                "{mode}: public commit preserves the terminal refusal: {refused}"
-            );
+            if mode == "consumed" {
+                // The inbox tombstone is inbox material and decides nothing
+                // on mainnet, so the commit meets the uniform refusal of a
+                // proof that does not verify against the durable record.
+                assert_eq!(
+                    refused["error"],
+                    wire(&super::common::approval_required_indistinguishable(
+                        "operator"
+                    ))["error"],
+                    "{mode}: public commit refuses uniformly: {refused}"
+                );
+                assert_eq!(
+                    stored(),
+                    state_before,
+                    "{mode}: the stored operation is unchanged"
+                );
+                assert_eq!(
+                    std::fs::read(run.f.server.window_store.path()).unwrap(),
+                    window_before,
+                    "{mode}: the commit writes no window state"
+                );
+            } else {
+                assert!(
+                    refuses(&refused),
+                    "{mode}: public commit preserves the terminal refusal: {refused}"
+                );
+            }
             assert_eq!(std::fs::read(&path).unwrap(), before);
             assert_eq!(run.f.nonce_reads.load(Ordering::SeqCst), reads);
             assert_eq!(run.f.seed_reads.load(Ordering::SeqCst), 0);

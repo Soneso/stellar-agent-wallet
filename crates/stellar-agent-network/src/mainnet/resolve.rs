@@ -1008,13 +1008,20 @@ mod enabled {
         now: u64,
         store: &PersistedWindowStore,
         operation: Option<OperationLink>,
+        parent: Option<&MessageUseReceipt>,
     ) -> Result<(), MainnetAuthorizationError> {
         match authority {
             MainnetAuthority::Approval(approval) => {
                 let facts = ApprovalStatus::new(store, context.profile())
                     .facts_by_nonce(approval.witness().nonce())
                     .map_err(mint::store_error)?;
-                check_approval_facts(facts.as_ref(), approval.witness(), operation, now)?;
+                check_approval_facts(
+                    facts.as_ref(),
+                    approval.witness(),
+                    operation.map(|link| link.operation_id),
+                    parent.and_then(MessageUseReceipt::approval_nonce),
+                    now,
+                )?;
                 approval_checks(
                     context,
                     policy,
@@ -1047,22 +1054,29 @@ mod enabled {
     }
 
     /// Compares a witness with the retained consent after ordered state checks.
+    ///
+    /// A missing record refuses `ApprovalNotFound`, so no approval admits on
+    /// inbox material alone. `parent` is the approval nonce of the used
+    /// message proof an authenticated payment continues. When it names this
+    /// record, the record was consumed, and the operation is the record's,
+    /// a later revocation does not refuse; every other check still runs.
     pub(super) fn check_approval_facts(
         facts: Option<&ApprovalFacts>,
         approval: &ApprovalWitness,
-        operation: Option<OperationLink>,
+        operation: Option<crate::policy_state::OperationId>,
+        parent: Option<&str>,
         now: u64,
     ) -> Result<(), MainnetAuthorizationError> {
-        let Some(facts) = facts else {
-            return Ok(());
-        };
+        let facts = facts.ok_or_else(|| refused(P::ApprovalNotFound))?;
         let record = facts.record();
+        let same_operation = operation.is_some_and(|id| *id.as_bytes() == record.operation_id);
+        let used_parent = parent == Some(record.nonce.as_str())
+            && record.consumed_at_ms.is_some()
+            && same_operation;
         require(
-            record.disposition != ApprovalDisposition::Revoked,
+            record.disposition != ApprovalDisposition::Revoked || used_parent,
             P::ApprovalRevoked,
         )?;
-        let same_operation =
-            operation.is_some_and(|link| *link.operation_id.as_bytes() == record.operation_id);
         if record.disposition == ApprovalDisposition::Consumed {
             require(same_operation, P::ApprovalNonceReused)?;
         }
@@ -1541,6 +1555,7 @@ mod enabled {
             now,
             req.store,
             req.operation,
+            None,
         )?;
         let mut request = request(
             req.context,
@@ -1753,6 +1768,7 @@ mod enabled {
             now,
             req.store,
             req.operation,
+            authenticated,
         )?;
         let mut request = request(
             req.context,
@@ -1865,6 +1881,12 @@ mod enabled {
                         if *home_domain == req.message.domain.home_domain),
                     P::AuthorityScopeMismatch,
                 )?;
+                // The message consumes the record of the operation it names;
+                // without that identity no record matches.
+                let facts = ApprovalStatus::new(req.store, req.context.profile())
+                    .facts_by_nonce(approval.nonce())
+                    .map_err(mint::store_error)?;
+                check_approval_facts(facts.as_ref(), approval, req.approval_operation, None, now)?;
             }
             MainnetAuthority::Policy(authority) => {
                 check_policy_authority(req.context, req.policy, authority, now)?;
@@ -2212,7 +2234,7 @@ mod tests {
             authority,
             audit: f.audit(),
             store: &f.window,
-            operation: None,
+            operation: f.link_of(authority),
             restriction: None,
             sac_payment_context: None,
         }
@@ -2787,6 +2809,8 @@ mod tests {
         });
         let approval = f.approval(&f.envelope, created, 600_000);
         let before = f.wire();
+        // The durable consent of an approval created after the clock is also
+        // after it, and the record check precedes the witness checks.
         assert_refused(
             resolve_tx_sign(request(
                 &f,
@@ -2795,7 +2819,7 @@ mod tests {
                 &f.approval_authority(&approval),
             ))
             .await,
-            P::NotYetValid,
+            P::ApprovalExpired,
             &f,
             &before,
         );
@@ -2937,7 +2961,7 @@ mod tests {
             audit: f.audit(),
             store: &f.window,
             authenticated: None,
-            operation: None,
+            operation: f.link_of(authority),
         }
     }
     async fn resolved_intent(
@@ -3831,12 +3855,17 @@ mod tests {
         let server = f.server().await;
         let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
         let root = transfer_root(&f, &native_sac(), 10);
+        // The approval's durable record is written before the fault is
+        // armed, so the fault meets the mint's generation commit.
+        let approval = intent_approval(&f, &root, None);
         {
             let _fault = crate::policy_state::store::commit_faults::arm_accounting_fault(
                 crate::policy_state::store::commit_faults::COMMIT_FAULT_AFTER_PREPARED,
             );
             assert_eq!(
-                resolve_root(&f, &context, &root).await.unwrap_err(),
+                resolve_root_with(&f, &context, &root, &approval)
+                    .await
+                    .unwrap_err(),
                 MainnetAuthorizationError::Refused(P::StoreUnavailable),
                 "the commit fault refuses as an unavailable store"
             );
@@ -3960,10 +3989,13 @@ mod tests {
                 &retained_mint(&f, "above-balance", 2 * FIXTURE_BALANCE_STROOPS, 0),
             )
             .unwrap();
-        let before = f.wire();
         let root = transfer_root(&f, &native_sac(), i128::MAX);
+        let approval = intent_approval(&f, &root, None);
+        let before = f.wire();
         assert_eq!(
-            resolve_root(&f, &context, &root).await.unwrap_err(),
+            resolve_root_with(&f, &context, &root, &approval)
+                .await
+                .unwrap_err(),
             MainnetAuthorizationError::Accounting(AccountingRefusal::Overflow)
         );
         assert_eq!(f.wire(), before, "nothing is minted");
@@ -4241,7 +4273,9 @@ mod tests {
             }
         };
     }
-    binding_case!(approval_profile_refuses, "profile", ApprovalProfileMismatch);
+    // The record lookup is scoped to the context's profile, so another
+    // profile's approval finds no record there before its witness checks.
+    binding_case!(approval_profile_refuses, "profile", ApprovalNotFound);
     binding_case!(approval_policy_refuses, "policy", ApprovalPolicyMismatch);
     binding_case!(approval_subject_refuses, "subject", ApprovalSubjectMismatch);
     binding_case!(
@@ -4308,6 +4342,7 @@ mod tests {
                 &f.signer,
                 f.now,
                 &f.window,
+                f.link_of(&authority),
                 None,
             )
         };
@@ -5113,6 +5148,8 @@ mod tests {
         );
         f.clock.set(created - 8 * 24 * 60 * 60 * 1000);
         let before = f.wire();
+        // The durable consent of an approval created after the clock is also
+        // after it, and the record check precedes the witness checks.
         assert_refused(
             resolve_soroban_intent(intent_request(
                 &f,
@@ -5122,7 +5159,7 @@ mod tests {
                 &f.approval_authority(&approval),
             ))
             .await,
-            P::NotYetValid,
+            P::ApprovalExpired,
             &f,
             &before,
         );
@@ -5235,6 +5272,9 @@ mod tests {
             let authority = f.approval_authority(&second);
             let mut req = request(&f, &context, &client, &authority);
             req.unsigned_envelope_xdr = &envelope;
+            // A root mint names no operation of the consumed record, so the
+            // held nonce refuses first.
+            req.operation = None;
             assert_refused(
                 resolve_tx_sign(req).await,
                 P::ApprovalNonceReused,
@@ -5302,10 +5342,12 @@ mod tests {
             }
         };
     }
+    // The record lookup is scoped to the context's profile, so another
+    // profile's approval finds no record there before its witness checks.
     soroban_approval_case!(
         soroban_approval_profile_refuses,
         "profile",
-        ApprovalProfileMismatch
+        ApprovalNotFound
     );
     soroban_approval_case!(
         soroban_approval_policy_refuses,
@@ -6262,6 +6304,8 @@ mod tests {
             &before,
         );
         let fresh = f.x402_approval(&root, Some(MESSAGE_HOME_DOMAIN), f.now);
+        // The fresh approval's durable record precedes the refused mints.
+        let before = f.wire();
         assert_refused(
             resolve_message_sign(f.message_request(&intent, &first, &f.approval_authority(&fresh))),
             P::DuplicateOpen,
@@ -6579,14 +6623,18 @@ mod tests {
             audit: f.audit(),
             store: &f.window,
             authenticated: Some(&receipt),
-            operation: None,
+            operation: f.link_of(&authority),
         };
         match case {
             "no_receipt" => req.authenticated = None,
-            "plain_subject" => req.authority = &plain_authority,
+            "plain_subject" => {
+                req.authority = &plain_authority;
+                req.operation = f.link_of(&plain_authority);
+            }
             "create_plain" => {
                 req.authenticated = None;
                 req.authority = &plain_authority;
+                req.operation = f.link_of(&plain_authority);
             }
             _ => {}
         }
@@ -7102,6 +7150,7 @@ mod tests {
                 &f.signer,
                 now,
                 &f.window,
+                f.link_of(authority),
                 None,
             )
         };
@@ -7628,6 +7677,10 @@ mod tests {
     async fn public_floor_admits_only_covered_history() {
         for min in [FIXTURE_BALANCE_STROOPS, 1] {
             let f = floor_fixture(min);
+            // The approval's durable record is written first: its commit
+            // marks native coverage, which the earlier build's image below
+            // does not carry.
+            let approval = f.approval(&f.envelope, f.now, 600_000);
             // An existing image that an earlier build wrote, without the
             // native coverage marker.
             f.clock.set(f.now - 5_000);
@@ -7638,7 +7691,6 @@ mod tests {
             let server = floor_server(&f).await;
             let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
             let client = context.primary_client().unwrap();
-            let approval = f.approval(&f.envelope, f.now, 600_000);
             let before = f.wire();
             for authority in [
                 f.approval_authority(&approval),
@@ -7677,14 +7729,17 @@ mod tests {
     /// fixture's signer, outside any operation.
     fn retained_mint(
         f: &ResolverFixture,
-        nonce: &str,
+        label: &str,
         debit: i64,
         fee: i64,
     ) -> crate::policy_state::MintRequest {
+        // The retained approval holds its durable record, as every approval
+        // mint requires; `label` keeps each retained content distinct.
+        let held = f.approval(&f.envelope, f.now, 600_000);
         crate::policy_state::MintRequest {
             chain: f.profile.chain_id,
             binding: crate::policy_state::DomainBinding::Transaction {
-                unsigned_envelope_sha256: Sha256::digest(nonce.as_bytes()).into(),
+                unsigned_envelope_sha256: Sha256::digest(label.as_bytes()).into(),
                 tx_hash: [2; 32],
                 source: stellar_strkey::ed25519::PublicKey(f.signer.public_key())
                     .to_string()
@@ -7695,7 +7750,7 @@ mod tests {
             policy_sequence: f.policy.sequence(),
             policy_digest: f.policy.digest(),
             authority: crate::policy_state::MintAuthority::Approval {
-                nonce: nonce.to_owned(),
+                nonce: held.nonce().to_owned(),
                 expires_at_ms: f.now + 120_000,
             },
             chain_deadline_ms: None,
@@ -7714,7 +7769,7 @@ mod tests {
             },
             holds: vec![],
             parent: None,
-            operation: None,
+            operation: f.link(held.nonce()),
             intent_digest: None,
             predecessor: None,
             approval_operation: None,
@@ -7794,10 +7849,22 @@ mod tests {
         context: &MainnetWriteContext,
         root: &SorobanAuthorizedInvocation,
     ) -> Result<MainnetSorobanIntentAuthorization, MainnetAuthorizationError> {
+        let approval = intent_approval(f, root, None);
+        resolve_root_with(f, context, root, &approval).await
+    }
+
+    /// [`resolve_root`] under `approval`, whose durable record the caller
+    /// wrote before the resolution, so a fault or an image snapshot taken
+    /// after it sees only the resolver's writes.
+    async fn resolve_root_with(
+        f: &ResolverFixture,
+        context: &MainnetWriteContext,
+        root: &SorobanAuthorizedInvocation,
+        approval: &ApprovalWitness,
+    ) -> Result<MainnetSorobanIntentAuthorization, MainnetAuthorizationError> {
         let client = context.primary_client().unwrap();
         let intent = intent(root);
-        let approval = intent_approval(f, root, None);
-        let authority = f.approval_authority(&approval);
+        let authority = f.approval_authority(approval);
         resolve_soroban_intent(intent_request(f, context, &client, &intent, &authority)).await
     }
 
@@ -7827,6 +7894,7 @@ mod tests {
             f.window
                 .mint_authorization(&f.profile, &retained_mint(&f, "retained-floor", 40, 10))
                 .unwrap();
+            let approval = intent_approval(&f, &root, None);
             let before = f.wire();
             let refusal = MainnetAuthorizationError::PolicyDenied(Box::new(
                 DenyReason::AccountFloorRefused {
@@ -7835,7 +7903,9 @@ mod tests {
                 },
             ));
             assert_eq!(
-                resolve_root(&f, &context, &root).await.unwrap_err(),
+                resolve_root_with(&f, &context, &root, &approval)
+                    .await
+                    .unwrap_err(),
                 refusal,
                 "the payer's balance minus the retained 50 and the native debit 10"
             );

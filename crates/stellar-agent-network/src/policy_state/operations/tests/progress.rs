@@ -227,14 +227,13 @@ fn submission_progress_and_admission_share_predecessor_guards() {
         assert_eq!(fs::read(fx.store.path()).unwrap(), before);
     }
     for linked in [false, true] {
-        let mut fx = Fx::new();
-        let handle = projected_not_included(&mut fx, 1);
+        let mut fx = Fx::with_approvals();
+        let (handle, approval) = approved_not_included(&mut fx, 1);
         fx.rewrite(|wire| section_mut(wire).records[0].execution_expires_at_ms = None);
         assert!(
             progress(&fx, 1).retry_eligible,
             "historical absent end permits a candidate"
         );
-        let approval = fx.approval();
         let next = if linked {
             link_next(&fx, &handle, 21, approval);
             begin_linked(&mut fx, &handle).unwrap()
@@ -650,7 +649,7 @@ fn submission_progress_two_process_generations() {
 #[serial]
 fn submission_progress_candidate_checks_remain_admission_only() {
     let (_guard, _home) = homed();
-    let mut fx = Fx::new();
+    let mut fx = Fx::with_approvals();
     let (handle, commit, nonce) = commit_approved(&mut fx, 1, Checked::NotIncluded);
     fx.recorder()
         .acknowledge_projection(handle.id(), 1, commit)

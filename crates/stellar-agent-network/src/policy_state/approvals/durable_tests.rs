@@ -594,7 +594,11 @@ pub(crate) struct IntentFx {
     pub(crate) facts: ApprovalFacts,
     pub(crate) policy: VerifiedPolicy,
     blob: [u8; 32],
-    pub(crate) _clock: crate::mainnet::clock::TestClockGuard,
+    #[cfg_attr(
+        not(feature = "mainnet-write"),
+        allow(dead_code, reason = "only the mainnet resolver tests move this clock")
+    )]
+    pub(crate) clock: crate::mainnet::clock::TestClockGuard,
 }
 
 impl IntentFx {
@@ -697,7 +701,7 @@ impl IntentFx {
             facts,
             policy,
             blob,
-            _clock: clock,
+            clock,
         }
     }
 

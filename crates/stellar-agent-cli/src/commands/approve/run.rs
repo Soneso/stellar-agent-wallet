@@ -453,7 +453,9 @@ struct MainnetApproved {
 ///
 /// # Errors
 ///
-/// `approval.wrong_kind` for a kind without a mainnet consent path, the
+/// `approval.wrong_kind` for a kind without a mainnet consent path,
+/// `approval.not_found` for a value entry that no durable record names, the
+/// refusals of [`validate_durable_approval`] for that entry's record, the
 /// presence refusals of [`acquire_mainnet_presence_with_mode`], and the policy, key,
 /// sink, attester and durable store refusals. An integrated kind also refuses
 /// with `audit.outbox_evidence_unusable` for an unready scope or unusable
@@ -592,7 +594,14 @@ async fn approve_mainnet(
     })
 }
 
-/// Reads the durable record only for mainnet value approvals.
+/// Reads the durable record that names `entry`'s nonce and checks it against
+/// this entry with [`validate_durable_approval`]. Only a mainnet value
+/// approval has a record; every other entry returns `None`.
+///
+/// # Errors
+///
+/// `approval.not_found` when no durable record names the nonce, the store's
+/// read refusals, and the refusals of [`validate_durable_approval`].
 fn durable_approval(
     window: &PersistedWindowStore,
     profile: &Profile,
@@ -624,7 +633,16 @@ fn durable_approval(
     Ok(Some(view))
 }
 
-/// Checks the durable disposition and signed inbox facts before consent.
+/// Checks the durable disposition of `entry`'s record and the entry's signed
+/// facts against it before consent.
+///
+/// # Errors
+///
+/// `approval.revoked` or `approval.consumed` for the record's state,
+/// `approval.clock_error` without a clock, `approval.expired` outside the
+/// waiting window, `approval.wrong_kind` for
+/// another kind or subject convention, and `approval.attestation_invalid`
+/// when the subject or the signed clocks differ.
 fn validate_durable_approval(
     view: &ApprovalView,
     entry: &PendingApproval,

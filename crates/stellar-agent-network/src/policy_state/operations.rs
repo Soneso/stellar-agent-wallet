@@ -1906,6 +1906,26 @@ fn authority_of(
     })
 }
 
+/// On the operation route the handle `operation` names the approval
+/// identity, so a raw mint that carries an approval operation or a link to
+/// another operation refuses before any read. A link to the handle's own
+/// operation passes.
+fn handle_identity_only(
+    mint: &MintRequest,
+    operation: OperationId,
+) -> Result<(), WindowStoreError> {
+    if mint.approval_operation.is_some()
+        || mint
+            .operation
+            .is_some_and(|link| link.operation_id != operation)
+    {
+        return Err(unexpected(
+            "an operation mint takes its identity from the handle",
+        ));
+    }
+    Ok(())
+}
+
 /// Takes `auth`'s authority onto `record`: the authority on first adoption,
 /// and an execution expiry no later than the authority's end, the envelope's
 /// end, the durable consent bound and any earlier execution expiry.
@@ -4587,8 +4607,8 @@ impl<'a> OperationRecorder<'a> {
         let profile = self.profile;
         // A malformed mint entry refuses before the lock, the key, and any
         // read.
-        if let Some((request, _)) = mint {
-            request.approval_identity()?;
+        if let Some((request, operation)) = mint {
+            handle_identity_only(request, operation)?;
             super::store::check_total_shape(&request.holds)?;
         }
         if !profile.chain_id.is_mainnet() {
@@ -4617,8 +4637,8 @@ impl<'a> OperationRecorder<'a> {
         mint: Option<(&MintRequest, OperationId)>,
         step: impl FnOnce(&mut Session<'_>) -> Result<T, WindowStoreError>,
     ) -> Result<T, WindowStoreError> {
-        if let Some((request, _)) = mint {
-            request.approval_identity()?;
+        if let Some((request, operation)) = mint {
+            handle_identity_only(request, operation)?;
         }
         let store = self.store;
         let profile = self.profile;
@@ -4635,8 +4655,7 @@ impl<'a> OperationRecorder<'a> {
         let now = now_ms()?;
         let mint_expires = match mint {
             Some((request, operation)) => {
-                let identity = request.approval_identity()?.or(Some(operation));
-                let cap = store.mint_record_checks(profile, request, identity, now)?;
+                let cap = store.mint_record_checks(profile, request, Some(operation), now)?;
                 Some(store.mint_prechecks(lock, profile, request, now, cap)?)
             }
             None => None,
@@ -4779,6 +4798,7 @@ impl<'a> OperationRecorder<'a> {
                         .to_owned(),
                 });
             }
+            handle_identity_only(mint, handle.id())?;
         }
         if request
             .envelope
@@ -6606,6 +6626,18 @@ pub(crate) mod tests {
         pub(crate) clock: TestClockGuard,
         pub(crate) sink: Sink,
         nonces: Cell<u32>,
+        /// The consent fixture whose profile [`Self::approve`] records under.
+        consent: Option<stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture>,
+    }
+
+    /// A wall clock fixed at one instant, so a consent ceremony runs on the
+    /// fixture clock.
+    struct FixedWall(u64);
+
+    impl stellar_agent_core::timefmt::Clock for FixedWall {
+        fn now_unix_ms(&self) -> Result<u64, stellar_agent_core::wallet::WalletLifecycleError> {
+            Ok(self.0)
+        }
     }
 
     impl Fx {
@@ -6623,6 +6655,29 @@ pub(crate) mod tests {
             )
             .build();
             profile.audit_log_path = dir.path().join("audit.jsonl");
+            Self::with_profile(dir, profile, None)
+        }
+
+        /// [`Self::new`] on the profile of a consent fixture, so
+        /// [`Self::approve`] can record durable approvals.
+        pub(crate) fn with_approvals() -> Self {
+            let consent =
+                stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture::new("ops");
+            let dir = TempDir::new().unwrap();
+            let mut profile = consent.profile().clone();
+            profile.audit_log_path = dir.path().join("audit.jsonl");
+            // The fixture's pin lives under its own window key, so the consent
+            // fixture keeps its policy pin.
+            profile.policy_window_state_key_id =
+                stellar_agent_core::profile::schema::KeyringEntryRef::new("ops-window", "ops");
+            Self::with_profile(dir, profile, Some(consent))
+        }
+
+        fn with_profile(
+            dir: TempDir,
+            profile: Profile,
+            consent: Option<stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture>,
+        ) -> Self {
             let store = PersistedWindowStore::at_path(dir.path().join("ops.window"));
             let fx = Self {
                 _dir: dir,
@@ -6631,6 +6686,7 @@ pub(crate) mod tests {
                 clock: set_now_ms_for_test(T0),
                 sink: Sink::default(),
                 nonces: Cell::new(0),
+                consent,
             };
             let lock = WindowStoreLock::acquire_for(
                 fx.store.path(),
@@ -6722,14 +6778,64 @@ pub(crate) mod tests {
             self.store.record_and_persist(&self.profile, &[]).unwrap();
         }
 
-        fn approval(&self) -> MintAuthority {
+        /// A policy authority of its own rule index, so two calls never name
+        /// the same authority. A test whose subject is an approval records
+        /// one with [`Self::approve`].
+        fn fresh_policy(&self) -> MintAuthority {
             let n = self.nonces.get() + 1;
             self.nonces.set(n);
+            MintAuthority::Policy(PolicyAuthorityBinding {
+                policy_digest: [7; 32],
+                policy_sequence: 7,
+                rule_index: n,
+                evaluated_at_ms: self.now(),
+                governing_until_ms: self.now() + APPROVAL_MS,
+                scope: AuthorityScope::Classic,
+            })
+        }
+
+        /// Records a durable approval of `operation` on the fixture clock:
+        /// its pending record and the operator's consent, through the
+        /// producer facades, and returns its authority.
+        fn approve(&self, operation: OperationId) -> MintAuthority {
+            use super::super::approvals::{
+                ApprovalRecorder, PendingApprovalFacts,
+                tests::{Rows, proof},
+            };
+            let fixture = self.consent.as_ref().expect("a fixture with approvals");
+            let now = self.now();
+            let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(fixture.home());
+            let _wall = stellar_agent_core::timefmt::test_clock::install(std::sync::Arc::new(
+                FixedWall(now),
+            ));
+            let entry = fixture.payment(APPROVAL_MS);
+            let (witness, payload) =
+                proof(fixture, &entry, &format!("{}.toml", entry.approval_nonce));
+            let intent_digest = self.record(operation).intent.intent_digest();
+            let mut rows = Rows::default();
+            let mut recorder = ApprovalRecorder::new(&self.store, &self.profile, &mut rows, "ok");
+            let view = recorder
+                .open_pending(
+                    operation,
+                    &PendingApprovalFacts {
+                        nonce: witness.nonce().to_owned(),
+                        kind: witness.kind(),
+                        subject_kind: witness.subject_kind(),
+                        subject: witness.subject(),
+                        intent_digest,
+                        created_at_ms: witness.created_at_ms(),
+                        waiting_expires_at_ms: witness.expires_at_ms(),
+                        rule_ttl_ms: APPROVAL_MS,
+                    },
+                    stellar_agent_core::audit_log::PolicyDecision::RequireApproval,
+                )
+                .unwrap();
+            recorder
+                .record_consent(view.record.id, &witness, &payload)
+                .unwrap();
             MintAuthority::Approval {
-                // 22 base64url characters, the shape a pending approval
-                // store accepts.
-                nonce: format!("approval-nonce-{n:07}"),
-                expires_at_ms: self.now() + APPROVAL_MS,
+                nonce: witness.nonce().to_owned(),
+                expires_at_ms: now + APPROVAL_MS,
             }
         }
 
@@ -7494,7 +7600,7 @@ pub(crate) mod tests {
         open.rule_ttl_ms = Some(APPROVAL_MS);
         let handle = fx.open_new(&open);
         assert_eq!(handle.waiting_expires_at_ms(), T0 + 100_000);
-        let mint = fx.mint_request(tx(5), fx.approval(), vec![]);
+        let mint = fx.mint_request(tx(5), fx.fresh_policy(), vec![]);
         let started = fx.begin_mint(&handle, &mint).unwrap();
         assert_eq!(
             fx.record(handle.id()).execution_expires_at_ms,
@@ -7513,7 +7619,7 @@ pub(crate) mod tests {
         let mut fx = Fx::new();
         let handle = fx.open_new(&request("order-1", envelope(5, 6, 0)));
         let before = fx.generation();
-        let mint = fx.mint_request(tx(5), fx.approval(), vec![]);
+        let mint = fx.mint_request(tx(5), fx.fresh_policy(), vec![]);
         let refused = fx.recorder().begin_attempt(
             &handle,
             &AttemptRequest {
@@ -8464,7 +8570,10 @@ pub(crate) mod tests {
         for case in [Case::ApprovalClassic, Case::PolicyClassic, Case::X402] {
             for after_execution in [false, true] {
                 let label = format!("{case:?}, after execution expiry: {after_execution}");
-                let mut fx = Fx::new();
+                let mut fx = match case {
+                    Case::PolicyClassic => Fx::new(),
+                    Case::ApprovalClassic | Case::X402 => Fx::with_approvals(),
+                };
                 let (slot, binding) = match case {
                     Case::X402 => (x402([1; 32]), soroban(1)),
                     Case::ApprovalClassic | Case::PolicyClassic => (canonical(1), tx(1)),
@@ -8476,7 +8585,7 @@ pub(crate) mod tests {
                 fx.clock.set(T0 + 299_000);
                 let authority = match case {
                     Case::PolicyClassic => fx.policy(),
-                    Case::ApprovalClassic | Case::X402 => fx.approval(),
+                    Case::ApprovalClassic | Case::X402 => fx.approve(handle.id()),
                 };
                 let mut linked =
                     fx.operation_mint_request(&handle, binding, authority.clone(), vec![]);
@@ -8488,11 +8597,16 @@ pub(crate) mod tests {
                 assert_eq!(minted.expires_at_ms, T0 + 299_000 + TTL_MS, "{label}");
 
                 fx.clock.set(T0 + 299_000 + TTL_MS + 1);
-                let other = fx.mint_request(tx(0x40), fx.approval(), vec![]);
+                let other = fx.mint_request(tx(0x40), fx.fresh_policy(), vec![]);
                 fx.store.mint_authorization(&fx.profile, &other).unwrap();
+                // An approval's operation waits from the moment its durable
+                // record opens; a policy operation stays prepared.
                 assert_eq!(
                     fx.record(handle.id()).state,
-                    OperationState::Prepared,
+                    match case {
+                        Case::PolicyClassic => OperationState::Prepared,
+                        Case::ApprovalClassic | Case::X402 => OperationState::AwaitingApproval,
+                    },
                     "{label}"
                 );
                 let untouched = fx.auth(minted.id);
@@ -8569,13 +8683,13 @@ pub(crate) mod tests {
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let fx = Fx::new();
-        let mut open = fx.mint_request(tx(1), fx.approval(), vec![hold(70)]);
+        let mut open = fx.mint_request(tx(1), fx.fresh_policy(), vec![hold(70)]);
         open.native_reservation = Some(super::super::ledger::NativeReservation {
             debit_stroops: 70,
             fee_stroops: 1,
         });
         let unused = fx.store.mint_authorization(&fx.profile, &open).unwrap();
-        let mut claimed_request = fx.mint_request(tx(2), fx.approval(), vec![hold(30)]);
+        let mut claimed_request = fx.mint_request(tx(2), fx.fresh_policy(), vec![hold(30)]);
         claimed_request.native_reservation = open.native_reservation;
         let claimed = fx
             .store
@@ -8640,7 +8754,7 @@ pub(crate) mod tests {
         let mut fx = Fx::new();
         cover(&fx);
         let handle = fx.open_new(&request("order-1", canonical(1)));
-        let authority = fx.approval();
+        let authority = fx.fresh_policy();
         let mut linked =
             fx.operation_mint_request(&handle, tx(1), authority.clone(), vec![hold(70)]);
         linked.operation = Some(OperationLink {
@@ -9025,7 +9139,7 @@ pub(crate) mod tests {
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let protected = fx.open_new(&request("order-1", x402([1; 32])));
-        let mint = fx.mint_request(soroban(1), fx.approval(), vec![]);
+        let mint = fx.mint_request(soroban(1), fx.fresh_policy(), vec![]);
         let started = fx.begin_mint(&protected, &mint).unwrap();
         fx.claim(&mint, started.minted.as_ref().unwrap());
         fx.recorder()
@@ -9050,7 +9164,7 @@ pub(crate) mod tests {
             .unwrap();
 
         let released = fx.open_new(&request("order-2", canonical(2)));
-        let mint = fx.operation_mint_request(&released, tx(2), fx.approval(), vec![]);
+        let mint = fx.operation_mint_request(&released, tx(2), fx.fresh_policy(), vec![]);
         let released_attempt = fx.begin_mint(&released, &mint).unwrap();
         fx.recorder()
             .transition(
@@ -9131,16 +9245,22 @@ pub(crate) mod tests {
             .store
             .mint_authorization(
                 &fx.profile,
-                &fx.mint_request(soroban(1), fx.approval(), vec![]),
+                &fx.mint_request(soroban(1), fx.fresh_policy(), vec![]),
             )
             .unwrap();
         let close_bound = fx
             .store
-            .mint_authorization(&fx.profile, &fx.mint_request(tx(2), fx.approval(), vec![]))
+            .mint_authorization(
+                &fx.profile,
+                &fx.mint_request(tx(2), fx.fresh_policy(), vec![]),
+            )
             .unwrap();
         let always = fx
             .store
-            .mint_authorization(&fx.profile, &fx.mint_request(tx(3), fx.approval(), vec![]))
+            .mint_authorization(
+                &fx.profile,
+                &fx.mint_request(tx(3), fx.fresh_policy(), vec![]),
+            )
             .unwrap();
         fx.rewrite(|wire| {
             release_with(wire, ledger_bound.id, ReleaseBound::Ledger(5_000));
@@ -9182,7 +9302,7 @@ pub(crate) mod tests {
                     &fx.profile,
                     &fx.mint_request(
                         soroban(u8::try_from(bound / 1000).unwrap()),
-                        fx.approval(),
+                        fx.fresh_policy(),
                         vec![],
                     ),
                 )
@@ -10594,9 +10714,9 @@ pub(crate) mod tests {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        let mut fx = Fx::new();
+        let mut fx = Fx::with_approvals();
         let handle = fx.open_new(&request("order-1", canonical(1)));
-        let authority = fx.approval();
+        let authority = fx.approve(handle.id());
         let carrier = linked_mint(&fx, &handle, tx(1), authority.clone(), 1);
         let minted = fx.store.mint_authorization(&fx.profile, &carrier).unwrap();
         fx.claim(&carrier, &minted);
@@ -10712,7 +10832,7 @@ pub(crate) mod tests {
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let handle = fx.open_new(&request("order-1", canonical(1)));
-        let linked = linked_mint(&fx, &handle, tx(1), fx.approval(), 1);
+        let linked = linked_mint(&fx, &handle, tx(1), fx.fresh_policy(), 1);
         let minted = fx.store.mint_authorization(&fx.profile, &linked).unwrap();
         assert!(
             fx.store
@@ -10793,7 +10913,7 @@ pub(crate) mod tests {
         open.rule_ttl_ms = Some(300_000);
         let adopted = fx.open_new(&open);
         fx.clock.set(T0 + 699_000);
-        let linked = linked_mint(&fx, &adopted, tx(2), fx.approval(), 1);
+        let linked = linked_mint(&fx, &adopted, tx(2), fx.fresh_policy(), 1);
         let minted = fx.store.mint_authorization(&fx.profile, &linked).unwrap();
         fx.clock.set(T0 + 701_000);
         let started = fx
@@ -10947,12 +11067,12 @@ pub(crate) mod tests {
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         let waiting = fx.open_new(&request("order-1", canonical(1)));
-        let mut linked = linked_mint(&fx, &waiting, tx(1), fx.approval(), 1);
+        let mut linked = linked_mint(&fx, &waiting, tx(1), fx.fresh_policy(), 1);
         linked.holds = vec![hold(10)];
         let minted = fx.store.mint_authorization(&fx.profile, &linked).unwrap();
 
         fx.clock.set(T0 + TTL_MS + 1);
-        let other = fx.mint_request(tx(0x40), fx.approval(), vec![]);
+        let other = fx.mint_request(tx(0x40), fx.fresh_policy(), vec![]);
         fx.store.mint_authorization(&fx.profile, &other).unwrap();
         assert_eq!(fx.record(waiting.id()).state, OperationState::Prepared);
         let untouched = fx.auth(minted.id);
@@ -11151,7 +11271,7 @@ pub(crate) mod tests {
         step(&mut fx, &handle, None, OperationState::Expired);
         let before = fx.generation();
         let bytes = file_bytes(&fx);
-        let linked = linked_mint(&fx, &handle, tx(1), fx.approval(), 1);
+        let linked = linked_mint(&fx, &handle, tx(1), fx.fresh_policy(), 1);
         let error = fx
             .store
             .mint_authorization(&fx.profile, &linked)
@@ -11176,7 +11296,7 @@ pub(crate) mod tests {
         let fresh = fx.open_new(&request("order-1", canonical(1)));
         let before = fx.generation();
         let bytes = file_bytes(&fx);
-        let ahead = linked_mint(&fx, &fresh, tx(1), fx.approval(), 2);
+        let ahead = linked_mint(&fx, &fresh, tx(1), fx.fresh_policy(), 2);
         let error = fx
             .store
             .mint_authorization(&fx.profile, &ahead)
@@ -11187,7 +11307,7 @@ pub(crate) mod tests {
         );
         assert_eq!(fx.generation(), before);
         assert_eq!(file_bytes(&fx), bytes);
-        let next = linked_mint(&fx, &fresh, tx(1), fx.approval(), 1);
+        let next = linked_mint(&fx, &fresh, tx(1), fx.fresh_policy(), 1);
         fx.store.mint_authorization(&fx.profile, &next).unwrap();
 
         let retried = fx.open_new(&request("order-2", canonical(2)));
@@ -11220,7 +11340,7 @@ pub(crate) mod tests {
         open.rule_ttl_ms = Some(300_000);
         let waiting = fx.open_new(&open);
         let adopted = fx.open_new(&request("order-2", canonical(2)));
-        let linked = linked_mint(&fx, &adopted, tx(2), fx.approval(), 1);
+        let linked = linked_mint(&fx, &adopted, tx(2), fx.fresh_policy(), 1);
         let minted = fx.store.mint_authorization(&fx.profile, &linked).unwrap();
         let stored = [fx.record(waiting.id()), fx.record(adopted.id())];
         let link = fx.auth(minted.id);
@@ -12645,12 +12765,19 @@ pub(crate) mod tests {
         n: u8,
         checked: Checked,
     ) -> (OperationHandle, CommitId, String) {
-        let authority = fx.approval();
+        let handle = fx.open_new(&request(&format!("order-{n}"), canonical(n)));
+        let authority = fx.approve(handle.id());
         let MintAuthority::Approval { nonce, .. } = &authority else {
             panic!("an approval authority is required");
         };
         let nonce = nonce.clone();
-        let (handle, _) = decided_attempt_under(fx, n, authority, 100 + i64::from(n));
+        let binding = DomainBinding::Transaction {
+            unsigned_envelope_sha256: [n; 32],
+            tx_hash: [n ^ 0x80; 32],
+            source: SOURCE.to_owned(),
+            sequence: 100 + i64::from(n),
+        };
+        decidable_attempt(fx, &handle, n, binding, authority);
         let commit = commit_on(
             fx,
             [n ^ 0x80; 32],
@@ -12875,7 +13002,11 @@ pub(crate) mod tests {
             source: SOURCE.to_owned(),
             sequence,
         };
-        let authority = if approval { fx.approval() } else { fx.policy() };
+        let authority = if approval {
+            fx.approve(handle.id())
+        } else {
+            fx.policy()
+        };
         let nonce = match &authority {
             MintAuthority::Approval { nonce, .. } => Some(nonce.clone()),
             MintAuthority::Policy(_) => None,
@@ -13345,6 +13476,38 @@ pub(crate) mod tests {
         fx.store.mint_authorization(&fx.profile, &linked).unwrap()
     }
 
+    /// [`projected_not_included`] of an approved operation: the durable
+    /// record opens while the operation is prepared, and the first attempt
+    /// runs under the policy. Returns the handle and the approval authority.
+    fn approved_not_included(fx: &mut Fx, n: u8) -> (OperationHandle, MintAuthority) {
+        let handle = fx.open_new(&request(&format!("order-{n}"), canonical(n)));
+        let approval = fx.approve(handle.id());
+        let binding = DomainBinding::Transaction {
+            unsigned_envelope_sha256: [n; 32],
+            tx_hash: [n ^ 0x80; 32],
+            source: SOURCE.to_owned(),
+            sequence: 100 + i64::from(n),
+        };
+        let policy = fx.policy();
+        decidable_attempt(fx, &handle, n, binding, policy);
+        let attempt = OperationStatus::new(&fx.store, &fx.profile)
+            .outcome_snapshot(Some(&[n ^ 0x80; 32]))
+            .unwrap()
+            .pop()
+            .unwrap();
+        let commit = fx
+            .recorder()
+            .commit_decision(&decide(
+                &attempt,
+                DecidedTransition::NotIncluded(not_included_proof()),
+            ))
+            .unwrap();
+        fx.recorder()
+            .acknowledge_projection(handle.id(), 1, commit)
+            .unwrap();
+        (handle, approval)
+    }
+
     /// A checked, projected classic non-inclusion of `order-{n}`.
     fn projected_not_included(fx: &mut Fx, n: u8) -> OperationHandle {
         let (handle, commit) = checked_not_included(fx, n);
@@ -13552,15 +13715,27 @@ pub(crate) mod tests {
             "owned wallet root is marked before the home guard"
         );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
-        let mut fx = Fx::new();
-        let handle = projected_not_included(&mut fx, 1);
-        let mint = fx.operation_mint_request(&handle, tx(21), fx.approval(), vec![]);
+        let mut fx = Fx::with_approvals();
+        let (handle, approval) = approved_not_included(&mut fx, 1);
+        let mint = fx.operation_mint_request(&handle, tx(21), approval.clone(), vec![]);
         assert_eq!(fx.begin_mint(&handle, &mint).unwrap().attempt_index, 2);
         assert_eq!(fx.record(handle.id()).state, OperationState::Sending);
+        // The successor consumed the record for its operation; a public mint
+        // of other content under the same nonce and identity refuses.
+        let mut reuse = fx.mint_request(tx(23), approval, vec![]);
+        reuse.approval_operation = Some(handle.id());
+        let before = file_bytes(&fx);
+        assert!(matches!(
+            fx.store.mint_authorization(&fx.profile, &reuse),
+            Err(WindowStoreError::AuthorizationRefused {
+                precondition: MainnetPrecondition::ApprovalNonceReused
+            })
+        ));
+        assert_eq!(file_bytes(&fx), before);
 
-        let mut fx = Fx::new();
-        let handle = projected_not_included(&mut fx, 2);
-        let minted = link_next(&fx, &handle, 22, fx.approval());
+        let mut fx = Fx::with_approvals();
+        let (handle, approval) = approved_not_included(&mut fx, 2);
+        let minted = link_next(&fx, &handle, 22, approval);
         assert_eq!(begin_linked(&mut fx, &handle).unwrap().attempt_index, 2);
         assert_eq!(
             fx.record(handle.id()).attempts[1].authorization_id,
@@ -13615,7 +13790,7 @@ pub(crate) mod tests {
     /// ledger 500 and moved to `to`, without window entries.
     pub(crate) fn x402_exposed(fx: &mut Fx, n: u8, to: OperationState) -> OperationHandle {
         let handle = fx.open_new(&request(&format!("order-x{n}"), x402([n; 32])));
-        let mint = fx.mint_request(soroban(n), fx.approval(), vec![]);
+        let mint = fx.mint_request(soroban(n), fx.fresh_policy(), vec![]);
         let started = fx.begin_mint(&handle, &mint).unwrap();
         fx.claim(&mint, started.minted.as_ref().unwrap());
         fx.recorder()
@@ -13938,7 +14113,7 @@ pub(crate) mod tests {
         let unknown = unknown_named(&mut fx, 5);
         let released = x402_exposed(&mut fx, 6, OperationState::PayloadReleased);
         let unexposed = fx.open_new(&request("order-x8", x402([8; 32])));
-        let mint = fx.mint_request(soroban(8), fx.approval(), vec![]);
+        let mint = fx.mint_request(soroban(8), fx.fresh_policy(), vec![]);
         fx.begin_mint(&unexposed, &mint).unwrap();
         let overflowing = terminal_classic(&mut fx, 9, u64::MAX / 1000 + 1);
         // The timed attempt keeps a run record this build cannot interpret.
@@ -14275,7 +14450,7 @@ pub(crate) mod tests {
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let mut fx = Fx::new();
             let handle = fx.open_new(&request("order-1", canonical(1)));
-            let authority = fx.approval();
+            let authority = fx.fresh_policy();
             let mut linked =
                 fx.operation_mint_request(&handle, tx(1), authority.clone(), vec![total(6)]);
             linked.operation = Some(OperationLink {
@@ -14309,7 +14484,7 @@ pub(crate) mod tests {
             let mut fx = Fx::new();
             let handle = fx.open_new(&request("order-1", canonical(1)));
             let mut linked =
-                fx.operation_mint_request(&handle, tx(1), fx.approval(), vec![total(6)]);
+                fx.operation_mint_request(&handle, tx(1), fx.fresh_policy(), vec![total(6)]);
             linked.operation = Some(OperationLink {
                 operation_id: handle.id(),
                 attempt_index: 1,
@@ -14333,7 +14508,7 @@ pub(crate) mod tests {
                     .iter()
                     .all(|hold| hold.authorization_id != first.id)
             );
-            let unlinked = fx.mint_request(tx(2), fx.approval(), vec![total(10)]);
+            let unlinked = fx.mint_request(tx(2), fx.fresh_policy(), vec![total(10)]);
             fx.store.mint_authorization(&fx.profile, &unlinked).unwrap();
         }
 
@@ -14708,7 +14883,7 @@ pub(crate) mod tests {
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let mut fx = Fx::new();
             let handle = started(&mut fx, 1, 6, false);
-            let unused = fx.mint_request(tx(2), fx.approval(), vec![total(2)]);
+            let unused = fx.mint_request(tx(2), fx.fresh_policy(), vec![total(2)]);
             let minted = fx.store.mint_authorization(&fx.profile, &unused).unwrap();
             let scope = PinScope::for_profile(fx.store.path(), &fx.profile);
             let entry = scope.pin_entry_ref();
@@ -14777,7 +14952,7 @@ pub(crate) mod tests {
         fn live_linked_hold(fx: &mut Fx) -> (MintRequest, MintedRecord) {
             let handle = fx.open_new(&request("order-1", canonical(1)));
             let mut linked =
-                fx.operation_mint_request(&handle, tx(1), fx.approval(), vec![total(6)]);
+                fx.operation_mint_request(&handle, tx(1), fx.fresh_policy(), vec![total(6)]);
             linked.operation = Some(OperationLink {
                 operation_id: handle.id(),
                 attempt_index: 1,
@@ -14933,13 +15108,14 @@ pub(crate) mod tests {
                 .expose(exposed.id(), 1, &timed_exposure(2), None)
                 .unwrap();
             let live = fx.open_new(&request("order-3", canonical(3)));
-            let mut linked = fx.operation_mint_request(&live, tx(3), fx.approval(), vec![total(1)]);
+            let mut linked =
+                fx.operation_mint_request(&live, tx(3), fx.fresh_policy(), vec![total(1)]);
             linked.operation = Some(OperationLink {
                 operation_id: live.id(),
                 attempt_index: 1,
             });
             let linked = fx.store.mint_authorization(&fx.profile, &linked).unwrap();
-            let unlinked = fx.mint_request(tx(4), fx.approval(), vec![total(4)]);
+            let unlinked = fx.mint_request(tx(4), fx.fresh_policy(), vec![total(4)]);
             fx.store.mint_authorization(&fx.profile, &unlinked).unwrap();
             assert_eq!(sum(&fx), 10);
             let after = linked.expires_at_ms + 1;
@@ -15786,7 +15962,7 @@ pub(crate) mod tests {
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let fx = Fx::new();
-            let request = fx.mint_request(tx(1), fx.approval(), vec![total(6)]);
+            let request = fx.mint_request(tx(1), fx.fresh_policy(), vec![total(6)]);
             let minted = fx.store.mint_authorization(&fx.profile, &request).unwrap();
             fx.clock.set(minted.expires_at_ms);
             fx.store
@@ -15907,7 +16083,7 @@ pub(crate) mod tests {
             );
 
             let fx = Fx::new();
-            let request = fx.mint_request(tx(2), fx.approval(), vec![total(6)]);
+            let request = fx.mint_request(tx(2), fx.fresh_policy(), vec![total(6)]);
             let minted = fx.store.mint_authorization(&fx.profile, &request).unwrap();
             fx.clock.set(minted.expires_at_ms);
             fx.store
@@ -16257,7 +16433,7 @@ pub(crate) mod tests {
                 envelope_slot(5),
                 Some(envelope_text(vec![pay(M_MAX)])),
             );
-            let mint = fx.mint_request(tx(5), fx.approval(), vec![]);
+            let mint = fx.mint_request(tx(5), fx.fresh_policy(), vec![]);
             fx.begin_mint(&handle, &mint).unwrap();
             let restarted = PersistedWindowStore::at_path(fx.store.path().to_path_buf());
             let view = view_of(&fx, &restarted, "sent");

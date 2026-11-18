@@ -1,8 +1,9 @@
 - Refuse approvals revoked during the CLI presence ceremony before writing
   consent, and preserve the MCP protocol error channel for approval directory
   and initial inbox-open failures.
-- Persist and reuse x402 approval records, bind authenticated message mints to
-  their approval operation, and require durable value records before CLI or
-  inbox presence starts. On mainnet, the second x402 call reuses the first
+- An x402 retry no longer opens a second approval record, an authenticated
+  message mint no longer uses an approval without its operation, and CLI or
+  inbox presence no longer starts for a value approval without its durable
+  record. On mainnet, the second x402 call reuses the first
   call's `business_id`; another `business_id` refuses with
-  `network.mainnet_authorization_refused`.
+  `policy.approval_consumed`.

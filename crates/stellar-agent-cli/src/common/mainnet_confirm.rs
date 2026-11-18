@@ -17,9 +17,9 @@ use stellar_agent_core::audit_log::{EvidenceReservation, PolicyDecision};
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::{
     approval::{
-        ApprovalContext, ApprovalKind, AttestationBinding, ConsentAudit, DEFAULT_RETRY_ATTEMPTS,
-        DEFAULT_RETRY_BACKOFF, MainnetApprovalAuthority, PendingApproval, PendingApprovalStore,
-        VerifiedMainnetPresence,
+        ApprovalContext, ApprovalKind, AttestationBinding, ClassicIntent, ConsentAudit,
+        DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, MainnetApprovalAuthority, PendingApproval,
+        PendingApprovalStore, VerifiedMainnetPresence,
         attest::{attest_mainnet_confirmation_admitted_with_row, record_error},
         error::ApprovalError,
         load_attestation_key, open_with_retry,
@@ -27,10 +27,16 @@ use stellar_agent_core::{
         process_uid_for_attestation,
         store::MAINNET_POLICY_AUTHORITY_TTL_SECONDS,
         subject::approval_subject_classic,
-        witness::{ApprovalExpectation, ApprovalWitness, ApprovedKind, verify_approval_admitted},
+        witness::{
+            ApprovalExpectation, ApprovalWitness, ApprovedKind, verify_approval_admitted,
+            verify_durable_approval, verify_durable_intent_approval,
+        },
     },
     envelope_decode::decode_authoritative_args,
-    error::{ApprovalFailure, InternalError, ProtocolError, ValidationError, WalletError},
+    error::{
+        ApprovalFailure, InternalError, ProtocolError, SubmissionError, ValidationError,
+        WalletError,
+    },
     mainnet::{
         decision::{MainnetDecision, MainnetRefusal},
         verified_policy::VerifiedPolicy,
@@ -39,12 +45,15 @@ use stellar_agent_core::{
         Decision, PolicyError,
         v1::value::{ValueClass, derive_value_class},
     },
-    profile::owner_key::OwnerKeyContext,
+    profile::{owner_key::OwnerKeyContext, receipt::ReceiptStore},
 };
 use stellar_agent_network::mainnet::authority::{AuthorityRefusal, MainnetAuthority};
 use stellar_agent_network::operation_entry::{
     ConsentAdmission, approval_requires_prepared, commit_consent, consent_completion,
     operation_refusal, pending_approval_facts, persisted_attestation,
+};
+use stellar_agent_network::policy_state::approvals::{
+    consent_evidence_time_floor, delivery_enforced,
 };
 use stellar_agent_network::policy_state::{
     ApprovalRecorder, ApprovalStatus, ConsentRow, OperationHandle, OperationState,
@@ -342,6 +351,7 @@ pub(crate) async fn cli_mainnet_authority<'w>(
                 store_path,
                 operation,
                 prepared,
+                decision,
             )
             .await
             .map_err(AuthorityRefusal::Gate)?;
@@ -401,7 +411,9 @@ pub(crate) fn render_authority_refusal(
 /// ceremony. Without a record, the entries a crash left for the operation go,
 /// the new entry is parked, and the record opens with `prepared` before the
 /// presence wait. Every refusal after the open keeps entry and record, and the
-/// witness returns only after the record's consent commits.
+/// witness returns only after the record's consent commits and the committed
+/// record verifies the presented proof again, as [`verify_committed`] states.
+/// A canonical intent consent verifies under `governing`, the fresh decision.
 ///
 /// A kind the shared capability integrates runs in a different order: the
 /// record opens with the held writer, its evidence is reserved, and only then
@@ -425,7 +437,12 @@ pub(crate) fn render_authority_refusal(
 /// summary's, the attestation key's and the consent sink's refusals before
 /// anything is parked; the store refusals of the record's read, open and
 /// consent; the presence refusals of [`acquire_mainnet_presence`]; and the
-/// attester's, the store's and the witness's refusals.
+/// attester's, the store's and the witness's refusals; under `operation`
+/// also the refusals of [`verify_committed`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the ceremony takes each input explicitly"
+)]
 pub(crate) async fn confirm_mainnet_write(
     summary: &MainnetWriteSummary,
     decision: ConfirmDecision,
@@ -434,6 +451,7 @@ pub(crate) async fn confirm_mainnet_write(
     store_path: &Path,
     operation: Option<&OperationHandle>,
     prepared: PolicyDecision,
+    governing: &MainnetDecision,
 ) -> Result<ApprovalWitness, WalletError> {
     if matches!(decision, ConfirmDecision::RequireApproval { .. }) && operation.is_none() {
         return Err(WalletError::Internal(InternalError::UnexpectedState {
@@ -449,6 +467,14 @@ pub(crate) async fn confirm_mainnet_write(
         })
         .transpose()?
         .flatten();
+    let check = operation.map(|handle| CommitCheck {
+        operation: handle,
+        expected: ApprovalExpectation {
+            kind: summary.kind,
+            subject: approval_subject_classic(&summary.envelope),
+        },
+        intent: intent.as_ref().map(|intent| (intent, governing)),
+    });
     let mut rendered = Vec::new();
     if let Some(intent) = intent.as_ref() {
         super::intent_summary::write(intent, &mut rendered)
@@ -463,8 +489,7 @@ pub(crate) async fn confirm_mainnet_write(
             .replace(CONSENT_LINE, SIGNED_CONSENT_LINE)
             .into_bytes();
     }
-    let integrated = profile.chain_id.is_mainnet()
-        && stellar_agent_network::policy_state::approvals::delivery_enforced(name, summary.kind);
+    let integrated = profile.chain_id.is_mainnet() && delivery_enforced(name, summary.kind);
     if !integrated {
         show_summary(&rendered)?;
     }
@@ -488,14 +513,15 @@ pub(crate) async fn confirm_mainnet_write(
     )?;
     drop(acquire_operator_row_sink(profile, name)?);
     let mut reservation = None;
-    let entry = match operation {
+    let entry = match &check {
         None => {
             open_store(store_path)?
                 .insert(entry.clone(), entry.created_at_unix_ms)
                 .map_err(store_error)?;
             entry
         }
-        Some(handle) => {
+        Some(check) => {
+            let handle = check.operation;
             let facts = pending_approval_facts(
                 &entry,
                 handle,
@@ -528,6 +554,7 @@ pub(crate) async fn confirm_mainnet_write(
                         ConsentRow::Recovered,
                         admission,
                         integrated,
+                        check,
                     );
                 }
             }
@@ -553,7 +580,7 @@ pub(crate) async fn confirm_mainnet_write(
             store_path,
             &entry,
             presence,
-            operation.is_some(),
+            check.as_ref(),
             reservation,
         ),
         Err(error) => Err(error),
@@ -800,10 +827,22 @@ fn remove_orphans(
     Ok(())
 }
 
-/// Verifies the attested entry `nonce` in `pending` against its durable
-/// record, releases the inbox, then commits the consent and returns its
-/// witness. `row` states where the consent row went; `published` selects the
-/// verified publication handoff of an integrated consent.
+/// What a committed consent must approve, taken from the request and its
+/// admitted operation, never from the durable record.
+struct CommitCheck<'a> {
+    /// The operation this command admitted.
+    operation: &'a OperationHandle,
+    /// The requested kind and envelope subject.
+    expected: ApprovalExpectation,
+    /// The operation's canonical intent and the fresh decision governing it.
+    intent: Option<(&'a ClassicIntent, &'a MainnetDecision)>,
+}
+
+/// Captures the attestation of `nonce` in `pending`, verifies the attested
+/// entry against its durable record, releases the inbox, commits the consent
+/// and returns the witness of [`verify_committed`]. `row` states where the
+/// consent row went; `published` selects the verified publication handoff of
+/// an integrated consent.
 #[allow(
     clippy::too_many_arguments,
     reason = "completion retains its policy admission and delivery choice"
@@ -816,9 +855,11 @@ fn commit_durable(
     row: ConsentRow,
     admission: PolicyAdmission,
     published: bool,
+    check: &CommitCheck<'_>,
 ) -> Result<ApprovalWitness, WalletError> {
     let profile = context.profile();
     let window = PersistedWindowStore::for_profile(context.profile_name());
+    let presented = persisted_attestation(&pending, nonce)?;
     let completion = if published {
         super::consent::publication_completion(
             pending,
@@ -844,7 +885,118 @@ fn commit_durable(
         completion
     };
     commit_consent(&window, profile, &completion)?;
-    Ok(completion.into_witness())
+    #[cfg(all(test, feature = "mainnet-write"))]
+    commit_test::run(context.profile_name(), nonce);
+    verify_committed(context, policy, nonce, &presented, check)
+}
+
+/// Verifies `presented`, the attestation captured for `nonce` before the
+/// inbox was released, against the committed durable record, and returns the
+/// witness that grants authority. The inbox is not read, so collecting or
+/// locking it after the commit changes nothing.
+///
+/// The verification time is the wall clock, raised to the consent evidence
+/// floor when the requested kind enforces delivery.
+///
+/// # Errors
+///
+/// In the order the check runs: `submission.record_unavailable` when the
+/// receipt store cannot be read, and `approval.consumed` when a submission
+/// receipt names the nonce, both before any durable read; the store
+/// refusals of the record's read; `approval.clock_error` when the wall clock
+/// cannot be read; `audit.*` when the evidence floor cannot be read; the
+/// refusals of [`verify_durable_approval`] or
+/// [`verify_durable_intent_approval`], including `approval.not_found`,
+/// `approval.revoked`, `approval.expired` and `approval.attestation_invalid`;
+/// and `approval.consumed` when the record belongs to another operation.
+fn verify_committed(
+    context: &MainnetWriteContext,
+    policy: &VerifiedPolicy,
+    nonce: &str,
+    presented: &[u8; 32],
+    check: &CommitCheck<'_>,
+) -> Result<ApprovalWitness, WalletError> {
+    let profile = context.profile();
+    let name = context.profile_name();
+    let receipt = ReceiptStore::open(name)
+        .and_then(|receipts| receipts.find_by_approval_nonce(nonce))
+        .map_err(|error| {
+            WalletError::Submission(SubmissionError::ReceiptStoreUnreadable {
+                detail: error.to_string(),
+            })
+        })?;
+    if receipt.is_some() {
+        return Err(WalletError::Approval(ApprovalFailure::Consumed {
+            detail: "this approval was already spent on a submission".to_owned(),
+        }));
+    }
+    let window = PersistedWindowStore::for_profile(name);
+    let facts = ApprovalStatus::new(&window, profile)
+        .facts_by_nonce(nonce)
+        .map_err(operation_refusal)?;
+    let mut now = clock_now()?;
+    if delivery_enforced(name, check.expected.kind) {
+        now = now.max(consent_evidence_time_floor(profile, name)?);
+    }
+    let witness = match check.intent {
+        Some((intent, decision)) => verify_durable_intent_approval(
+            facts.as_ref(),
+            presented,
+            profile,
+            name,
+            intent,
+            decision,
+            policy,
+            now,
+        ),
+        None => verify_durable_approval(
+            facts.as_ref(),
+            presented,
+            profile,
+            name,
+            &check.expected,
+            policy,
+            now,
+        ),
+    }?;
+    if facts.map(|facts| facts.record().operation_id) != Some(*check.operation.id().as_bytes()) {
+        return Err(WalletError::Approval(ApprovalFailure::Consumed {
+            detail: "this approval belongs to another operation".to_owned(),
+        }));
+    }
+    Ok(witness)
+}
+
+/// Runs a test's action between the consent commit and [`verify_committed`].
+#[cfg(all(test, feature = "mainnet-write"))]
+pub(crate) mod commit_test {
+    use std::cell::RefCell;
+    type Hook = Box<dyn FnOnce(&str)>;
+    thread_local! { static HOOK: RefCell<Option<(String, Hook)>> = const { RefCell::new(None) }; }
+    /// Removes the action when dropped.
+    pub(crate) struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            HOOK.with_borrow_mut(|hook| *hook = None);
+        }
+    }
+    /// Runs `hook` with the nonce after the next commit of profile `name`.
+    pub(crate) fn after_commit(name: &str, hook: impl FnOnce(&str) + 'static) -> Guard {
+        HOOK.with_borrow_mut(|slot| *slot = Some((name.to_owned(), Box::new(hook))));
+        Guard
+    }
+    pub(super) fn run(name: &str, nonce: &str) {
+        let hook = HOOK.with_borrow_mut(|slot| {
+            if slot.as_ref().is_some_and(|(owner, _)| owner == name) {
+                slot.take().map(|(_, hook)| hook)
+            } else {
+                None
+            }
+        });
+        if let Some(hook) = hook {
+            hook(nonce);
+        }
+    }
 }
 
 /// The wall clock in Unix milliseconds, refused as `approval.clock_error`.
@@ -922,9 +1074,10 @@ fn discard_parked(store_path: &Path, entry: &PendingApproval) {
     }
 }
 
-/// Attests `entry` under `presence` and returns its witness. A `durable`
-/// confirmation then commits the consent to the operation's record, retaining
-/// the queued row's reference, and returns the witness only after that commit.
+/// Attests `entry` under `presence` and returns its witness. A confirmation
+/// with a `durable` check then commits the consent to the operation's record,
+/// retaining the queued row's reference, and returns the witness only after
+/// that commit and the check.
 #[allow(
     clippy::too_many_arguments,
     reason = "the ceremony's inputs and its durable choice are each explicit"
@@ -936,7 +1089,7 @@ fn persist_confirmation(
     store_path: &Path,
     entry: &PendingApproval,
     presence: VerifiedMainnetPresence,
-    durable: bool,
+    durable: Option<&CommitCheck<'_>>,
     reservation: Option<EvidenceReservation>,
 ) -> Result<ApprovalWitness, WalletError> {
     let profile = context.profile();
@@ -973,7 +1126,7 @@ fn persist_confirmation(
             attest(&mut pending, ConsentAudit::Writer(&mut guard), presence)?;
             ConsentRow::Written
         }
-        OperatorRowSink::Outbox(outbox) if durable => {
+        OperatorRowSink::Outbox(outbox) if durable.is_some() => {
             let outbox = match reservation {
                 Some(reservation) => outbox.with_evidence_reservation(reservation),
                 None => outbox,
@@ -991,7 +1144,7 @@ fn persist_confirmation(
             ConsentRow::Written
         }
     };
-    if durable {
+    if let Some(check) = durable {
         return commit_durable(
             pending,
             context,
@@ -1000,6 +1153,7 @@ fn persist_confirmation(
             row,
             admission,
             published,
+            check,
         );
     }
     let attestation = persisted_attestation(&pending, &entry.approval_nonce)?;
@@ -1028,6 +1182,8 @@ pub(crate) mod tests {
     pub(crate) mod canonical_consent_tests {
         include!("canonical_consent_tests.rs");
     }
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) mod committed;
     #[cfg(feature = "mainnet-write")]
     mod publication;
     use super::*;
@@ -1383,8 +1539,33 @@ pub(crate) mod tests {
             &fixture.store_path(),
             None,
             PolicyDecision::Allow,
+            &governing(context, &fixture.current_policy(), 600_000),
         )
         .await
+    }
+
+    /// A fresh classic RequireApproval decision of `ttl_ms` under `policy`.
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) fn governing(
+        context: &MainnetWriteContext,
+        policy: &VerifiedPolicy,
+        ttl_ms: u64,
+    ) -> MainnetDecision {
+        MainnetDecision::for_test(
+            Decision::RequireApproval(stellar_agent_core::policy::ApprovalRequest::new(
+                "fixture".to_owned(),
+                u32::try_from(ttl_ms / 1000).unwrap(),
+            )),
+            None,
+            policy.digest(),
+            policy.sequence(),
+            7,
+            context.profile_name(),
+            context.chain().caip2_str(),
+            1_900_000_000_000,
+            ttl_ms,
+            stellar_agent_core::mainnet::decision::AuthorityScope::Classic,
+        )
     }
 
     /// The audit sink of fixture operation opens, which keeps no rows.
@@ -1778,18 +1959,36 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn confirmed_claim_witness_resolves() {
-        claim_authority_resolves(true).await;
+        claim_authority_resolves("confirm-claim-resolve", true, |_| {}).await;
     }
 
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
     #[serial_test::serial]
     async fn allow_claim_resolves_without_confirmation() {
-        claim_authority_resolves(false).await;
+        claim_authority_resolves("allow-claim-resolve", false, |_| {}).await;
     }
 
+    /// The state [`claim_authority_resolves`] reaches after its mint.
     #[cfg(feature = "mainnet-write")]
-    async fn claim_authority_resolves(approval_required: bool) {
+    pub(crate) struct Minted<'a> {
+        pub(crate) fixture: &'a MainnetConsentFixture,
+        pub(crate) context: &'a MainnetWriteContext,
+        pub(crate) policy: &'a VerifiedPolicy,
+        pub(crate) operation: &'a OperationHandle,
+        pub(crate) envelope: &'a str,
+        pub(crate) witness: Option<&'a ApprovalWitness>,
+    }
+
+    /// Resolves a claim authority of profile `profile_name` under an approval
+    /// rule or `Allow`, mints it, and then runs `after_mint` on the minted
+    /// state.
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) async fn claim_authority_resolves(
+        profile_name: &str,
+        approval_required: bool,
+        after_mint: fn(Minted<'_>),
+    ) {
         use sha2::Digest as _;
         use stellar_agent_core::approval::mainnet_fixtures::ENABLEMENT_NONCE;
         use stellar_agent_core::cross_check::{CrossCheckValue, ThresholdSet};
@@ -1816,26 +2015,17 @@ pub(crate) mod tests {
             EchoIdResponder, SignedTestEnvelope, signed_envelope::get_network_result,
         };
         use stellar_xdr::*;
-        let (fixture, context, encoded) = confirmation_fixture_with(
-            if approval_required {
-                "confirm-claim-resolve"
-            } else {
-                "allow-claim-resolve"
-            },
-            |profile| {
-                use stellar_agent_core::profile::schema::{PrimaryProviderRecord, ProviderRecord};
-                let providers = profile.providers.get_or_insert_with(Default::default);
-                providers.primary =
-                    Some(PrimaryProviderRecord::new("primary", "rpc.example.invalid"));
-                providers.oracle = Some(ProviderRecord::new(
-                    "oracle",
-                    "oracle.example.invalid",
-                    true,
-                ));
-                profile.oracle_provider_url =
-                    Some("https://oracle.example.invalid".parse().unwrap());
-            },
-        );
+        let (fixture, context, encoded) = confirmation_fixture_with(profile_name, |profile| {
+            use stellar_agent_core::profile::schema::{PrimaryProviderRecord, ProviderRecord};
+            let providers = profile.providers.get_or_insert_with(Default::default);
+            providers.primary = Some(PrimaryProviderRecord::new("primary", "rpc.example.invalid"));
+            providers.oracle = Some(ProviderRecord::new(
+                "oracle",
+                "oracle.example.invalid",
+                true,
+            ));
+            profile.oracle_provider_url = Some("https://oracle.example.invalid".parse().unwrap());
+        });
         clear_shown_summaries();
         let _presence = driver::install(driver::fixture_credential());
         let TransactionEnvelope::Tx(mut tx) =
@@ -2073,6 +2263,14 @@ pub(crate) mod tests {
                 .len(),
             1
         );
+        after_mint(Minted {
+            fixture: &fixture,
+            context: &context,
+            policy: &policy,
+            operation: &operation,
+            envelope: &encoded,
+            witness: slot.as_ref(),
+        });
     }
 
     /// The `approval_attested` rows of the profile's audit log.
@@ -2237,6 +2435,7 @@ pub(crate) mod tests {
             &fixture.store_path(),
             None,
             PolicyDecision::Allow,
+            &governing(&context, &policy, 600_000),
         )
         .await
         .unwrap_err();
@@ -2407,6 +2606,7 @@ pub(crate) mod tests {
             &fixture.store_path(),
             Some(handle),
             PolicyDecision::RequireApproval,
+            &governing(context, &fixture.current_policy(), ttl_ms),
         )
         .await
     }
@@ -2784,6 +2984,7 @@ pub(crate) mod tests {
             &fixture.store_path(),
             None,
             PolicyDecision::RequireApproval,
+            &governing(&context, &fixture.current_policy(), 300_000),
         )
         .await
         .unwrap_err();

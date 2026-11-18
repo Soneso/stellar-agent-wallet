@@ -1735,6 +1735,19 @@ pub fn commit_classic(
     }
 }
 
+/// What the read of [`commit_preview`] finds for a classic commit.
+#[derive(Debug)]
+pub enum CommitPreview {
+    /// The operation needs no further work; answer with [`replay_json`].
+    Replay(Box<OperationView>),
+    /// The record under the id continues as this operation, which the
+    /// commit's approval must name.
+    Continues(OperationId),
+    /// The window could not be read. The gates read the same window and
+    /// refuse it with their own codes.
+    Unread,
+}
+
 /// Answers a classic commit of `unsigned_envelope_b64` under `business_id`
 /// from the store, before the commit verifies its approval, rebuilds its
 /// envelope or consumes its nonce.
@@ -1744,29 +1757,32 @@ pub fn commit_classic(
 /// [`commit_identities`] of the envelope. A record or
 /// tombstone that does no further work answers with its view, so a commit
 /// retried after a lost reply does no new work. A record that continues
-/// gives `None`: the commit runs its gates, and [`commit_classic`] then
-/// decides under the recorder. A window this read cannot read gives `None`
-/// too, so the gates, which read the same window, refuse it with their own
-/// codes.
+/// gives its operation id: the commit's approval gate compares it with the
+/// approval's record, and [`commit_classic`] then decides under the
+/// recorder.
 ///
 /// # Errors
 ///
 /// `operation.business_id_mismatch` and `operation.business_id_conflict`.
-pub fn commit_replay(
+pub fn commit_preview(
     store: &PersistedWindowStore,
     profile: &Profile,
     business_id: &BusinessId,
     unsigned_envelope_b64: &str,
     identities: &[[u8; 32]],
-) -> Result<Option<OperationView>, WalletError> {
+) -> Result<CommitPreview, WalletError> {
     let envelope_sha256 = unsigned_envelope_sha256(unsigned_envelope_b64);
     let Ok(binding) =
         OperationStatus::new(store, profile).commit_binding(business_id, &envelope_sha256)
     else {
-        return Ok(None);
+        return Ok(CommitPreview::Unread);
     };
     let view = checked_commit_target(binding, business_id, &envelope_sha256, identities)?;
-    Ok((view.compacted || !view.state.resumes()).then_some(view))
+    Ok(if view.compacted || !view.state.resumes() {
+        CommitPreview::Replay(Box::new(view))
+    } else {
+        CommitPreview::Continues(view.operation_id)
+    })
 }
 
 /// Admits a classic commit of the unsigned envelope with digest

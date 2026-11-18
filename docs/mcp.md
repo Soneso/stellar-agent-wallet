@@ -517,12 +517,26 @@ receipt bound to a policy other than the current one. Mainnet consent
 requires a verified passkey assertion from an approval credential in the
 owner-signed policy, and the operator approves on the local passkey page or at the signed approval origin. The
 approval hint names the same `stellar-agent approve --id <nonce> --profile <name>`
-command on every network. A live rejection uses `policy.approval_rejected`. A
-live consumed approval or an approval held by a submission receipt uses
-`policy.approval_consumed`. Expired tombstones use `policy.approval_required`.
-Authorization consumption followed by pre-send recording failure can leave an
-unspent pending approval. Reusing it can produce
-`network.mainnet_authorization_refused` without a tombstone.
+command on every network. A live rejection uses `policy.approval_rejected`. On
+testnet a live consumed approval or an approval held by a submission receipt
+uses `policy.approval_consumed`, and expired tombstones use
+`policy.approval_required`. On mainnet a repeated proof of a completed payment
+answers `policy.approval_required`; only a submission receipt or a proof of
+another operation answers `policy.approval_consumed`.
+
+On mainnet a commit verifies the presented attestation against the wallet's
+durable approval record, never against the approval inbox. An approval
+without a record uses `policy.approval_required`, also when the inbox holds a
+consent for it. Removing, locking or editing the inbox entry changes no
+outcome, except that a live rejection entry answers `policy.approval_rejected`.
+A revoked approval returns the wallet error `approval.revoked` with
+`isError` set. A verified approval of another operation, such as a commit
+under another `business_id`, uses `policy.approval_consumed`. The inbox is
+read only to report a live rejection after the proof has failed.
+Authorization consumption followed by a pre-send recording failure consumes
+the durable approval record and ends the operation unsent. A retry under the
+same `business_id` returns that stored outcome; a retry under another
+`business_id` refuses with `policy.approval_required`.
 
 The wallet's own signing paths sign mainnet payloads only under mainnet
 authorization. The library signers enforce it too: every `Signer`, the public
@@ -1237,8 +1251,9 @@ immediately before the signing primitive, with no intervening I/O or await.
 
 An approval releases at most one signed authorization.
 A failed or interrupted call can spend it without returning a payment payload.
-A repeated proof with a live spent tombstone answers `policy.approval_consumed`.
+On testnet a repeated proof with a live spent tombstone answers `policy.approval_consumed`.
 An expired or pruned tombstone can answer `policy.approval_required`.
+On mainnet a repeated proof of a completed payment answers `policy.approval_required`; only a submission receipt or a proof of another operation answers `policy.approval_consumed`.
 The authorization expires within 60 ledgers of the paying call's simulation ledger.
 The protocol estimates five seconds per ledger.
 
@@ -1349,7 +1364,7 @@ without approval arguments, and that call signs and pays. Under
 RequireApproval it takes two calls: call 1 stores the pending approval, and
 call 2 presents it and pays. On mainnet, call 2 reuses call 1's `business_id`
 for both tools, and a call 2 under another `business_id` refuses with
-`network.mainnet_authorization_refused`. The call that pays is the signing
+`policy.approval_consumed`. The call that pays is the signing
 call. For the authenticated tool it also runs the SEP-10 exchange. Each
 authorization the signing call mints lasts at most 120 seconds. Both tools
 take the optional `approval_nonce` and `approval_attestation` arguments.
