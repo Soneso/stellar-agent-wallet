@@ -2685,6 +2685,7 @@ mod tests {
                 store: &f.window,
                 operation: None,
                 restriction: None,
+                sac_payment_context: None,
             };
             let before = f.wire();
             policy_refusal(resolve_tx_sign(request(&other)).await.unwrap_err());

@@ -2246,6 +2246,14 @@ impl WalletServer {
         if !mainnet && !matches!(outcome, DispatchOutcome::Allow(_)) {
             return Ok(outcome);
         }
+        // A contract transfer carries no asset context here, so it refuses
+        // terminally rather than keeping the preparation's outcome.
+        if commit_tool == "stellar_pay_commit"
+            && let Err(reason) =
+                stellar_agent_core::sac_payment::refuse_contract_transfer(envelope_xdr, None)
+        {
+            return Err(ToolError::Business(ledger_err_result(&reason.into())));
+        }
         let mut commit_args = match stellar_agent_core::envelope_decode::decode_authoritative_args(
             envelope_xdr,
             commit_tool,
@@ -5652,6 +5660,50 @@ pub(crate) mod tests {
                 }))
             ),
             "an undecodable envelope leaves the outcome unchanged, got {undecodable:?}"
+        );
+    }
+
+    /// A contract transfer never keeps the preparation's outcome: the paired
+    /// commit refuses it terminally off mainnet, where an undecodable
+    /// envelope would keep the Allow.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn paired_commit_outcome_refuses_a_contract_transfer() {
+        use stellar_xdr::WriteXdr as _;
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let server = make_server_with_engine(MockPolicyEngine::returns(Ok(Decision::Allow)));
+        let context = stellar_agent_core::sac_payment::SacPaymentContext::new(
+            stellar_agent_core::profile::caip2::Caip2::Testnet,
+            stellar_agent_core::approval::IntentAsset::Native,
+        )
+        .unwrap();
+        let envelope = stellar_xdr::TransactionEnvelope::Tx(
+            stellar_agent_core::approval::fixtures::sac_transfer(&context),
+        )
+        .to_xdr_base64(stellar_xdr::Limits::none())
+        .unwrap();
+        let outcome = server
+            .paired_commit_outcome(
+                DispatchOutcome::Allow(AllowOutcome {
+                    value_effects: None,
+                    governing_ttl_ms: 600_000,
+                    now_ms: None,
+                    decision: None,
+                    snapshot: None,
+                }),
+                &envelope,
+                "stellar_pay_commit",
+                "stellar:testnet",
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(
+            outcome.err().map(|error| error.code()),
+            Some("validation.contract_payment_invalid".to_owned()),
+            "contract transfer refuses terminally"
         );
     }
 
@@ -15393,6 +15445,7 @@ pub(crate) mod tests {
                 store: &server.window_store,
                 operation: None,
                 restriction: None,
+                sac_payment_context: None,
             })
             .await;
             assert!(
@@ -15481,6 +15534,7 @@ pub(crate) mod tests {
                 store: &store,
                 operation: None,
                 restriction: None,
+                sac_payment_context: None,
             })
             .await
             .unwrap_err();

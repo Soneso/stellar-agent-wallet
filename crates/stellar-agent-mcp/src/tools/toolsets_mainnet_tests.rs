@@ -360,6 +360,133 @@ async fn toolset_preparation_composes_before_exposure() {
     }
 }
 
+/// On an admitted mainnet profile both toolset payment actions refuse a C
+/// recipient after admission and before the outer gate, any approval, record,
+/// nonce read, or send.
+#[tokio::test]
+#[serial_test::serial(keyring, mainnet_clock)]
+#[serial_test::serial]
+async fn public_contract_payment_refuses_after_mainnet_admission() {
+    use stellar_xdr::WriteXdr as _;
+    let run = Run::new("allow", "allow", &["propose-transaction", "sign-payment"]).await;
+    let mut args = Tool::Pay.prepare_args(&run.f);
+    args["destination"] = format!("{}", stellar_strkey::Contract([2; 32])).into();
+    let context = stellar_agent_core::sac_payment::SacPaymentContext::new(
+        stellar_agent_core::profile::caip2::Caip2::Mainnet,
+        stellar_agent_core::approval::IntentAsset::Native,
+    )
+    .unwrap();
+    let mut commit = args.clone();
+    commit["envelope_xdr"] = stellar_xdr::TransactionEnvelope::Tx(
+        stellar_agent_core::approval::fixtures::sac_transfer(&context),
+    )
+    .to_xdr_base64(stellar_xdr::Limits::none())
+    .unwrap()
+    .into();
+    commit["nonce"] = "A".repeat(64).into();
+    commit["expires_at_unix_ms"] = 9_999_999_999_u64.into();
+    let nonce_reads = run.f.nonce_reads.load(Ordering::SeqCst);
+    for (action, presented) in [("stellar_pay", args), ("stellar_pay_commit", commit)] {
+        let code = match run
+            .f
+            .server
+            .call_stellar_toolset_invoke(StellarToolsetInvokeArgs {
+                toolset: TOOLSET.to_owned(),
+                action: action.to_owned(),
+                chain_id: Some("stellar:mainnet".to_owned()),
+                args: presented,
+            })
+            .await
+        {
+            Ok(result) => wire(&result)["error"]["code"].to_string(),
+            Err(error) => format!("protocol error: {}", error.message),
+        };
+        assert_eq!(
+            code, "\"validation.contract_payment_unavailable\"",
+            "{action}"
+        );
+    }
+    assert!(run.pending().is_empty(), "nothing is queued");
+    assert!(run.control.sent().is_empty(), "nothing is sent");
+    assert!(authorizations(&run.f).is_empty(), "no authorization");
+    assert_eq!(run.f.nonce_reads.load(Ordering::SeqCst), nonce_reads);
+}
+
+/// A mainnet server that is not admitted, or whose admission is stale,
+/// answers a C recipient with its mainnet refusal, not the contract code, on
+/// the toolset route and on direct commit.
+#[tokio::test]
+#[serial_test::serial(keyring, mainnet_clock)]
+#[serial_test::serial]
+async fn mainnet_refusals_precede_the_contract_payment_refusal() {
+    use stellar_xdr::WriteXdr as _;
+    let context = stellar_agent_core::sac_payment::SacPaymentContext::new(
+        stellar_agent_core::profile::caip2::Caip2::Mainnet,
+        stellar_agent_core::approval::IntentAsset::Native,
+    )
+    .unwrap();
+    let envelope = stellar_xdr::TransactionEnvelope::Tx(
+        stellar_agent_core::approval::fixtures::sac_transfer(&context),
+    )
+    .to_xdr_base64(stellar_xdr::Limits::none())
+    .unwrap();
+    for (case, expected) in [
+        (
+            "not admitted",
+            "network.mainnet_write_forbidden: mainnet writes require verified enablement",
+        ),
+        ("stale", "enablement or policy changed, restart the server"),
+    ] {
+        let mut run = Run::new("allow", "allow", &["propose-transaction", "sign-payment"]).await;
+        if case == "not admitted" {
+            run.f.server.enablement = None;
+        } else {
+            super::common::tests::mainnet::put(
+                &stellar_agent_core::profile::schema::mainnet_enablement_entry_ref(
+                    &run.f.server.profile.policy_window_state_key_id,
+                ),
+                "rotated-installation",
+            );
+        }
+        let mut commit = Tool::Pay.prepare_args(&run.f);
+        commit["destination"] = format!("{}", stellar_strkey::Contract([2; 32])).into();
+        commit["envelope_xdr"] = envelope.clone().into();
+        commit["nonce"] = "A".repeat(64).into();
+        commit["expires_at_unix_ms"] = 9_999_999_999_u64.into();
+        let toolset = run
+            .f
+            .server
+            .call_stellar_toolset_invoke(StellarToolsetInvokeArgs {
+                toolset: TOOLSET.to_owned(),
+                action: "stellar_pay_commit".to_owned(),
+                chain_id: Some("stellar:mainnet".to_owned()),
+                args: commit.clone(),
+            })
+            .await;
+        commit["chain_id"] = "stellar:mainnet".into();
+        let direct = run
+            .f
+            .server
+            .call_stellar_pay_commit(serde_json::from_value(commit).unwrap())
+            .await;
+        for (route, result) in [("toolset", toolset), ("direct commit", direct)] {
+            let refusal = match result {
+                Ok(result) => {
+                    let body = wire(&result);
+                    format!("{} {}", body["error"]["code"], body["error"]["message"])
+                }
+                Err(error) => format!("protocol error: {}", error.message),
+            };
+            assert_eq!(
+                refusal,
+                format!("\"network.mainnet_write_forbidden\" \"{expected}\""),
+                "{case}, {route}"
+            );
+        }
+        assert!(run.control.sent().is_empty(), "{case}: nothing is sent");
+    }
+}
+
 #[tokio::test]
 #[serial_test::serial(keyring, mainnet_clock)]
 #[serial_test::serial]
@@ -426,6 +553,25 @@ async fn public_commit_is_unattended_or_queues_before_nonce_use() {
             let first = run.pending();
             assert_eq!(first.len(), 1);
             assert_eq!(first[0].reason.as_deref(), Some("outer consent"));
+            let operation = stellar_agent_network::policy_state::OperationStatus::new(
+                &run.f.server.window_store,
+                run.f.server.security_profile(),
+            )
+            .view(
+                &stellar_agent_network::policy_state::BusinessId::parse(
+                    commit["business_id"].as_str().unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+            let waiting_end = operation.waiting_expires_at_ms.unwrap();
+            assert_eq!(
+                first[0].expires_at_unix_ms,
+                (first[0].created_at_unix_ms + 60_000).min(waiting_end),
+                "the queued end is the earlier of the outer 60 s consent and the operation's \
+                 waiting end {waiting_end}"
+            );
             let repeated = run.invoke("stellar_pay_commit", commit.clone()).await;
             assert_eq!(repeated["error"]["code"], "policy.approval_required");
             let retained = run.pending();

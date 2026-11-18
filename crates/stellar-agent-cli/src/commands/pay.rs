@@ -341,7 +341,18 @@ pub struct PayArgs {
     #[arg(long = "profile", value_name = "NAME")]
     pub profile: Option<String>,
 
-    /// Destination G account or M address. An M address keeps its mux ID in the payment.
+    /// Destination G account or M address. An M address keeps its mux ID in
+    /// the payment. The full payment and `--build-only` refuse a C contract
+    /// destination after the mainnet mode and feature refusals:
+    /// `validation.contract_payment_memo_unsupported`
+    /// with a memo flag, otherwise `validation.contract_payment_unavailable`.
+    /// `--sign-only` and `--submit-only` skip this check, and the supplied
+    /// envelope decides. An envelope holding one contract transfer refuses
+    /// with `validation.contract_payment_invalid` for an invalid `ASSET`.
+    /// Otherwise it refuses with `validation.contract_payment_memo_unsupported`
+    /// when it carries a memo, `validation.contract_payment_unavailable` once
+    /// proven for `ASSET`, and `validation.contract_payment_invalid` when not
+    /// proven.
     #[arg(value_name = "DESTINATION")]
     pub destination: String,
 
@@ -578,6 +589,15 @@ where
         print_error(&Envelope::<()>::err(&e), args.output);
         return 1;
     }
+    // A built payment refuses a contract destination before the keyring and
+    // any request; a staged envelope is classified by its own content.
+    if args.sign_only.is_none()
+        && args.submit_only.is_none()
+        && let Err(e) = contract_destination_refusal(args)
+    {
+        print_error(&Envelope::<()>::err(&e), args.output);
+        return 1;
+    }
 
     // Every gated stage reads the owner key from the keyring through
     // `build_v1_policy_engine` when the resolved profile is V1, including
@@ -696,6 +716,7 @@ where
 {
     if let Err(e) =
         stellar_agent_network::signing::envelope_signing::check_envelope_address_forms(unsigned_xdr)
+            .and_then(|()| staged_contract_refusal(context, args, unsigned_xdr))
     {
         print_error(&Envelope::<()>::err(&e), args.output);
         return 1;
@@ -795,6 +816,7 @@ where
 {
     if let Err(e) =
         stellar_agent_network::signing::envelope_signing::check_envelope_address_forms(signed_xdr)
+            .and_then(|()| staged_contract_refusal(context, args, signed_xdr))
     {
         print_error(&Envelope::<()>::err(&e), args.output);
         return 1;
@@ -1695,6 +1717,38 @@ async fn checked_client_and_build_inputs<'a>(
     Ok((client, inputs))
 }
 
+/// Refuses a payment to a canonical C contract: an invalid asset or amount
+/// with its own code, then `validation.contract_payment_memo_unsupported`
+/// with a memo, otherwise `validation.contract_payment_unavailable`.
+fn contract_destination_refusal(args: &PayArgs) -> Result<(), WalletError> {
+    let memo = args.memo_text.is_some()
+        || args.memo_id.is_some()
+        || args.memo_hash_hex.is_some()
+        || args.memo_return_hex.is_some();
+    stellar_agent_core::sac_payment::refuse_contract_destination(&args.destination, memo)
+        .map_err(|reason| parse_asset_and_amount(args).err().unwrap_or(reason.into()))
+}
+
+/// Refuses a staged contract transfer, proven for the caller's asset on this
+/// network. Such a transfer is a payment, never an opaque envelope.
+fn staged_contract_refusal(
+    context: &NetworkContext,
+    args: &PayArgs,
+    envelope_xdr: &str,
+) -> Result<(), WalletError> {
+    let sac_context = Asset::parse(&args.asset).ok().and_then(|asset| {
+        stellar_agent_core::sac_payment::SacPaymentContext::new(
+            context.chain_id,
+            stellar_agent_network::operation_entry::intent_asset(&asset),
+        )
+        .ok()
+    });
+    Ok(stellar_agent_core::sac_payment::refuse_contract_transfer(
+        envelope_xdr,
+        sac_context.as_ref(),
+    )?)
+}
+
 /// Parses the asset and its human amount before constructing the payment.
 fn parse_asset_and_amount(args: &PayArgs) -> Result<(Asset, StellarAmount), WalletError> {
     let asset = Asset::parse(&args.asset)?;
@@ -2347,6 +2401,9 @@ where
         Ok(parsed) => parsed,
         Err(e) => return fail(&Envelope::<()>::err(&e)),
     };
+    if let Err(e) = contract_destination_refusal(args) {
+        return fail(&Envelope::<()>::err(&e));
+    }
     if let Err(e) = init_keyring() {
         return fail(&Envelope::<()>::err(&e));
     }
@@ -5180,6 +5237,158 @@ pub(crate) mod tests {
         );
     }
 
+    /// The base64 testnet transfer of one stroop of `asset` from the G account
+    /// of key `[1; 32]` to the C contract of key `[2; 32]`.
+    fn contract_transfer_b64(asset: stellar_agent_core::approval::IntentAsset) -> String {
+        use stellar_xdr::WriteXdr as _;
+        let context = stellar_agent_core::sac_payment::SacPaymentContext::new(
+            stellar_agent_core::profile::caip2::Caip2::Testnet,
+            asset,
+        )
+        .unwrap();
+        stellar_xdr::TransactionEnvelope::Tx(stellar_agent_core::approval::fixtures::sac_transfer(
+            &context,
+        ))
+        .to_xdr_base64(stellar_xdr::Limits::none())
+        .unwrap()
+    }
+
+    /// Every stage refuses a C recipient with its fixed code before the
+    /// keyring, any client, or any request. A staged transfer is a payment,
+    /// never an opaque envelope: it refuses under the opaque allowance an
+    /// unclassifiable envelope signs under. An invalid asset keeps its code,
+    /// and mainnet refusals precede the contract refusal as they precede a G.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn contract_recipients_refuse_on_every_cli_stage() {
+        use crate::test_rpc::{ClassicRpc, last_rendered, methods};
+        use stellar_agent_core::approval::IntentAsset;
+        const UNAVAILABLE: &str = "validation.contract_payment_unavailable";
+        let _isolation = zero_config();
+        let signer = EnvSigner::new([0x65; 32], "PAY_CONTRACT_RECIPIENT_SK");
+        let server = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+        let contract = format!("{}", stellar_strkey::Contract([2; 32]));
+        let issuer = stellar_strkey::ed25519::PublicKey([7; 32]).to_string();
+        let usd = IntentAsset::Issued {
+            code: "USD".to_owned(),
+            issuer: issuer.to_string(),
+        };
+        let keyring = std::cell::Cell::new(0);
+        let run = async |args: PayArgs| {
+            let (code, built) = crate::test_rpc::clients_built_by(run_with_dependencies(
+                &args,
+                absent_profile_file,
+                || {
+                    keyring.set(keyring.get() + 1);
+                    Ok(())
+                },
+            ))
+            .await;
+            let rendered = last_rendered();
+            assert_eq!(
+                (code, built),
+                (1, 0),
+                "one refusal and no client: {rendered}"
+            );
+            rendered["error"]["code"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let request = |change: &dyn Fn(&mut PayArgs)| {
+            let mut args = signed_payment_args(&signer, &server.uri());
+            args.destination = contract.clone();
+            change(&mut args);
+            args
+        };
+        /// A case name, its change to the request, and the expected code.
+        type Case<'a> = (&'a str, &'a dyn Fn(&mut PayArgs), &'a str);
+        const MEMO: &str = "validation.contract_payment_memo_unsupported";
+        let cases: [Case<'_>; 12] = [
+            ("full", &|_| {}, UNAVAILABLE),
+            ("build", &|a| a.build_only = true, UNAVAILABLE),
+            (
+                "text memo",
+                &|a| a.memo_text = Some("note".to_owned()),
+                MEMO,
+            ),
+            ("id memo", &|a| a.memo_id = Some(1), MEMO),
+            (
+                "hash memo",
+                &|a| a.memo_hash_hex = Some("ab".repeat(32)),
+                MEMO,
+            ),
+            (
+                "return memo",
+                &|a| {
+                    a.build_only = true;
+                    a.memo_return_hex = Some("cd".repeat(32));
+                },
+                MEMO,
+            ),
+            (
+                "asset",
+                &|a| a.asset = "USD:BAD".to_owned(),
+                "validation.asset_invalid",
+            ),
+            (
+                "sign native",
+                &|a| a.sign_only = Some(contract_transfer_b64(IntentAsset::Native)),
+                UNAVAILABLE,
+            ),
+            (
+                "submit issued",
+                &|a| {
+                    a.asset = format!("USD:{issuer}");
+                    a.amount = "1 USD".to_owned();
+                    a.submit_only = Some(contract_transfer_b64(usd.clone()));
+                },
+                UNAVAILABLE,
+            ),
+            (
+                "sign wrong asset",
+                &|a| a.sign_only = Some(contract_transfer_b64(usd.clone())),
+                "validation.contract_payment_invalid",
+            ),
+            (
+                "sign G argument",
+                &|a| {
+                    a.destination = DEST_G.to_owned();
+                    a.sign_only = Some(contract_transfer_b64(IntentAsset::Native));
+                },
+                UNAVAILABLE,
+            ),
+            (
+                "sign unparsed asset",
+                &|a| {
+                    a.asset = "USD:BAD".to_owned();
+                    a.sign_only = Some(contract_transfer_b64(IntentAsset::Native));
+                },
+                "validation.contract_payment_invalid",
+            ),
+        ];
+        for (case, change, expected) in cases {
+            assert_eq!(run(request(change)).await, expected, "{case}");
+            assert_eq!(keyring.get(), 0, "{case} refuses before the keyring");
+        }
+        assert!(methods(&server).await.is_empty(), "no request");
+
+        for stage in [&(|_: &mut PayArgs| {}) as &dyn Fn(&mut PayArgs), &|a| {
+            a.sign_only = Some(contract_transfer_b64(IntentAsset::Native))
+        }] {
+            let mainnet = |destination: &str| {
+                request(&|a: &mut PayArgs| {
+                    a.network = Some(TargetNetwork::Mainnet);
+                    a.destination = destination.to_owned();
+                    stage(a);
+                })
+            };
+            let g_code = run(mainnet(DEST_G)).await;
+            assert_eq!(run(mainnet(&contract)).await, g_code, "mainnet precedence");
+            assert_ne!(g_code, UNAVAILABLE);
+        }
+    }
+
     /// `--submit-only` builds one client: the endpoint check is its first
     /// request, the reconcile and the gate reads follow, and the send goes
     /// through it. The submit layer checks it again before the send.
@@ -7018,6 +7227,39 @@ pub(crate) mod tests {
             )
             .unwrap();
             assert_eq!(facts["memo_id"], "0");
+        }
+
+        /// An enabled mainnet profile refuses a C recipient in full mode with
+        /// its fixed code before the keyring, any confirmation, record, or
+        /// request, and a memo gets the memo code.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mainnet_contract_recipient_refuses_before_the_keyring() {
+            let fixture = Spec::new("pay-contract-mainnet")
+                .rules(vec![pay_rule("allow", "")])
+                .build()
+                .await;
+            const MEMO: &str = "validation.contract_payment_memo_unsupported";
+            for (form, code) in [
+                ("none", "validation.contract_payment_unavailable"),
+                ("text", MEMO),
+                ("id", MEMO),
+                ("hash", MEMO),
+                ("return", MEMO),
+            ] {
+                let mut args = mainnet_args(&fixture);
+                args.destination = format!("{}", stellar_strkey::Contract([2; 32]));
+                match form {
+                    "text" => args.memo_text = Some("note".to_owned()),
+                    "id" => args.memo_id = Some(4),
+                    "hash" => args.memo_hash_hex = Some("ab".repeat(32)),
+                    "return" => args.memo_return_hex = Some("cd".repeat(32)),
+                    _ => {}
+                }
+                let refused = run(&fixture, &args).await;
+                assert_refused_before_confirmation(&fixture, &refused, code).await;
+                assert_eq!(fixture.initializer_calls(), 0, "no keyring access");
+            }
         }
 
         /// One run of the verb: its exit code and the envelope it printed.

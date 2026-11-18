@@ -1652,3 +1652,57 @@ tests = [
 claim = "status.toolset_sequence_unattended_recovery"
 rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit"]
 not_applicable = "This claim covers the admitted toolset payment path."
+
+# Cells: contract recipients.
+
+[[claim]]
+id = "approval.contract_recipient_refused"
+family = "approval"
+statement = "a payment to a C contract recipient refuses with validation.contract_payment_unavailable, or validation.contract_payment_memo_unsupported for every memo form; a single contract transfer envelope refuses with validation.contract_payment_invalid without a valid asset, otherwise with validation.contract_payment_memo_unsupported when it carries a memo, validation.contract_payment_unavailable once proven for the asset, and validation.contract_payment_invalid when not proven; both refuse before any account read, approval, grant, nonce, signing or request"
+applies = ["prepare", "commit", "verb"]
+
+[[cell]]
+claim = "approval.contract_recipient_refused"
+rows = ["mcp.pay", "mcp.pay_commit", "mcp.toolset_pay", "mcp.toolset_pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "muxed_destination_integration::contract_recipients_refuse_on_every_mcp_payment_route" },
+]
+
+[[cell]]
+claim = "approval.contract_recipient_refused"
+rows = ["cli.pay"]
+tests = [
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "commands::pay::tests::contract_recipients_refuse_on_every_cli_stage" },
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "commands::pay::tests::mainnet_full::mainnet_contract_recipient_refuses_before_the_keyring", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "approval.contract_recipient_refused"
+rows = ["mcp.create_account", "mcp.create_account_commit", "mcp.claim", "mcp.claim_commit", "mcp.trustline", "mcp.trustline_commit", "cli.claim", "cli.trustline", "cli.accounts_create"]
+not_applicable = "These tools take no payment recipient; their destination, if any, is an account ID, which a C contract cannot encode."
+
+[[claim]]
+id = "approval.contract_recipient_mainnet_first"
+family = "approval"
+statement = "on mainnet, an unadmitted or stale server and a refused mainnet mode answer a C contract recipient with their mainnet refusal, before the contract payment refusal"
+applies = ["commit", "verb"]
+builds = "feature-on"
+
+[[cell]]
+claim = "approval.contract_recipient_mainnet_first"
+rows = ["mcp.pay_commit", "mcp.toolset_pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::mainnet_refusals_precede_the_contract_payment_refusal", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "approval.contract_recipient_mainnet_first"
+rows = ["cli.pay"]
+tests = [
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "commands::pay::tests::contract_recipients_refuse_on_every_cli_stage", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "approval.contract_recipient_mainnet_first"
+rows = ["mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "cli.claim", "cli.trustline", "cli.accounts_create"]
+not_applicable = "These tools take no payment recipient; their destination, if any, is an account ID, which a C contract cannot encode."

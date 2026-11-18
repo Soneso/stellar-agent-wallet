@@ -1586,6 +1586,7 @@ mod signed {
                     attempt_index: 1,
                 }),
                 restriction: None,
+                sac_payment_context: None,
             }),
             |_| async {},
         )

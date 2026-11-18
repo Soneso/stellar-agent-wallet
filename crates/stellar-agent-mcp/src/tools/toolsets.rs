@@ -413,6 +413,13 @@ impl WalletServer {
                 rmcp::ErrorData::invalid_params(format!("chain_id mismatch: {error}"), None)
             })?;
         }
+        // A contract payment refuses before the outer gate, the first-invoke
+        // grant, and every approval or nonce.
+        if is_payment
+            && let Some(refusal) = toolset_contract_refusal(self.context.chain_id, &args.args)
+        {
+            return Ok(refusal);
+        }
         let outer = if mainnet_payment {
             None
         } else {
@@ -558,6 +565,26 @@ fn grant_invocation_facts(authoritative: &serde_json::Value) -> (String, String,
         .and_then(crate::tools::amount_wire::value_as_stroops_i64)
         .unwrap_or(0_i64);
     (destination, asset, amount_stroops)
+}
+
+/// The contract payment refusal of a routed payment's raw arguments: its
+/// `envelope_xdr` with the context of its `asset`, then its `destination`.
+fn toolset_contract_refusal(
+    chain: stellar_agent_core::profile::caip2::Caip2,
+    args: &serde_json::Value,
+) -> Option<CallToolResult> {
+    let text = |key: &str| args.get(key).and_then(serde_json::Value::as_str);
+    let memo = ["memo_text", "memo_id", "memo_hash_hex", "memo_return_hex"]
+        .iter()
+        .any(|key| args.get(key).is_some_and(|value| !value.is_null()));
+    let asset = text("asset").and_then(|asset| stellar_agent_network::Asset::parse(asset).ok());
+    super::pay::contract_payment_refusal(
+        chain,
+        text("destination").unwrap_or_default(),
+        memo,
+        text("envelope_xdr"),
+        asset.as_ref(),
+    )
 }
 
 /// Payment fields shared by preparation and sign-payment routes.
@@ -1441,7 +1468,7 @@ impl WalletServer {
                             None,
                         )
                     })?;
-                self.invoke_stellar_pay(typed, preparation).await
+                self.stellar_pay_impl(typed, preparation).await
             }
             "stellar_claim" => {
                 let typed: super::claim::StellarClaimArgs =

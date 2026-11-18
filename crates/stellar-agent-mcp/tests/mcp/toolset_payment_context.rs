@@ -155,7 +155,9 @@ struct Writers {
     home: PathBuf,
     peer: Mutex<Option<LockPeer>>,
     before: Mutex<Vec<Vec<u8>>>,
-    seen: Mutex<Vec<[bool; 4]>>,
+    /// Per send: whether the peer's writers refused, and whether the grant
+    /// bytes stayed unchanged.
+    seen: Mutex<Vec<[bool; 2]>>,
 }
 
 impl Writers {
@@ -192,10 +194,7 @@ impl Writers {
         let mut peer = LockPeer::spawn("writers", self);
         let refused = peer.wait_for("refused");
         let unchanged = self.bytes() == *self.before.lock().unwrap();
-        self.seen
-            .lock()
-            .unwrap()
-            .push([refused, refused, refused, unchanged]);
+        self.seen.lock().unwrap().push([refused, unchanged]);
         *self.peer.lock().unwrap() = Some(peer);
     }
 }
@@ -937,7 +936,7 @@ async fn carried_outer_outcome_governs_off_mainnet() {
                 }),
             })
             .await
-            .unwrap();
+            .expect("the proposal answers with a business envelope, not a protocol error");
         let body: serde_json::Value =
             serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap();
         assert_eq!(body["ok"], true, "{body}");
@@ -1246,7 +1245,7 @@ async fn lease_holds_toolset_writers_off_until_submission_returns() {
     );
     assert_eq!(
         *writers.seen.lock().unwrap(),
-        vec![[true, true, true, true]],
+        vec![[true, true]],
         "the lease holds off every writer, with unchanged bytes, during the send"
     );
     *h.writers.lock().unwrap() = None;

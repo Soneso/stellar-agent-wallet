@@ -99,6 +99,36 @@ fn binding() -> AttestationBinding<'static> {
     AttestationBinding::new(PROFILE, MAINNET_CHAIN_ID)
 }
 
+#[test]
+#[serial]
+fn contract_presence_binds_active_chain() {
+    use crate::approval::IntentAsset;
+    use crate::profile::caip2::Caip2;
+    let fixture = MainnetConsentFixture::new("contract-presence");
+    let binding = AttestationBinding::new(fixture.name(), MAINNET_CHAIN_ID);
+    let policy = fixture.current_policy();
+    for chain in [Caip2::Mainnet, Caip2::Testnet] {
+        let entry = fixtures::sac_payment_pending(chain, IntentAsset::Native);
+        let result = issue_mainnet_presence(
+            &entry,
+            &binding,
+            &policy,
+            ORIGIN,
+            entry.created_at_unix_ms,
+            Instant::now(),
+        );
+        if chain == Caip2::Mainnet {
+            assert!(result.is_ok(), "matching presence chain: {result:?}");
+        } else {
+            assert_eq!(
+                result.unwrap_err().code(),
+                "approval.binding_mismatch",
+                "active presence chain"
+            );
+        }
+    }
+}
+
 fn now_ms() -> u64 {
     crate::timefmt::now_unix_ms().unwrap()
 }

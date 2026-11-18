@@ -199,6 +199,18 @@ Simulate step: builds a Payment transaction envelope for a native XLM or non-nat
 
 **Returns:** `{envelope_xdr, nonce, expires_at_unix_ms, simulation, operational}`.
 
+A C contract `destination` refuses with `validation.contract_payment_unavailable`
+("Contract payments are not available on this payment surface."), or with
+`validation.contract_payment_memo_unsupported` when any memo argument is set,
+before any request, approval, or nonce. `stellar_pay_commit` applies the same
+refusal, and a commit envelope holding one `transfer(Account, Contract, I128)`
+invocation refuses first. Without a valid `asset` its code is
+`validation.contract_payment_invalid`. Otherwise it is
+`validation.contract_payment_memo_unsupported` when the envelope carries a
+memo, `validation.contract_payment_unavailable` once proven for `asset`, and
+`validation.contract_payment_invalid` when not proven. On mainnet the commit's
+admission and freshness refusals come first.
+
 **Annotations:** `readOnlyHint=false`, `destructiveHint=false`.
 
 **SEP-29:** If the destination's `config.memo_required` data entry is set to `"1"` and no memo is provided, returns `validation.memo_required`.
