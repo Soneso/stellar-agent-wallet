@@ -67,7 +67,7 @@ drift drift-new-step drift-unnamed-step drift-removed-step drift-renamed-step
 install-hint coverage-suppression coverage-unavailable coverage-written coverage-off-only-fails coverage-on-only-fails
 release-shape-libudev"
 
-ALWAYS=(docs-style install-surface gate-tool-versions)
+ALWAYS=(docs-style install-surface gate-tool-versions docs-reads)
 RUST=(fmt clippy rustdoc)
 # The scripts that preflight.sh executes by path; an execution case replaces
 # them with logging stubs.
@@ -83,6 +83,7 @@ EXPECTED_REGISTRY=$(
 docs-style	python3 .github/scripts/check-docs-style.py
 install-surface	python3 .github/scripts/check-install-surface.py
 gate-tool-versions	bash .github/scripts/check-gate-tool-versions.sh
+docs-reads	python3 .github/scripts/check-docs-reads.py
 changelog	python3 .github/scripts/changelog.py check
 self-test:test-changelog.py	python3 .github/scripts/test-changelog.py
 actionlint	actionlint
@@ -94,6 +95,7 @@ self-test:test-check-provenance.py	python3 .github/scripts/test-check-provenance
 workflow-invariants	python3 .github/scripts/check-workflow-invariants.py
 self-test:test-check-coverage.py	python3 .github/scripts/test-check-coverage.py
 self-test:test-check-crates-exist.sh	bash .github/scripts/test-check-crates-exist.sh
+self-test:test-check-docs-reads.py	python3 .github/scripts/test-check-docs-reads.py
 self-test:test-check-docs-style.py	python3 .github/scripts/test-check-docs-style.py
 self-test:test-check-gate-tool-versions.sh	bash .github/scripts/test-check-gate-tool-versions.sh
 self-test:test-check-install-surface.py	python3 .github/scripts/test-check-install-surface.py
@@ -101,6 +103,7 @@ self-test:test-check-no-direct-sasignersetbaselined-emit.sh	bash .github/scripts
 self-test:test-check-proof-matrix.py	python3 .github/scripts/test-check-proof-matrix.py
 self-test:test-check-ref-on-main.sh	bash .github/scripts/test-check-ref-on-main.sh
 self-test:test-check-workflow-invariants.py	python3 .github/scripts/test-check-workflow-invariants.py
+self-test:test-classify-docs-only.py	python3 .github/scripts/test-classify-docs-only.py
 self-test:test-compare-crate-sums.py	python3 .github/scripts/test-compare-crate-sums.py
 self-test:test-preflight.sh	bash .github/scripts/test-preflight.sh
 self-test:test-publish-crates-check.sh	.github/scripts/test-publish-crates-check.sh
@@ -1202,9 +1205,10 @@ case_deploy_scripts_run() {
   echo "scripts/deploy/test-deploy.sh=1" >>"$STATE/status"
   run_preflight
   expect_line "- \`$(registry_row deploy-harness | cut -f 2)\`: exit 1"
-  expect_end 1 "preflight: 5 gates run, 1 failed, 0 unavailable"
+  expect_end 1 "preflight: 6 gates run, 1 failed, 0 unavailable"
   expect_calls "python3 .github/scripts/check-docs-style.py" "python3 .github/scripts/check-install-surface.py" \
-    "bash .github/scripts/check-gate-tool-versions.sh" "$(registry_row deploy-shellcheck | cut -f 2)" \
+    "bash .github/scripts/check-gate-tool-versions.sh" "python3 .github/scripts/check-docs-reads.py" \
+    "$(registry_row deploy-shellcheck | cut -f 2)" \
     "bash scripts/deploy/test-deploy.sh"
   assert_clean_calls
 }
@@ -1424,7 +1428,7 @@ case_spaces_and_an_apostrophe() {
   : >".github/scripts/it's.sh"
   write_shim "$BIN/shellcheck" shellcheck plain
   run_preflight
-  expect_end 1 "preflight: 4 gates run, 0 failed, 2 unavailable"
+  expect_end 1 "preflight: 5 gates run, 0 failed, 2 unavailable"
   shellcheck_call=$(argv_record shellcheck -s bash ".github/scripts/it's.sh" ".github/scripts/with space.sh")
   record_gate_calls
   if [ "$(grep -c '^\["shellcheck"' "$CASE_DIR.calls")" -ne 1 ] ||
@@ -1447,8 +1451,8 @@ case_full() {
       *) original=$((original + 1)) ;;
     esac
   done
-  if [ "$original" -ne 61 ] || [ "$added" -ne 2 ]; then
-    fail "the expected registry requires 61 original rows and 2 changelog rows"
+  if [ "$original" -ne 64 ] || [ "$added" -ne 2 ]; then
+    fail "the expected registry requires 64 original rows and 2 changelog rows"
   fi
   expect_list --full "${ids[@]}"
 }
@@ -1567,9 +1571,10 @@ case_unavailable_tool() {
   version=$(sed -n 's/.*actionlint_\([0-9][0-9.]*\)_linux_amd64.*/\1/p' .github/workflows/install-surface.yml)
   [ -n "$version" ] || fail "install-surface.yml pins no actionlint archive"
   expect_line "- \`actionlint\`: unavailable (actionlint: brew install actionlint, or the $version release archive for your platform (actionlint_${version}_<os>_<arch>.tar.gz))"
-  expect_end 1 "preflight: 5 gates run, 0 failed, 3 unavailable"
+  expect_end 1 "preflight: 6 gates run, 0 failed, 3 unavailable"
   expect_calls "python3 .github/scripts/check-docs-style.py" "python3 .github/scripts/check-install-surface.py" \
-    "bash .github/scripts/check-gate-tool-versions.sh" "python3 .github/scripts/check-workflow-invariants.py" \
+    "bash .github/scripts/check-gate-tool-versions.sh" "python3 .github/scripts/check-docs-reads.py" \
+    "python3 .github/scripts/check-workflow-invariants.py" \
     "python3 .github/scripts/test-check-workflow-invariants.py"
   assert_clean_calls
 }
@@ -1588,9 +1593,9 @@ case_missing_pyyaml() {
   hint='python3 -m venv .venv && .venv/bin/python -m pip install --require-hashes -r .github/scripts/workflow-check-requirements.txt && export PATH=$PWD/.venv/bin:$PATH'
   expect_line "- \`python3 .github/scripts/check-workflow-invariants.py\`: unavailable (yaml: $hint)"
   expect_line "- \`python3 .github/scripts/test-check-workflow-invariants.py\`: unavailable (yaml: $hint)"
-  expect_end 1 "preflight: 4 gates run, 0 failed, 4 unavailable"
+  expect_end 1 "preflight: 5 gates run, 0 failed, 4 unavailable"
   expect_calls "python3 .github/scripts/check-docs-style.py" "python3 .github/scripts/check-install-surface.py" \
-    "bash .github/scripts/check-gate-tool-versions.sh" "actionlint"
+    "bash .github/scripts/check-gate-tool-versions.sh" "python3 .github/scripts/check-docs-reads.py" "actionlint"
   assert_clean_calls
 }
 
@@ -1607,9 +1612,9 @@ run_exit_aggregation() {
 case_exit_aggregation() {
   run_exit_aggregation
   expect_line "- \`actionlint\`: exit 3"
-  expect_end 1 "preflight: 7 gates run, 1 failed, 2 unavailable"
+  expect_end 1 "preflight: 8 gates run, 1 failed, 2 unavailable"
   expect_calls "python3 .github/scripts/check-docs-style.py" "python3 .github/scripts/check-install-surface.py" \
-    "bash .github/scripts/check-gate-tool-versions.sh" "actionlint" \
+    "bash .github/scripts/check-gate-tool-versions.sh" "python3 .github/scripts/check-docs-reads.py" "actionlint" \
     "python3 .github/scripts/check-workflow-invariants.py" "python3 .github/scripts/test-check-docs-style.py" \
     "python3 .github/scripts/test-check-workflow-invariants.py"
   assert_clean_calls
@@ -1632,6 +1637,7 @@ case_table() {
       "- \`python3 .github/scripts/check-docs-style.py\`: exit 0" \
       "- \`python3 .github/scripts/check-install-surface.py\`: exit 0" \
       "- \`bash .github/scripts/check-gate-tool-versions.sh\`: exit 0" \
+      "- \`python3 .github/scripts/check-docs-reads.py\`: exit 0" \
       "- \`actionlint\`: exit 3" \
       "- \`cargo fetch --locked && python3 .github/scripts/check-feature-discipline.py\`: unavailable (cargo: install Rust with rustup from https://rustup.rs)" \
       "- \`python3 .github/scripts/test-check-feature-discipline.py --mutations\`: unavailable (cargo: install Rust with rustup from https://rustup.rs)" \
@@ -1640,14 +1646,14 @@ case_table() {
       "- \`python3 .github/scripts/test-check-workflow-invariants.py\`: exit 0" \
       "- \`.github/scripts/test-mpp-interop.sh\`: not run (--full; needs Node $node and Corepack)" \
       "- \`.github/scripts/test-sdk-v17-interop.sh\`: not run (--full; needs Node $node and Corepack)" \
-      "preflight: 7 gates run, 1 failed, 2 unavailable"
+      "preflight: 8 gates run, 1 failed, 2 unavailable"
   } >"$CASE_DIR.expected-table"
   if ! diff -u "$CASE_DIR.expected-table" "$CASE_DIR.table" >&2; then
     fail "the table differs"
   fi
   rows=$(grep -c '^- ' "$CASE_DIR.table" || true)
-  if [ "$rows" -ne 11 ]; then
-    fail "the table holds $rows rows, expected 11"
+  if [ "$rows" -ne 12 ]; then
+    fail "the table holds $rows rows, expected 12"
   fi
   # shellcheck disable=SC2016 # The backticks are literal row characters.
   if grep '^- ' "$CASE_DIR.table" |
@@ -1959,8 +1965,8 @@ mutation_case() {
     dev-dependencies) echo "dev-dependency-edge $differs" ;;
     target-dependencies) echo "target-specific-edge $differs" ;;
     unique-gates) echo "duplicate-triggers $differs" ;;
-    failed-gate) echo "exit-aggregation $end1 7 gates run, 1 failed, 2 unavailable'" ;;
-    unavailable-gate) echo "unavailable-tool $end 5 gates run, 0 failed, 3 unavailable'" ;;
+    failed-gate) echo "exit-aggregation $end1 8 gates run, 1 failed, 2 unavailable'" ;;
+    unavailable-gate) echo "unavailable-tool $end 6 gates run, 0 failed, 3 unavailable'" ;;
     fresh-coverage)
       floors=$(registry_row coverage-floors | cut -f 2)
       echo "coverage-suppression the run printed no line '- \`$floors\`:" \

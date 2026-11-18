@@ -249,7 +249,31 @@ runs the complete local registry, including coverage.
 
 CI runs the offline workspace suite on every pull request. Pull-request
 coverage requires the `coverage` label; live acceptance uses its separate
-workflow. Local coverage, `cargo machete`, and `cargo deny check` are optional
+workflow. A pull request into `mainnet-write` that changes only documentation,
+as `.github/scripts/classify-docs-only.py` decides, skips the `ci.yml` build
+and test jobs and runs `docs-tests`: the tests that `.github/docs-tests.tsv`
+lists, which `.github/scripts/check-docs-reads.py` keeps complete.
+The check counts as a documentation read an `include_str!` or `include_bytes!`
+of a documentation path, in an attribute too, and a crate-level inner
+`#![doc = include_str!(..)]`.
+It also counts a string literal in test code or in a build script that names a
+documentation path or directory: whole, as a slash-free directory such as
+`"docs"`, as a prefix before a placeholder or wildcard such as
+`"../../docs/{name}.md"`, or after one, such as `"{}/../../docs/guide.md"` or
+`"{}/../../README.md"`.
+An include or a build-script literal outside test code fails, and only the
+crate-level doc include takes a `doc` row.
+The check does not see a test that walks the repository root, a helper in
+another package that holds the documentation path, an include whose file name
+arrives as a macro argument, a proc macro that reads a documentation file, or
+an embedding crate that takes a directory; review such code by hand.
+The full suite still covers them: every pull request into `main` runs the full
+`ci.yml` suite, every push to `mainnet-write` or `main` runs the workspace
+tests of `coverage.yml`, and a push that changes a path other than Markdown,
+`LICENSE`, or `.claude-plugin/**` runs `ci.yml`.
+A push that changes only Markdown skips `ci.yml`.
+A pull request retargeted to `main` runs the full set only after a new push.
+Local coverage, `cargo machete`, and `cargo deny check` are optional
 reproductions. See the build-gate dimension of the
 [review checklist](review-checklist.md#8-build-gates).
 
