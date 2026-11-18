@@ -57,6 +57,10 @@ impl stellar_agent_approval_ui::decision::ConsentRecording for NoDurableRecords 
         Ok(())
     }
 
+    fn publishes(&self, _: stellar_agent_core::approval::witness::ApprovedKind) -> bool {
+        false
+    }
+
     fn complete(
         &self,
         _: stellar_agent_approval_ui::decision::VerifiedConsent,

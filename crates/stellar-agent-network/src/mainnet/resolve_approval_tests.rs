@@ -116,6 +116,7 @@ fn revoke_record(f: &ResolverFixture, witness: &ApprovalWitness) {
 }
 
 #[tokio::test]
+#[serial_test::serial(mainnet_clock)]
 #[serial_test::serial]
 async fn consumed_resolver_refusals_precede_expiry_for_another_operation() {
     use crate::policy_state::{OperationRecorder, OperationState, TransitionEvidence};
@@ -232,6 +233,7 @@ fn durable_envelope_authority_keeps_signed_expiry() {
 }
 
 #[tokio::test]
+#[serial_test::serial(mainnet_clock)]
 #[serial_test::serial]
 async fn resolver_state_matrix() {
     for soroban in [false, true] {
@@ -343,6 +345,7 @@ async fn resolver_state_matrix() {
 }
 
 #[test]
+#[serial_test::serial(mainnet_clock)]
 #[serial_test::serial]
 fn facts_comparisons_refuse_alone() {
     use stellar_agent_core::approval::witness::ApprovalFacts;
@@ -413,6 +416,7 @@ fn facts_comparisons_refuse_alone() {
 }
 
 #[tokio::test]
+#[serial_test::serial(mainnet_clock)]
 #[serial_test::serial]
 async fn legacy_envelope_keeps_its_rule_bound() {
     let f = current_record_fixture(false);
@@ -435,6 +439,7 @@ async fn legacy_envelope_keeps_its_rule_bound() {
 }
 
 #[tokio::test]
+#[serial_test::serial(mainnet_clock)]
 #[serial_test::serial]
 async fn gates_never_fall_back_to_the_inbox() {
     let f = current_record_fixture(false);
@@ -482,7 +487,7 @@ async fn gates_never_fall_back_to_the_inbox() {
             &authority,
             witness.subject(),
             witness.kind(),
-            &evaluation,
+            stellar_agent_core::approval::store::governing_ttl_ms(&evaluation),
             &f.audit(),
             &f.signer,
             witness.consent_at_ms(),
@@ -495,6 +500,7 @@ async fn gates_never_fall_back_to_the_inbox() {
 }
 
 #[tokio::test]
+#[serial_test::serial(mainnet_clock)]
 #[serial_test::serial]
 async fn released_payload_refuses_as_expired() {
     use crate::policy_state::{
@@ -557,6 +563,7 @@ async fn released_payload_refuses_as_expired() {
 }
 
 #[tokio::test]
+#[serial_test::serial(mainnet_clock)]
 #[serial_test::serial]
 async fn policy_path_reads_no_record() {
     let f = ResolverFixture::new();
@@ -587,6 +594,7 @@ async fn policy_path_reads_no_record() {
 }
 
 #[test]
+#[serial_test::serial(mainnet_clock)]
 #[serial_test::serial]
 fn header_preserves_bindings_and_bounds() {
     use super::super::digest::BindingFacts;
@@ -612,6 +620,7 @@ fn header_preserves_bindings_and_bounds() {
         reservation: None,
         authority: witness.fact_digest(),
         audit: audit.fact_digest(),
+        restriction: None,
     };
     let request = MintRequest {
         intent_digest: None,
@@ -632,6 +641,7 @@ fn header_preserves_bindings_and_bounds() {
             expires_at_ms: u64::MAX,
         },
         chain_deadline_ms: None,
+        restriction_end_ms: None,
         authorization_ttl_ms: 2_000_000,
         bindings: facts,
         holds: vec![],
@@ -690,6 +700,7 @@ fn header_preserves_bindings_and_bounds() {
 }
 
 #[test]
+#[serial_test::serial(mainnet_clock)]
 #[serial_test::serial]
 fn intent_restart_seam() {
     use crate::policy_state::{
@@ -738,7 +749,7 @@ fn intent_restart_seam() {
         &witness,
         witness.subject(),
         witness.kind(),
-        &evaluation,
+        stellar_agent_core::approval::store::governing_ttl_ms(&evaluation),
         now,
     );
     assert!(
@@ -781,6 +792,7 @@ fn intent_restart_seam() {
             expires_at_ms: witness.execution_expires_at_ms(),
         },
         chain_deadline_ms: None,
+        restriction_end_ms: None,
         authorization_ttl_ms: 120_000,
         bindings: super::super::digest::BindingFacts {
             endpoint: None,
@@ -791,6 +803,7 @@ fn intent_restart_seam() {
             reservation: None,
             authority: [4; 32],
             audit: [5; 32],
+            restriction: None,
         },
         holds: vec![],
         parent: None,

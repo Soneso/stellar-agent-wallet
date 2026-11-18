@@ -2522,6 +2522,7 @@ pub(crate) mod tests {
     /// rebuilt from the exposure and the attempt's authority alone.
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
+    #[serial(mainnet_clock)]
     #[serial]
     async fn recovery_exposure_persists_zero_entry_identity() {
         let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();

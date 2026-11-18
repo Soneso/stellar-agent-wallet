@@ -151,6 +151,7 @@ pub(crate) mod budget {
     /// holds adds to no bucket. The unlisted bucket and a retired epoch
     /// report why they have no figures, and an overflowing sum refuses typed.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn budget_bucket_breakdown_and_dedup() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -306,6 +307,7 @@ pub(crate) mod budget {
     /// names none, corrupt bytes keep the store's refusal, and a pin naming
     /// another policy refuses. None of them reads as zero.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn budget_one_snapshot_and_integrity() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -435,6 +437,7 @@ pub(crate) mod budget {
     /// Missing lock protection admits fresh absence, but never committed
     /// history, even when the caller presents another policy digest.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn budget_missing_lock_refuses_committed_history() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -485,6 +488,7 @@ pub(crate) mod budget {
     /// Project rules use the engine's cached project even after the
     /// environment changes, retaining document order and inactive scopes.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn budget_rules_use_cached_project_scope() {
         use stellar_agent_test_support::env_guard::ScopedEnvVar;
@@ -536,6 +540,7 @@ pub(crate) mod budget {
     /// Individually representable used and reserved totals must also fit
     /// together, as the admission total reader requires.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn budget_combined_used_and_reserved_overflow_refuses() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -644,6 +649,7 @@ pub(crate) mod budget {
     /// Missing native amounts stay disclosed until an admissible observation
     /// proves a bounded release, or an `Always` row releases unconditionally.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn budget_legacy_disclosure_requires_proven_release() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -911,6 +917,7 @@ pub(crate) mod budget {
     /// authorization is listed, and an observation dated after the clock
     /// refuses as a clock error.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn budget_native_observation_matrix() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1129,6 +1136,7 @@ pub(crate) mod budget {
     /// exposure; its informational bound is the attempt's `max_time` in
     /// milliseconds, and it counts in every class without a row.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn authorization_projection_classes_follow_operation_evidence() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();

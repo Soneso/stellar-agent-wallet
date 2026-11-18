@@ -78,6 +78,18 @@ more than 60 seconds from the host clock with `network.endpoint_not_ready`.
 
 ## Shared flags
 
+The CLI `pay` command and MCP payments follow the governing payment policy.
+For an installed toolset, the MCP actions `stellar_pay` and
+`stellar_pay_commit` also evaluate the exact `stellar_toolset_invoke` rule.
+A first-invoke grant limits the destination, asset, amount and expiry. With
+that grant and composed Allow, the MCP commit sends without another consent;
+RequireApproval still needs `stellar-agent approve --id <nonce> --profile <profile>`.
+The two policy checks account for one payment once. A complete M destination,
+including ID zero, remains in the signed payment and the approval summary.
+`stellar-agent toolsets run` only resolves actions; it does not execute payments.
+See [toolset payments and recovery](../toolsets.md) for retained retries,
+coordination refusals and the remaining mainnet exclusions.
+
 Several flags recur across the commands on this page with the same meaning. Their full description lives in the [global conventions](index.md#global-conventions) section of the index:
 
 - `--profile <NAME>`: selects the [profile](../concepts.md). Every command on this page that loads a profile resolves it in the order the index documents: the flag, then `STELLAR_AGENT_PROFILE`, then `"default"`. For `accounts create`, `pay`, and `claim` a profile that resolves to no file is synthesised only when no name was given. For these commands, a name you supplied through the flag or the variable is refused if its file does not exist. `accounts deploy-c` resolves its network from the profile and opens its writer only with `--profile`. `fees stats` loads a profile only with `--profile`. Each command's table states its own default.

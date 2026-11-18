@@ -226,7 +226,7 @@ for target in "${CHILD_DRIVER_SUITES[@]}"; do
   expect_prebuild off testnet-acceptance "$target"
 done
 # Suites outside the list keep their single cargo call.
-for entry in "stellar-agent-mcp pay_commit_testnet_acceptance" "stellar-agent-cli claim_testnet_acceptance" \
+for entry in "stellar-agent-mcp claim_commit_testnet_acceptance" "stellar-agent-cli claim_testnet_acceptance" \
   "stellar-agent-network fee_bump_testnet"; do
   read -r crate target <<< "$entry"
   : > "$STUB/args"

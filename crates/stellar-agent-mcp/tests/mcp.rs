@@ -72,12 +72,16 @@ mod registry_walk;
 mod rejected_client_input;
 #[path = "mcp/resource_no_secrets.rs"]
 mod resource_no_secrets;
+#[path = "mcp/restricted_submission_lease.rs"]
+mod restricted_submission_lease;
 #[path = "mcp/rpc_credential_integration.rs"]
 mod rpc_credential_integration;
 #[path = "mcp/sep48_sep47_envelope_shape.rs"]
 mod sep48_sep47_envelope_shape;
 #[path = "mcp/toolset_args_validation_integration.rs"]
 mod toolset_args_validation_integration;
+#[path = "mcp/toolset_payment_context.rs"]
+mod toolset_payment_context;
 #[path = "mcp/toolset_sign_payment_gated_integration.rs"]
 mod toolset_sign_payment_gated_integration;
 #[path = "mcp/toolsets_matrix_invariants.rs"]

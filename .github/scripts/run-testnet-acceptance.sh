@@ -138,6 +138,8 @@ CHILD_DRIVER_SUITES=(
   "create_account_testnet_acceptance"
   "trustline_classic_testnet_acceptance"
   "policy_value_descriptor_testnet_acceptance"
+  "pay_commit_testnet_acceptance"
+  "toolset_sign_payment_gated_testnet_acceptance"
 )
 
 needs_server_child() {

@@ -1098,6 +1098,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn an_invalidated_classic_authorization_never_reaches_the_signer() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1140,6 +1141,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_classic_claim_that_fails_to_persist_never_reaches_the_signer() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1165,6 +1167,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_changed_policy_pin_at_the_classic_claim_never_reaches_the_signer() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1189,6 +1192,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn muxed_contract_authorized_signature_refuses_without_consuming() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1230,6 +1234,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_classic_authorization_signs_once() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1274,6 +1279,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_late_classic_signature_is_discarded() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1302,6 +1308,7 @@ mod tests {
         /// interval, the key checks it immediately before signing, and the
         /// claim keeps its spend counted.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_classic_authorization_expiring_before_the_signature_signs_nothing() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1342,6 +1349,7 @@ mod tests {
         /// The valid case signs once, and the attached signature verifies
         /// under the transaction's mainnet payload.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn the_authorized_sibling_signs_once_under_the_mainnet_payload() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1380,6 +1388,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn another_consumer_is_refused() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1401,6 +1410,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn another_transaction_hash_is_refused() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1429,6 +1439,7 @@ mod tests {
         /// A pre-signed copy of the approved envelope carries the same
         /// transaction under another text, so only its digest differs.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_pre_signed_envelope_is_refused() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1452,6 +1463,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn another_source_is_refused() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1478,6 +1490,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn another_sequence_is_refused() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1506,6 +1519,7 @@ mod tests {
         /// A signer whose key is not the bound one is refused after its key
         /// is read and before it signs.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn another_signer_key_is_refused() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1527,6 +1541,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn an_expired_authorization_is_refused() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1549,6 +1564,7 @@ mod tests {
 
         /// An authorization presented with the testnet passphrase is refused.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn an_authorization_on_testnet_is_refused() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1572,6 +1588,7 @@ mod tests {
         /// The chain check compares the bound chain too: an authorization
         /// bound to testnet is refused under the mainnet passphrase.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn an_authorization_bound_to_another_chain_is_refused() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1596,6 +1613,7 @@ mod tests {
         /// A fee-bump envelope whose every bound fact matches is refused: a
         /// transaction authorization covers a transaction envelope only.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_fee_bump_envelope_is_refused() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1624,6 +1642,7 @@ mod tests {
 
         /// A decoded fee bump refuses before chain, consumer, expiry, or key access.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_fee_bump_refuses_before_chain_consumer_and_expiry_checks() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1662,6 +1681,7 @@ mod tests {
         /// after it signed, and nothing is attached. Each path signs under
         /// its own freshly claimed authorization.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_bad_signature_is_refused_after_signing() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();

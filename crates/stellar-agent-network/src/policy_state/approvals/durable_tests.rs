@@ -63,6 +63,7 @@ fn refusal(result: Result<ApprovalWitness, WalletError>, code: &str, message: &s
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn durable_facts_match_the_record_and_read_without_writing() {
     let mut fx = Fx::new(300_000);
@@ -196,6 +197,7 @@ fn durable_facts_match_the_record_and_read_without_writing() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn durable_witness_state_matrix() {
     let mut fx = Fx::new(300_000);
@@ -267,6 +269,7 @@ fn durable_witness_state_matrix() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn durable_scope_and_policy_are_current() {
     let mut fx = Fx::new(300_000);
@@ -381,6 +384,7 @@ fn durable_scope_and_policy_are_current() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn presented_attestation_must_match_the_record() {
     let mut fx = Fx::new(300_000);
@@ -466,6 +470,7 @@ fn presented_attestation_must_match_the_record() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn durable_envelope_bounds_refuse_alone() {
     for ttl in [300_000, 86_400_000] {
@@ -519,6 +524,7 @@ fn durable_envelope_bounds_refuse_alone() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn missing_intent_challenge_refuses_before_retention() {
     let mut fx = Fx::new(300_000);
@@ -558,6 +564,7 @@ fn missing_intent_challenge_refuses_before_retention() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn durable_x402_envelope_record_verifies() {
     let mut fx = Fx::x402(300_000);
@@ -733,6 +740,7 @@ impl IntentFx {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn durable_intent_clocks_and_signed_digest_survive_retry() {
     use sha2::Digest as _;
@@ -794,6 +802,7 @@ fn durable_intent_clocks_and_signed_digest_survive_retry() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn durable_intent_allow_preserves_approval_and_producer_contract() {
     use crate::mainnet::authority::MainnetAuthority;
@@ -854,6 +863,7 @@ fn durable_intent_allow_preserves_approval_and_producer_contract() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn durable_subject_dispatch_and_receipt_challenge() {
     let fx = IntentFx::new(300_000);

@@ -223,6 +223,7 @@ mod tests {
         assert_eq!(generation.get_password().unwrap(), generation_before);
     }
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn intent_views_report_horizons_without_mutation() {
         use stellar_agent_network::intent_view_test_helpers::IntentViewFixture;

@@ -36,7 +36,8 @@ use crate::fees::ClassicFeeChoice;
 use crate::mainnet::MainnetAuthorizationError;
 use crate::mainnet::canonical::{CanonicalPart, CanonicalRefusal};
 use crate::policy_state::approvals::{
-    ConsentDeliveryV1, require_consent_evidence_inventory, sweep_ended_consent_evidence,
+    ConsentDeliveryV1, adopt_consent_evidence_pins, require_consent_evidence_inventory,
+    sweep_ended_consent_evidence,
 };
 use crate::policy_state::{
     ApprovalRecorder, ApprovalStatus, ApprovalView, AttemptAuthorization, AttemptEnvelope,
@@ -1600,23 +1601,21 @@ impl ConsentAdmission<'_> {
     /// Admits an integrated approval request for `operation`, then runs
     /// `present` with the committed record and its reservation.
     ///
-    /// In order: the owner-scope inventory, the pending record, the owner's
-    /// evidence initialization, the release of evidence whose records ended,
-    /// and the reservation. The record is the one
-    /// already committed for the operation, else the one `open` commits from
-    /// `facts`, else the committed winner of a conflicting open. Its stored
-    /// nonce, clocks and facts govern a retry, never the retry's own facts.
-    /// Each step after the open runs outside the window lock. A refusal
-    /// keeps the committed record and any reservation.
+    /// In order: the owner-scope readiness proof, the pending record, the
+    /// owner's evidence initialization, the release of evidence whose records
+    /// ended, and the reservation. The record is the one already committed
+    /// for the operation, else the one `open` commits from `facts`, else the
+    /// committed winner of a conflicting open. Its stored nonce, clocks and
+    /// facts govern a retry, never the retry's own facts. Each step after the
+    /// open runs outside the window lock. A refusal keeps the committed
+    /// record and any reservation.
     ///
     /// # Errors
     ///
     /// The refusals of [`require_consent_evidence_inventory`], of `open`
     /// when no record names the operation, of evidence initialization, of
-    /// [`sweep_ended_consent_evidence`],
-    /// `audit.outbox_evidence_unusable` while a migration pin remains, the
-    /// refusals of [`ApprovalRecorder::reserve_consent_evidence`], and those
-    /// of `present`.
+    /// [`sweep_ended_consent_evidence`], of [`Self::reacquire`], and those of
+    /// `present`.
     pub fn admit<T>(
         &mut self,
         operation: OperationId,
@@ -1625,7 +1624,7 @@ impl ConsentAdmission<'_> {
         present: impl FnOnce(&WireApproval, &EvidenceReservation) -> Result<T, WalletError>,
     ) -> Result<T, WalletError> {
         let name = profile_name_for_approval(self.profile);
-        require_consent_evidence_inventory(&name)?;
+        require_consent_evidence_inventory(self.store, self.profile, self.outbox)?;
         let status = ApprovalStatus::new(self.store, self.profile);
         let committed = || {
             status
@@ -1655,12 +1654,15 @@ impl ConsentAdmission<'_> {
     }
 
     /// Reacquires an existing record's slot without acquiring an audit writer.
-    /// Inventory, initialized evidence and authenticated facts must all agree.
+    /// The readiness proof, initialized evidence and authenticated facts must
+    /// all agree. Before the reservation, each migration pin that a live
+    /// authenticated grant's queued reference matches exactly is adopted.
     /// This path never initializes from absent ownership or evidence files.
     ///
     /// # Errors
-    /// Returns inventory, evidence and authenticated record refusals, including
-    /// `approval.evidence_capacity`. Unresolved migration pins refuse admission.
+    /// Returns readiness, adoption, evidence and authenticated record
+    /// refusals, including `approval.evidence_capacity`. A migration pin that
+    /// no grant adopts refuses with `unresolved migration pin`.
     pub fn reacquire(
         store: &PersistedWindowStore,
         profile: &Profile,
@@ -1669,7 +1671,8 @@ impl ConsentAdmission<'_> {
         outbox: &AuditOutbox,
     ) -> Result<EvidenceReservation, WalletError> {
         let name = profile_name_for_approval(profile);
-        require_consent_evidence_inventory(&name)?;
+        require_consent_evidence_inventory(store, profile, outbox)?;
+        adopt_consent_evidence_pins(store, profile, outbox)?;
         let evidence_refusal = |error: WriterError| audit_writer_refusal(&name, &error);
         if outbox
             .evidence()
@@ -2577,6 +2580,7 @@ pub(crate) mod tests {
     /// exhausted sequence refuses before the deadline clock is read.
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn rebuild_reads_after_consent_and_rebinds_oracle() {
         use crate::cross_check::{
@@ -2923,6 +2927,7 @@ pub(crate) mod tests {
         /// edges it commits; a refused second entry commits nothing and
         /// keeps the batch's earlier edges.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn attempt_wrappers_preserve_commits_on_success_and_refusal() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();

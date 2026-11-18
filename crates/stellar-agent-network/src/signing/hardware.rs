@@ -1203,6 +1203,7 @@ mod tests {
     /// its key. A clock that leaves the interval during that exchange sends
     /// no signing command.
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn transaction_signing_rechecks_the_authorization_after_the_key_exchange() {
         let own_key = [7; 32];

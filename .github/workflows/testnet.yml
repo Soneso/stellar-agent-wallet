@@ -114,6 +114,7 @@ jobs:
       - name: Run testnet acceptance suites
         env:
           SHARE: 1/2
+          STELLAR_AGENT_PAYMENT_EVIDENCE_DIR: ${{ github.workspace }}/target/tmp/payment-evidence
           FILTER: ${{ inputs.filter }}
           MAINNET_WRITE: ${{ inputs.mainnet_write && 'on' || 'off' }}
           STELLAR_AGENT_TEST_KEYRING: ${{ inputs.keyring || 'headless' }}
@@ -123,6 +124,19 @@ jobs:
             gnome-keyring-daemon --components=secrets --daemonize --unlock <<< "ci-headless-keyring-password"
             exec .github/scripts/run-testnet-acceptance.sh
           '
+
+      - name: Validate payment evidence
+        if: always()
+        env:
+          PAYMENT_FILTER: ${{ inputs.filter }}
+        run: python3 .github/scripts/check-payment-evidence.py target/tmp/payment-evidence --execution live-testnet --share 1/2 --filter "$PAYMENT_FILTER"
+      - name: Retain payment evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: payment-evidence-share-1-mainnet-${{ inputs.mainnet_write && 'on' || 'off' }}
+          path: target/tmp/payment-evidence/*.jsonl
+          if-no-files-found: warn
 
   acceptance-2:
     needs: acceptance-1
@@ -189,6 +203,7 @@ jobs:
       - name: Run testnet acceptance suites
         env:
           SHARE: 2/2
+          STELLAR_AGENT_PAYMENT_EVIDENCE_DIR: ${{ github.workspace }}/target/tmp/payment-evidence
           FILTER: ${{ inputs.filter }}
           MAINNET_WRITE: ${{ inputs.mainnet_write && 'on' || 'off' }}
           STELLAR_AGENT_TEST_KEYRING: ${{ inputs.keyring || 'headless' }}
@@ -198,3 +213,16 @@ jobs:
             gnome-keyring-daemon --components=secrets --daemonize --unlock <<< "ci-headless-keyring-password"
             exec .github/scripts/run-testnet-acceptance.sh
           '
+
+      - name: Validate payment evidence
+        if: always()
+        env:
+          PAYMENT_FILTER: ${{ inputs.filter }}
+        run: python3 .github/scripts/check-payment-evidence.py target/tmp/payment-evidence --execution live-testnet --share 2/2 --filter "$PAYMENT_FILTER"
+      - name: Retain payment evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: payment-evidence-share-2-mainnet-${{ inputs.mainnet_write && 'on' || 'off' }}
+          path: target/tmp/payment-evidence/*.jsonl
+          if-no-files-found: warn

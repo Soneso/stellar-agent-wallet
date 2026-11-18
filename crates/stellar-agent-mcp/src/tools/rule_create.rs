@@ -1198,16 +1198,9 @@ impl WalletServer {
 
     /// Inner implementation of `stellar_rule_create_commit`.
     ///
-    /// Separated so BOTH call sites — the public tool handler
-    /// (`stellar_rule_create_commit`) and the toolset-gated path
-    /// (`invoke_stellar_rule_create_commit_toolset_gated`) — supply a
-    /// forced `DispatchOutcome::RequireApproval` override, mirroring
-    /// `stellar_pay_commit_impl` (pay.rs:1135)'s override PLUMBING, but with
-    /// a DELIBERATE divergence from the pay precedent: `forced_dispatch_outcome`
-    /// is `Some(..)` at EVERY call site here, never `None`. A payment `Allow`
-    /// spends within an operator-configured budget; a rule-create `Allow`
-    /// would let the agent grant itself permanent (potentially
-    /// account-wide) authority, which this feature's contract forbids.
+    /// Both the public and toolset handlers supply a forced
+    /// `DispatchOutcome::RequireApproval`. Installing a rule grants persistent
+    /// account authority, so every installation requires operator consent.
     ///
     /// # Security
     ///
@@ -1748,8 +1741,7 @@ impl WalletServer {
     }
 
     /// Routes to `stellar_rule_create_commit` with the per-action
-    /// `RuleProposalSimulated` approval FORCED ON UNCONDITIONALLY — mirrors
-    /// `invoke_stellar_pay_commit_toolset_gated` (pay.rs:1654).
+    /// `RuleProposalSimulated` approval required unconditionally.
     ///
     /// Unlike the pay/claim toolset-gated wrappers, no "synthesise a fresh
     /// pending approval if the agent doesn't already have one" branch is

@@ -20,5 +20,8 @@ pub mod fact;
 /// The oracle a mainnet profile needs for enablement and writes.
 pub mod oracle;
 
+/// The checked toolset grant facts a restricted mainnet payment binds.
+pub mod toolset_grant;
+
 /// The verified signed policy of a mainnet profile and its mainnet section.
 pub mod verified_policy;

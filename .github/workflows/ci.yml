@@ -1,7 +1,11 @@
 name: CI
 
-# Every pull request to main or mainnet-write runs the offline gate suite,
-# including docs changes. Pushes to those branches use the paths filter below.
+# Every pull request to main runs the offline gate suite, including docs
+# changes. A pull request to mainnet-write that changes only documentation
+# skips the jobs that read no documentation path and the workspace build and
+# test jobs; the docs-tests job runs the tests that read documentation in
+# their place. The changes job decides.
+# Pushes to those branches use the paths filter below.
 # Skill changes run the archive checks on main.
 # The suite covers format, lint, rustdoc, offline tests, dependencies, and licenses.
 # Coverage runs in coverage.yml.
@@ -37,8 +41,34 @@ env:
   FEATURES_EXCEPT_MAINNET_WRITE: live-platform-keyring,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance
 
 jobs:
+  # Prints docs_only=true for a pull request into mainnet-write that changes
+  # only documentation paths, and docs_only=false for every other event.
+  changes:
+    name: changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      docs_only: ${{ steps.classify.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Classify the changed files
+        id: classify
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 .github/scripts/classify-docs-only.py >> "$GITHUB_OUTPUT"
+
+  # A job that reads no documentation path skips a docs-only pull request.
+  # !cancelled() keeps it running when the changes job fails.
   fmt:
     name: fmt
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -54,6 +84,8 @@ jobs:
 
   clippy:
     name: clippy
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -82,6 +114,8 @@ jobs:
 
   doc:
     name: rustdoc
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -105,6 +139,8 @@ jobs:
 
   test:
     name: test (offline)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     # Dropping test-profile debuginfo roughly halves target/ size and link time,
@@ -163,6 +199,8 @@ jobs:
 
   feature-on-clippy:
     name: feature-on-clippy
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -190,6 +228,8 @@ jobs:
 
   feature-on-doc:
     name: feature-on-doc
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -211,6 +251,8 @@ jobs:
 
   feature-on-test:
     name: feature-on-test
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     # Dropping test-profile debuginfo roughly halves target/ size and link
@@ -252,6 +294,49 @@ jobs:
       - name: Check the proof matrix
         run: python3 .github/scripts/check-proof-matrix.py --configuration feature-on --workspace
 
+  # Runs on a docs-only pull request into mainnet-write only, where clippy,
+  # test, feature-on-clippy, feature-on-test, and windows-storage skip. It
+  # builds and runs the tests that .github/docs-tests.tsv lists, the tests
+  # that read a documentation path, in both feature states of the test jobs.
+  # cargo check --all-targets of each listed package fails on a renamed or
+  # deleted file that an include_str! names.
+  docs-tests:
+    name: docs-tests
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - name: Install libudev (Linux hidapi)
+        run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config
+      # The shared key restores the cache that push runs of the test job save;
+      # this job runs on pull requests only, so it never saves.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: test
+          save-if: ${{ github.event_name == 'push' }}
+      - name: Check the documentation reads
+        run: python3 .github/scripts/check-docs-reads.py
+      - name: Run the documentation tests, feature off
+        run: python3 .github/scripts/run-docs-tests.py --no-default-features --features test-helpers,test-hooks,test-loopback,verifier-registry
+      - name: Run the documentation tests, feature on
+        run: python3 .github/scripts/run-docs-tests.py --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry
+
   feature-discipline:
     name: feature-discipline
     runs-on: ubuntu-24.04
@@ -280,6 +365,8 @@ jobs:
 
   release-shape:
     name: release-shape
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -299,6 +386,8 @@ jobs:
 
   inbox-js:
     name: inbox renderers
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -315,6 +404,8 @@ jobs:
 
   mpp-interop:
     name: mpp released-sdk interop
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -331,6 +422,8 @@ jobs:
 
   sdk-v17-interop:
     name: stellar-sdk v17 preimage interop
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -379,6 +472,12 @@ jobs:
         run: python3 .github/scripts/test-check-coverage.py
       - name: Self-test the proof matrix check
         run: python3 .github/scripts/test-check-proof-matrix.py
+      - name: Self-test the docs-only classifier
+        run: python3 .github/scripts/test-classify-docs-only.py
+      - name: Check the documentation reads
+        run: python3 .github/scripts/check-docs-reads.py
+      - name: Self-test the documentation read check
+        run: python3 .github/scripts/test-check-docs-reads.py
       - name: Self-test the unsigned archive validation
         run: python3 .github/scripts/test-validate-unsigned-archive.py
       # The runner image documents no PyYAML for its system Python, so the
@@ -401,6 +500,8 @@ jobs:
 
   windows-storage:
     name: windows-storage
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     runs-on: windows-2025
     timeout-minutes: 90
     # Targeted regression coverage for Windows-only local-storage bugs that
@@ -541,6 +642,8 @@ jobs:
 
   platform-keyring:
     name: platform-keyring
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     # Mainnet wallet processes store their keys in the platform keyring, so
@@ -578,6 +681,8 @@ jobs:
 
   deploy-scripts:
     name: deploy-scripts (${{ matrix.os }})
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     # The wrappers read stat, ls, and pgrep output, whose forms differ
@@ -603,6 +708,8 @@ jobs:
 
   machete:
     name: unused-deps
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -622,6 +729,8 @@ jobs:
 
   deny:
     name: licenses-advisories
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:

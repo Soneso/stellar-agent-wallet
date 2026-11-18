@@ -1,4 +1,5 @@
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn canonical_wire_compatibility_and_lifecycle() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();

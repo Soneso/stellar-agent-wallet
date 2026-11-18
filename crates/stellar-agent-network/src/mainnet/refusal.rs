@@ -255,6 +255,14 @@ pub enum MainnetPrecondition {
     /// was minted under: another variant, another approval, or another
     /// policy authority.
     AuthorityMismatch,
+    /// A toolset restriction is presented to another consumer than the MCP
+    /// payment commit, or for another action than `stellar_pay_commit`.
+    ToolsetRestrictionConsumer,
+    /// A toolset restriction's profile, chain, destination, asset, or amount
+    /// differs from the resolution's context or authoritative payment.
+    ToolsetRestrictionMismatch,
+    /// The restricting toolset grant's original end has passed.
+    ToolsetGrantExpired,
 }
 
 impl MainnetPrecondition {
@@ -376,6 +384,9 @@ impl MainnetPrecondition {
             Self::FreshDecisionRequiresApproval => "fresh_decision_requires_approval",
             Self::AuthorityScopeMismatch => "authority_scope_mismatch",
             Self::AuthorityMismatch => "authority_mismatch",
+            Self::ToolsetRestrictionConsumer => "toolset_restriction_consumer",
+            Self::ToolsetRestrictionMismatch => "toolset_restriction_mismatch",
+            Self::ToolsetGrantExpired => "toolset_grant_expired",
         }
     }
 }
@@ -796,6 +807,9 @@ mod tests {
             P::FreshDecisionRequiresApproval,
             P::AuthorityScopeMismatch,
             P::AuthorityMismatch,
+            P::ToolsetRestrictionConsumer,
+            P::ToolsetRestrictionMismatch,
+            P::ToolsetGrantExpired,
         ];
         for precondition in all {
             match precondition {
@@ -911,7 +925,10 @@ mod tests {
                 | P::MessageClientAccount
                 | P::FreshDecisionRequiresApproval
                 | P::AuthorityScopeMismatch
-                | P::AuthorityMismatch => {}
+                | P::AuthorityMismatch
+                | P::ToolsetRestrictionConsumer
+                | P::ToolsetRestrictionMismatch
+                | P::ToolsetGrantExpired => {}
             }
         }
         all.to_vec()
@@ -1037,6 +1054,9 @@ mod tests {
             "fresh_decision_requires_approval",
             "authority_scope_mismatch",
             "authority_mismatch",
+            "toolset_restriction_consumer",
+            "toolset_restriction_mismatch",
+            "toolset_grant_expired",
         ];
         assert_eq!(all.iter().map(|p| p.label()).collect::<Vec<_>>(), expected);
         let mut labels: Vec<_> = all.iter().map(|p| p.label()).collect();

@@ -73,6 +73,35 @@ use crate::mainnet::types::{
 };
 use crate::mainnet::{MainnetPrecondition, refusal::require};
 
+/// Observes a prepared mint before it takes the durable accounting lock.
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod mint_test_seam {
+    use super::MintRequest;
+    type Hook = Box<dyn FnOnce(&MintRequest)>;
+    thread_local! {
+        static BEFORE: std::cell::RefCell<Option<Hook>> = const { std::cell::RefCell::new(None) };
+    }
+    /// Removes an uncalled observer on this thread.
+    #[must_use]
+    pub struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            BEFORE.with_borrow_mut(|hook| *hook = None);
+        }
+    }
+    /// Calls the observer once after sizing and before the next mint's writer lock.
+    pub fn before_next_mint(hook: impl FnOnce(&MintRequest) + 'static) -> Guard {
+        BEFORE.with_borrow_mut(|slot| *slot = Some(Box::new(hook)));
+        Guard
+    }
+    pub(super) fn fire(request: &MintRequest) {
+        let hook = BEFORE.with_borrow_mut(Option::take);
+        if let Some(hook) = hook {
+            hook(request);
+        }
+    }
+}
+
 /// The most authorizations one profile holds open at once.
 pub const MAX_OPEN_AUTHORIZATIONS: usize = 16;
 
@@ -1195,6 +1224,9 @@ pub struct MintRequest {
     pub authority: MintAuthority,
     /// The signed envelope's on-chain deadline; the authorization expires no later.
     pub chain_deadline_ms: Option<u64>,
+    /// The restricting toolset grant's original end; the authorization
+    /// expires no later.
+    pub restriction_end_ms: Option<u64>,
     /// The authorization's lifetime, in milliseconds.
     pub authorization_ttl_ms: u64,
     /// Per-proof fact digests. The reservation must be absent; mint computes it.
@@ -2222,6 +2254,8 @@ impl PersistedWindowStore {
         let approval_identity = request.approval_identity()?;
         // A malformed entry refuses before the lock, the key, and any read.
         check_total_shape(&request.holds)?;
+        #[cfg(any(test, feature = "test-helpers"))]
+        mint_test_seam::fire(request);
         let lock = self.ledger_lock(profile)?;
         let now = now_ms()?;
         let cap = self.mint_record_checks(profile, request, approval_identity, now)?;
@@ -2367,7 +2401,8 @@ impl PersistedWindowStore {
         let expires = ttl_end
             .min(request.authority.expires_at_ms())
             .min(cap.unwrap_or(u64::MAX))
-            .min(request.chain_deadline_ms.unwrap_or(u64::MAX));
+            .min(request.chain_deadline_ms.unwrap_or(u64::MAX))
+            .min(request.restriction_end_ms.unwrap_or(u64::MAX));
         check(expires > now, P::LifetimeInvalid)?;
 
         pin::compare(
@@ -2788,6 +2823,7 @@ mod tests {
     use crate::mainnet::types::RecomputedFacts;
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn revocation_waits_for_the_mint_commit() {
         use super::super::approvals::{
@@ -2969,6 +3005,7 @@ mod tests {
                     expires_at_ms: T0 + APPROVAL_MS,
                 },
                 chain_deadline_ms: None,
+                restriction_end_ms: None,
                 authorization_ttl_ms: TTL_MS,
                 bindings: BindingFacts {
                     endpoint: None,
@@ -2979,6 +3016,7 @@ mod tests {
                     reservation: None,
                     authority: [7; 32],
                     audit: [8; 32],
+                    restriction: None,
                 },
                 holds,
                 parent: None,
@@ -3159,6 +3197,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_claim_moves_an_open_record_and_keeps_its_holds() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -3190,6 +3229,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn an_invalidation_after_the_claim_keeps_the_holds() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -3214,6 +3254,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_claim_after_the_invalidation_refuses() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -3234,14 +3275,32 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn an_expired_claim_keeps_its_spend_counted() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let l = Ledger::new();
-        let request = l.request(tx(1), vec![hold(700), hold_in("fee", 30)]);
+        let total = WindowEntry::new(
+            StateKey::new("ledger", 1, "total:native", 0),
+            T0,
+            700,
+            WindowLimit::Total {
+                asset: "native".to_owned(),
+                max_stroops: 1_000,
+            },
+        )
+        .with_epoch(Some([7; 32]));
+        let mut request = l.request(tx(1), vec![hold(700), hold_in("fee", 30), total.clone()]);
+        request.restriction_end_ms = Some(T0 + 30_000);
+        request.bindings.restriction = Some([0x91; 32]);
         let minted = l.mint(&request).unwrap();
+        assert_eq!(
+            minted.expires_at_ms,
+            T0 + 30_000,
+            "the original restriction end bounds the claim"
+        );
         l.clock.set(T0 + 7);
         l.claim(&request, &minted).unwrap();
         l.clock.set(minted.expires_at_ms);
@@ -3261,7 +3320,7 @@ mod tests {
             .iter()
             .flat_map(|bucket| &bucket.records)
             .collect();
-        assert_eq!(records.len(), 2);
+        assert_eq!(records.len(), 3);
         for record in &records {
             assert_eq!(record.ts_ms, T0 + 7);
             assert_eq!(record.status, RecordStatus::Confirmed);
@@ -3289,9 +3348,46 @@ mod tests {
             Err(WindowStoreError::PolicyDenied { .. })
         ));
         l.mint(&l.request(tx(2), vec![hold(300)])).unwrap();
+        let reopened = PersistedWindowStore::at_path(l.store.path().to_owned());
+        let after_retention = T0 + RETENTION_MS + 2 * 86_400_000;
+        l.clock.set(after_retention);
+        reopened.record_authorized(&l.profile, &[]).unwrap();
+        let memory = PolicyStateStore::new();
+        reopened
+            .load_into_at("ledger", &l.profile, &memory, after_retention)
+            .unwrap();
+        assert_eq!(
+            memory
+                .query_window(&state_key("native"), after_retention)
+                .unwrap(),
+            (0, 0),
+            "the rolling debit ages normally"
+        );
+        assert_eq!(
+            memory.query_epoch(total.key(), [7; 32]).unwrap(),
+            (700, 1),
+            "the original total epoch remains counted after retention"
+        );
+        assert!(
+            matches!(
+                reopened.record_authorized(
+                    &l.profile,
+                    &[WindowEntry::new(
+                        total.key().clone(),
+                        after_retention,
+                        301,
+                        total.limit().clone()
+                    )
+                    .with_epoch(Some([7; 32]))]
+                ),
+                Err(WindowStoreError::PolicyDenied { .. })
+            ),
+            "settlement and aging cannot restore the total budget"
+        );
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_reopened_store_cannot_claim_twice_or_mint_the_approval_again() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -3318,6 +3414,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_claim_round_trips_under_the_claim_version() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -3346,6 +3443,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_claim_time_on_an_open_record_is_refused() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -3363,6 +3461,7 @@ mod tests {
     /// A claim time belongs to a claimed record or to the used or expired
     /// record a claim settles into, and lies inside the record's lifetime.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn claim_times_follow_the_record_state_and_lifetime() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -3422,6 +3521,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_claimed_content_refuses_a_duplicate_mint() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -3440,6 +3540,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn claimed_records_count_toward_the_open_limit() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -3458,6 +3559,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_claim_holds_to_the_lifetime_on_the_store_clock() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -3486,6 +3588,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_claim_refuses_a_mismatched_expectation() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -3535,6 +3638,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_claim_refuses_a_changed_policy_pin() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -3555,6 +3659,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_claim_that_fails_to_persist_leaves_the_record_open() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -3735,6 +3840,7 @@ mod tests {
     // ── mint ─────────────────────────────────────────────────────────────
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_mint_records_the_authorization_its_holds_and_its_reservation() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -3784,6 +3890,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn mint_caps_the_authorization_at_the_chain_deadline() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -3799,6 +3906,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn the_lifetime_is_the_earlier_of_the_ttl_and_the_approval_expiry() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -3832,6 +3940,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_mint_requires_the_mainnet_profile_chain() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -3856,6 +3965,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_mint_requires_a_present_matching_pin() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -3893,6 +4003,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_duplicate_open_content_refuses_until_the_record_settles() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -3928,33 +4039,49 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn an_approval_nonce_is_single_use_within_retention() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        let l = Ledger::new();
-        let first = l.request(message(1), vec![]);
-        let minted = l.mint(&first).unwrap();
-        let mut reuse = l.request(message(2), vec![]);
-        *reuse.authority.nonce_mut() = first.authority.nonce().clone();
-        assert_eq!(
-            refusal(l.mint(&reuse)),
-            MainnetPrecondition::ApprovalNonceReused
-        );
-        assert!(
-            l.store
-                .invalidate_authorization(&l.profile, minted.id, "abandoned")
-                .unwrap()
-        );
-        assert_eq!(
-            refusal(l.mint(&reuse)),
-            MainnetPrecondition::ApprovalNonceReused,
-            "a settled record keeps its nonce spent"
-        );
+        for restricted in [true, false] {
+            let l = Ledger::new();
+            let mut first = l.request(if restricted { tx(1) } else { message(1) }, vec![]);
+            if restricted {
+                first.restriction_end_ms = Some(T0 + 30_000);
+                first.bindings.restriction = Some([0x91; 32]);
+                first.holds = vec![hold(10)];
+            }
+            assert!(
+                first.operation.is_none(),
+                "operation serialization must not decide proof reuse"
+            );
+            let minted = l.mint(&first).unwrap();
+            let mut reuse = l.request(if restricted { tx(2) } else { message(2) }, vec![]);
+            reuse.restriction_end_ms = first.restriction_end_ms;
+            reuse.bindings.restriction = first.bindings.restriction;
+            reuse.holds = first.holds.clone();
+            *reuse.authority.nonce_mut() = first.authority.nonce().clone();
+            assert_eq!(
+                refusal(l.mint(&reuse)),
+                MainnetPrecondition::ApprovalNonceReused
+            );
+            assert!(
+                l.store
+                    .invalidate_authorization(&l.profile, minted.id, "abandoned")
+                    .unwrap()
+            );
+            assert_eq!(
+                refusal(l.mint(&reuse)),
+                MainnetPrecondition::ApprovalNonceReused,
+                "a settled record keeps its nonce spent"
+            );
+        }
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn approval_mint_without_a_record_keeps_its_body() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -3983,6 +4110,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn at_most_sixteen_authorizations_are_open() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4005,6 +4133,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_domain_without_holds_refuses_entries_and_records_no_reservation() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4033,6 +4162,7 @@ mod tests {
     // ── admission and accounting ────────────────────────────────────────
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn holds_count_against_spend_pending_records_and_other_holds() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4076,6 +4206,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn hydration_and_reconciliation_never_see_holds() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4099,6 +4230,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn expiry_at_equality_drops_only_the_expired_holds() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4143,9 +4275,153 @@ mod tests {
         );
     }
 
+    #[test]
+    #[serial_test::serial(mainnet_clock)]
+    #[serial]
+    fn fresh_restricted_mint_sweeps_expired_capacity() {
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let l = Ledger::new();
+        let mut ids = Vec::new();
+        for index in 0..MAX_OPEN_AUTHORIZATIONS {
+            let mut request = l.request(tx(u8::try_from(index + 1).unwrap()), vec![hold(1)]);
+            request.restriction_end_ms = Some(T0 + 10_000);
+            request.bindings.restriction = Some([0x91; 32]);
+            let minted = l.mint(&request).unwrap();
+            assert_eq!(minted.expires_at_ms, T0 + 10_000);
+            ids.push(minted.id);
+        }
+        assert_eq!(l.wire().holds.len(), MAX_OPEN_AUTHORIZATIONS);
+        l.clock.set(T0 + 10_000);
+        let mut next = l.request(tx(100), vec![hold(1)]);
+        next.restriction_end_ms = Some(T0 + 20_000);
+        next.bindings.restriction = Some([0x92; 32]);
+        let minted = l
+            .mint(&next)
+            .expect("a fresh mint sweeps expired capacity before admission");
+        assert_eq!(l.wire().holds.len(), 1);
+        for id in ids {
+            assert_eq!(l.record(id).state, AuthorizationState::Expired);
+            assert_eq!(l.record(id).settled_ms, Some(T0 + 10_000));
+        }
+        assert_eq!(l.record(minted.id).state, AuthorizationState::Open);
+        l.clock.set(T0 + 9_999);
+        assert_eq!(
+            l.wire()
+                .authorizations
+                .iter()
+                .filter(|record| record.state == AuthorizationState::Expired)
+                .count(),
+            MAX_OPEN_AUTHORIZATIONS,
+            "a backward clock cannot revive swept records"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(mainnet_clock)]
+    #[serial]
+    fn restricted_mint_recovers_composed_holds_at_each_commit_write() {
+        use super::super::store::{
+            COMMIT_FAULT_AFTER_COUNTER, COMMIT_FAULT_AFTER_PREPARED, COMMIT_FAULT_COMPACTION,
+            arm_accounting_fault,
+        };
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        for seam in [
+            COMMIT_FAULT_AFTER_COUNTER,
+            COMMIT_FAULT_AFTER_PREPARED,
+            COMMIT_FAULT_COMPACTION,
+        ] {
+            let l = Ledger::new();
+            l.mint(&l.request(tx(1), vec![])).unwrap();
+            let mut original_wire = l.wire();
+            let launch: WireFile = serde_json::from_str(VERSION_NINE_BODY).unwrap();
+            let old = launch.authorizations[1].clone();
+            original_wire.authorizations[0] = old.clone();
+            validate(&original_wire).unwrap();
+            l.store.seal_unchecked_for_test(&l.profile, &original_wire);
+            assert_eq!(
+                l.record(old.id),
+                old,
+                "the literal launch-base unrestricted message record loads"
+            );
+            let total = WindowEntry::new(
+                StateKey::new("ledger", 1, "total:native", 0),
+                T0,
+                10,
+                WindowLimit::Total {
+                    asset: "native".to_owned(),
+                    max_stroops: 100,
+                },
+            )
+            .with_epoch(Some([7; 32]));
+            let mut request = l.request(tx(2), vec![hold(10), total]);
+            request.authority = MintAuthority::Policy(policy_binding(T0 + APPROVAL_MS));
+            request.restriction_end_ms = Some(T0 + 30_000);
+            request.bindings.restriction = Some([0x91; 32]);
+            let armed = arm_accounting_fault(seam);
+            let result = l.mint(&request);
+            drop(armed);
+            assert_eq!(result.is_ok(), seam == COMMIT_FAULT_COMPACTION);
+            let reopened = PersistedWindowStore::at_path(l.store.path().to_owned());
+            let recovered = reopened.read_for_inspection(&l.profile).unwrap().unwrap();
+            let committed = seam != COMMIT_FAULT_AFTER_PREPARED;
+            assert_eq!(recovered.authorizations.len(), 1 + usize::from(committed));
+            assert_eq!(
+                serde_json::to_value(&recovered.authorizations[0]).unwrap(),
+                serde_json::to_value(old).unwrap(),
+                "the unrestricted record stays byte-equivalent"
+            );
+            let (id, bindings_digest) = if committed {
+                let record = &recovered.authorizations[1];
+                assert_eq!(record.expires_ms, T0 + 30_000);
+                assert_eq!(recovered.holds.len(), 2);
+                assert!(recovered.holds.iter().all(|hold| hold.amount == 10));
+                assert_eq!(
+                    refusal(reopened.mint_authorization(&l.profile, &request)),
+                    MainnetPrecondition::DuplicateOpen
+                );
+                (record.id, record.bindings_digest)
+            } else {
+                let minted = reopened.mint_authorization(&l.profile, &request).unwrap();
+                (minted.id, minted.bindings_digest)
+            };
+            let fresh = l.wire();
+            assert_eq!(fresh.authorizations.len(), 2);
+            assert_eq!(fresh.holds.len(), 2);
+            assert_eq!(l.record(id).expires_ms, T0 + 30_000);
+            assert_eq!(
+                fresh
+                    .holds
+                    .iter()
+                    .find(|hold| hold.bucket == "total:native")
+                    .unwrap()
+                    .epoch,
+                Some([7; 32])
+            );
+            l.clock.set(T0 + 29_999);
+            let expectation = ClaimExpect {
+                operation: request.operation,
+                intent_digest: request.intent_digest,
+                predecessor: request.predecessor,
+                domain: request.binding.domain(),
+                consumer: request.consumer,
+                bindings_digest,
+                policy_sequence: request.policy_sequence,
+                policy_digest: request.policy_digest,
+                authority: request.authority.clone(),
+            };
+            reopened
+                .claim_authorization(&l.profile, id, &expectation)
+                .unwrap();
+            assert_eq!(l.record(id).state, AuthorizationState::Claimed);
+        }
+    }
+
     // ── consumption ─────────────────────────────────────────────────────
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_transaction_consume_converts_its_holds_into_the_submission() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4195,6 +4471,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_second_consume_refuses() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4223,6 +4500,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_consume_compares_every_expectation() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4392,6 +4670,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_consume_accepts_the_audit_count_at_equality() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4405,6 +4684,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_consume_checks_the_binding_against_the_domain_facts() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4506,6 +4786,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_consume_rereads_the_pin_under_its_lock() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4525,6 +4806,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_consume_holds_to_the_lifetime_on_the_store_clock() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4556,6 +4838,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_soroban_consume_retains_its_holds_as_authorized_spend() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4609,6 +4892,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn an_x402_submission_continues_its_used_intent_once() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4640,6 +4924,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_continuation_breaking_a_requirement_refuses() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4726,6 +5011,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_release_checks_its_parent_and_payload() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4775,6 +5061,7 @@ mod tests {
     // ── fee bumps and batches ───────────────────────────────────────────
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn the_fee_bump_roles_split_value_and_fee_holds() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4853,6 +5140,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_fee_bump_consume_checks_its_role_facts() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4914,6 +5202,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_batch_consume_is_all_or_nothing() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4970,6 +5259,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_consume_of_an_envelope_the_window_holds_is_a_duplicate() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5010,6 +5300,7 @@ mod tests {
     /// A consumed binding preserves ownership even when it reserved no window
     /// entries. The duplicate check runs before authorization expectations.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_consumed_envelope_without_holds_is_a_duplicate() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5061,6 +5352,7 @@ mod tests {
     // ── contention, invalidation, pruning, versions ─────────────────────
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn concurrent_mints_of_one_content_yield_one_open_record() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5099,6 +5391,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn an_invalidation_releases_the_holds_and_never_reopens() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5146,6 +5439,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn settled_history_is_pruned_after_retention_and_the_version_follows() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5247,6 +5541,7 @@ mod tests {
     /// the store clock, so its nonce stays single use. A record that holds
     /// capacity becomes expired; the mainnet rules refuse while it is open.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_reset_keeps_every_record_whose_approval_can_be_presented() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5352,6 +5647,7 @@ mod tests {
     /// A record whose approval ends at or before the store clock does not
     /// survive the reset, and the store clock, not the caller's, decides.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_reset_drops_records_whose_approval_expired() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5397,6 +5693,7 @@ mod tests {
     /// pruning keeps it while its approval can still be presented, even when
     /// the settlement lies before its retention window.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_reset_settles_a_record_minted_ahead_of_the_store_clock() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5443,6 +5740,7 @@ mod tests {
     /// A reset keeps a used intent and its child, so the intent continues
     /// once.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_reset_keeps_a_continued_intent_and_its_child() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5482,6 +5780,7 @@ mod tests {
     /// A reset keeps the acknowledged, unprojected expiry records and the
     /// presentable authorization records together.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_reset_keeps_both_retained_collections() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5520,6 +5819,7 @@ mod tests {
     /// reset and `record` never runs.
     #[cfg(feature = "mainnet-write")]
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn the_snapshot_refusals_precede_the_owner_consent() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5777,6 +6077,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn open_authorizations_reads_without_writing() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5819,6 +6120,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn mint_computes_the_reservation_aggregate() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5841,6 +6143,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn mint_refuses_a_supplied_reservation() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5859,6 +6162,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn an_absent_pin_mints_no_window_key() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5890,6 +6194,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_future_hold_refuses_before_key_creation() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5925,6 +6230,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn soroban_mint_requires_an_x402_consumer() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -6018,6 +6324,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_message_record_is_minted_only_for_the_authenticated_consumer() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -6037,6 +6344,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn an_authenticated_intent_continues_its_used_message_once() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -6051,6 +6359,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn an_authenticated_continuation_breaking_a_requirement_refuses() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -6170,6 +6479,7 @@ mod tests {
     /// A message consume compares the recomputed content digest before the
     /// consumption binding.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_message_consume_compares_the_content_before_the_binding() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -6209,6 +6519,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn an_open_soroban_consume_checks_the_intent() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -6239,6 +6550,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_changed_audit_segment_refuses_even_after_the_count_recovers() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -6276,6 +6588,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn consume_refuses_another_profile_name() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -6303,6 +6616,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn consume_refuses_another_profile_chain() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -6329,6 +6643,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn invalidate_refuses_another_profile_name() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -6351,6 +6666,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn invalidate_refuses_another_profile_chain() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -6372,6 +6688,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn every_fee_bump_fact_is_compared_at_consumption() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -6471,6 +6788,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn only_the_inner_hash_carried_by_the_envelope_consumes() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -6492,6 +6810,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_held_lock_refuses_a_mint() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -6528,6 +6847,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_second_path_over_one_entry_cannot_mint_while_the_first_holds_the_lock() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -6550,6 +6870,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_second_path_over_one_entry_cannot_admit_cancel_or_bind_while_the_first_holds_the_lock() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -6626,6 +6947,7 @@ mod tests {
     /// the nonce check nor the duplicate content check of the other's file
     /// can stop the second mint. The lock of the entry is what stops it.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn two_paths_mint_one_approval_once() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -6671,6 +6993,7 @@ mod tests {
     /// Each transition through a second path refuses while the entry's lock is
     /// held through the first, and neither file nor the commitment moves.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn every_store_transition_takes_the_entry_lock() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -6896,6 +7219,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     fn a_wrong_pin_guard_is_an_invalid_request() {
         assert!(matches!(
             pin_refusal(PinError::WrongGuard),
@@ -6983,6 +7307,7 @@ mod tests {
         }
     }
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn consumption_requires_the_submission_scope() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -7201,6 +7526,7 @@ mod tests {
     /// An open record blocks the same domain and content under either
     /// authority until it settles.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_duplicate_open_policy_content_refuses_until_the_record_settles() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -7237,6 +7563,7 @@ mod tests {
     /// parent. A policy child of a policy parent under the same authority
     /// continues it.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn policy_child_under_approval_parent_refuses() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -7280,6 +7607,7 @@ mod tests {
     /// expiry, or a policy authority. Every other shape refuses the read, and
     /// a mainnet load reports the state unverifiable.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn wire_authorization_refuses_both_projections() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -7371,6 +7699,7 @@ mod tests {
     /// These successors use the current write version, with or without a policy
     /// authority, and a version below 10 carrying one refuses the read.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn version_ten_only_with_policy_authority() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -7499,6 +7828,7 @@ mod tests {
     /// variant or another policy authority refuses, the record's own
     /// proceeds.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_policy_record_compares_its_authority() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -7557,6 +7887,7 @@ mod tests {
     /// refuses, and a consumption refuses a record that outlives its
     /// authority.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn a_policy_record_lives_within_its_governing_end() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -7630,6 +7961,7 @@ mod tests {
     struct NullAudit;
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn first_mint_consumes_the_record_for_its_operation() {
         use super::super::approvals::{ApprovalState, tests::Fx};
@@ -7663,6 +7995,7 @@ mod tests {
     /// A mint persists its native amounts with or without window entries,
     /// zero amounts included, and refuses negative amounts unwritten.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn mint_persists_native_amounts_including_zero_buckets() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -7723,6 +8056,7 @@ mod tests {
     /// epochs. A row releases only at or past its bound. `used` alone
     /// releases nothing, and an absent observation keeps bounded rows.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn native_amounts_count_once_per_reservation() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -7798,6 +8132,7 @@ mod tests {
     /// Consumption keeps the authorization's native amounts and writes no
     /// release row.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn consumption_keeps_native_amounts() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -7829,6 +8164,7 @@ mod tests {
     /// A remint under the same operation stores the successor's amounts and
     /// leaves the retired record's amounts beside it.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn remint_carries_native_amounts() {
         use super::super::approvals::tests::Fx;
@@ -7886,6 +8222,7 @@ mod tests {
     /// A record minted without amounts keeps them absent: its bytes hold no
     /// amount field and round-trip unchanged.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn legacy_authorization_without_amounts_keeps_its_bytes() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -7912,6 +8249,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn remint_under_the_same_operation_passes() {
         use super::super::approvals::tests::Fx;
@@ -7953,6 +8291,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn mint_without_an_operation_link_refuses_under_a_record() {
         use super::super::approvals::tests::Fx;
@@ -7970,8 +8309,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[serial(mainnet_clock)]
+    #[serial]
     fn consume_key_refuses_conflicting_identities_before_a_record_read() {
         use super::super::approvals::tests::Fx;
         let mut fx = Fx::new(300_000);
@@ -8096,6 +8435,7 @@ mod tests {
     /// untouched: the window file keeps its bytes and generation, another
     /// operation still refuses, and so does a revoked record.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn inbox_gc_leaves_the_durable_approval_record() {
         use super::super::approvals::{ApprovalState, tests::Fx};
@@ -8192,6 +8532,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn revoked_record_refuses_every_mint() {
         use super::super::approvals::{ApprovalState, tests::Fx};
@@ -8234,6 +8575,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn pending_record_without_consent_refuses_the_mint() {
         use super::super::approvals::tests::Fx;
@@ -8251,6 +8593,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn execution_boundary_is_exclusive() {
         use super::super::approvals::tests::Fx;
@@ -8302,6 +8645,7 @@ mod tests {
     /// operation the window does not hold, or to an attempt outside the
     /// allowance, refuses without a write.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn mint_stores_the_operation_link() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -8610,6 +8954,7 @@ mod tests {
         // ── probes on the mainnet route ──────────────────────────────────
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn total_survives_the_mcp_refresh() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -8644,6 +8989,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn total_survives_a_reopen_past_every_horizon() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -8672,6 +9018,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_new_epoch_starts_at_zero() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -8696,6 +9043,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn an_expired_signed_claim_stays_counted() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -8723,6 +9071,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn an_unresolved_send_stays_counted() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -8756,6 +9105,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn an_unused_hold_releases() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -8780,6 +9130,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn concurrent_admissions_admit_one() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -8862,6 +9213,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn total_rows_survive_successful_pruning() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -8886,6 +9238,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn an_x402_consume_stays_counted() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -8911,6 +9264,7 @@ mod tests {
         /// Authorized spend of 2 and a retained Soroban consumption of 4 are
         /// final charges; a transaction consumption of 3 stays pending.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn each_writer_marks_only_its_final_charges() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -8947,6 +9301,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn assets_are_isolated_within_one_digest() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -8967,6 +9322,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn open_holds_stay_in_their_epoch() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -8989,6 +9345,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn an_invalidated_hold_releases() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -9012,6 +9369,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_mint_binds_the_hold_epoch() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -9038,6 +9396,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn equality_at_the_limit_passes() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -9061,6 +9420,7 @@ mod tests {
         // ── reset ────────────────────────────────────────────────────────
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn reset_retains_a_claimed_total_once() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -9103,6 +9463,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn reset_converts_each_hold_once() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -9155,6 +9516,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn earlier_build_content_is_not_relabelled() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -9208,6 +9570,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn retirement_refuses_a_total_mint() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -9247,6 +9610,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn hydration_and_admission_agree_on_the_sum() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -9313,6 +9677,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn hydration_samples_one_clock() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -9432,6 +9797,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn equivalent_asset_spellings_share_one_total() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -9473,6 +9839,7 @@ mod tests {
         /// name taken from the policy text, counts in the one bucket that
         /// both spellings name.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn stored_rows_of_either_spelling_count_together() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -9546,6 +9913,7 @@ mod tests {
         /// refuses: the shape refusal wins, and no key, file, or counter is
         /// created.
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_malformed_mint_creates_no_key() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -9634,6 +10002,7 @@ mod tests {
         // ── shape checks of the mint ─────────────────────────────────────
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_mint_refuses_a_total_limit_on_a_windowed_key() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -9666,6 +10035,7 @@ mod tests {
         }
 
         #[test]
+        #[serial(mainnet_clock)]
         #[serial]
         fn a_mint_refuses_an_amount_limit_on_a_total_key() {
             let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();

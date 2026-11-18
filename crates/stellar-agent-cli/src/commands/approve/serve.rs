@@ -899,6 +899,7 @@ mod tests {
     /// durable record.
     #[cfg(feature = "mainnet-write")]
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn surface_revocation_preserves_child_mint_under_used_parent() {
         use stellar_agent_approval_ui::decision::RevocationAccess as _;

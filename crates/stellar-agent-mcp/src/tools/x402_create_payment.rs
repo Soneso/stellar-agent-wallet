@@ -787,15 +787,21 @@ impl WalletServer {
                 let DispatchOutcome::RequireApproval(approval) = &dispatch else {
                     return Ok(approval_required_indistinguishable(name));
                 };
-                let entry =
-                    self.x402_pending_approval(entry.as_ref(), dispatch.audit_decision(), || {
-                        self.write_x402_pending_approval(
-                            &root,
-                            None,
-                            approval,
-                            stellar_agent_network::mainnet::clock::now_ms,
-                        )
-                    });
+                let entry = self.x402_pending_approval(
+                    entry.as_ref(),
+                    dispatch.audit_decision(),
+                    crate::tools::business_entry::Staged {
+                        build: |_: Option<&stellar_agent_core::approval::ClassicIntent>| {
+                            self.x402_pending_entry(&root, None, approval)
+                        },
+                        insert: |entry| {
+                            self.insert_x402_pending(
+                                entry,
+                                stellar_agent_network::mainnet::clock::now_ms,
+                            )
+                        },
+                    },
+                );
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(error) => {
@@ -1005,13 +1011,26 @@ impl WalletServer {
         now_ms: impl FnOnce() -> Result<u64, stellar_agent_core::WalletError>,
     ) -> Result<stellar_agent_core::approval::PendingApproval, stellar_agent_core::WalletError>
     {
+        let entry = self.x402_pending_entry(root, home_domain, approval)?;
+        self.insert_x402_pending(entry, now_ms)
+    }
+
+    /// Builds the pending approval of an x402 payment intent without storing
+    /// it.
+    pub(super) fn x402_pending_entry(
+        &self,
+        root: &stellar_xdr::SorobanAuthorizedInvocation,
+        home_domain: Option<String>,
+        approval: &crate::tools::common::ApprovalOutcome,
+    ) -> Result<stellar_agent_core::approval::PendingApproval, stellar_agent_core::WalletError>
+    {
         use sha2::{Digest, Sha256};
         use stellar_agent_core::approval::{
             PendingApproval, attest::record_error, user_id::process_uid_for_attestation,
         };
         let network_id = Sha256::digest(self.context.network_passphrase().as_bytes()).into();
         let uid = process_uid_for_attestation().map_err(|error| record_error(&error))?;
-        let entry = PendingApproval::new_x402_pending(
+        Ok(PendingApproval::new_x402_pending(
             &network_id,
             root,
             home_domain,
@@ -1019,7 +1038,17 @@ impl WalletServer {
             approval.governing_ttl_ms,
         )
         .map_err(|error| record_error(&error))?
-        .with_policy_request(&approval.request);
+        .with_policy_request(&approval.request))
+    }
+
+    /// Stores a built x402 `entry` at the clock `now_ms` reads.
+    pub(super) fn insert_x402_pending(
+        &self,
+        entry: stellar_agent_core::approval::PendingApproval,
+        now_ms: impl FnOnce() -> Result<u64, stellar_agent_core::WalletError>,
+    ) -> Result<stellar_agent_core::approval::PendingApproval, stellar_agent_core::WalletError>
+    {
+        use stellar_agent_core::approval::attest::record_error;
         let mut store = self.x402_approval_store()?;
         let now = now_ms()?;
         store
@@ -2405,6 +2434,40 @@ pub(super) mod approval_tests {
     #[serial_test::serial]
     async fn key_read_crossing_expiry_signs_nothing() {
         expiry_case(false, true).await;
+    }
+
+    /// Dispatches both x402 tools off mainnet with the x402 kind's consent
+    /// publication enabled. Each call queues its approval through the direct
+    /// write, and no approval facade runs.
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) async fn off_mainnet_published_case() {
+        use stellar_agent_network::policy_state::approvals::{
+            ConsentEvidenceEnforcementGuard, facade_calls,
+        };
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let fixture = crate::tools::message_signing_tests::Fixture::new();
+        fixture.seed_signer();
+        fixture.seed_audit();
+        let mut server = fixture.server();
+        server.policy_engine = super::tests::make_require_approval_server().policy_engine;
+        server.set_approval_dir_for_test(fixture.dir.path().join("approvals"));
+        let _enabled = ConsentEvidenceEnforcementGuard::new(
+            &server.profile_name_for_approval(),
+            stellar_agent_core::approval::witness::ApprovedKind::X402Payment,
+        );
+        let before = facade_calls::count(server.window_store.path());
+        for auth in [false, true] {
+            let queued = value(&call(&server, auth, None).await);
+            assert!(
+                queued["data"]["approval"]["approval_nonce"].is_string(),
+                "auth={auth}: off mainnet the write runs alone: {queued}"
+            );
+        }
+        assert_eq!(
+            facade_calls::count(server.window_store.path()),
+            before,
+            "a published kind off mainnet calls no approval facade"
+        );
     }
 
     pub(crate) async fn subject_gate_case(expired: bool) {

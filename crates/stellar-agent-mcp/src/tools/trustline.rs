@@ -347,24 +347,21 @@ impl WalletServer {
         )
     }
 
-    /// Persists a [`PendingApproval`] entry for a `stellar_trustline` simulate call.
+    /// Builds the unattested entry of a `stellar_trustline` simulate call,
+    /// which [`WalletServer::insert_classic_pending`] stores.
     ///
     /// Records the holder, asset issuer, and optional limit as a trustline change.
     /// A missing or `i64::MAX` limit is stored as unlimited; zero removes the trustline.
     ///
-    /// Opens (or creates) the profile-scoped approval store, constructs an
-    /// unattested entry, inserts it, and returns the entry for nonce/expiry
-    /// extraction by the caller.
+    /// It also stages the canonical `intent`.
     ///
     /// # Errors
     ///
-    /// Returns a string error on any I/O, store-lock, clock, or trustline-field
-    /// validation failure from [`PendingApproval::new_trustline_pending`].
-    ///
-    /// The simulate path persists a wallet-owned `PendingApproval` entry.
+    /// Returns a string error when the process UID is unavailable, on a
+    /// trustline-field validation failure from
+    /// [`PendingApproval::new_trustline_pending`], or when staging fails.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn persist_trustline_pending_approval(
-        &self,
+    pub(crate) fn trustline_pending_entry(
         envelope_xdr: &str,
         from_account: &str,
         summary_asset_code: &str,
@@ -372,19 +369,9 @@ impl WalletServer {
         summary_limit_stroops: Option<i64>,
         summary_simulated_total_stroops: u32,
         summary_simulated_seq_num: i64,
-        profile_name: &str,
         request: &stellar_agent_core::policy::ApprovalRequest,
         intent: Option<&stellar_agent_core::approval::ClassicIntent>,
     ) -> Result<PendingApproval, String> {
-        let approvals_dir = self
-            .resolve_approval_dir()
-            .map_err(|e| format!("approval dir resolution failed: {e}"))?;
-        std::fs::create_dir_all(&approvals_dir)
-            .map_err(|e| format!("approval dir create_all failed: {e}"))?;
-        let store_path = approvals_dir.join(format!("{profile_name}.toml"));
-        let mut store = open_with_retry(&store_path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF)
-            .map_err(|e| format!("approval store open failed: {e}"))?;
-
         let uid =
             process_uid_for_attestation().map_err(|e| format!("process UID unavailable: {e}"))?;
 
@@ -409,6 +396,54 @@ impl WalletServer {
             u64::from(request.ttl_seconds) * 1000,
         )
         .map_err(|error| error.to_string())?;
+
+        Ok(entry)
+    }
+
+    /// Persists a [`PendingApproval`] entry for a trustline change.
+    ///
+    /// Opens (or creates) the profile-scoped approval store, constructs an
+    /// unattested entry through [`Self::trustline_pending_entry`], inserts it,
+    /// and returns the entry for nonce/expiry extraction by the caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns a string error on any I/O, store-lock, clock, or trustline-field
+    /// validation failure from [`PendingApproval::new_trustline_pending`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn persist_trustline_pending_approval(
+        &self,
+        envelope_xdr: &str,
+        from_account: &str,
+        summary_asset_code: &str,
+        summary_asset_issuer: &str,
+        summary_limit_stroops: Option<i64>,
+        summary_simulated_total_stroops: u32,
+        summary_simulated_seq_num: i64,
+        profile_name: &str,
+        request: &stellar_agent_core::policy::ApprovalRequest,
+        intent: Option<&stellar_agent_core::approval::ClassicIntent>,
+    ) -> Result<PendingApproval, String> {
+        let approvals_dir = self
+            .resolve_approval_dir()
+            .map_err(|e| format!("approval dir resolution failed: {e}"))?;
+        std::fs::create_dir_all(&approvals_dir)
+            .map_err(|e| format!("approval dir create_all failed: {e}"))?;
+        let store_path = approvals_dir.join(format!("{profile_name}.toml"));
+        let mut store = open_with_retry(&store_path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF)
+            .map_err(|e| format!("approval store open failed: {e}"))?;
+
+        let entry = Self::trustline_pending_entry(
+            envelope_xdr,
+            from_account,
+            summary_asset_code,
+            summary_asset_issuer,
+            summary_limit_stroops,
+            summary_simulated_total_stroops,
+            summary_simulated_seq_num,
+            request,
+            intent,
+        )?;
 
         let now_ms = now_unix_ms()
             .map_err(|e| format!("approval store insert: current time unavailable: {e}"))?;
@@ -1002,19 +1037,21 @@ impl WalletServer {
                     prepared.handle.as_ref(),
                     stellar_agent_core::approval::witness::ApprovedKind::Trustline,
                     dispatch_outcome.audit_decision(),
-                    |intent| {
-                        self.persist_trustline_pending_approval(
-                            &envelope_xdr,
-                            &args.from,
-                            &resolved.code,
-                            &resolved.issuer,
-                            limit_stroops,
-                            total_fee_stroops,
-                            source_sequence.saturating_add(1),
-                            &profile_name,
-                            &approval.request,
-                            intent,
-                        )
+                    super::business_entry::Staged {
+                        build: |intent: Option<&stellar_agent_core::approval::ClassicIntent>| {
+                            Self::trustline_pending_entry(
+                                &envelope_xdr,
+                                &args.from,
+                                &resolved.code,
+                                &resolved.issuer,
+                                limit_stroops,
+                                total_fee_stroops,
+                                source_sequence.saturating_add(1),
+                                &approval.request,
+                                intent,
+                            )
+                        },
+                        insert: |entry| self.insert_classic_pending(&profile_name, entry),
                     },
                 ) {
                     Ok(entry) => {
@@ -1542,6 +1579,7 @@ impl WalletServer {
             &args.chain_id,
             "stellar_trustline_commit",
             now_ms,
+            None,
         )
         .await
         {
@@ -1605,6 +1643,7 @@ impl WalletServer {
             cross_check.witness(),
             Some(&floor_hook),
             operation.as_ref(),
+            None,
         )
         .await
         {

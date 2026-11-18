@@ -119,6 +119,7 @@ PYFEATURES
 docs-style	python3 .github/scripts/check-docs-style.py	-	install-surface.yml	install-surface	Check the docs style
 install-surface	python3 .github/scripts/check-install-surface.py	-	install-surface.yml	install-surface	Check the install surface
 gate-tool-versions	bash .github/scripts/check-gate-tool-versions.sh	-	install-surface.yml	install-surface	Check the gate tool versions
+docs-reads	python3 .github/scripts/check-docs-reads.py	-	ci.yml	release-contracts	Check the documentation reads
 changelog	python3 .github/scripts/changelog.py check	-	changelog.yml	changelog	Check changelog fragments
 self-test:test-changelog.py	python3 .github/scripts/test-changelog.py	-	changelog.yml	changelog	Test changelog fragments
 actionlint	actionlint	actionlint	install-surface.yml	install-surface	Check workflows
@@ -130,6 +131,7 @@ self-test:test-check-provenance.py	python3 .github/scripts/test-check-provenance
 workflow-invariants	python3 .github/scripts/check-workflow-invariants.py	yaml	ci.yml	release-contracts	Check the workflow structure and the label sync
 self-test:test-check-coverage.py	python3 .github/scripts/test-check-coverage.py	-	ci.yml	release-contracts	Self-test the coverage floor gate
 self-test:test-check-crates-exist.sh	bash .github/scripts/test-check-crates-exist.sh	jq	ci.yml	release-contracts	Self-test the crates.io existence check
+self-test:test-check-docs-reads.py	python3 .github/scripts/test-check-docs-reads.py	-	ci.yml	release-contracts	Self-test the documentation read check
 self-test:test-check-docs-style.py	python3 .github/scripts/test-check-docs-style.py	-	install-surface.yml	install-surface	Self-test Python checks on Python 3.13
 self-test:test-check-gate-tool-versions.sh	bash .github/scripts/test-check-gate-tool-versions.sh	-	install-surface.yml	install-surface	Self-test the gate tool version check
 self-test:test-check-install-surface.py	python3 .github/scripts/test-check-install-surface.py	-	install-surface.yml	install-surface	Self-test Python checks on Python 3.13
@@ -137,6 +139,7 @@ self-test:test-check-no-direct-sasignersetbaselined-emit.sh	bash .github/scripts
 self-test:test-check-proof-matrix.py	python3 .github/scripts/test-check-proof-matrix.py	-	ci.yml	release-contracts	Self-test the proof matrix check
 self-test:test-check-ref-on-main.sh	bash .github/scripts/test-check-ref-on-main.sh	-	ci.yml	release-contracts	Self-test the ref-on-main check
 self-test:test-check-workflow-invariants.py	python3 .github/scripts/test-check-workflow-invariants.py	yaml	ci.yml	release-contracts	Check the workflow structure and the label sync
+self-test:test-classify-docs-only.py	python3 .github/scripts/test-classify-docs-only.py	-	ci.yml	release-contracts	Self-test the docs-only classifier
 self-test:test-compare-crate-sums.py	python3 .github/scripts/test-compare-crate-sums.py	-	ci.yml	release-contracts	Self-test the crate checksum comparison
 self-test:test-preflight.sh	bash .github/scripts/test-preflight.sh	-	install-surface.yml	install-surface	Self-test the preflight
 self-test:test-publish-crates-check.sh	.github/scripts/test-publish-crates-check.sh	cargo	ci.yml	release-contracts	Self-test the publish tier check
@@ -331,6 +334,7 @@ select_self_tests() {
     changelog.d/* | .github/scripts/changelog.py) select_gate self-test:test-changelog.py ;;
     .github/scripts/check-coverage.py) select_gate self-test:test-check-coverage.py ;;
     .github/scripts/check-crates-exist.sh) select_gate self-test:test-check-crates-exist.sh ;;
+    .github/scripts/check-docs-reads.py) select_gate self-test:test-check-docs-reads.py ;;
     .github/scripts/check-docs-style.py) select_gate self-test:test-check-docs-style.py ;;
     .github/scripts/check-gate-tool-versions.sh) select_gate self-test:test-check-gate-tool-versions.sh ;;
     .github/scripts/check-install-surface.py) select_gate self-test:test-check-install-surface.py ;;
@@ -339,6 +343,7 @@ select_self_tests() {
       ;;
     .github/scripts/check-proof-matrix.py) select_gate self-test:test-check-proof-matrix.py ;;
     .github/scripts/check-ref-on-main.sh) select_gate self-test:test-check-ref-on-main.sh ;;
+    .github/scripts/classify-docs-only.py) select_gate self-test:test-classify-docs-only.py ;;
     .github/scripts/check-workflow-invariants.py) select_gate self-test:test-check-workflow-invariants.py ;;
     .github/scripts/compare-crate-sums.py) select_gate self-test:test-compare-crate-sums.py ;;
     .github/scripts/preflight.sh) select_gate self-test:test-preflight.sh ;;
@@ -724,6 +729,7 @@ plan() {
   select_gate docs-style
   select_gate install-surface
   select_gate gate-tool-versions
+  select_gate docs-reads
   while IFS= read -r -d '' path; do
     select_for_path "$path"
   done <"$SCRATCH/changed"

@@ -251,10 +251,9 @@ impl WalletServer {
     ///
     /// Opens (or creates) the profile-scoped approval store at
     /// `~/.local/share/stellar-agent/approvals/<profile_name>.toml`, constructs
-    /// an unattested entry, inserts it, and returns the entry for nonce /
-    /// expiry extraction by the caller. A `stellar_create_account` simulate
-    /// call stores its starting balance in XLM; a SEP-43 path payment stores
-    /// its send asset and send amount.
+    /// an unattested entry through [`Self::send_pending_entry`], inserts it,
+    /// and returns the entry for nonce / expiry extraction by the caller. A
+    /// SEP-43 path payment stores its send asset and send amount.
     ///
     /// # Errors
     ///
@@ -284,6 +283,50 @@ impl WalletServer {
         let mut store = open_with_retry(&store_path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF)
             .map_err(|e| format!("approval store open failed: {e}"))?;
 
+        let entry = Self::send_pending_entry(
+            envelope_xdr,
+            summary_destination,
+            summary_asset,
+            summary_amount_stroops,
+            summary_simulated_total_stroops,
+            summary_simulated_seq_num,
+            request,
+            intent,
+        )?;
+
+        let now_ms = now_unix_ms()
+            .map_err(|e| format!("approval store insert: current time unavailable: {e}"))?;
+        store
+            .insert(entry.clone(), now_ms)
+            .map_err(|e| format!("approval store insert failed: {e}"))?;
+
+        Ok(entry)
+    }
+
+    /// Builds the unattested payment [`PendingApproval`] entry that sends
+    /// `summary_amount_stroops` of `summary_asset` to `summary_destination`
+    /// and stages its canonical `intent`. A `stellar_create_account` simulate
+    /// call stores its starting balance in XLM, and
+    /// [`WalletServer::insert_classic_pending`] stores the entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns a string error description when the process UID is
+    /// unavailable or the entry is refused.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "approval binds the simulated payment and its policy request"
+    )]
+    pub(crate) fn send_pending_entry(
+        envelope_xdr: &str,
+        summary_destination: &str,
+        summary_asset: &str,
+        summary_amount_stroops: i64,
+        summary_simulated_total_stroops: u32,
+        summary_simulated_seq_num: i64,
+        request: &stellar_agent_core::policy::ApprovalRequest,
+        intent: Option<&stellar_agent_core::approval::ClassicIntent>,
+    ) -> Result<PendingApproval, String> {
         let uid =
             process_uid_for_attestation().map_err(|e| format!("process UID unavailable: {e}"))?;
         let entry = PendingApproval::new_payment_pending(
@@ -307,12 +350,6 @@ impl WalletServer {
             u64::from(request.ttl_seconds) * 1000,
         )
         .map_err(|error| error.to_string())?;
-
-        let now_ms = now_unix_ms()
-            .map_err(|e| format!("approval store insert: current time unavailable: {e}"))?;
-        store
-            .insert(entry.clone(), now_ms)
-            .map_err(|e| format!("approval store insert failed: {e}"))?;
 
         Ok(entry)
     }
@@ -722,18 +759,20 @@ impl WalletServer {
                 prepared.handle.as_ref(),
                 stellar_agent_core::approval::witness::ApprovedKind::Payment,
                 dispatch_outcome.audit_decision(),
-                |intent| {
-                    self.persist_send_pending_approval(
-                        &envelope_xdr,
-                        &args.destination,
-                        "XLM",
-                        starting_balance_stroops,
-                        total_fee_stroops,
-                        source_sequence.saturating_add(1),
-                        &profile_name,
-                        &approval.request,
-                        intent,
-                    )
+                super::business_entry::Staged {
+                    build: |intent: Option<&stellar_agent_core::approval::ClassicIntent>| {
+                        Self::send_pending_entry(
+                            &envelope_xdr,
+                            &args.destination,
+                            "XLM",
+                            starting_balance_stroops,
+                            total_fee_stroops,
+                            source_sequence.saturating_add(1),
+                            &approval.request,
+                            intent,
+                        )
+                    },
+                    insert: |entry| self.insert_classic_pending(&profile_name, entry),
                 },
             ) {
                 Ok(entry) => Some(json!({
@@ -1312,6 +1351,7 @@ impl WalletServer {
             &args.chain_id,
             "stellar_create_account_commit",
             now_ms,
+            None,
         )
         .await
         {
@@ -1365,6 +1405,7 @@ impl WalletServer {
             cross_check.witness(),
             Some(&floor_hook),
             operation.as_ref(),
+            None,
         )
         .await
         {

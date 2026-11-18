@@ -8,7 +8,8 @@
 //!
 //! Under either test feature, and in this crate's own tests,
 //! `set_now_ms_for_test` fixes the clock for every caller in the process
-//! until its guard drops; tests that use it run serially.
+//! until its guard drops. Every caller holds the `mainnet_clock` serial key
+//! beside its other keys; the override itself serializes nothing.
 
 use stellar_agent_core::error::{WalletError, WalletStateError};
 
@@ -88,6 +89,10 @@ impl Drop for TestClockGuard {
 
 /// Fixes [`now_ms`] at `now_ms` for every caller until the guard drops.
 ///
+/// Every test that installs this process-global override holds the
+/// `mainnet_clock` serial key beside its other keys. This function does not
+/// serialize callers; keyless and keyed serial tests do not exclude each other.
+///
 /// Available only with `test-hooks`, `test-helpers`, or this crate's tests.
 /// Production and release builds exclude both test features.
 #[cfg(any(test, feature = "test-hooks", feature = "test-helpers"))]
@@ -107,6 +112,7 @@ mod tests {
     /// The override holds while its guard lives, moves with it, and the
     /// system clock returns when it drops.
     #[test]
+    #[serial(mainnet_clock)]
     #[serial]
     fn the_override_lasts_while_its_guard_lives() {
         let guard = set_now_ms_for_test(5);

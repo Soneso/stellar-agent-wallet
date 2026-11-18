@@ -191,6 +191,22 @@ impl AuthorizedSubmissionFixture {
         (authorization.id(), MainnetSubmitGrant::Tx(authorization))
     }
 
+    /// [`Self::grant`] whose authorization holds `restriction`, as a
+    /// restricted resolution leaves it.
+    #[must_use]
+    pub fn restricted_grant(
+        &self,
+        envelope: &FixtureEnvelope,
+        client: &StellarRpcClient,
+        nonce: &str,
+        restriction: super::restriction::ToolsetRestriction,
+    ) -> (AuthorizationId, MainnetSubmitGrant) {
+        let (id, MainnetSubmitGrant::Tx(mut authorization)) =
+            self.grant(envelope, client, None, nonce);
+        authorization.0._restriction = Some(restriction);
+        (id, MainnetSubmitGrant::Tx(authorization))
+    }
+
     /// The wallet recorder of a `stellar_pay_commit` submission sizing the
     /// holds of [`Self::grant`], writing through `writer`.
     #[must_use]

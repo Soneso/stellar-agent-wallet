@@ -123,6 +123,7 @@ impl Fixture {
                 scope: AuthorityScope::Classic,
             }),
             chain_deadline_ms: None,
+            restriction_end_ms: None,
             authorization_ttl_ms: 120_000,
             bindings: BindingFacts {
                 endpoint: None,
@@ -133,6 +134,7 @@ impl Fixture {
                 reservation: None,
                 authority: [7; 32],
                 audit: [8; 32],
+                restriction: None,
             },
             holds: vec![WindowEntry::new(
                 StateKey::new("recovery", 0, "native", 86_400),
@@ -286,6 +288,7 @@ impl Endpoints {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn recovery_two_post_expiry_ledgers_release_only_the_sequence() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -360,6 +363,7 @@ async fn recovery_two_post_expiry_ledgers_release_only_the_sequence() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn recovery_single_endpoint_refuses() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -380,6 +384,7 @@ async fn recovery_single_endpoint_refuses() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn recovery_two_not_found_without_coverage_keeps_hold() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -402,6 +407,7 @@ async fn recovery_two_not_found_without_coverage_keeps_hold() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn recovery_fresh_concurrence_does_not_accumulate_legacy_bounds() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -435,6 +441,7 @@ async fn recovery_fresh_concurrence_does_not_accumulate_legacy_bounds() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn recovery_receipt_claim_honors_sequence_release() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();

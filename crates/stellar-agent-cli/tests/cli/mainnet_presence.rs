@@ -1585,6 +1585,7 @@ mod signed {
                     operation_id: record.operation_id,
                     attempt_index: 1,
                 }),
+                restriction: None,
             }),
             |_| async {},
         )

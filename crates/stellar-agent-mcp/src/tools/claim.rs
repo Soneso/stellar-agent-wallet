@@ -29,9 +29,6 @@ use stellar_agent_claimable::preview::{
 };
 use stellar_agent_core::approval::store::PendingApproval;
 use stellar_agent_core::approval::user_id::process_uid_for_attestation;
-use stellar_agent_core::approval::{
-    DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, open_with_retry,
-};
 use stellar_agent_core::envelope_decode::decode_authoritative_args;
 use stellar_agent_core::timefmt::now_unix_ms;
 use stellar_agent_network::{
@@ -195,26 +192,17 @@ fn preview_asset_string(preview: &ClaimPreview) -> String {
 // ─────────────────────────────────────────────────────────────────────────────
 
 impl WalletServer {
-    /// Persists a [`PendingApproval`] entry for a `stellar_claim` simulate call.
-    ///
-    /// Opens (or creates) the profile-scoped approval store, constructs an
-    /// unattested `ClaimSimulated` entry from the claim summary, inserts it, and
-    /// returns the entry for nonce / expiry extraction by the caller.
+    /// Builds the unattested `ClaimSimulated` entry of a `stellar_claim`
+    /// simulate call from the claim summary and stages its canonical
+    /// `intent`. [`WalletServer::insert_classic_pending`] stores it.
     ///
     /// # Errors
     ///
-    /// Returns a string error description on any I/O, store-lock, validation, or
-    /// clock failure. The caller maps this to an `internal_error` MCP response.
-    ///
-    /// # Feature gate
-    ///
-    /// Exposed as `pub(crate)`; `dead_code`-allowed in non-test builds because
-    /// the approval path is exercised only when the policy engine requires
-    /// approval.
+    /// Returns a string error description when the process UID is
+    /// unavailable or the entry fails validation or staging. The caller maps this to an
+    /// `internal_error` MCP response.
     #[allow(clippy::too_many_arguments)]
-    #[cfg_attr(not(any(test, feature = "test-helpers")), allow(dead_code))]
-    pub(crate) fn persist_claim_pending_approval(
-        &self,
+    pub(crate) fn claim_pending_entry(
         envelope_xdr: &str,
         balance_id_hex72: &str,
         balance_id_strkey: &str,
@@ -223,19 +211,9 @@ impl WalletServer {
         source: &str,
         simulated_fee_stroops: u32,
         simulated_seq_num: i64,
-        profile_name: &str,
         request: &stellar_agent_core::policy::ApprovalRequest,
         intent: Option<&stellar_agent_core::approval::ClassicIntent>,
     ) -> Result<PendingApproval, String> {
-        let approvals_dir = self
-            .resolve_approval_dir()
-            .map_err(|e| format!("approval dir resolution failed: {e}"))?;
-        std::fs::create_dir_all(&approvals_dir)
-            .map_err(|e| format!("approval dir create_all failed: {e}"))?;
-        let store_path = approvals_dir.join(format!("{profile_name}.toml"));
-        let mut store = open_with_retry(&store_path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF)
-            .map_err(|e| format!("approval store open failed: {e}"))?;
-
         let uid =
             process_uid_for_attestation().map_err(|e| format!("process UID unavailable: {e}"))?;
         let entry = PendingApproval::new_claim_pending(
@@ -260,12 +238,6 @@ impl WalletServer {
             u64::from(request.ttl_seconds) * 1000,
         )
         .map_err(|error| error.to_string())?;
-
-        let now_ms = now_unix_ms()
-            .map_err(|e| format!("approval store insert: current time unavailable: {e}"))?;
-        store
-            .insert(entry.clone(), now_ms)
-            .map_err(|e| format!("approval store insert failed: {e}"))?;
 
         Ok(entry)
     }
@@ -654,20 +626,22 @@ impl WalletServer {
                     prepared.handle.as_ref(),
                     stellar_agent_core::approval::witness::ApprovedKind::Claim,
                     dispatch_outcome.audit_decision(),
-                    |intent| {
-                        self.persist_claim_pending_approval(
-                            &envelope_xdr,
-                            &preview.balance_id_hex72,
-                            &preview.balance_id_strkey,
-                            &asset_str,
-                            preview.amount_stroops,
-                            &source,
-                            total_fee_stroops,
-                            source_sequence.saturating_add(1),
-                            &profile_name,
-                            &approval.request,
-                            intent,
-                        )
+                    super::business_entry::Staged {
+                        build: |intent: Option<&stellar_agent_core::approval::ClassicIntent>| {
+                            Self::claim_pending_entry(
+                                &envelope_xdr,
+                                &preview.balance_id_hex72,
+                                &preview.balance_id_strkey,
+                                &asset_str,
+                                preview.amount_stroops,
+                                &source,
+                                total_fee_stroops,
+                                source_sequence.saturating_add(1),
+                                &approval.request,
+                                intent,
+                            )
+                        },
+                        insert: |entry| self.insert_classic_pending(&profile_name, entry),
                     },
                 ) {
                     Ok(entry) => Some(json!({
@@ -779,11 +753,8 @@ impl WalletServer {
 
     /// Inner implementation of `stellar_claim_commit`.
     ///
-    /// Separated from the public tool handler for testability via the
-    /// `call_stellar_claim_commit` test helper. Unlike `stellar_pay_commit`,
-    /// there is no `forced_dispatch_outcome` override: `stellar_claim_commit`
-    /// has no toolset-gated tier (it is denylist-only), so the policy-engine
-    /// outcome drives the attestation gate directly.
+    /// The policy outcome drives the attestation gate. Claim commits remain
+    /// on the toolset signing denylist and have no gated toolset route.
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn stellar_claim_commit_impl(
         &self,
@@ -1204,6 +1175,7 @@ impl WalletServer {
             &args.chain_id,
             "stellar_claim_commit",
             now_ms,
+            None,
         )
         .await
         {
@@ -1257,6 +1229,7 @@ impl WalletServer {
             cross_check.witness(),
             Some(&floor_hook),
             operation.as_ref(),
+            None,
         )
         .await
         {

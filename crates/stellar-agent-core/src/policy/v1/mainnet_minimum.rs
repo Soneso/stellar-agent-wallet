@@ -35,6 +35,12 @@ pub const MAINNET_VALUE_OUT_TOOLS: &[&str] = &[
     "stellar_x402_create_payment",
     "stellar_x402_authenticated_payment",
 ];
+
+/// Outer toolset rules must meet payment minimums. Recipient-editing presets
+/// keep their explicit tool targets because an outer rule also names an action.
+fn requires_value_out_minimums(tool: &str) -> bool {
+    tool == "stellar_toolset_invoke" || MAINNET_VALUE_OUT_TOOLS.contains(&tool)
+}
 /// Registry tools that change a trust line.
 pub const MAINNET_TRUSTLINE_TOOLS: &[&str] = &["stellar_trustline", "stellar_trustline_commit"];
 /// Registry tools that claim a claimable balance.
@@ -361,7 +367,7 @@ fn evaluate_rule(findings: &mut Findings, index: usize, rule: &dyn TableLike, pr
     findings.rule(
         Requirement::Tool,
         index,
-        MAINNET_VALUE_OUT_TOOLS.contains(&tool)
+        requires_value_out_minimums(tool)
             || MAINNET_TRUSTLINE_TOOLS.contains(&tool)
             || MAINNET_CLAIM_TOOLS.contains(&tool)
             || MAINNET_READ_ONLY_TOOLS.contains(&tool),
@@ -415,7 +421,7 @@ fn evaluate_rule(findings: &mut Findings, index: usize, rule: &dyn TableLike, pr
     if decision == Some("deny") {
         return;
     }
-    if MAINNET_VALUE_OUT_TOOLS.contains(&tool)
+    if requires_value_out_minimums(tool)
         || MAINNET_TRUSTLINE_TOOLS.contains(&tool)
         || MAINNET_CLAIM_TOOLS.contains(&tool)
     {
@@ -425,7 +431,7 @@ fn evaluate_rule(findings: &mut Findings, index: usize, rule: &dyn TableLike, pr
             criteria.iter().any(|c| kind(c) == "rate_limit"),
         );
     }
-    if !(MAINNET_VALUE_OUT_TOOLS.contains(&tool) || MAINNET_TRUSTLINE_TOOLS.contains(&tool)) {
+    if !(requires_value_out_minimums(tool) || MAINNET_TRUSTLINE_TOOLS.contains(&tool)) {
         return;
     }
     let assets: Vec<_> = allowlists
@@ -443,7 +449,7 @@ fn evaluate_rule(findings: &mut Findings, index: usize, rule: &dyn TableLike, pr
             && !assets.is_empty()
             && assets.iter().all(|asset| pinned_asset(asset).is_ok()),
     );
-    if !MAINNET_VALUE_OUT_TOOLS.contains(&tool) {
+    if !requires_value_out_minimums(tool) {
         return;
     }
     findings.rule(

@@ -3097,6 +3097,7 @@ mod tests {
     /// clock that leaves the interval during the read yields no signature and
     /// no success event.
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn transaction_signing_rechecks_the_authorization_after_the_secret_read() {
         use std::sync::atomic::{AtomicU64, Ordering};

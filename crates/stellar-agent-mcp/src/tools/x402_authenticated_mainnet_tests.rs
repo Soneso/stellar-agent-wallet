@@ -2032,7 +2032,7 @@ impl Boundary {
 /// The completion refuses a receipt whose record expired before it signs,
 /// under an approval and under policy authority.
 #[tokio::test]
-#[serial_test::serial(keyring)]
+#[serial_test::serial(keyring, mainnet_clock)]
 #[serial_test::serial]
 async fn the_sibling_refuses_an_expired_authorization() {
     for policy in [false, true] {
@@ -2148,7 +2148,7 @@ async fn the_sibling_refuses_a_receipt_with_another_digest() {
 
 /// The completion refuses when the mainnet clock fails.
 #[tokio::test]
-#[serial_test::serial(keyring)]
+#[serial_test::serial(keyring, mainnet_clock)]
 #[serial_test::serial]
 async fn the_sibling_refuses_a_failing_clock() {
     let b = Boundary::new().await;
@@ -2215,7 +2215,7 @@ async fn the_sibling_fails_to_attach_to_a_full_envelope() {
 /// The identity gate refuses an approval created after the mainnet clock
 /// before anything is minted or signed.
 #[tokio::test]
-#[serial_test::serial(keyring)]
+#[serial_test::serial(keyring, mainnet_clock)]
 #[serial_test::serial]
 async fn the_identity_gate_refuses_a_future_created_approval() {
     let b = Boundary::new().await;
@@ -2266,7 +2266,7 @@ async fn the_identity_gate_refuses_a_future_created_approval() {
 /// The identity gate refuses policy authority whose governing end has passed
 /// before anything is minted or signed.
 #[tokio::test]
-#[serial_test::serial(keyring)]
+#[serial_test::serial(keyring, mainnet_clock)]
 #[serial_test::serial]
 async fn the_identity_gate_refuses_an_ended_policy_authority() {
     let b = Boundary::allowed().await;

@@ -837,6 +837,22 @@ pub enum MainnetSubmitGrant {
     Tx(MainnetTxSignAuthorization),
 }
 
+#[cfg(feature = "mainnet-write")]
+impl MainnetSubmitGrant {
+    /// Splits the toolset restriction from the authorization, so the caller
+    /// owns it, and the grant's lease, apart from the consumption.
+    fn detach_restriction(
+        self,
+    ) -> (
+        Self,
+        Option<crate::mainnet::restriction::ToolsetRestriction>,
+    ) {
+        let Self::Tx(mut authorization) = self;
+        let restriction = authorization.0._restriction.take();
+        (Self::Tx(authorization), restriction)
+    }
+}
+
 /// Submits a signed mainnet `Tx` envelope under a grant and polls until
 /// confirmed.
 ///
@@ -976,6 +992,11 @@ pub(crate) async fn authorized_submission(
     consumer: MainnetConsumer,
     grant: MainnetSubmitGrant,
 ) -> Result<SubmissionResult, AuthorizedPathError> {
+    // This scope owns the toolset restriction, and with it the grant's lease,
+    // until it returns after the outcome is reported. The recorder consumes
+    // the authorization without it.
+    #[cfg(feature = "mainnet-write")]
+    let (grant, _restriction) = grant.detach_restriction();
     let MainnetSubmitGrant::Tx(authorization) = &grant;
     let authority = client.url.authority();
     let now_ms = crate::mainnet::clock::now_ms()?;
@@ -2691,6 +2712,7 @@ mod tests {
 
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn muxed_contract_authorized_submit_refuses_without_recording() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4203,6 +4225,7 @@ mod tests {
 
         /// The valid grant is consumed once and the envelope sent once.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_valid_grant_sends_once() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4253,6 +4276,7 @@ mod tests {
         /// grant is consumed once for both sends.
         #[cfg(feature = "test-hooks")]
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_resent_envelope_is_consumed_once() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4284,6 +4308,7 @@ mod tests {
         /// A grant for another client of the same endpoint is refused before
         /// any request.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_grant_for_another_client_is_refused_before_any_request() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4308,6 +4333,7 @@ mod tests {
         /// A grant for another endpoint authority is refused before any
         /// request.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_grant_for_another_authority_is_refused_before_any_request() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4331,6 +4357,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_grant_on_testnet_is_refused_before_any_request() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4360,6 +4387,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn another_consumer_is_refused_before_any_request() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4389,6 +4417,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn an_expired_grant_is_refused_before_any_request() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4412,6 +4441,7 @@ mod tests {
         /// An endpoint that reports another network is refused after the
         /// probe and before any send.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn an_endpoint_on_another_network_is_refused_before_the_send() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4436,6 +4466,7 @@ mod tests {
 
         /// A grant over another transaction hash is refused before the send.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn another_transaction_hash_is_refused_before_the_send() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4466,6 +4497,7 @@ mod tests {
         /// signature the network binding accepts, is refused because the
         /// grant's signer did not sign it.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn an_envelope_without_the_grant_signer_is_refused_before_the_send() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4522,6 +4554,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_proof_of_another_envelope_is_refused_before_the_send() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4536,6 +4569,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_proof_of_other_content_is_refused_before_the_send() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4550,6 +4584,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_proof_of_another_authorization_is_refused_before_the_send() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4567,6 +4602,7 @@ mod tests {
         /// oracle reports applied settles nothing: the reservation keeps the
         /// debit and the caller gets the timeout shape.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_failed_confirmation_the_oracle_reports_applied_keeps_the_reservation() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4602,6 +4638,7 @@ mod tests {
         /// oracle's result, and the submission stands: a reported failure does
         /// not release possible spending and writes no failed row.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_failed_confirmation_the_oracle_confirms_returns_the_oracle_code_and_stands() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4649,6 +4686,7 @@ mod tests {
         /// A `FAILED` confirmation with an oracle that cannot be reached, and
         /// with no oracle at all, settles nothing.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_failed_confirmation_without_an_oracle_answer_keeps_the_reservation() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4683,6 +4721,7 @@ mod tests {
         /// `FAILED` for the same hash does not settle the submission, and its
         /// transaction is never asked.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_failed_confirmation_an_oracle_on_another_network_reports_keeps_the_reservation()
         {
@@ -4721,6 +4760,7 @@ mod tests {
         /// deadline, before the oracle's late `FAILED`, and the reservation
         /// stands.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_failed_confirmation_the_oracle_confirms_after_the_deadline_keeps_the_reservation()
          {
@@ -4776,6 +4816,7 @@ mod tests {
         /// deadline, the call returns the timeout shape, the transaction is
         /// never asked, and the reservation stands.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_failed_confirmation_whose_oracle_identity_answers_after_the_deadline_keeps_the_reservation()
          {
@@ -4830,6 +4871,7 @@ mod tests {
         /// mainnet: the reservation and the pending receipt stand, and the
         /// sequence stays held against a second submission.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_refused_send_keeps_the_reservation_and_the_sequence() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4906,6 +4948,7 @@ mod tests {
         /// any request: at exactly the margin, and inside it. Nothing is
         /// recorded and the authorization stays open.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn authorized_submission_refuses_inside_the_margin_before_any_request() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4945,6 +4988,7 @@ mod tests {
         /// converted holds are released, the pending row is closed, the
         /// receipt is removed, and the authorization stays used.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn authorized_submission_sends_by_the_margin() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -4992,6 +5036,7 @@ mod tests {
         /// instant: the envelope's deadline less the send margin, in Unix
         /// milliseconds.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn the_intent_carries_the_attempt_send_by() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -5018,6 +5063,7 @@ mod tests {
         /// A refusal leaves the public entry point as the generic mainnet
         /// authorization refusal.
         #[tokio::test]
+        #[serial(mainnet_clock)]
         #[serial]
         async fn a_refused_grant_reports_the_authorization_refusal() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();

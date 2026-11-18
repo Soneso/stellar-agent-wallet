@@ -74,6 +74,7 @@ struct VerbRun {
 
 /// A child loses its payment response after durable exposure; a fresh process replays it.
 #[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(mainnet_clock)]
 #[serial_test::serial]
 async fn payment_process_lost_response_replays_without_effects() {
     use crate::common::mainnet_write_fixture::{ORACLE_HOST, PRIMARY_HOST};
@@ -745,6 +746,7 @@ fn expiring_balance(expired: &Arc<AtomicBool>) -> ClassicRpc {
 /// runs once the stored attempt is due, so the recovery driver reserves one
 /// automatic run for it and stores a stop with an automatic retry time.
 #[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(mainnet_clock)]
 #[serial_test::serial]
 async fn claim_replays_its_business_id_after_the_predicate_expires() {
     let expired = Arc::new(AtomicBool::new(false));
@@ -991,6 +993,7 @@ fn replay_exit_codes_follow_the_state() {
 /// stores a time bound 120 seconds ahead. A replay 61 seconds later and one
 /// past the bound each send both endpoints the base requests of a replay.
 #[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(mainnet_clock)]
 #[serial_test::serial]
 async fn a_delayed_replay_runs_no_recovery_stage() {
     for verb in Verb::ALL {

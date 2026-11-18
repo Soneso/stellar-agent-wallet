@@ -2,6 +2,7 @@ use super::*;
 use crate::policy_state::operations::tests::{Checked, commit_checked};
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn single_oversize_is_cached_terminal() {
     let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -75,6 +76,7 @@ async fn single_oversize_is_cached_terminal() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn managed_status_uses_cached_result() {
     let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -157,6 +159,7 @@ async fn managed_status_uses_cached_result() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn production_status_and_dispatch_use_outcomes() {
     use crate::submission_flow::{self, ReconcilePass, StatusRequest};
@@ -257,6 +260,7 @@ async fn production_status_and_dispatch_use_outcomes() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn recovery_result_contract() {
     let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -331,6 +335,7 @@ async fn recovery_result_contract() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn recovery_reporting_legacy_compatibility() {
     let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -394,6 +399,7 @@ async fn recovery_reporting_legacy_compatibility() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn identity_refusal_is_visible() {
     let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -488,6 +494,7 @@ async fn identity_refusal_is_visible() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn writer_or_store_refusal_is_visible() {
     let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -620,6 +627,7 @@ fn store_run(fx: &Fixture, run: &WireRecoveryRun) {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn explicit_retry_starts_one_bounded_run() {
     let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -831,6 +839,7 @@ async fn refused_retry(
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn explicit_retry_refuses_an_earlier_clock() {
     let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -858,6 +867,7 @@ async fn explicit_retry_refuses_an_earlier_clock() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn explicit_retry_refuses_an_earlier_clock_after_a_configuration_change() {
     let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -916,6 +926,7 @@ async fn explicit_retry_refuses_an_earlier_clock_after_a_configuration_change() 
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn explicit_retry_refuses_a_live_lease() {
     let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -947,6 +958,7 @@ async fn explicit_retry_refuses_a_live_lease() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn explicit_retry_refuses_unusable_metadata() {
     let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -973,6 +985,7 @@ async fn explicit_retry_refuses_unusable_metadata() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn non_selectable_records_get_no_status_action() {
     let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1028,6 +1041,7 @@ async fn non_selectable_records_get_no_status_action() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 async fn status_recovery_projection() {
     let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
@@ -1097,6 +1111,7 @@ async fn status_recovery_projection() {
 }
 
 #[test]
+#[serial(mainnet_clock)]
 #[serial]
 fn attached_report_keeps_the_refusal_shape() {
     let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();

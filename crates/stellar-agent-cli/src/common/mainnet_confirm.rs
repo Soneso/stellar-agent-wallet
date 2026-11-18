@@ -400,13 +400,24 @@ pub(crate) fn render_authority_refusal(
 /// presence wait. Every refusal after the open keeps entry and record, and the
 /// witness returns only after the record's consent commits.
 ///
+/// A kind the shared capability integrates runs in a different order: the
+/// record opens with the held writer, its evidence is reserved, and only then
+/// is the entry inserted and the summary shown. A contended writer reacquires
+/// an existing record's slot through the keyed outbox instead. Attestation and
+/// proof verification load the policy under the held admission, which drops
+/// with the inbox and writer before the publication commit.
+///
 /// Without `operation`, a refusal after the entry was parked removes it while
 /// it is still the unattested record parked here.
 ///
 /// # Errors
 ///
 /// `internal.unexpected_state` for an approval rule without `operation`, or
-/// an operation outside `Prepared` without a record;
+/// an operation outside `Prepared` without a record; for an integrated kind,
+/// `audit.outbox_evidence_unusable` for an unready scope, uninitialized
+/// evidence or an unresolved migration pin, `approval.evidence_capacity` for
+/// a full scope, and `approval.attestation_invalid` for a linked entry whose
+/// signed facts differ from the record;
 /// `approval.presence_unavailable` when the summary cannot be shown; the
 /// summary's, the attestation key's and the consent sink's refusals before
 /// anything is parked; the store refusals of the record's read, open and
@@ -2023,6 +2034,7 @@ pub(crate) mod tests {
             operation: Some(stellar_agent_network::operation_entry::next_attempt_link(
                 &operation,
             )),
+            restriction: None,
         };
         assert_eq!(
             resolve_tx_sign(request(None))

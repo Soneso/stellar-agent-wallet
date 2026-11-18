@@ -105,6 +105,9 @@ mod mainnet_presence_tests;
 #[cfg(all(test, feature = "mainnet-write"))]
 mod operation_replay_tests;
 
+#[cfg(all(test, feature = "mainnet-write"))]
+mod toolsets_mainnet_tests;
+
 #[cfg(test)]
 pub(crate) mod identity_fixture;
 

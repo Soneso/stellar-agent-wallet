@@ -301,6 +301,7 @@ mod tests {
     /// permitting decisions.
     #[cfg(feature = "mainnet-write")]
     #[test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     fn a_witness_gives_approval_authority() {
         for required in [false, true] {

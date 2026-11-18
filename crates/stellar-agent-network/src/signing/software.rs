@@ -363,6 +363,7 @@ mod tests {
     /// valid on the mainnet clock. Outside the interval the key derives its
     /// public key once for the binding check and never reaches `sign_raw`.
     #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
     async fn transaction_signing_refuses_outside_the_authorization_interval() {
         let key = SoftwareSigningKey::new_from_bytes([7; 32]);

@@ -2740,6 +2740,7 @@ fn the_decision_id_encoding_has_a_known_answer() {
 /// `submission_accounting_expired` row under the authenticated identifier, and
 /// the projection overwrites the forged code with the accounting code.
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 #[cfg(feature = "test-hooks")]
 async fn authentic_decision_overrides_forged_release_code() {
@@ -3891,6 +3892,7 @@ async fn reported_success_keeps_short_window(delayed: bool) {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 #[cfg(feature = "test-hooks")]
 async fn delayed_success_does_not_backdate_accounting() {
@@ -3901,6 +3903,7 @@ async fn delayed_success_does_not_backdate_accounting() {
 }
 
 #[tokio::test]
+#[serial(mainnet_clock)]
 #[serial]
 #[cfg(feature = "test-hooks")]
 async fn early_success_retains_deadline_plus_short_window() {

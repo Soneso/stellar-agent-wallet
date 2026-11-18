@@ -723,6 +723,14 @@ pub struct WalletServer {
     /// lock is contended.  The lock is held only for the duration of the
     /// `verify` call (sub-microsecond, no await inside).
     pub(crate) replay_window: Arc<TokioMutex<ReplayWindow>>,
+    #[cfg(all(test, feature = "mainnet-write"))]
+    pub(crate) payment_proof_barrier: Option<(
+        Arc<tokio::sync::Barrier>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    )>,
+    /// Issued payment nonces and their retained mainnet operation facts.
+    pub(crate) prepared_payments:
+        Arc<TokioMutex<HashMap<String, crate::tools::pay::PreparedPaymentNonce>>>,
     /// In-process per-source-account confirmed-sequence floor.
     ///
     /// Populated by confirmed-submit sites, consulted by build-time
@@ -752,8 +760,6 @@ pub struct WalletServer {
     /// Gated on `test-helpers` feature or `#[cfg(test)]`.
     #[cfg(any(test, feature = "test-helpers"))]
     pub(crate) approval_dir_override: Option<std::path::PathBuf>,
-    #[cfg(any(test, feature = "test-helpers"))]
-    pub(crate) forced_snapshot_observer: Option<Arc<dyn Fn(bool) + Send + Sync>>,
     /// Test-only protected spent record backend.
     #[cfg(any(test, feature = "test-helpers"))]
     pub(crate) rule_approval_spent_store_override:
@@ -795,6 +801,14 @@ pub struct WalletServer {
     /// Gated on `test-helpers` feature or `#[cfg(test)]`.
     #[cfg(any(test, feature = "test-helpers"))]
     pub(crate) toolset_pin_key_override: Option<stellar_agent_toolsets_runtime::PinKey>,
+
+    /// Test-only probe a payment commit's toolset restriction runs as it
+    /// drops, while its grant lease still holds its locks. Set via
+    /// [`WalletServer::set_toolset_lease_release_probe_for_test`].
+    ///
+    /// Gated on `test-helpers` feature or `#[cfg(test)]`.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub(crate) toolset_lease_release_probe: Option<Arc<dyn Fn() + Send + Sync>>,
 
     /// Test-only stand-in for the SEP-10 counterparty-identity gate of
     /// `stellar_x402_authenticated_payment`: the JWT, the subject, and the
@@ -1021,6 +1035,9 @@ impl WalletServer {
             tool_catalogue,
             nonce_mint: Arc::new(nonce_mint),
             replay_window: Arc::new(TokioMutex::new(ReplayWindow::new())),
+            #[cfg(all(test, feature = "mainnet-write"))]
+            payment_proof_barrier: None,
+            prepared_payments: Arc::new(TokioMutex::new(HashMap::new())),
             sequence_floor: Arc::new(TokioMutex::new(
                 crate::sequence_floor::SequenceFloorTracker::new(),
             )),
@@ -1029,8 +1046,6 @@ impl WalletServer {
             clock,
             #[cfg(any(test, feature = "test-helpers"))]
             approval_dir_override: None,
-            #[cfg(any(test, feature = "test-helpers"))]
-            forced_snapshot_observer: None,
             #[cfg(any(test, feature = "test-helpers"))]
             rule_approval_spent_store_override: None,
             #[cfg(any(test, feature = "test-helpers"))]
@@ -1041,6 +1056,8 @@ impl WalletServer {
             toolsets_root_override: None,
             #[cfg(any(test, feature = "test-helpers"))]
             toolset_pin_key_override: None,
+            #[cfg(any(test, feature = "test-helpers"))]
+            toolset_lease_release_probe: None,
             #[cfg(any(test, feature = "test-helpers"))]
             x402_identity_session_override: None,
             #[cfg(all(feature = "mainnet-write", any(test, feature = "test-helpers")))]
@@ -1335,15 +1352,6 @@ impl WalletServer {
         self.counterparty_resolver = resolver;
     }
 
-    /// Observes whether a forced approval retains the evaluated gate's frame.
-    #[doc(hidden)]
-    pub fn set_forced_snapshot_observer_for_test(
-        &mut self,
-        observer: Arc<dyn Fn(bool) + Send + Sync>,
-    ) {
-        self.forced_snapshot_observer = Some(observer);
-    }
-
     /// Supplies signed fixture provenance when a synthetic engine queues payment consent.
     #[doc(hidden)]
     pub fn set_payment_recovery_policy_for_test(
@@ -1461,6 +1469,15 @@ impl WalletServer {
     #[doc(hidden)]
     pub fn set_toolset_pin_key_for_test(&mut self, key: stellar_agent_toolsets_runtime::PinKey) {
         self.toolset_pin_key_override = Some(key);
+    }
+
+    /// Sets the probe a payment commit's toolset restriction runs as it
+    /// drops, before its grant lease releases its locks.
+    ///
+    /// Gated on `test-helpers` feature or `#[cfg(test)]`.
+    #[doc(hidden)]
+    pub fn set_toolset_lease_release_probe_for_test(&mut self, probe: Arc<dyn Fn() + Send + Sync>) {
+        self.toolset_lease_release_probe = Some(probe);
     }
 }
 

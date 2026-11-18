@@ -583,6 +583,7 @@ pub(crate) async fn authorize_and_submit(
         audit: readiness,
         store: &window_store,
         operation: operation.map(next_attempt_link),
+        restriction: None,
     })
     .await
     .map_err(|e: MainnetAuthorizationError| {
