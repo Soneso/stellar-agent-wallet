@@ -890,7 +890,7 @@ async fn trustline_endpoint(seed: [u8; 32]) -> (MockServer, String) {
     Mock::given(method("POST"))
         .respond_with(TrustlineSubmitSuccessRpcResponder {
             source_key_xdr: account_ledger_key_xdr(&source_g),
-            source_xdr: account_entry_xdr_with_balance(&source_g, 100_000_000_000_000),
+            source_xdr: account_entry_xdr_with_balance(&source_g, SOURCE_BALANCE),
             issuer_key_xdr: account_ledger_key_xdr(USDC_TESTNET_ISSUER),
             issuer_xdr: account_entry_xdr_with_balance(USDC_TESTNET_ISSUER, 100_000_000_000_000),
             network: crate::common::EndpointNetwork::testnet(),
@@ -898,6 +898,44 @@ async fn trustline_endpoint(seed: [u8; 32]) -> (MockServer, String) {
         .mount(&server)
         .await;
     (server, source_g)
+}
+
+/// Answers a source read that requests the USDC trustline with the source
+/// account and that trustline, and every other request through `inner`.
+struct HeldTrustlineResponder {
+    inner: TrustlineSubmitSuccessRpcResponder,
+    trustline_key_xdr: String,
+    trustline_xdr: String,
+}
+
+impl Respond for HeldTrustlineResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body = String::from_utf8_lossy(&request.body);
+        if !body.contains(&self.trustline_key_xdr) {
+            return self.inner.respond(request);
+        }
+        let request_value: serde_json::Value =
+            serde_json::from_slice(&request.body).unwrap_or_default();
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request_value.get("id").cloned().unwrap_or_else(|| serde_json::json!(1)),
+            "result": {
+                "entries": [
+                    {
+                        "key": self.inner.source_key_xdr,
+                        "xdr": self.inner.source_xdr,
+                        "lastModifiedLedgerSeq": 1000
+                    },
+                    {
+                        "key": self.trustline_key_xdr,
+                        "xdr": self.trustline_xdr,
+                        "lastModifiedLedgerSeq": 1000
+                    }
+                ],
+                "latestLedger": 1001
+            },
+        }))
+    }
 }
 
 fn trustline_args(source_g: &str) -> StellarTrustlineArgs {
@@ -909,6 +947,200 @@ fn trustline_args(source_g: &str) -> StellarTrustlineArgs {
         classic_base: None,
         business_id: None,
     }
+}
+
+/// The reserve of a source without subentries after it opens one trustline:
+/// `(2 + 1) * BASE_RESERVE_STROOPS`.
+const RESERVE_AFTER_OPENING: i64 = 3 * stellar_agent_core::BASE_RESERVE_STROOPS;
+
+/// The native balance [`trustline_endpoint`] reports for the source.
+const SOURCE_BALANCE: i64 = 100_000_000_000_000;
+
+/// The envelope fee of a one-operation trustline at the default profile fee.
+const TRUSTLINE_FEE: i64 = 100;
+
+/// The source read requests the USDC trustline and the endpoint lists none,
+/// so the view answers that it is absent and the trustline opens one: the
+/// commit at the raised reserve plus fee signs and sends, and a commit one
+/// stroop under it refuses before the signer read and sends nothing.
+#[tokio::test]
+#[serial]
+async fn trustline_commit_counts_the_opened_reserve() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let _data_root = crate::common::isolated_data_root();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&reads);
+    keyring_mock::install_with_read_hooks(vec![keyring_mock::ReadHook::new(
+        "svc",
+        "acct",
+        Arc::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+        }),
+    )])
+    .expect("mock keyring store init");
+    install_test_nonce_key(216);
+    let tools = ["stellar_trustline", "stellar_trustline_commit"];
+    let boundary = SOURCE_BALANCE - RESERVE_AFTER_OPENING - TRUSTLINE_FEE;
+    let engine = |margin| {
+        std::sync::Arc::new(crate::common::v1_engine_mock::minimum_reserve_engine(
+            &tools, margin,
+        ))
+    };
+    let commit_args = |data: &serde_json::Value, from: &str| StellarTrustlineCommitArgs {
+        chain_id: "stellar:testnet".to_owned(),
+        from: from.to_owned(),
+        nonce: data["nonce"].as_str().unwrap().to_owned(),
+        expires_at_unix_ms: data["expires_at_unix_ms"].as_u64().unwrap(),
+        envelope_xdr: data["envelope_xdr"].as_str().unwrap().to_owned(),
+        approval_nonce: None,
+        approval_attestation: None,
+        business_id: None,
+    };
+    let sent = |methods: Vec<String>| methods.iter().filter(|m| *m == "sendTransaction").count();
+
+    // At the boundary: prepared and committed, the envelope is sent.
+    let (rpc, source) = trustline_endpoint([0x4e; 32]).await;
+    let profile = testnet_profile_with_rpc(&rpc.uri());
+    let mut server = WalletServer::new(profile.clone()).unwrap();
+    server.set_policy_engine_for_test(engine(boundary));
+    let prepared = server
+        .call_stellar_trustline(trustline_args(&source))
+        .await
+        .unwrap();
+    assert_ne!(
+        prepared.is_error,
+        Some(true),
+        "{}",
+        call_result_text(&prepared)
+    );
+    let data = call_result_json(&prepared)["data"].clone();
+    let committed = server
+        .call_stellar_trustline_commit(commit_args(&data, &source))
+        .await
+        .unwrap();
+    assert_ne!(
+        committed.is_error,
+        Some(true),
+        "the commit at the opened reserve must pass: {}",
+        call_result_text(&committed)
+    );
+    assert_eq!(sent(crate::common::received_methods(&rpc).await), 1);
+
+    // One stroop under: prepared at the boundary, the commit refuses.
+    let prepared = server
+        .call_stellar_trustline(trustline_args(&source))
+        .await
+        .unwrap();
+    assert_ne!(
+        prepared.is_error,
+        Some(true),
+        "{}",
+        call_result_text(&prepared)
+    );
+    let data = call_result_json(&prepared)["data"].clone();
+    let mut under = WalletServer::new(profile).unwrap();
+    under.set_policy_engine_for_test(engine(boundary + 1));
+    reads.store(0, Ordering::SeqCst);
+    let refused = under
+        .call_stellar_trustline_commit(commit_args(&data, &source))
+        .await
+        .unwrap();
+    assert_eq!(
+        call_result_json(&refused)["error"]["code"],
+        "policy.deny.minimum_reserve_breached",
+        "one stroop under the opened reserve must refuse: {}",
+        call_result_text(&refused)
+    );
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        0,
+        "refusal precedes signer access"
+    );
+    assert_eq!(
+        sent(crate::common::received_methods(&rpc).await),
+        1,
+        "the refused commit sends nothing"
+    );
+}
+
+/// The source holds one USDC trustline: 1.6 XLM against a reserve of
+/// 1.5 XLM. Removing it with limit 0 at margin 0 opens no subentry, so
+/// prepare and commit admit it and the envelope is sent.
+#[tokio::test]
+#[serial]
+async fn removing_a_held_trustline_adds_no_reserve() {
+    use stellar_agent_test_support::xdr_fixtures::{
+        account_entry_xdr, trustline_entry_xdr, trustline_ledger_key_xdr,
+    };
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key(217);
+    let seed = [0x4f; 32];
+    let source = gstrkey_for_seed(seed);
+    keyring_core::Entry::new("svc", "acct")
+        .expect("Entry::new")
+        .set_password(&sstrkey_for_seed(seed))
+        .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct", seed);
+    let rpc = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(HeldTrustlineResponder {
+            inner: TrustlineSubmitSuccessRpcResponder {
+                source_key_xdr: account_ledger_key_xdr(&source),
+                source_xdr: account_entry_xdr(&source, 16_000_000, 1),
+                issuer_key_xdr: account_ledger_key_xdr(USDC_TESTNET_ISSUER),
+                issuer_xdr: account_entry_xdr_with_balance(USDC_TESTNET_ISSUER, SOURCE_BALANCE),
+                network: crate::common::EndpointNetwork::testnet(),
+            },
+            trustline_key_xdr: trustline_ledger_key_xdr(&source, "USDC", USDC_TESTNET_ISSUER),
+            trustline_xdr: trustline_entry_xdr(&source, "USDC", USDC_TESTNET_ISSUER, 0),
+        })
+        .mount(&rpc)
+        .await;
+    let mut server = WalletServer::new(testnet_profile_with_rpc(&rpc.uri())).unwrap();
+    server.set_policy_engine_for_test(std::sync::Arc::new(
+        crate::common::v1_engine_mock::minimum_reserve_engine(
+            &["stellar_trustline", "stellar_trustline_commit"],
+            0,
+        ),
+    ));
+    let mut args = trustline_args(&source);
+    args.limit_stroops = Some("0".to_owned());
+    let prepared = server.call_stellar_trustline(args).await.unwrap();
+    assert_ne!(
+        prepared.is_error,
+        Some(true),
+        "the removal needs no added reserve: {}",
+        call_result_text(&prepared)
+    );
+    let data = call_result_json(&prepared)["data"].clone();
+    let committed = server
+        .call_stellar_trustline_commit(StellarTrustlineCommitArgs {
+            chain_id: "stellar:testnet".to_owned(),
+            from: source.clone(),
+            nonce: data["nonce"].as_str().unwrap().to_owned(),
+            expires_at_unix_ms: data["expires_at_unix_ms"].as_u64().unwrap(),
+            envelope_xdr: data["envelope_xdr"].as_str().unwrap().to_owned(),
+            approval_nonce: None,
+            approval_attestation: None,
+            business_id: None,
+        })
+        .await
+        .unwrap();
+    assert_ne!(
+        committed.is_error,
+        Some(true),
+        "the commit of the removal needs no added reserve: {}",
+        call_result_text(&committed)
+    );
+    let methods = crate::common::received_methods(&rpc).await;
+    assert_eq!(
+        methods.iter().filter(|m| *m == "sendTransaction").count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -925,7 +1157,7 @@ async fn trustline_reserve_uses_the_selected_fee() {
     server.set_policy_engine_for_test(std::sync::Arc::new(
         crate::common::v1_engine_mock::minimum_reserve_engine(
             &["stellar_trustline"],
-            100_000_000_000_000 - 10_000_000 - 500,
+            SOURCE_BALANCE - RESERVE_AFTER_OPENING - 500,
         ),
     ));
     let mut args = trustline_args(&source);

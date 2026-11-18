@@ -2207,6 +2207,23 @@ impl WalletServer {
         source: &str,
         tools: &[&'static str],
     ) -> Result<Option<stellar_agent_network::policy_state::FloorSource>, ToolError> {
+        self.classic_floor_source_requesting(client, source, &[], tools)
+            .await
+    }
+
+    /// [`Self::classic_floor_source`] whose account read also requests the
+    /// trustlines of `trustline_assets`.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::classic_floor_source`].
+    pub(crate) async fn classic_floor_source_requesting(
+        &self,
+        client: &stellar_agent_network::StellarRpcClient,
+        source: &str,
+        trustline_assets: &[stellar_agent_network::Asset],
+        tools: &[&'static str],
+    ) -> Result<Option<stellar_agent_network::policy_state::FloorSource>, ToolError> {
         use stellar_agent_network::policy_state::{FloorSource, floor_rule_matches};
         let Some(policy) = self.mainnet_evaluation_policy() else {
             return Ok(None);
@@ -2219,9 +2236,10 @@ impl WalletServer {
         {
             return Ok(None);
         }
-        FloorSource::read(
+        FloorSource::read_requesting(
             client,
             source,
+            trustline_assets,
             &self.window_store,
             self.security_profile(),
             stellar_agent_network::operational::readiness_deadline(),

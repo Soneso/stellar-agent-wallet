@@ -143,6 +143,11 @@ pub struct AccountView {
     /// disclosure check; `auth_revocable` is informational only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_flags: Option<AccountFlagsView>,
+
+    /// The credit assets whose trustlines the read requested, listed or not.
+    /// An asset here without an entry in `balances` has no trustline.
+    #[serde(skip)]
+    pub(crate) requested_trustlines: Vec<AssetView>,
 }
 
 /// A typed projection of `AccountEntry.flags` into named boolean fields.
@@ -252,6 +257,7 @@ impl AccountView {
             signers,
             home_domain,
             account_flags,
+            requested_trustlines: Vec::new(),
         }
     }
 
@@ -628,7 +634,18 @@ pub async fn fetch_account_observed(
     account_id: &str,
     report: &crate::operational::OperationalReport,
 ) -> Result<ObservedAccount<AccountView>, WalletError> {
-    let (view, latest_ledger) = fetch_account_at(client, account_id, &[]).await?;
+    fetch_account_observed_requesting(client, account_id, &[], report).await
+}
+
+/// [`fetch_account_observed`] with the trustlines of `trustline_assets` in
+/// the same request, as [`fetch_account`] reads them.
+pub(crate) async fn fetch_account_observed_requesting(
+    client: &StellarRpcClient,
+    account_id: &str,
+    trustline_assets: &[Asset],
+    report: &crate::operational::OperationalReport,
+) -> Result<ObservedAccount<AccountView>, WalletError> {
+    let (view, latest_ledger) = fetch_account_at(client, account_id, trustline_assets).await?;
     let observed_at_ms = crate::mainnet::clock::now_ms()?;
     let latest_ledger = account_coverage(latest_ledger, report.latest_ledger)?;
     Ok(ObservedAccount::new(
@@ -780,6 +797,13 @@ fn project_account_response(
     tracing::debug!(account_id = %redact_account_id(account_id), "fetch_account: account entry received");
 
     let mut view = project_account_entry(account_id, &account_entry_data)?;
+    view.requested_trustlines = trustline_assets
+        .iter()
+        .filter_map(|asset| match asset {
+            Asset::Credit { code, issuer } => Some(AssetView::credit(code, issuer)),
+            Asset::Native => None,
+        })
+        .collect();
 
     // Append trustline entries in request order.
     //
@@ -1206,6 +1230,7 @@ pub(crate) fn project_account_entry(
         signers,
         home_domain,
         account_flags,
+        requested_trustlines: Vec::new(),
     })
 }
 

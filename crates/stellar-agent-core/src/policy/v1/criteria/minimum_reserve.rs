@@ -17,11 +17,17 @@
 //! move is not a native debit and does not reduce the native reserve (§7.4).
 //!
 //! ```text
-//! reserve_required = account.reserves_stroops(BASE_RESERVE_STROOPS) + margin_stroops
+//! reserve_required = account.reserves_stroops(BASE_RESERVE_STROOPS)
+//!                  + opened_subentries * BASE_RESERVE_STROOPS
+//!                  + margin_stroops
 //! post_balance     = pre_balance - (amount_stroops + total_fee_stroops) [checked]
 //!
 //! if post_balance < reserve_required → DenyReason::MinimumReserveBreached
 //! ```
+//!
+//! `opened_subentries` counts the trustline legs whose asset the account
+//! view does not show a trustline for, including a view that cannot tell.
+//! A trustline that already exists adds no reserve.
 //!
 //! # Missing account view (fail-closed)
 //!
@@ -42,10 +48,10 @@
 //! `(2 + subentries) * base_reserve` may change.  Update
 //! `AccountReservesView::reserves_stroops` at protocol release.
 
-use crate::policy::v1::EvalContext;
 use crate::policy::v1::asset_equivalence::assets_equivalent;
 use crate::policy::v1::criteria::Criterion;
-use crate::policy::v1::value::{ValueGate, classify_value};
+use crate::policy::v1::value::{ActionKind, ValueEffects, ValueGate, classify_value};
+use crate::policy::v1::{AccountReservesView, EvalContext};
 use crate::policy::{DenyReason, PolicyError};
 use crate::protocol_consts::BASE_RESERVE_STROOPS;
 
@@ -56,7 +62,8 @@ use crate::protocol_consts::BASE_RESERVE_STROOPS;
 /// Minimum-reserve guard criterion.
 ///
 /// Checks that the account balance after the transaction will be at least
-/// `reserves_stroops(BASE_RESERVE_STROOPS) + margin_stroops`.
+/// `reserves_stroops(BASE_RESERVE_STROOPS) + margin_stroops`, plus one
+/// `BASE_RESERVE_STROOPS` for each trustline the call opens.
 ///
 /// # Missing account view (fail-closed)
 ///
@@ -97,7 +104,8 @@ impl MinimumReserveCriterion {
     /// Constructs a new [`MinimumReserveCriterion`].
     ///
     /// `margin_stroops` is added to the protocol-computed
-    /// `(2 + subentries) * BASE_RESERVE_STROOPS` floor.
+    /// `(2 + subentries + opened_subentries) * BASE_RESERVE_STROOPS` floor,
+    /// where `opened_subentries` counts the trustlines the call opens.
     ///
     /// # Examples
     ///
@@ -127,7 +135,9 @@ impl Criterion for MinimumReserveCriterion {
     /// Evaluates the minimum-reserve guard.
     ///
     /// Returns `Ok(None)` when the post-transaction balance is at or above the
-    /// required reserve (`reserves_stroops + margin_stroops`).
+    /// required reserve (`reserves_stroops + opened_subentries *
+    /// BASE_RESERVE_STROOPS + margin_stroops`), where `opened_subentries`
+    /// counts the trustlines the call opens.
     ///
     /// Returns `Ok(Some(DenyReason::MinimumReserveBreached))` when the
     /// post-transaction balance would fall below the required reserve.
@@ -202,9 +212,19 @@ impl Criterion for MinimumReserveCriterion {
             .checked_sub(debit)
             .ok_or(PolicyError::AccountingOverflow)?;
 
+        let opened = match classify_value(ctx) {
+            ValueGate::Effects(effects) => opened_subentries(
+                effects,
+                account_view,
+                ctx.profile.chain_id.network_passphrase(),
+            ),
+            _ => 0,
+        };
+        let opened_reserve_stroops = opened.saturating_mul(BASE_RESERVE_STROOPS);
         let reserve_required_stroops = i128::from(
             account_view
                 .reserves_stroops(BASE_RESERVE_STROOPS)
+                .saturating_add(opened_reserve_stroops)
                 .saturating_add(self.margin_stroops),
         );
 
@@ -295,6 +315,32 @@ pub(super) fn extract_amount_stroops(ctx: &EvalContext<'_>) -> Result<AmountOutc
     }
 
     Ok(AmountOutcome::Debit(sum))
+}
+
+/// Counts the subentries the legs of `effects` open on the account of
+/// `account_view`, with assets compared under `network_passphrase`.
+///
+/// A trustline leg opens one unless the account view shows a trustline for
+/// its asset. A view that cannot tell, or a leg without an asset, counts as
+/// opening one. Every other leg kind opens no subentry on the source.
+#[must_use]
+pub fn opened_subentries(
+    effects: &ValueEffects,
+    account_view: &dyn AccountReservesView,
+    network_passphrase: &str,
+) -> i64 {
+    let opened = effects
+        .legs()
+        .iter()
+        .filter(|leg| leg.kind == ActionKind::Trustline)
+        .filter(|leg| {
+            leg.asset
+                .as_deref()
+                .and_then(|asset| account_view.holds_trustline(asset, network_passphrase))
+                != Some(true)
+        })
+        .count();
+    i64::try_from(opened).unwrap_or(i64::MAX)
 }
 
 /// Extracts the decoded envelope's total transaction fee in stroops.
@@ -1062,5 +1108,174 @@ mod tests {
             result.is_none(),
             "a token-only debit must not reduce the native reserve; got {result:?}"
         );
+    }
+
+    // ── Subentries the call opens ────────────────────────────────────────────
+
+    const TRUSTED: &str = "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
+    /// The envelope fee every subentry case carries.
+    const FEE: i64 = 100;
+    /// The reserve of an account without subentries.
+    const RESERVE: i64 = 2 * BASE_RESERVE_STROOPS;
+
+    /// An account view without subentries that answers `trust` for every
+    /// trustline question.
+    #[derive(Debug)]
+    struct TrustlineView {
+        balance: i64,
+        trust: Option<bool>,
+    }
+
+    impl AccountReservesView for TrustlineView {
+        fn reserves_stroops(&self, base_reserve: i64) -> i64 {
+            2 * base_reserve
+        }
+
+        fn balance_stroops(&self) -> Result<i64, AccountReserveLookupError> {
+            Ok(self.balance)
+        }
+
+        fn holds_trustline(&self, _asset: &str, _network_passphrase: &str) -> Option<bool> {
+            self.trust
+        }
+    }
+
+    /// Evaluates one leg of `kind` over `asset` and `amount` against a view of
+    /// `balance` answering `trust`, with margin 0.
+    fn evaluate_leg(
+        kind: ActionKind,
+        asset: Option<&str>,
+        amount: Option<i128>,
+        balance: i64,
+        trust: Option<bool>,
+    ) -> Option<DenyReason> {
+        use crate::policy::v1::value::{ValueClass, ValueEffects, ValueLeg};
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let store = PolicyStateStore::new();
+        let view = TrustlineView { balance, trust };
+        let leg = ValueLeg {
+            kind,
+            amount,
+            asset: asset.map(str::to_owned),
+            destination: None,
+        };
+        let args = json!({ "total_fee_stroops": FEE });
+        let tool = make_tool("stellar_trustline");
+        let profile = make_profile();
+        let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store, 1_700_000_000_000)
+            .with_account_view(&view)
+            .with_value(ValueClass::Value(ValueEffects::single(leg)));
+        MinimumReserveCriterion::new(0).evaluate(&ctx).unwrap()
+    }
+
+    fn trustline(balance: i64, trust: Option<bool>) -> Option<DenyReason> {
+        evaluate_leg(ActionKind::Trustline, Some(TRUSTED), None, balance, trust)
+    }
+
+    /// A new trustline raises the reserve by one base reserve: the balance at
+    /// the raised reserve plus the fee passes, one stroop less breaches.
+    #[test]
+    #[serial_test::serial]
+    fn a_new_trustline_adds_one_base_reserve() {
+        let boundary = RESERVE + BASE_RESERVE_STROOPS + FEE;
+        assert_eq!(trustline(boundary, Some(false)), None);
+        assert!(
+            matches!(
+                trustline(boundary - 1, Some(false)),
+                Some(DenyReason::MinimumReserveBreached {
+                    reserve_required_stroops,
+                    ..
+                }) if reserve_required_stroops == i128::from(RESERVE + BASE_RESERVE_STROOPS)
+            ),
+            "one stroop under the raised reserve must breach"
+        );
+    }
+
+    /// An existing trustline opens no subentry: the pre-call reserve applies.
+    #[test]
+    #[serial_test::serial]
+    fn an_existing_trustline_adds_no_reserve() {
+        let boundary = RESERVE + FEE;
+        assert_eq!(trustline(boundary, Some(true)), None);
+        assert!(matches!(
+            trustline(boundary - 1, Some(true)),
+            Some(DenyReason::MinimumReserveBreached { .. })
+        ));
+    }
+
+    /// A view that cannot tell whether the trustline exists counts it as
+    /// opening one.
+    #[test]
+    #[serial_test::serial]
+    fn an_unknown_trustline_adds_one_base_reserve() {
+        let boundary = RESERVE + BASE_RESERVE_STROOPS + FEE;
+        assert_eq!(trustline(boundary, None), None);
+        assert!(
+            matches!(
+                trustline(boundary - 1, None),
+                Some(DenyReason::MinimumReserveBreached { .. })
+            ),
+            "an unknown trustline must count the added reserve"
+        );
+    }
+
+    /// A trustline leg without an asset counts as opening one, whatever the
+    /// view answers.
+    #[test]
+    #[serial_test::serial]
+    fn a_trustline_leg_without_an_asset_adds_one_base_reserve() {
+        let boundary = RESERVE + BASE_RESERVE_STROOPS + FEE;
+        let unnamed =
+            |balance| evaluate_leg(ActionKind::Trustline, None, None, balance, Some(true));
+        assert_eq!(unnamed(boundary), None);
+        assert!(matches!(
+            unnamed(boundary - 1),
+            Some(DenyReason::MinimumReserveBreached { .. })
+        ));
+    }
+
+    /// Claim, account-creation, payment, DEX trade, lending, vault, and x402
+    /// legs open no subentry on the source, even when the view cannot tell
+    /// about trustlines.
+    #[test]
+    #[serial_test::serial]
+    fn other_legs_add_no_reserve() {
+        let debit = 10_000_000;
+        let native = |kind| (kind, Some("native"), Some(i128::from(debit)), debit);
+        // A token leg and an inbound leg debit no native balance.
+        let token = |kind| (kind, Some(TRUSTED), Some(1), 0);
+        for (kind, asset, amount, spent) in [
+            (ActionKind::Claim, None, None, 0),
+            (ActionKind::Claim, Some(TRUSTED), None, 0),
+            native(ActionKind::AccountCreation),
+            native(ActionKind::Payment),
+            token(ActionKind::Payment),
+            native(ActionKind::DexTrade),
+            token(ActionKind::DexTrade),
+            native(ActionKind::Lend),
+            token(ActionKind::Lend),
+            token(ActionKind::LendWithdraw),
+            native(ActionKind::VaultDeposit),
+            token(ActionKind::VaultDeposit),
+            token(ActionKind::VaultWithdraw),
+            native(ActionKind::X402Payment),
+            token(ActionKind::X402Payment),
+        ] {
+            let boundary = RESERVE + FEE + spent;
+            assert_eq!(
+                evaluate_leg(kind, asset, amount, boundary, None),
+                None,
+                "{kind:?} over {asset:?} at the pre-call reserve must pass"
+            );
+            assert!(
+                matches!(
+                    evaluate_leg(kind, asset, amount, boundary - 1, None),
+                    Some(DenyReason::MinimumReserveBreached { .. })
+                ),
+                "{kind:?} over {asset:?} one stroop under the pre-call reserve must breach"
+            );
+        }
     }
 }

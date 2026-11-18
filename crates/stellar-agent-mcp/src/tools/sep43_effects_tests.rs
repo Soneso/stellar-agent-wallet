@@ -260,6 +260,31 @@ pub(crate) struct Account {
     pub rejects: bool,
     /// A read answers an entry that is not account XDR.
     pub bad_xdr: bool,
+    /// The codes of the trustlines it holds on assets issued by `OTHER`.
+    pub trustlines: Vec<[u8; 4]>,
+}
+
+/// The trustline entry of a trustline key `key` the fixture account holds.
+fn held_trustline(ledger: &Ledger, key: &stellar_xdr::LedgerKeyTrustLine) -> Option<String> {
+    let PublicKey::PublicKeyTypeEd25519(Uint256(bytes)) = key.account_id.0;
+    let stellar_xdr::TrustLineAsset::CreditAlphanum4(asset) = &key.asset else {
+        return None;
+    };
+    let account = ledger.accounts.lock().unwrap().get(&g(bytes)).cloned()?;
+    let held = account.trustlines.contains(&asset.asset_code.0)
+        && asset.issuer == AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(OTHER)));
+    held.then(|| {
+        LedgerEntryData::Trustline(stellar_xdr::TrustLineEntry {
+            account_id: key.account_id.clone(),
+            asset: key.asset.clone(),
+            balance: 0,
+            limit: i64::MAX,
+            flags: 1,
+            ext: stellar_xdr::TrustLineEntryExt::V0,
+        })
+        .to_xdr_base64(Limits::none())
+        .unwrap()
+    })
 }
 
 #[derive(Default)]
@@ -300,10 +325,17 @@ impl Respond for LedgerRpc {
                 let mut entries = Vec::new();
                 for key in request["params"]["keys"].as_array().unwrap() {
                     let key = key.as_str().unwrap();
-                    let LedgerKey::Account(account) =
-                        LedgerKey::from_xdr_base64(key, Limits::none()).unwrap()
-                    else {
-                        continue;
+                    let account = match LedgerKey::from_xdr_base64(key, Limits::none()).unwrap() {
+                        LedgerKey::Account(account) => account,
+                        LedgerKey::Trustline(trustline) => {
+                            if let Some(xdr) = held_trustline(&self.0, &trustline) {
+                                entries.push(json!({
+                                    "key": key, "xdr": xdr, "lastModifiedLedgerSeq": 100,
+                                }));
+                            }
+                            continue;
+                        }
+                        _ => continue,
                     };
                     let PublicKey::PublicKeyTypeEd25519(Uint256(bytes)) = account.account_id.0;
                     let id = g(bytes);
@@ -1673,6 +1705,137 @@ async fn the_minimum_reserve_sees_earlier_operations_and_the_fee() {
     );
 }
 
+/// Allowing rules for both transaction tools, and a trustline rule with a
+/// zero-margin reserve.
+fn trustline_reserve_rules() -> Vec<PolicyRule> {
+    let mut rules = reserve_rules();
+    rules.push(rule(
+        "stellar_trustline_commit",
+        vec![Box::new(
+            stellar_agent_core::policy::v1::criteria::minimum_reserve::MinimumReserveCriterion::new(
+                0,
+            ),
+        )],
+        false,
+    ));
+    rules
+}
+
+/// A trustline on `code` issued by `OTHER`.
+fn trustline_on(code: [u8; 4], limit: i64) -> OperationBody {
+    OperationBody::ChangeTrust(stellar_xdr::ChangeTrustOp {
+        line: stellar_xdr::ChangeTrustAsset::CreditAlphanum4(stellar_xdr::AlphaNum4 {
+            asset_code: stellar_xdr::AssetCode4(code),
+            issuer: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(OTHER))),
+        }),
+        limit,
+    })
+}
+
+/// The reserve earlier operations open accumulates: two new trustlines
+/// with a balance enough for one refuse, and a balance enough for both signs.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn two_new_trustlines_need_the_reserve_of_both() {
+    let fx = Fixture::new(trustline_reserve_rules()).await;
+    let base = stellar_agent_core::BASE_RESERVE_STROOPS;
+    let two = || {
+        fx.tx(vec![
+            trustline_on(*b"USDC", 100 * XLM),
+            trustline_on(*b"EURC", 100 * XLM),
+        ])
+    };
+    fx.account(fx.key, RESERVE + 2 * base + 200, None);
+    signed(&fx.sign(two()).await);
+    fx.account(fx.key, RESERVE + 2 * base + 199, None);
+    assert_eq!(
+        refused(&fx.sign(two()).await).0,
+        "policy.deny.minimum_reserve_breached"
+    );
+    fx.account(fx.key, RESERVE + base + 200, None);
+    signed(
+        &fx.sign(fx.tx(vec![trustline_on(*b"USDC", 100 * XLM)]))
+            .await,
+    );
+    assert_eq!(
+        refused(&fx.sign(two()).await).0,
+        "policy.deny.minimum_reserve_breached"
+    );
+}
+
+/// The wallet read requests the trustline a `ChangeTrust` names: removing
+/// or changing a held trustline needs only the pre-call reserve and fee.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn a_held_trustline_adds_no_reserve() {
+    let fx = Fixture::new(trustline_reserve_rules()).await;
+    let held = |balance| {
+        fx.serve(
+            fx.key,
+            Account {
+                balance,
+                trustlines: vec![*b"USDC"],
+                ..Default::default()
+            },
+        );
+    };
+    for limit in [0, 100 * XLM] {
+        let change = || fx.tx(vec![trustline_on(*b"USDC", limit)]);
+        held(RESERVE + 100);
+        signed(&fx.sign(change()).await);
+        held(RESERVE + 99);
+        assert_eq!(
+            refused(&fx.sign(change()).await).0,
+            "policy.deny.minimum_reserve_breached",
+            "limit {limit}"
+        );
+    }
+}
+
+/// A `ChangeTrust` whose operation source is another account opens no
+/// subentry on the wallet: the wallet's pre-call reserve and fee suffice.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn another_sources_trustline_adds_no_reserve() {
+    let fx = Fixture::new(trustline_reserve_rules()).await;
+    fx.source(B, true);
+    let foreign = || fx.ops(vec![from(B, None, trustline_on(*b"USDC", 100 * XLM))]);
+    fx.account(fx.key, RESERVE + 100, None);
+    signed(&fx.sign(foreign()).await);
+    fx.account(fx.key, RESERVE + 99, None);
+    assert_eq!(
+        refused(&fx.sign(foreign()).await).0,
+        "policy.deny.minimum_reserve_breached"
+    );
+}
+
+/// A pool share trustline the wallet opens counts two base reserves toward
+/// every leg: a later payment needs the reserve of both subentries.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn a_pool_share_trustline_adds_two_base_reserves() {
+    let fx = Fixture::new(reserve_rules()).await;
+    let base = stellar_agent_core::BASE_RESERVE_STROOPS;
+    let pool = OperationBody::ChangeTrust(stellar_xdr::ChangeTrustOp {
+        line: stellar_xdr::ChangeTrustAsset::PoolShare(
+            stellar_xdr::LiquidityPoolParameters::default(),
+        ),
+        limit: 100 * XLM,
+    });
+    let pooled = || fx.tx(vec![pool.clone(), payment(muxed(A, None), XLM)]);
+    fx.account(fx.key, RESERVE + 2 * base + 200 + XLM, None);
+    signed(&fx.sign(pooled()).await);
+    fx.account(fx.key, RESERVE + 2 * base + 199 + XLM, None);
+    assert_eq!(
+        refused(&fx.sign(pooled()).await).0,
+        "policy.deny.minimum_reserve_breached"
+    );
+}
+
 /// The wallet fee reduces the reserve balance exactly once.
 #[tokio::test]
 #[serial_test::serial(keyring)]
@@ -1731,6 +1894,10 @@ impl AccountReservesView for InnerView {
     fn effective_native_reservations_stroops(&self) -> Option<u64> {
         Some(6)
     }
+
+    fn holds_trustline(&self, _asset: &str, _network_passphrase: &str) -> Option<bool> {
+        Some(false)
+    }
 }
 
 struct BrokenView;
@@ -1750,13 +1917,19 @@ impl AccountReservesView for BrokenView {
 }
 
 /// The spent view subtracts exactly, floors at zero, propagates a balance
-/// error and delegates reserves, observation and reservations.
+/// error and delegates reserves, observation, reservations and trustlines.
+/// The subentries earlier operations open raise its reserve, and their
+/// trustlines and another source's trustline answer held.
 #[test]
 fn spent_view_delegates_and_propagates_errors() {
     use super::SpentAccountView;
+    let opened = vec!["EURC:G".to_owned()];
     let view = |spent_stroops| SpentAccountView {
         inner: &InnerView,
         spent_stroops,
+        opened_subentries: 0,
+        opened_trustlines: &[],
+        other_source: false,
     };
     assert_eq!(view(30).balance_stroops().unwrap(), 70);
     assert_eq!(view(101).balance_stroops().unwrap(), 0);
@@ -1765,9 +1938,36 @@ fn spent_view_delegates_and_propagates_errors() {
     assert_eq!(view(0).reserves_stroops(5), 15);
     assert_eq!(view(0).observation(), InnerView.observation());
     assert_eq!(view(0).effective_native_reservations_stroops(), Some(6));
+    assert_eq!(
+        view(0).holds_trustline("USDC:G", TESTNET_PASSPHRASE),
+        Some(false)
+    );
+    let after = |other_source| SpentAccountView {
+        inner: &InnerView,
+        spent_stroops: 0,
+        opened_subentries: 2,
+        opened_trustlines: &opened,
+        other_source,
+    };
+    assert_eq!(after(false).reserves_stroops(5), 25);
+    assert_eq!(
+        after(false).holds_trustline("EURC:G", TESTNET_PASSPHRASE),
+        Some(true)
+    );
+    assert_eq!(
+        after(false).holds_trustline("USDC:G", TESTNET_PASSPHRASE),
+        Some(false)
+    );
+    assert_eq!(
+        after(true).holds_trustline("USDC:G", TESTNET_PASSPHRASE),
+        Some(true)
+    );
     let broken = SpentAccountView {
         inner: &BrokenView,
         spent_stroops: 0,
+        opened_subentries: 0,
+        opened_trustlines: &[],
+        other_source: false,
     };
     assert_eq!(
         broken.balance_stroops().unwrap_err().detail,

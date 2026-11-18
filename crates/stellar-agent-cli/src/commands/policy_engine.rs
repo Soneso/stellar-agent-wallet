@@ -689,6 +689,23 @@ pub(crate) async fn mainnet_floor_source(
     tool_name: &'static str,
     source: &str,
 ) -> Result<Option<FloorSource>, WalletError> {
+    mainnet_floor_source_requesting(context, client, policy, tool_name, source, &[]).await
+}
+
+/// [`mainnet_floor_source`] whose account read also requests the trustlines
+/// of `trustline_assets`.
+///
+/// # Errors
+///
+/// The errors of [`mainnet_floor_source`].
+pub(crate) async fn mainnet_floor_source_requesting(
+    context: &MainnetWriteContext,
+    client: &stellar_agent_network::StellarRpcClient,
+    policy: &VerifiedPolicy,
+    tool_name: &'static str,
+    source: &str,
+    trustline_assets: &[stellar_agent_network::Asset],
+) -> Result<Option<FloorSource>, WalletError> {
     let tool = value_descriptor(
         tool_name,
         ToolValueKind::MovesValue,
@@ -700,9 +717,10 @@ pub(crate) async fn mainnet_floor_source(
     let store = stellar_agent_network::policy_state::PersistedWindowStore::for_profile(
         context.profile_name(),
     );
-    FloorSource::read(
+    FloorSource::read_requesting(
         client,
         source,
+        trustline_assets,
         &store,
         context.profile(),
         stellar_agent_network::operational::readiness_deadline(),

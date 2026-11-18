@@ -131,6 +131,29 @@ impl ClassicRpc {
         }
     }
 
+    /// Answers for the funded `account` with `balance_stroops` and
+    /// `subentries` until it sends.
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) fn with_account(
+        mut self,
+        account: &str,
+        balance_stroops: i64,
+        subentries: u32,
+    ) -> Self {
+        let key = account_ledger_key_xdr(account);
+        for (entry_key, entry) in Arc::make_mut(&mut self.entries) {
+            if *entry_key == key {
+                *entry = account_entry_xdr_with_seq(
+                    account,
+                    balance_stroops,
+                    subentries,
+                    ACCOUNT_SEQUENCE,
+                );
+            }
+        }
+        self
+    }
+
     /// Answers `getLedgerEntries` for `key` with `entry` as well.
     pub(crate) fn with_entry(mut self, key: String, entry: String) -> Self {
         Arc::make_mut(&mut self.entries).push((key, entry));

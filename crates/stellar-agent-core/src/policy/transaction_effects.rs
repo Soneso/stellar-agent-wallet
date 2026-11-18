@@ -277,6 +277,9 @@ pub struct TransactionEffects {
     pub unvalued: Vec<UnvaluedOperation>,
     /// The memo of a `Tx` envelope; `None` for a fee bump and for a text memo that is not UTF-8.
     pub memo: Option<ClassicMemo>,
+    /// The wallet-sourced pool share `ChangeTrust` operations with a nonzero limit.
+    /// Each can open a pool share trustline, two subentries under CAP-38.
+    pub pool_share_trustlines: u32,
 }
 
 impl TransactionEffects {
@@ -714,6 +717,7 @@ fn prepare(
                 valued: Vec::new(),
                 unvalued: Vec::new(),
                 memo: None,
+                pool_share_trustlines: 0,
             }));
         }
     };
@@ -734,6 +738,7 @@ fn prepare(
         valued: Vec::new(),
         unvalued: Vec::new(),
         memo,
+        pool_share_trustlines: 0,
     };
     // Refuse the whole transaction before deriving any operation's value.
     validate_amounts(&tx)?;
@@ -830,14 +835,21 @@ fn decode_operation(
 ) -> Result<(), TransactionEffectsError> {
     #[cfg(test)]
     tests::record_operation();
-    if has_no_effect(&operation.body) {
-        return Ok(());
-    }
     let source = operation
         .source_account
         .as_ref()
         .unwrap_or(&tx.source_account);
     let other_source = !is_wallet(source, wallet);
+    if let OperationBody::ChangeTrust(trust) = &operation.body
+        && matches!(trust.line, ChangeTrustAsset::PoolShare(_))
+        && trust.limit > 0
+        && !other_source
+    {
+        effects.pool_share_trustlines = effects.pool_share_trustlines.saturating_add(1);
+    }
+    if has_no_effect(&operation.body) {
+        return Ok(());
+    }
     let incoming = |destination: &MuxedAccount| other_source && is_wallet(destination, wallet);
     let mut value = |route| -> Result<(), TransactionEffectsError> {
         effects
@@ -2376,6 +2388,7 @@ mod tests {
                     valued: Vec::new(),
                     unvalued: Vec::new(),
                     memo: Some(ClassicMemo::None),
+                    pool_share_trustlines: 0,
                 };
                 match fixture(kind).1 {
                     Outcome::Valued(route) => {
@@ -3019,6 +3032,27 @@ mod tests {
             empty(&decode(&transaction(vec![op.clone()])));
         }
         empty(&decode(&transaction(operations)));
+    }
+
+    /// A wallet-sourced pool share `ChangeTrust` with a nonzero limit counts;
+    /// a removal and another source's operation count none.
+    #[test]
+    fn pool_share_trustlines_count_the_wallet_openings() {
+        let pool = |limit| {
+            operation(OperationBody::ChangeTrust(ChangeTrustOp {
+                line: ChangeTrustAsset::PoolShare(LiquidityPoolParameters::default()),
+                limit,
+            }))
+        };
+        let mut other = pool(100);
+        other.source_account = Some(muxed(THIRD, None));
+        let effects = decode(&transaction(vec![
+            pool(100),
+            pool(0),
+            other,
+            pool(i64::MAX),
+        ]));
+        assert_eq!(effects.pool_share_trustlines, 2);
     }
 
     #[test]

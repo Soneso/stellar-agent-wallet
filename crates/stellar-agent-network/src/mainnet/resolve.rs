@@ -1430,7 +1430,20 @@ mod enabled {
             Some(body.classic_max_fee_per_op_stroops),
         )
         .map_err(|_| refused(P::FeeAboveCap))?;
-        let view = fetch_account(req.client, &source, &[])
+        // A trustline read requests its trustline, so the view tells whether it exists.
+        let requested: Vec<crate::Asset> = match (
+            decoder_tool,
+            args["asset_code"].as_str(),
+            args["asset_issuer"].as_str(),
+        ) {
+            ("stellar_trustline_commit", Some(code), Some(issuer)) => {
+                crate::Asset::from_code_and_issuer(code, issuer)
+                    .into_iter()
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        let view = fetch_account(req.client, &source, &requested)
             .await
             .map_err(|_| refused(P::AccountUnavailable))?;
         let canonical =
@@ -1440,9 +1453,10 @@ mod enabled {
         let engine = req.policy.engine();
         let floor = if floor_rule_matches(&engine, &descriptor) {
             Some(
-                FloorSource::read(
+                FloorSource::read_requesting(
                     req.client,
                     &source,
+                    &requested,
                     req.store,
                     req.context.profile(),
                     crate::operational::readiness_deadline(),
