@@ -330,6 +330,9 @@ pub(crate) const WIRE_VERSION_CANONICAL_LINEAGE: u32 = 17;
 pub(crate) const WIRE_VERSION_NATIVE_COVERAGE: u32 = 18;
 
 /// Selects the format required by stored fields and retains each committed floor.
+///
+/// Every committed write carries the native coverage marker, so it selects
+/// version 18. The lower branches serve only an unmarked image.
 pub(in crate::policy_state) fn select_wire_version(wire: &WireFile, committed: Option<u32>) -> u32 {
     if committed.is_some_and(|version| version >= WIRE_VERSION_NATIVE_COVERAGE)
         || wire.native_coverage.is_some()
@@ -3522,10 +3525,12 @@ impl PersistedWindowStore {
     /// A window that holds an operation record that has not ended refuses with
     /// [`WindowStoreError::OperationsOpen`] before either callback runs. The
     /// successor keeps terminal operation records, tombstones and every
-    /// authorization an operation links, or of a value-holding or fee-holding
-    /// domain, without a release row. It keeps the admissible floors, raised
-    /// by the release bounds of the records it drops, and the native coverage
-    /// marker.
+    /// authorization without a release row that an operation links. It keeps
+    /// every value-holding or fee-holding authorization without a release row,
+    /// except an unused one that no operation links and that was never
+    /// claimed. It keeps the admissible floors, raised by the release bounds
+    /// of the records it drops. It keeps the native coverage marker unless it
+    /// drops such an unused record, which clears the marker.
     ///
     /// A mainnet profile in a build with mainnet writes also refuses while an
     /// effective open or claimed authorization remains. Expiry releases
@@ -4885,7 +4890,7 @@ impl PersistedWindowStore {
             })?;
         let max_version = WIRE_VERSION_MAX;
         #[cfg(test)]
-        let max_version = DESTINATION_READER_CAP.get().unwrap_or(max_version);
+        let max_version = READER_VERSION_CAP.get().unwrap_or(max_version);
         if version.version > max_version {
             return Err(WindowStoreError::UnsupportedVersion);
         }
@@ -5250,7 +5255,7 @@ fn authenticated_scope(wire: &WireFile) -> Result<ChainScope, WindowStoreError> 
 fn check_snapshot(wire: &WireFile) -> Result<(), WindowStoreError> {
     let max_version = WIRE_VERSION_MAX;
     #[cfg(test)]
-    let max_version = DESTINATION_READER_CAP.get().unwrap_or(max_version);
+    let max_version = READER_VERSION_CAP.get().unwrap_or(max_version);
     if wire.version > max_version {
         return Err(WindowStoreError::UnsupportedVersion);
     }
@@ -8019,7 +8024,7 @@ pub mod commit_faults {
 
 #[cfg(test)]
 thread_local! {
-    pub(in crate::policy_state) static DESTINATION_READER_CAP: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    pub(in crate::policy_state) static READER_VERSION_CAP: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
     static DESTINATION_BEFORE_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 

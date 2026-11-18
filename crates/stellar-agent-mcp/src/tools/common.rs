@@ -2066,7 +2066,11 @@ impl WalletServer {
                 },
             )
             .and_then(|decision| {
-                stellar_agent_network::policy_state::refuse_unproved_floor(policy, decision)
+                stellar_agent_network::policy_state::refuse_uncovered_floor(
+                    policy,
+                    decision,
+                    account_view,
+                )
             }) {
                 Ok(decision) => Ok(GateEvaluation::mainnet(decision)),
                 Err(MainnetRefusal::Denied { reason, .. }) => Ok(GateEvaluation::denied(reason)),
@@ -2319,7 +2323,11 @@ impl WalletServer {
     ///
     /// `policy.deny.<reason>` when the preparation name denies, and the
     /// evaluation's own refusal, such as `policy.engine_required` or
-    /// `wallet.clock_error`, when it cannot evaluate.
+    /// `wallet.clock_error`, when it cannot evaluate. `account.unread` when
+    /// the preparation name's rule carries a native `balance_floor` and the
+    /// commit name's rule carries none, or a lower one. Signing resolution
+    /// evaluates the commit name alone, so the locked mint rechecks only that
+    /// name's floor, which must be the highest floor that admitted the call.
     pub(crate) async fn commit_governing_outcome(
         &self,
         outcome: DispatchOutcome,
@@ -2331,6 +2339,21 @@ impl WalletServer {
     ) -> Result<DispatchOutcome, ToolError> {
         if self.mainnet_context.is_none() {
             return Ok(outcome);
+        }
+        if let Some(policy) = self.mainnet_evaluation_policy() {
+            let engine = policy.engine();
+            let floor = |tool: &str| {
+                self.policy_descriptor(tool).and_then(|descriptor| {
+                    stellar_agent_network::policy_state::floor_rule_minimum(&engine, &descriptor)
+                })
+            };
+            if let Some(prepared) = floor(prepare_tool)
+                && floor(&format!("{prepare_tool}_commit")).is_none_or(|commit| commit < prepared)
+            {
+                return Err(ToolError::Business(policy_denial_error_result(
+                    &DenyReason::AccountUnread,
+                )));
+            }
         }
         let snapshot = outcome.snapshot()?;
         let now_ms = snapshot.policy.now_ms();
@@ -2414,8 +2437,63 @@ impl WalletServer {
         compose_toolset_outer(routed, outer, now_ms, self.mainnet_context.is_some())
     }
 
+    /// The payer's account input of a mainnet x402 preparation of `tool`
+    /// under a verified mainnet policy: a floor source when the first rule
+    /// matching `tool` carries a `balance_floor`, a plain read within the
+    /// readiness deadline when it carries a `minimum_reserve` alone, and
+    /// `None` otherwise. `client` is built only for a read.
+    ///
+    /// # Errors
+    ///
+    /// The client, readiness, account read, and native exposure refusals,
+    /// as business results.
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) async fn x402_payer_view(
+        &self,
+        client: impl FnOnce() -> Result<stellar_agent_network::StellarRpcClient, WalletError>,
+        payer: &str,
+        tool: &'static str,
+    ) -> Result<Option<stellar_agent_network::policy_state::PayerView>, ToolError> {
+        use stellar_agent_network::policy_state::{
+            FloorSource, PayerView, floor_rule_matches, reserve_rule_matches,
+        };
+        let refusal = |error: &WalletError| ToolError::Business(ledger_err_result(error));
+        let (Some(policy), Some(descriptor)) = (
+            self.mainnet_evaluation_policy(),
+            self.policy_descriptor(tool),
+        ) else {
+            return Ok(None);
+        };
+        let engine = policy.engine();
+        let floor = floor_rule_matches(&engine, &descriptor);
+        if !floor && !reserve_rule_matches(&engine, &descriptor) {
+            return Ok(None);
+        }
+        let client = client().map_err(|error| refusal(&error))?;
+        let deadline = stellar_agent_network::operational::readiness_deadline();
+        if floor {
+            return FloorSource::read(
+                &client,
+                payer,
+                &self.window_store,
+                self.security_profile(),
+                deadline,
+            )
+            .await
+            .map(|floor| Some(PayerView::Floor(floor)))
+            .map_err(|error| refusal(&WalletError::from(error)));
+        }
+        stellar_agent_network::operational::read_within_readiness_deadline(
+            deadline,
+            stellar_agent_network::fetch_account(&client, payer, &[]),
+        )
+        .await
+        .map(|view| Some(PayerView::Plain(view)))
+        .map_err(|error| refusal(&error))
+    }
+
     /// Refreshes verified local state without reconciling through RPC and
-    /// evaluates `tool` for `scope`.
+    /// evaluates `tool` for `scope` on `account_view`.
     #[cfg(feature = "mainnet-write")]
     pub(crate) async fn dispatch_preparation(
         &self,
@@ -2423,6 +2501,7 @@ impl WalletServer {
         args: &Value,
         chain: &str,
         value: stellar_agent_core::policy::v1::ValueClass,
+        account_view: Option<&dyn stellar_agent_core::policy::v1::AccountReservesView>,
         scope: EvaluationScope,
     ) -> Result<DispatchOutcome, ToolError> {
         self.dispatch_gate_inner(
@@ -2430,7 +2509,7 @@ impl WalletServer {
             args,
             chain,
             Some(value),
-            None,
+            account_view,
             None,
             scope,
             GateMode::Preparation,
@@ -8143,6 +8222,7 @@ pub(crate) mod tests {
                                 &requirements,
                                 10,
                             )),
+                            None,
                             scope,
                         )
                         .await
@@ -10282,6 +10362,21 @@ pub(crate) mod tests {
                 Self::build(tool, Some(true), policy, profile, prepare).await
             }
 
+            /// A run of [`Self::with`] over a window whose native coverage
+            /// marker covers the endpoint's balance reads.
+            pub(crate) async fn covered(tool: Tool, policy: impl FnOnce(String) -> String) -> Self {
+                Self::build(
+                    tool,
+                    Some(true),
+                    policy,
+                    |_| {},
+                    |args| {
+                        args["cover_native_history"] = serde_json::json!(true);
+                    },
+                )
+                .await
+            }
+
             /// A run of [`Self::new`] whose durable record holds no consent
             /// after the attestation.
             pub(crate) async fn unconsented(tool: Tool) -> Self {
@@ -10327,6 +10422,13 @@ pub(crate) mod tests {
                 let oracle_control = mount_rpc(&f, &oracle).await;
                 let mut args = tool.prepare_args(&f);
                 prepare(&mut args);
+                if args
+                    .as_object_mut()
+                    .and_then(|args| args.remove("cover_native_history"))
+                    .is_some()
+                {
+                    cover_native_history(&f);
+                }
                 let (args, entry, prepared) = match consent {
                     Some(complete) => Self::prepared(&f, tool, args, complete).await,
                     None => Self::prepared_allowed(&f, tool, args).await,
@@ -10459,6 +10561,17 @@ pub(crate) mod tests {
                 let (args, entry, _) =
                     Self::prepared(&self.f, self.tool, self.tool.prepare_args(&self.f), true).await;
                 (args, entry)
+            }
+
+            /// [`Self::prepare_again`] for preparation arguments that `edit`
+            /// changes, so the commit signs another envelope.
+            pub(crate) async fn prepare_variant(
+                &self,
+                edit: impl FnOnce(&mut serde_json::Value),
+            ) -> serde_json::Value {
+                let mut args = self.tool.prepare_args(&self.f);
+                edit(&mut args);
+                Self::prepared(&self.f, self.tool, args, true).await.0
             }
 
             /// Commits the run's arguments; the request history then holds
@@ -12368,7 +12481,7 @@ pub(crate) mod tests {
         }
 
         /// `raw` with a `balance_floor` of `min_stroops` on the rule of `name`.
-        fn with_floor(raw: &str, name: &str, min_stroops: i64) -> String {
+        pub(crate) fn with_floor(raw: &str, name: &str, min_stroops: i64) -> String {
             with_criterion(
                 raw,
                 name,
@@ -12446,7 +12559,7 @@ pub(crate) mod tests {
         /// Commits the window store's first write 310 s before now, so that
         /// the native coverage marker it establishes covers a balance read
         /// that the endpoint reports closed now.
-        fn cover_native_history(f: &Fixture) {
+        pub(crate) fn cover_native_history(f: &Fixture) {
             let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
             let _clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(now - 310_000);
             f.server
@@ -12459,18 +12572,301 @@ pub(crate) mod tests {
         /// the operating account once for the preparation and its paired
         /// commit evaluation over a covered window. The fee takes the
         /// observed balance below a floor at that balance; a funded floor
-        /// refuses `account.unread`, as no public path binds a passing floor
-        /// into locked admission. Neither mints nor sends.
+        /// prepares. A preparation neither mints nor sends.
         #[tokio::test]
         #[serial_test::serial(keyring)]
         #[serial_test::serial]
         async fn mainnet_classic_preparations_read_the_floor_source() {
+            preparation_floor_matrix(&[Tool::Claim, Tool::CreateAccount, Tool::Trustline]).await;
+            // Each commit reads its own floor source: a floor on the commit
+            // name at the balance less one action's debit and fee passes
+            // both preparations, and the second commit counts the first
+            // commit's retained debit and fee.
             const BALANCE: i64 = 100_000_000_000;
-            for tool in [Tool::Claim, Tool::CreateAccount, Tool::Trustline] {
+            for (tool, spent) in [
+                (Tool::Claim, 100),
+                // The second creation funds 2 XLM; each passes alone.
+                (Tool::CreateAccount, 20_000_100),
+                (Tool::Trustline, 100),
+            ] {
+                let run = ClassicRun::covered(tool, |raw| {
+                    with_floor(&raw, tool.commit_name(), BALANCE - spent)
+                })
+                .await;
+                // The second preparation signs another envelope, so its
+                // commit could submit; a claim has no argument to change,
+                // and its repeat refuses as already submitted before any
+                // send, so only its code is asserted.
+                let second = run
+                    .prepare_variant(|args| match tool {
+                        Tool::CreateAccount => args["starting_balance"] = "2 XLM".into(),
+                        Tool::Trustline => args["limit_stroops"] = "11".into(),
+                        Tool::Claim | Tool::Pay => {}
+                    })
+                    .await;
+                let first = run.commit().await;
+                assert_eq!(first["ok"], true, "{tool:?}: {first}");
+                assert_eq!(
+                    run.control.count("sendTransaction"),
+                    1,
+                    "{tool:?}: the first commit submits"
+                );
+                let result = run.commit_with(second).await;
+                if !matches!(tool, Tool::Claim) {
+                    assert_eq!(
+                        run.control.count("sendTransaction"),
+                        0,
+                        "{tool:?}: nothing more is sent"
+                    );
+                }
+                assert_eq!(
+                    result["error"]["code"], "account.floor_refused",
+                    "{tool:?}: {result}"
+                );
+            }
+        }
+
+        /// `stellar_pay` under a floor on either name reads the source
+        /// once for its gate and paired check: a low balance refuses
+        /// `account.floor_refused`, and a funded one prepares.
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        #[serial_test::serial]
+        async fn mcp_pay_preparation_reads_the_floor_source() {
+            // The floor reads the source, not the payee: the payee holds
+            // twice the source's balance, and the refusal states the
+            // source's balance after the payment of 10 and its fee of 100.
+            const BALANCE: i64 = 100_000_000_000;
+            let primary = wiremock::MockServer::start().await;
+            let oracle = wiremock::MockServer::start().await;
+            let f = routed_fixture_with(
+                |raw| with_floor(&classic_policy(&raw), "stellar_pay", BALANCE),
+                |_| {},
+                &primary,
+                &oracle,
+            );
+            let mut entries = fixture_entries(&f);
+            entries.push(serde_json::json!({
+                "key": stellar_agent_test_support::xdr_fixtures::account_ledger_key_xdr(
+                    f.envelope.destination(),
+                ),
+                "xdr": stellar_agent_test_support::xdr_fixtures::account_entry_xdr_with_seq(
+                    f.envelope.destination(),
+                    2 * BALANCE,
+                    0,
+                    1,
+                ),
+                "lastModifiedLedgerSeq": 100,
+            }));
+            let control = Arc::new(RpcControl::default());
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(MainnetRpc {
+                    entries,
+                    state_path: f.server.window_store.path().to_path_buf(),
+                    audit_path: f.server.security_profile().audit_log_path.clone(),
+                    control: Arc::clone(&control),
+                    seed_reads: Arc::clone(&f.seed_reads),
+                })
+                .mount(&primary)
+                .await;
+            let _oracle_control = mount_rpc(&f, &oracle).await;
+            cover_native_history(&f);
+            let result = wire(
+                &Tool::Pay
+                    .prepare(&f.server, &Tool::Pay.prepare_args(&f))
+                    .await,
+            );
+            assert_eq!(result["error"]["code"], "account.floor_refused", "{result}");
+            let message = result["error"]["message"].as_str().unwrap();
+            assert!(
+                message.contains(&format!(
+                    "\"balance_after_stroops\":\"{}\"",
+                    BALANCE - 10 - 100
+                )),
+                "{message}"
+            );
+            assert_eq!(control.count("sendTransaction"), 0);
+            drop((f, primary, oracle));
+            // Under a real approval requirement the floor refusal writes no
+            // inbox entry and opens no durable record; the funded control
+            // writes the inbox entry and opens one durable record.
+            for (min, refused) in [(BALANCE, true), (1, false)] {
+                let primary = wiremock::MockServer::start().await;
+                let oracle = wiremock::MockServer::start().await;
+                let f = routed_fixture_with(
+                    |raw| {
+                        with_floor(
+                            &require_approval_rules(
+                                &classic_policy(&raw),
+                                &["stellar_pay", "stellar_pay_commit"],
+                                600,
+                            ),
+                            "stellar_pay",
+                            min,
+                        )
+                    },
+                    |_| {},
+                    &primary,
+                    &oracle,
+                );
+                let control = mount_rpc(&f, &primary).await;
+                let _oracle_control = mount_rpc(&f, &oracle).await;
+                cover_native_history(&f);
+                let result = wire(
+                    &Tool::Pay
+                        .prepare(&f.server, &Tool::Pay.prepare_args(&f))
+                        .await,
+                );
+                let inbox = f
+                    .server
+                    .resolve_approval_dir()
+                    .unwrap()
+                    .join("operator.toml")
+                    .exists();
+                let records = ledger(&f)
+                    .and_then(|state| state["approvals"]["records"].as_array().cloned())
+                    .unwrap_or_default();
+                if refused {
+                    assert_eq!(result["error"]["code"], "account.floor_refused", "{result}");
+                    assert!(!inbox, "no inbox entry");
+                    assert!(records.is_empty(), "no durable record");
+                } else {
+                    assert_eq!(result["ok"], true, "a funded floor proposes: {result}");
+                    assert!(inbox, "the funded proposal writes its inbox entry");
+                    assert_eq!(records.len(), 1, "the funded proposal opens one record");
+                }
+                assert_eq!(control.count("sendTransaction"), 0);
+                drop((f, primary, oracle));
+            }
+            preparation_floor_matrix(&[Tool::Pay]).await;
+        }
+
+        /// `stellar_pay_commit` reads its own floor source: two payments
+        /// prepare under a floor on the commit name with nothing retained,
+        /// the first commits, and the second commit's read counts the
+        /// first's debit and fee, which refuses `account.floor_refused`
+        /// before signing.
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        #[serial_test::serial]
+        async fn mcp_pay_commit_reads_its_own_floor_source() {
+            // Balance, minus payments of 10 and 9 and their 100 fees, falls
+            // 24 below this floor; one payment leaves it met. The second
+            // payment's amount makes its envelope another transaction, so its
+            // commit could submit.
+            const MIN: i64 = 100_000_000_000 - 2 * 110 + 25;
+            let second_payment = |args: &mut serde_json::Value| {
+                args["amount_in_stroops"] = "9".into();
+            };
+            let run =
+                ClassicRun::covered(Tool::Pay, |raw| with_floor(&raw, "stellar_pay_commit", MIN))
+                    .await;
+            let second = run.prepare_variant(second_payment).await;
+            assert_eq!(run.commit().await["ok"], true, "the first commit passes");
+            // `commit_raw` clears the primary's history first, so each count
+            // is that commit's own submits to the endpoint it sends through.
+            assert_eq!(
+                run.control.count("sendTransaction"),
+                1,
+                "the first commit submits through the primary"
+            );
+            let result = run.commit_with(second).await;
+            assert_eq!(
+                run.control.count("sendTransaction"),
+                0,
+                "nothing more is sent"
+            );
+            assert_eq!(result["error"]["code"], "account.floor_refused", "{result}");
+            drop(run);
+            // A commit-name floor below the preparation-name floor refuses
+            // `account.unread`: the locked mint would recheck only the
+            // weaker floor. Nothing is minted or sent.
+            let run = ClassicRun::covered(Tool::Pay, |raw| {
+                with_floor(
+                    &with_floor(&raw, "stellar_pay_commit", 1),
+                    "stellar_pay",
+                    MIN,
+                )
+            })
+            .await;
+            let result = run.commit().await;
+            assert_eq!(
+                result["error"]["code"], "account.unread",
+                "a weaker commit floor refuses: {result}"
+            );
+            assert!(authorizations(&run.f).is_empty(), "nothing minted");
+            assert_eq!(run.control.count("sendTransaction"), 0);
+            drop(run);
+            // Equal floors on both names: the first commit signs, and the
+            // second commit's own read and its governing check count the
+            // first commit's debit and fee.
+            let run = ClassicRun::covered(Tool::Pay, |raw| {
+                with_floor(
+                    &with_floor(&raw, "stellar_pay_commit", MIN),
+                    "stellar_pay",
+                    MIN,
+                )
+            })
+            .await;
+            let second = run.prepare_variant(second_payment).await;
+            assert_eq!(run.commit().await["ok"], true, "equal floors sign");
+            assert_eq!(
+                run.control.count("sendTransaction"),
+                1,
+                "the first commit submits"
+            );
+            let result = run.commit_with(second).await;
+            assert_eq!(
+                run.control.count("sendTransaction"),
+                0,
+                "nothing more is sent"
+            );
+            assert_eq!(result["error"]["code"], "account.floor_refused", "{result}");
+            drop(run);
+            // A floor on the preparation name alone refuses the commit with
+            // `account.unread`, as signing resolution evaluates the commit
+            // name only: no approval entry is written, nothing is minted,
+            // charged, or sent.
+            for tool in [Tool::Pay, Tool::Claim] {
+                let run =
+                    ClassicRun::covered(tool, |raw| with_floor(&raw, tool.prepare_name(), 1)).await;
+                let inbox = run
+                    .f
+                    .server
+                    .resolve_approval_dir()
+                    .unwrap()
+                    .join("operator.toml");
+                let entries = std::fs::read(&inbox).unwrap();
+                let result = run.commit().await;
+                assert_eq!(
+                    result["error"]["code"], "account.unread",
+                    "{tool:?}: {result}"
+                );
+                assert_eq!(
+                    std::fs::read(&inbox).unwrap(),
+                    entries,
+                    "{tool:?}: no entry"
+                );
+                assert!(
+                    authorizations(&run.f).is_empty(),
+                    "{tool:?}: nothing minted"
+                );
+                assert!(
+                    window_records(&run.f).is_empty(),
+                    "{tool:?}: nothing charged"
+                );
+                assert_eq!(run.control.count("sendTransaction"), 0, "{tool:?}");
+            }
+        }
+
+        async fn preparation_floor_matrix(tools: &[Tool]) {
+            const BALANCE: i64 = 100_000_000_000;
+            for &tool in tools {
                 for name in [tool.prepare_name(), tool.commit_name()] {
-                    for (min_stroops, code) in
-                        [(BALANCE, "account.floor_refused"), (1, "account.unread")]
-                    {
+                    for (min_stroops, code) in [
+                        (BALANCE, serde_json::json!("account.floor_refused")),
+                        (1, Value::Null),
+                    ] {
                         let primary = wiremock::MockServer::start().await;
                         let oracle = wiremock::MockServer::start().await;
                         let f = routed_fixture_with(
@@ -14537,6 +14933,7 @@ pub(crate) mod tests {
                             &requirements,
                             10,
                         )),
+                        None,
                         stellar_agent_core::mainnet::decision::EvaluationScope::Classic,
                     )
                     .await

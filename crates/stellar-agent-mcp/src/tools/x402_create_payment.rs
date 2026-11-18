@@ -751,12 +751,26 @@ impl WalletServer {
         let business_id = entry.as_ref().map(|handle| handle.business_id().clone());
         let value = ValueClass::single(x402_value_leg(&requirements, amount));
         let audit_leg = ValueLegRecord::from(&x402_value_leg(&requirements, amount));
+        let payer_view = match self
+            .x402_payer_view(
+                || guard.context.primary_client(),
+                &payer,
+                "stellar_x402_create_payment",
+            )
+            .await
+        {
+            Ok(view) => view,
+            Err(error) => return error.into_result(),
+        };
         let dispatch = match self
             .dispatch_preparation(
                 "stellar_x402_create_payment",
                 &json!({"chain_id": args.chain_id}),
                 &args.chain_id,
                 value,
+                payer_view
+                    .as_ref()
+                    .map(|view| view as &dyn stellar_agent_core::policy::v1::AccountReservesView),
                 stellar_agent_core::mainnet::decision::EvaluationScope::Classic,
             )
             .await
@@ -2633,6 +2647,7 @@ pub(super) mod approval_tests {
                     &json!({"chain_id":"stellar:mainnet"}),
                     "stellar:mainnet",
                     ValueClass::single(x402_value_leg(&terms, 10)),
+                    None,
                     stellar_agent_core::mainnet::decision::EvaluationScope::Classic,
                 )
                 .await
@@ -4416,32 +4431,226 @@ mod tests {
             );
         }
         drop(f);
-        let f = Fixture::new(|raw| {
-            raw.replace(
-                "criteria = [",
-                "criteria = [ { kind = \"minimum_reserve\", margin_stroops = 0 },",
-            )
-        });
-        let clients = stellar_agent_network::client::constructions_on_this_thread();
+        // A reserve rule reads the payer once: an unreachable endpoint
+        // refuses with its code, an underfunded payer with the reserve
+        // denial, and neither persists an approval.
+        let reserve = |margin: i64| {
+            move |raw: String| {
+                raw.replace(
+                    "criteria = [",
+                    &format!(
+                        "criteria = [ {{ kind = \"minimum_reserve\", margin_stroops = {margin} }},"
+                    ),
+                )
+            }
+        };
+        use crate::tools::common::tests::mainnet::{
+            mount_rpc, require_approval_rules, routed_fixture, wire, x402_args,
+        };
+        let approvals = |f: &Fixture| {
+            f.server
+                .resolve_approval_dir()
+                .unwrap()
+                .join("operator.toml")
+        };
+        let f = Fixture::new(reserve(0));
         let result = f
             .server
-            .call_stellar_x402_create_payment(X402CreatePaymentArgs {
-                payment_required: serde_json::to_string(&f.requirements()).unwrap(),
+            .call_stellar_x402_create_payment(x402_args(&f, None))
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::tools::common::assert_business_envelope(&result).0,
+            "network.rpc_unreachable"
+        );
+        assert!(!approvals(&f).exists());
+        drop(f);
+        for (margin, code) in [
+            (i64::MAX / 2, Some("policy.deny.minimum_reserve_breached")),
+            (0, None),
+        ] {
+            let rpc = wiremock::MockServer::start().await;
+            let f = routed_fixture(
+                |raw| {
+                    reserve(margin)(require_approval_rules(
+                        &raw,
+                        &["stellar_x402_create_payment"],
+                        600,
+                    ))
+                },
+                &rpc,
+            );
+            let control = mount_rpc(&f, &rpc).await;
+            let result = f
+                .server
+                .call_stellar_x402_create_payment(x402_args(&f, None))
+                .await
+                .unwrap();
+            assert_eq!(control.count("getLedgerEntries"), 1, "one payer read");
+            if let Some(code) = code {
+                assert_eq!(
+                    crate::tools::common::assert_business_envelope(&result).0,
+                    code
+                );
+                assert!(!approvals(&f).exists(), "no pending approval");
+                continue;
+            }
+            let body = wire(&result);
+            let nonce = body["data"]["approval"]["approval_nonce"].as_str();
+            assert!(nonce.is_some(), "a funded payer proposes: {body}");
+            assert!(
+                stellar_agent_network::policy_state::ApprovalStatus::new(
+                    &f.server.window_store,
+                    f.server.security_profile()
+                )
+                .find_by_nonce(nonce.unwrap())
+                .unwrap()
+                .is_some(),
+                "the proposal opens its durable record"
+            );
+        }
+    }
+
+    /// A floor on the x402 rule reads the enrolled payer before the
+    /// preparation persists anything: an uncovered window refuses
+    /// `account.unread`, a balance below the floor `account.floor_refused`,
+    /// and a funded payer on a covered window proposes. A refusal leaves no
+    /// pending approval.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn x402_preparation_reserve_and_floor_matrix() {
+        use crate::tools::common::tests::mainnet::{
+            cover_native_history, mount_rpc, require_approval_rules, routed_fixture, wire,
+            x402_args,
+        };
+        const BALANCE: i64 = 100_000_000_000;
+        for (min, covered, code) in [
+            (1, false, Some("account.unread")),
+            (BALANCE + 1, true, Some("account.floor_refused")),
+            (BALANCE, true, None),
+        ] {
+            let rpc = wiremock::MockServer::start().await;
+            let f = routed_fixture(
+                |raw| {
+                    require_approval_rules(&raw, &["stellar_x402_create_payment"], 600).replace(
+                        "criteria = [",
+                        &format!(
+                            "criteria = [ {{ kind = \"balance_floor\", min_stroops = \"{min}\" }},"
+                        ),
+                    )
+                },
+                &rpc,
+            );
+            let control = mount_rpc(&f, &rpc).await;
+            if covered {
+                cover_native_history(&f);
+            }
+            let result = f
+                .server
+                .call_stellar_x402_create_payment(x402_args(&f, None))
+                .await
+                .unwrap();
+            assert_eq!(control.count("getHealth"), 1, "one readiness check");
+            let body = wire(&result);
+            match code {
+                Some(code) => {
+                    assert_eq!(body["error"]["code"], code, "{body}");
+                    assert_eq!(result.is_error, Some(true));
+                    assert!(
+                        !f.server
+                            .resolve_approval_dir()
+                            .unwrap()
+                            .join("operator.toml")
+                            .exists()
+                    );
+                }
+                None => assert!(
+                    body["data"]["approval"]["approval_nonce"].is_string(),
+                    "a funded payer proposes: {body}"
+                ),
+            }
+        }
+    }
+
+    /// A native-SAC payment under a floor counts its amount as a native
+    /// debit. Below the floor it refuses with the balance after the debit
+    /// of 10. Under `Allow` a payment that leaves exactly the floor pays in
+    /// one call: it releases the payment payload, and its authorization
+    /// records the native debit.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn x402_native_sac_floor_and_allow_rows() {
+        use crate::tools::common::tests::mainnet::{
+            authorizations, cover_native_history, mount_rpc, require_approval_rules,
+            routed_fixture, wire,
+        };
+        const BALANCE: i64 = 100_000_000_000;
+        let native_floor = |min: i64, approval: bool| {
+            move |raw: String| {
+                let raw = if approval {
+                    require_approval_rules(&raw, &["stellar_x402_create_payment"], 600)
+                } else {
+                    raw
+                };
+                let mut doc = raw.parse::<toml_edit::DocumentMut>().unwrap();
+                for rule in doc["rules"].as_array_of_tables_mut().unwrap().iter_mut() {
+                    if rule["match"]["tool"].as_str() != Some("stellar_x402_create_payment") {
+                        continue;
+                    }
+                    let criteria = rule["criteria"].as_array_mut().unwrap();
+                    for criterion in criteria.iter_mut() {
+                        let table = criterion.as_inline_table_mut().unwrap();
+                        if table.contains_key("assets") {
+                            let mut assets = toml_edit::Array::new();
+                            assets.push("native");
+                            table.insert("assets", toml_edit::Value::Array(assets));
+                        }
+                        if table.contains_key("asset") {
+                            table.insert("asset", "native".into());
+                        }
+                    }
+                    let mut floor = toml_edit::InlineTable::new();
+                    floor.insert("kind", "balance_floor".into());
+                    floor.insert("min_stroops", min.to_string().into());
+                    criteria.push(floor);
+                }
+                doc.to_string()
+            }
+        };
+        let sac = stellar_agent_core::asset_id::CanonicalAsset::Native
+            .sac_contract_id(stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE)
+            .unwrap();
+        let args = |f: &crate::tools::common::tests::mainnet::Fixture| {
+            let mut requirements = serde_json::to_value(f.requirements()).unwrap();
+            requirements["asset"] = serde_json::json!(sac);
+            X402CreatePaymentArgs {
+                payment_required: requirements.to_string(),
                 chain_id: "stellar:mainnet".to_owned(),
                 address: None,
                 approval_nonce: None,
                 approval_attestation: None,
                 business_id: Some(crate::tools::common::tests::fresh_business_id()),
-            })
+            }
+        };
+        let rpc = wiremock::MockServer::start().await;
+        let f = routed_fixture(native_floor(BALANCE - 5, true), &rpc);
+        let control = mount_rpc(&f, &rpc).await;
+        cover_native_history(&f);
+        let result = f
+            .server
+            .call_stellar_x402_create_payment(args(&f))
             .await
             .unwrap();
-        assert_eq!(
-            crate::tools::common::assert_business_envelope(&result).0,
-            "policy.engine_required"
-        );
-        assert_eq!(
-            clients,
-            stellar_agent_network::client::constructions_on_this_thread()
+        let body = wire(&result);
+        assert_eq!(body["error"]["code"], "account.floor_refused", "{body}");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains(&format!("\"balance_after_stroops\":\"{}\"", BALANCE - 10)),
+            "{message}"
         );
         assert!(
             !f.server
@@ -4450,6 +4659,29 @@ mod tests {
                 .join("operator.toml")
                 .exists()
         );
+        assert_eq!(control.count("sendTransaction"), 0);
+        drop((f, control, rpc));
+        let rpc = wiremock::MockServer::start().await;
+        let f = routed_fixture(native_floor(BALANCE - 10, false), &rpc);
+        let _control = mount_rpc(&f, &rpc).await;
+        cover_native_history(&f);
+        let body = wire(
+            &f.server
+                .call_stellar_x402_create_payment(args(&f))
+                .await
+                .unwrap(),
+        );
+        assert!(
+            body["data"]["paymentSignature"].is_string(),
+            "a funded floor releases the payload: {body}"
+        );
+        let intents: Vec<serde_json::Value> = authorizations(&f)
+            .into_iter()
+            .filter(|auth| auth["domain"] == "soroban")
+            .collect();
+        assert_eq!(intents.len(), 1, "one payment intent: {intents:?}");
+        assert_eq!(intents[0]["native_reservation"]["debit_stroops"], 10);
+        assert_eq!(intents[0]["native_reservation"]["fee_stroops"], 0);
     }
 
     #[cfg(feature = "mainnet-write")]
@@ -4492,6 +4724,7 @@ mod tests {
                 &json!({"chain_id":"stellar:mainnet"}),
                 "stellar:mainnet",
                 ValueClass::single(x402_value_leg(&requirements, 10)),
+                None,
                 stellar_agent_core::mainnet::decision::EvaluationScope::Classic,
             )
             .await
@@ -4565,6 +4798,7 @@ mod tests {
                 &json!({"chain_id":"stellar:mainnet"}),
                 "stellar:mainnet",
                 ValueClass::single(x402_value_leg(&requirements, 10)),
+                None,
                 stellar_agent_core::mainnet::decision::EvaluationScope::Classic,
             )
             .await

@@ -1653,7 +1653,9 @@ pub(super) fn unreleased_link(auth: &WireAuthorization) -> bool {
 
 /// Whether `auth` belongs to a value-holding or fee-holding domain and has
 /// no release row. Only its release row can show that its native obligation
-/// ended, so retention and reset keep it whatever its link, age or clock.
+/// ended, so retention keeps it whatever its link, age or clock. A reset
+/// keeps it too, except an unused one that no operation links and that was
+/// never claimed.
 pub(super) fn unreleased_native(auth: &WireAuthorization) -> bool {
     auth.native_release.is_none() && auth.domain.hold_owner() != crate::mainnet::HoldOwner::NoHolds
 }
@@ -6097,8 +6099,8 @@ impl<'a> OperationStatus<'a> {
     /// Missing amounts refuse only this projection. Lifecycle and diagnostic
     /// reads remain available. The sum counts every native obligation in
     /// effect only on a file that carries the native coverage marker, at an
-    /// observation at or past both admissible floors. Public callers still
-    /// refuse a floor that passes on it through [`super::refuse_unproved_floor`].
+    /// observation at or past both admissible floors, as
+    /// [`super::refuse_uncovered_floor`] requires of a passing floor.
     ///
     /// # Errors
     ///

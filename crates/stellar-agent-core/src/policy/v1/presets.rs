@@ -99,11 +99,10 @@ const PAYMENT_TOOLS: [&str; 4] = [
     "stellar_x402_authenticated_payment",
 ];
 
-/// The payment tools whose rules carry the balance floor. The x402 tools
-/// evaluate without an account view, so a floor there denies every call.
+/// The payment tools whose rules carry the balance floor.
 const FLOOR_TOOLS: [&str; 2] = ["stellar_pay", "stellar_pay_commit"];
 
-/// The x402 tools, which evaluate without an account view.
+/// The x402 tools. Off mainnet they evaluate without an account view.
 const X402_TOOLS: [&str; 2] = [
     "stellar_x402_create_payment",
     "stellar_x402_authenticated_payment",
@@ -1634,8 +1633,8 @@ pub struct ToolLimits {
     pub unlisted_exhaustion: &'static str,
     /// Every recipient a payment rule lists, with this tool's treatment.
     pub recipients: Vec<RecipientTreatment>,
-    /// Whether the tool denies every call: an x402 rule with a balance floor,
-    /// since x402 tools evaluate without an account view.
+    /// Whether the tool denies every call: an x402 rule with a balance floor
+    /// off mainnet, where x402 tools evaluate without an account view.
     pub denies_every_call: bool,
 }
 
@@ -2146,7 +2145,7 @@ struct ToolView {
     /// A payment beyond the budget requests approval, as the evaluation on
     /// a mainnet profile decides, rather than being denied.
     budget_escalates: bool,
-    /// An x402 rule with a floor denies every call.
+    /// An x402 rule with a floor denies every call off mainnet.
     blocked: bool,
     /// The treatment of an address in no list.
     unlisted: Treatment,
@@ -2902,7 +2901,9 @@ fn tool_view(
                     });
             (stroops_of(u.get("per_tx_stroops")), period)
         });
-    let blocked = X402_TOOLS.contains(&tool) && rule.of_kind("balance_floor").next().is_some();
+    let blocked = X402_TOOLS.contains(&tool)
+        && rule.of_kind("balance_floor").next().is_some()
+        && !Caip2::from_passphrase(passphrase).is_some_and(Caip2::is_mainnet);
     // A `require_approval` rule escalates every call it does not deny.
     let decision = if rule.decision == "require_approval" {
         "require_approval"
@@ -3129,9 +3130,10 @@ pub fn total_bounds(body: &DocumentMut, network_passphrase: &str) -> Option<Vec<
 /// when its `kinds` select the recipient's kind. Its allowlist must also
 /// hold the recipient or, for an M address, its base G. A rule without a
 /// counterparty criterion admits every recipient, reported as
-/// `unrestricted`. A rule's floor is its highest floor; an x402 rule with a
-/// floor denies every call, since x402 tools evaluate without an account
-/// view.
+/// `unrestricted`. A rule's floor is its highest floor. On mainnet an x402
+/// floor is a funding condition on the payer's observed balance; off
+/// mainnet an x402 rule with a floor denies every call, since x402 tools
+/// evaluate there without an account view.
 ///
 /// The evaluation keeps one counter per asset identifier as written and per
 /// window, and one per identifier for the total budget. Every window a rule
@@ -3480,10 +3482,20 @@ pub fn summarize(
         ));
     }
     for (tool, _) in x402_floors.iter().filter(|(_, floored)| *floored) {
-        notes.push(format!(
-            "{tool} denies every call: its rule carries a balance floor, and x402 tools \
-             evaluate without an account view."
-        ));
+        notes.push(if mainnet_chain {
+            format!(
+                "{tool} pays only while the payer's native balance, less retained native \
+                 reservations and the payment's native debit, stays at or above its balance \
+                 floor. Below it \
+                 a call refuses account.floor_refused, and without the window's native \
+                 coverage marker account.unread."
+            )
+        } else {
+            format!(
+                "{tool} denies every call: its rule carries a balance floor, and x402 tools \
+                 evaluate without an account view off mainnet."
+            )
+        });
     }
     notes.extend(approval_notes);
     notes.extend(notes_extra);
@@ -4034,6 +4046,13 @@ mod tests {
     ) -> Decision {
         let descriptor = tool_on(payment.tool, net);
         let profile = net.profile();
+        let observed = ObservedAccount::new(Balance(balance), 1, now_ms, now_ms - 5_000);
+        let floor = FloorInput {
+            observed: &observed,
+            effective_reservations_stroops: 0,
+        };
+        // Mainnet x402 tools read the payer; elsewhere they evaluate
+        // without an account view.
         if X402_TOOLS.contains(&payment.tool) {
             return engine
                 .evaluate_with_value(
@@ -4041,7 +4060,7 @@ mod tests {
                     &serde_json::json!({}),
                     &profile,
                     payment.x402_value(net),
-                    None,
+                    matches!(net, Net::Mainnet).then_some(&floor as &dyn AccountReservesView),
                     None,
                     None,
                     None,
@@ -4050,11 +4069,6 @@ mod tests {
                 )
                 .unwrap();
         }
-        let observed = ObservedAccount::new(Balance(balance), 1, now_ms, now_ms - 5_000);
-        let floor = FloorInput {
-            observed: &observed,
-            effective_reservations_stroops: 0,
-        };
         engine
             .evaluate(
                 &descriptor,
@@ -4209,7 +4223,7 @@ mod tests {
                 &serde_json::json!({}),
                 &profile,
                 payment.x402_value(net),
-                None,
+                matches!(net, Net::Mainnet).then_some(&floor as &dyn AccountReservesView),
                 None,
                 None,
                 None,
@@ -5413,15 +5427,25 @@ mod tests {
             floor_notes,
             [
                 "The balance floor does not apply to stellar_x402_create_payment.",
-                "stellar_x402_authenticated_payment denies every call: its rule carries a \
-                 balance floor, and x402 tools evaluate without an account view.",
+                "stellar_x402_authenticated_payment pays only while the payer's native \
+                 balance, less retained native reservations and the payment's native debit, \
+                 stays at or above its balance floor. Below it a call refuses \
+                 account.floor_refused, and \
+                 without the window's native coverage marker account.unread.",
             ]
         );
+        // On mainnet the floor is a funding condition: the floored tool
+        // treats its recipients as the floor-free one does.
         let authenticated = tool_limits(&summary, "stellar_x402_authenticated_payment");
-        assert!(authenticated.denies_every_call);
-        assert_eq!(authenticated.unlisted_mode, "deny");
-        assert_eq!(authenticated.recipients[0].treatment, Treatment::Denied);
-        assert!(!tool_limits(&summary, CREATE_TOOL).denies_every_call);
+        let create = tool_limits(&summary, CREATE_TOOL);
+        assert!(!authenticated.denies_every_call);
+        assert!(!create.denies_every_call);
+        assert_eq!(authenticated.unlisted_mode, create.unlisted_mode);
+        assert_eq!(
+            authenticated.recipients[0].treatment,
+            create.recipients[0].treatment
+        );
+        assert_ne!(authenticated.recipients[0].treatment, Treatment::Denied);
         let floors: Vec<(&str, Option<&str>)> = summary
             .balance_floors
             .iter()
@@ -7887,7 +7911,7 @@ mod tests {
         }
         assert_eq!(
             (bodies.len(), cases, bounds, sequences, unreachable, staged),
-            (320, 36_650, 1_960, 671_777, 360, 60),
+            (320, 37_530, 2_027, 714_572, 451, 67),
             "property size"
         );
         // The family holds both rate windows, a repeated counter, an

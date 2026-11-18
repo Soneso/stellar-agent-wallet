@@ -1157,12 +1157,22 @@ impl WalletServer {
         let business_id = entry.as_ref().map(|handle| handle.business_id().clone());
         let value = ValueClass::single(x402_value_leg(&requirements, amount));
         let audit_leg = ValueLegRecord::from(&x402_value_leg(&requirements, amount));
+        let payer_view = match self
+            .x402_payer_view(|| guard.context.primary_client(), &payer, TOOL)
+            .await
+        {
+            Ok(view) => view,
+            Err(error) => return error.into_result(),
+        };
         let dispatch = match self
             .dispatch_preparation(
                 TOOL,
                 &json!({"chain_id": args.chain_id, "home_domain": args.home_domain}),
                 &args.chain_id,
                 value,
+                payer_view
+                    .as_ref()
+                    .map(|view| view as &dyn stellar_agent_core::policy::v1::AccountReservesView),
                 stellar_agent_core::mainnet::decision::EvaluationScope::X402Authenticated {
                     home_domain: args.home_domain.clone(),
                     tool: TOOL.to_owned(),

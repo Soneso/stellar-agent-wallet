@@ -257,6 +257,9 @@ impl X402Error {
                 stellar_agent_network::mainnet::MainnetAuthorizationError::TotalEpoch(refusal) => {
                     refusal.code()
                 }
+                stellar_agent_network::mainnet::MainnetAuthorizationError::Accounting(refusal) => {
+                    refusal.validation_error().code()
+                }
                 _ => "network.mainnet_authorization_refused",
             },
             X402Error::MainnetAuthorizationRefused => "network.mainnet_authorization_refused",
@@ -349,6 +352,24 @@ mod tests {
     )]
 
     use super::*;
+
+    /// An accounting refusal of the mainnet resolver keeps its typed code.
+    #[test]
+    fn wire_code_keeps_accounting_refusals() {
+        use stellar_agent_network::mainnet::{AccountingRefusal, MainnetAuthorizationError};
+        for (refusal, code) in [
+            (AccountingRefusal::Overflow, "policy.accounting_overflow"),
+            (AccountingRefusal::Invalid, "policy.accounting_invalid"),
+            (
+                AccountingRefusal::ApprovalRequired,
+                "policy.approval_required",
+            ),
+        ] {
+            let error =
+                X402Error::MainnetAuthorization(MainnetAuthorizationError::Accounting(refusal));
+            assert_eq!(error.wire_code(), code);
+        }
+    }
 
     // Display of all variants must not expose secret material.
     // We verify the display format does not contain known-sensitive patterns.

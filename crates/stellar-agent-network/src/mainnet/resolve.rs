@@ -654,7 +654,7 @@ mod enabled {
         keyring::EnrolledRole,
         policy_state::{
             ApprovalStatus, ConsumptionBinding, DomainBinding, FloorSource, FloorSourceError,
-            MintAuthority, MintRequest, NativeReservation, floor_rule_matches, unproved_floor_use,
+            MintAuthority, MintRequest, NativeReservation, floor_rule_matches, uncovered_floor_use,
         },
         policy_view::AccountViewAdapter,
     };
@@ -785,17 +785,18 @@ mod enabled {
     /// requirement or a denial needs an approval the action does not carry,
     /// except that an account denial keeps its reason under either authority.
     /// A permitting decision whose rule carries a balance floor refuses as
-    /// [`unproved_floor_use`] states.
+    /// [`uncovered_floor_use`] states for the evaluated `account_view`.
     fn check_evaluation(
         engine: &PolicyEngineV1,
         evaluation: &Evaluation,
         authority: &MainnetAuthority<'_>,
+        account_view: &dyn AccountReservesView,
     ) -> Result<ValueClass, MainnetAuthorizationError> {
         let value = || crate::mainnet::holds::value_class(evaluation);
         if !matches!(evaluation.decision, Decision::Deny(_))
             && let Some(reason) = evaluation
                 .rule_ordinal
-                .and_then(|ordinal| unproved_floor_use(engine, ordinal))
+                .and_then(|ordinal| uncovered_floor_use(engine, ordinal, Some(account_view)))
         {
             return Err(MainnetAuthorizationError::PolicyDenied(Box::new(reason)));
         }
@@ -827,6 +828,45 @@ mod enabled {
             FloorSourceError::Read(_) => refused(P::AccountUnavailable),
             FloorSourceError::Store(error) => mint::store_error(error),
         }
+    }
+
+    /// The native amounts an x402 intent of `amount` on contract `asset`
+    /// reserves. The facilitator pays the envelope fee, so the fee is zero.
+    /// The debit is the amount when `asset` is the network's native asset
+    /// contract, and zero for any other contract.
+    pub(super) fn intent_native_reservation(
+        asset: &str,
+        amount: i128,
+        network_passphrase: &str,
+    ) -> Result<NativeReservation, MainnetAuthorizationError> {
+        use stellar_agent_core::policy::v1::asset_equivalence::total_budget_identity;
+        let debit_stroops = if total_budget_identity(asset, network_passphrase) == "native" {
+            i64::try_from(amount)
+                .map_err(|_| MainnetAuthorizationError::Accounting(AccountingRefusal::Overflow))?
+        } else {
+            0
+        };
+        Ok(NativeReservation {
+            debit_stroops,
+            fee_stroops: 0,
+        })
+    }
+
+    /// The locked admission of a read floor: the mint rechecks `floor`'s
+    /// observation against its locked image, the native coverage marker
+    /// and both admissible floors included, with this request's amounts.
+    fn bind_floor(
+        floor: Option<&FloorSource>,
+        (context, policy, signer): (&MainnetWriteContext, &VerifiedPolicy, &EnrolledSigner),
+        descriptor: &ToolDescriptor,
+        evaluation: &Evaluation,
+        request: &MintRequest,
+    ) -> Result<Option<crate::policy_state::CheckedFloor>, MainnetAuthorizationError> {
+        floor.map_or(Ok(None), |floor| {
+            floor
+                .checked_floor(context, policy, descriptor, evaluation, signer, request)
+                .map_err(mint::store_error)
+        })
     }
 
     /// The refusal of an engine error: an accounting error keeps its code.
@@ -1435,9 +1475,9 @@ mod enabled {
                 (routed, Some(outer))
             }
         };
-        check_evaluation(&engine, &evaluation, req.authority)?;
+        check_evaluation(&engine, &evaluation, req.authority, account)?;
         if let Some((_, outer)) = &outer {
-            check_evaluation(&engine, outer, req.authority)?;
+            check_evaluation(&engine, outer, req.authority, account)?;
         }
         let entries = crate::mainnet::holds::size_evaluated_holds(
             &engine,
@@ -1537,6 +1577,15 @@ mod enabled {
             },
             fee_stroops: i64::from(tx.tx.fee),
         });
+        request.floor = bind_floor(
+            floor.as_ref(),
+            (req.context, req.policy, req.signer),
+            &descriptor,
+            &evaluation,
+            &request,
+        )?;
+        #[cfg(test)]
+        competing_writer::run();
         let minted = req
             .store
             .mint_authorization(req.context.profile(), &request)
@@ -1569,7 +1618,8 @@ mod enabled {
     pub(super) async fn intent(
         req: SorobanIntentRequest<'_>,
     ) -> Result<MainnetSorobanIntentAuthorization, MainnetAuthorizationError> {
-        let now = now()?;
+        // An unreadable clock refuses before any request.
+        now()?;
         let deadline = tokio::time::Instant::now() + req.probe_deadline;
         let body = policy_body(req.context, req.policy, req.enablement)?;
         // An authenticated payment continues its consumed message
@@ -1630,7 +1680,7 @@ mod enabled {
         let value = ValueClass::single(ValueLeg {
             kind: ActionKind::X402Payment,
             amount: Some(amount),
-            asset: Some(asset),
+            asset: Some(asset.clone()),
             destination: Some(address_string(to)?),
         });
         // The policy evaluates the rule of the tool the operator approved.
@@ -1640,24 +1690,43 @@ mod enabled {
             "stellar_x402_create_payment"
         });
         let engine = req.policy.engine();
+        let floor = if floor_rule_matches(&engine, &descriptor) {
+            Some(
+                FloorSource::read(
+                    req.client,
+                    &payer,
+                    req.store,
+                    req.context.profile(),
+                    crate::operational::readiness_deadline(),
+                )
+                .await
+                .map_err(floor_refusal)?,
+            )
+        } else {
+            None
+        };
+        // The evaluation instant follows every awaited read.
+        let now = self::now()?;
+        let adapter = AccountViewAdapter::new(&view);
+        let account_view = FloorSource::view_or(floor.as_ref(), &adapter);
         let evaluation = engine
             .evaluate_with_value_full(
                 &descriptor,
                 &serde_json::json!({"chain_id": "stellar:mainnet"}),
                 req.context.profile(),
                 value.clone(),
-                Some(&AccountViewAdapter::new(&view)),
+                Some(account_view),
                 None,
                 None,
                 None,
                 None,
                 now,
             )
-            .map_err(|_| refused(P::PolicyEvaluationFailed))?;
-        let value = check_evaluation(&engine, &evaluation, req.authority)?;
+            .map_err(|error| engine_refusal(&error))?;
+        let value = check_evaluation(&engine, &evaluation, req.authority, account_view)?;
         let entries = engine
             .size_window_entries(&descriptor, req.context.profile(), &value, now)
-            .map_err(|_| refused(P::PolicyEvaluationFailed))?;
+            .map_err(|error| engine_refusal(&error))?;
         witness(
             req.context,
             body,
@@ -1706,9 +1775,20 @@ mod enabled {
         // message record of the same approval.
         request.parent = authenticated.map(MessageUseReceipt::id);
         request.operation = req.operation;
-        // An x402 authorization moves a contract token and pays no envelope
-        // fee from the account, so it reserves no native amount.
-        request.native_reservation = Some(NativeReservation::default());
+        request.native_reservation = Some(intent_native_reservation(
+            &asset,
+            amount,
+            req.context.network_passphrase(),
+        )?);
+        request.floor = bind_floor(
+            floor.as_ref(),
+            (req.context, req.policy, req.signer),
+            &descriptor,
+            &evaluation,
+            &request,
+        )?;
+        #[cfg(test)]
+        competing_writer::run();
         let minted = req
             .store
             .mint_authorization(req.context.profile(), &request)
@@ -2065,12 +2145,34 @@ mod enabled {
             .map_err(mint::store_error)?;
         Ok(())
     }
+
+    /// A writer that commits between this process's floor read and its
+    /// locked mint, as a second process can.
+    #[cfg(test)]
+    pub(super) mod competing_writer {
+        use std::sync::{Mutex, PoisonError};
+
+        type Writer = Box<dyn FnOnce() + Send>;
+        static NEXT: Mutex<Option<Writer>> = Mutex::new(None);
+
+        /// Runs `writer` once, just before the next mint.
+        pub(in crate::mainnet) fn arm(writer: impl FnOnce() + Send + 'static) {
+            *NEXT.lock().unwrap_or_else(PoisonError::into_inner) = Some(Box::new(writer));
+        }
+
+        pub(super) fn run() {
+            let writer = NEXT.lock().unwrap_or_else(PoisonError::into_inner).take();
+            if let Some(writer) = writer {
+                writer();
+            }
+        }
+    }
 }
 
 #[cfg(all(test, feature = "mainnet-write"))]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, reason = "test assertions")]
-    use super::super::{MainnetPrecondition as P, fixtures::ResolverFixture};
+    use super::super::{AccountingRefusal, MainnetPrecondition as P, fixtures::ResolverFixture};
     use super::*;
     use stellar_agent_core::approval::witness::ApprovalWitness;
 
@@ -3691,11 +3793,12 @@ mod tests {
         assert_eq!(amounts["fee_stroops"], 157);
     }
 
-    /// A resolved x402 intent reserves no native debit and no native fee.
+    /// A resolved x402 intent on the fixture's non-native token contract
+    /// reserves no native debit and no native fee.
     #[tokio::test]
     #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
-    async fn resolved_x402_intent_reserves_no_native_amount() {
+    async fn resolved_non_native_x402_intent_reserves_no_native_amount() {
         let f = soroban_fixture();
         let root = root(&f);
         let server = f.server().await;
@@ -3705,6 +3808,165 @@ mod tests {
         let amounts = &wire["authorizations"][0]["native_reservation"];
         assert_eq!(amounts["debit_stroops"], 0, "{wire}");
         assert_eq!(amounts["fee_stroops"], 0, "{wire}");
+    }
+
+    /// A resolved native-SAC x402 intent records its amount as the native
+    /// debit with a zero fee, in its one authorization. A crash before the
+    /// generation commit leaves no debit and the retry debits once; a
+    /// repeated intent on one operation keeps one authorization and one
+    /// debit.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn resolver_native_sac_reserves_native_debit() {
+        let reserved = |f: &ResolverFixture| {
+            crate::policy_state::OperationStatus::new(&f.window, &f.profile)
+                .native_reserved_stroops(None)
+                .unwrap()
+        };
+        // Sequence 1: a crash after the prepared image and before the
+        // generation commit leaves no authorization and no debit after a
+        // restart; the retry mints once.
+        let f = sac_fixture(None);
+        cover(&f);
+        let server = f.server().await;
+        let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
+        let root = transfer_root(&f, &native_sac(), 10);
+        {
+            let _fault = crate::policy_state::store::commit_faults::arm_accounting_fault(
+                crate::policy_state::store::commit_faults::COMMIT_FAULT_AFTER_PREPARED,
+            );
+            assert_eq!(
+                resolve_root(&f, &context, &root).await.unwrap_err(),
+                MainnetAuthorizationError::Refused(P::StoreUnavailable),
+                "the commit fault refuses as an unavailable store"
+            );
+        }
+        let restarted =
+            crate::policy_state::PersistedWindowStore::at_path(f.window.path().to_path_buf());
+        assert!(
+            f.wire()["authorizations"]
+                .as_array()
+                .is_none_or(Vec::is_empty),
+            "no authorization after the crash"
+        );
+        assert_eq!(
+            crate::policy_state::OperationStatus::new(&restarted, &f.profile)
+                .native_reserved_stroops(None)
+                .unwrap(),
+            0,
+            "no debit after the crash"
+        );
+        resolve_root(&f, &context, &root).await.unwrap();
+        assert_eq!(f.wire()["authorizations"].as_array().unwrap().len(), 1);
+        assert_eq!(reserved(&f), 10, "the retry debits once");
+        drop((server, f));
+        // Sequence 4: a repeated intent on one operation keeps one
+        // authorization and one debit.
+        let mut f = sac_fixture(None);
+        f.now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+        f.clock.set(f.now);
+        let root = transfer_root(&f, &native_sac(), 10);
+        let witness = intent_approval(&f, &root, None);
+        let link = durable_record(&f, &witness, true);
+        f.clock.set(witness.consent_at_ms());
+        let server = f.server().await;
+        let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
+        let client = context.primary_client().unwrap();
+        let intent = intent(&root);
+        let authority = f.approval_authority(&witness);
+        let resolve = || {
+            let mut req = intent_request(&f, &context, &client, &intent, &authority);
+            req.operation = Some(link);
+            resolve_soroban_intent(req)
+        };
+        resolve().await.unwrap();
+        let before = f.wire();
+        assert_eq!(
+            resolve().await.unwrap_err(),
+            MainnetAuthorizationError::Refused(P::DuplicateOpen),
+            "the repeat mints nothing new"
+        );
+        assert_eq!(f.wire(), before, "the repeat writes nothing");
+        let intents = f.wire()["authorizations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|auth| auth["domain"] == "soroban")
+            .count();
+        assert_eq!(intents, 1, "one authorization");
+        assert_eq!(reserved(&f), 10, "one debit");
+        drop((server, f));
+        let f = sac_fixture(None);
+        let server = f.server().await;
+        let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
+        resolve_root(&f, &context, &transfer_root(&f, &native_sac(), 10))
+            .await
+            .unwrap();
+        let wire = f.wire();
+        let auths = wire["authorizations"].as_array().unwrap();
+        assert_eq!(auths.len(), 1, "one authorization: {wire}");
+        let amounts = &auths[0]["native_reservation"];
+        assert_eq!(amounts["debit_stroops"], 10, "{wire}");
+        assert_eq!(amounts["fee_stroops"], 0, "{wire}");
+    }
+
+    /// The intent debit: the mainnet native SAC counts its amount, exactly
+    /// up to `i64::MAX`, and refuses `policy.accounting_overflow` above it;
+    /// another contract, and the testnet native SAC on mainnet, count zero.
+    #[test]
+    fn intent_native_debit_limits_and_spellings() {
+        use stellar_agent_core::profile::caip2::{MAINNET_PASSPHRASE, TESTNET_PASSPHRASE};
+        let reserve = |asset: &str, amount| {
+            enabled::intent_native_reservation(asset, amount, MAINNET_PASSPHRASE)
+        };
+        let native = |debit_stroops| {
+            Ok(crate::policy_state::NativeReservation {
+                debit_stroops,
+                fee_stroops: 0,
+            })
+        };
+        assert_eq!(reserve(&native_sac(), 10), native(10));
+        assert_eq!(
+            reserve(&native_sac(), i128::from(i64::MAX)),
+            native(i64::MAX)
+        );
+        assert_eq!(
+            reserve(&native_sac(), i128::from(i64::MAX) + 1),
+            Err(MainnetAuthorizationError::Accounting(
+                AccountingRefusal::Overflow
+            ))
+        );
+        let testnet_sac = stellar_agent_core::asset_id::CanonicalAsset::Native
+            .sac_contract_id(TESTNET_PASSPHRASE)
+            .unwrap();
+        for other in [token(), testnet_sac] {
+            assert_eq!(reserve(&other, i128::MAX), native(0), "{other}");
+        }
+    }
+
+    /// A floor whose arithmetic overflows on a native-SAC amount near
+    /// `i128::MAX`, after a retained reservation above the balance, keeps
+    /// the accounting code and mints nothing.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn intent_accounting_overflow_keeps_its_code() {
+        let f = sac_fixture(Some(1));
+        cover(&f);
+        let server = floor_server(&f).await;
+        let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
+        f.window
+            .mint_authorization(
+                &f.profile,
+                &retained_mint(&f, "above-balance", 2 * FIXTURE_BALANCE_STROOPS, 0),
+            )
+            .unwrap();
+        let before = f.wire();
+        let root = transfer_root(&f, &native_sac(), i128::MAX);
+        assert_eq!(
+            resolve_root(&f, &context, &root).await.unwrap_err(),
+            MainnetAuthorizationError::Accounting(AccountingRefusal::Overflow)
+        );
+        assert_eq!(f.wire(), before, "nothing is minted");
     }
 
     #[tokio::test]
@@ -7357,36 +7619,304 @@ mod tests {
         server
     }
 
-    /// A funded payment under a matched floor reads the operating account
-    /// and still refuses `account.unread` under either authority, minting
-    /// nothing: no public path binds a passing floor into locked admission,
-    /// even on a covered empty history.
+    /// A matched floor on a window without the native coverage marker
+    /// refuses `account.unread` under either authority, funded or breached,
+    /// and mints nothing. On a covered window the funded payment mints, and
+    /// its authorization records the checked floor's amounts.
     #[tokio::test]
     #[serial_test::serial]
-    async fn public_floor_refuses_unproved_history() {
-        let f = floor_fixture(1);
+    async fn public_floor_admits_only_covered_history() {
+        for min in [FIXTURE_BALANCE_STROOPS, 1] {
+            let f = floor_fixture(min);
+            // An existing image that an earlier build wrote, without the
+            // native coverage marker.
+            f.clock.set(f.now - 5_000);
+            f.window.record_and_persist(&f.profile, &[]).unwrap();
+            f.window.write_earlier_build_for_test(&f.profile).unwrap();
+            f.clock.set(f.now);
+            assert!(f.wire()["native_coverage"].is_null(), "an unmarked image");
+            let server = floor_server(&f).await;
+            let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
+            let client = context.primary_client().unwrap();
+            let approval = f.approval(&f.envelope, f.now, 600_000);
+            let before = f.wire();
+            for authority in [
+                f.approval_authority(&approval),
+                policy_authority(&f, AuthorityScope::Classic, f.now, 600_000),
+            ] {
+                let result = resolve_tx_sign(request(&f, &context, &client, &authority)).await;
+                assert_eq!(
+                    result.unwrap_err(),
+                    MainnetAuthorizationError::PolicyDenied(Box::new(DenyReason::AccountUnread)),
+                    "an uncovered window proves no complete native exposure ({min})"
+                );
+            }
+            assert_eq!(f.wire(), before, "nothing is minted");
+            if min != 1 {
+                continue;
+            }
+            cover(&f);
+            let policy = policy_authority(&f, AuthorityScope::Classic, f.now, 600_000);
+            let minted = resolve_tx_sign(request(&f, &context, &client, &policy)).await;
+            assert!(
+                minted.is_ok(),
+                "a funded floor on a covered window mints: {minted:?}"
+            );
+            let auths = f.wire()["authorizations"].as_array().unwrap().clone();
+            assert_eq!(auths.len(), 1, "one authorization: {auths:?}");
+            let methods = received_methods(&server).await;
+            assert_eq!(
+                methods.iter().filter(|m| *m == "getHealth").count(),
+                3,
+                "each resolution checks readiness for its observed read: {methods:?}"
+            );
+        }
+    }
+
+    /// A native authorization of `debit` and `fee` stroops from the
+    /// fixture's signer, outside any operation.
+    fn retained_mint(
+        f: &ResolverFixture,
+        nonce: &str,
+        debit: i64,
+        fee: i64,
+    ) -> crate::policy_state::MintRequest {
+        crate::policy_state::MintRequest {
+            chain: f.profile.chain_id,
+            binding: crate::policy_state::DomainBinding::Transaction {
+                unsigned_envelope_sha256: Sha256::digest(nonce.as_bytes()).into(),
+                tx_hash: [2; 32],
+                source: stellar_strkey::ed25519::PublicKey(f.signer.public_key())
+                    .to_string()
+                    .to_string(),
+                sequence: 1,
+            },
+            consumer: MainnetConsumer::CliPay,
+            policy_sequence: f.policy.sequence(),
+            policy_digest: f.policy.digest(),
+            authority: crate::policy_state::MintAuthority::Approval {
+                nonce: nonce.to_owned(),
+                expires_at_ms: f.now + 120_000,
+            },
+            chain_deadline_ms: None,
+            restriction_end_ms: None,
+            authorization_ttl_ms: 120_000,
+            bindings: super::super::digest::BindingFacts {
+                endpoint: None,
+                signer: f.signer.fact_digest(),
+                policy: f.policy.fact_digest(),
+                enablement: [4; 32],
+                witness: None,
+                reservation: None,
+                authority: [7; 32],
+                audit: [8; 32],
+                restriction: None,
+            },
+            holds: vec![],
+            parent: None,
+            operation: None,
+            intent_digest: None,
+            predecessor: None,
+            approval_operation: None,
+            native_reservation: Some(crate::policy_state::NativeReservation {
+                debit_stroops: debit,
+                fee_stroops: fee,
+            }),
+            floor: None,
+        }
+    }
+
+    /// The mainnet native asset contract.
+    fn native_sac() -> String {
+        stellar_agent_core::asset_id::CanonicalAsset::Native
+            .sac_contract_id(stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE)
+            .unwrap()
+    }
+
+    /// An x402 fixture whose native limits govern the native asset
+    /// contract, with a `balance_floor` of `min_stroops` when given.
+    fn sac_fixture(min_stroops: Option<i64>) -> ResolverFixture {
+        ResolverFixture::configured(
+            |_| {},
+            |raw| {
+                let raw = raw
+                    .replace("stellar_pay", "stellar_x402_create_payment")
+                    .replace("\"100\"", &format!("\"{}\"", i128::MAX))
+                    .replace("\"200\"", &format!("\"{}\"", i128::MAX))
+                    .replace(
+                        "native = \"10000000000\"",
+                        &format!("native = \"{}\"", i128::MAX),
+                    );
+                match min_stroops {
+                    Some(min) => raw.replace(
+                        "criteria = [",
+                        &format!(
+                            "criteria = [\n    {{ kind = \"balance_floor\", min_stroops = \"{min}\" }},"
+                        ),
+                    ),
+                    None => raw,
+                }
+            },
+        )
+    }
+
+    /// The fixture's x402 transfer of `amount` from `contract`.
+    fn transfer_root(
+        f: &ResolverFixture,
+        contract: &str,
+        amount: i128,
+    ) -> SorobanAuthorizedInvocation {
+        let mut root = root(f);
+        let SorobanAuthorizedFunction::ContractFn(args) = &mut root.function else {
+            unreachable!()
+        };
+        args.contract_address = ScAddress::Contract(stellar_xdr::ContractId(stellar_xdr::Hash(
+            stellar_strkey::Contract::from_string(contract).unwrap().0,
+        )));
+        let mut values = args.args.to_vec();
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "splits the i128 into its XDR halves"
+        )]
+        let parts = stellar_xdr::Int128Parts {
+            hi: (amount >> 64) as i64,
+            lo: amount as u64,
+        };
+        values[2] = ScVal::I128(parts);
+        args.args = values.try_into().unwrap();
+        root
+    }
+
+    /// Resolves `root` as a plain x402 intent under its approval.
+    async fn resolve_root(
+        f: &ResolverFixture,
+        context: &MainnetWriteContext,
+        root: &SorobanAuthorizedInvocation,
+    ) -> Result<MainnetSorobanIntentAuthorization, MainnetAuthorizationError> {
+        let client = context.primary_client().unwrap();
+        let intent = intent(root);
+        let approval = intent_approval(f, root, None);
+        let authority = f.approval_authority(&approval);
+        resolve_soroban_intent(intent_request(f, context, &client, &intent, &authority)).await
+    }
+
+    /// A native-SAC x402 intent under a floor reads the payer: its debit
+    /// and a retained authorization's debit and fee take the observed
+    /// balance below the floor, which refuses with the exact balance after
+    /// and mints nothing. The endpoint advances the clock during the read.
+    /// A funded floor on the covered window mints.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn intent_floor_counts_observed_exposure() {
+        let min = FIXTURE_BALANCE_STROOPS - 10 - 25;
+        for (floor, refused) in [(min, true), (1, false)] {
+            let f = sac_fixture(Some(floor));
+            cover(&f);
+            let server = floor_server(&f).await;
+            let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
+            let root = transfer_root(&f, &native_sac(), 10);
+            if !refused {
+                let minted = resolve_root(&f, &context, &root).await;
+                assert!(
+                    minted.is_ok(),
+                    "a funded floor on a covered window mints: {minted:?}"
+                );
+                continue;
+            }
+            f.window
+                .mint_authorization(&f.profile, &retained_mint(&f, "retained-floor", 40, 10))
+                .unwrap();
+            let before = f.wire();
+            let refusal = MainnetAuthorizationError::PolicyDenied(Box::new(
+                DenyReason::AccountFloorRefused {
+                    min_stroops: i128::from(min),
+                    balance_after_stroops: i128::from(FIXTURE_BALANCE_STROOPS - 10 - 50),
+                },
+            ));
+            assert_eq!(
+                resolve_root(&f, &context, &root).await.unwrap_err(),
+                refusal,
+                "the payer's balance minus the retained 50 and the native debit 10"
+            );
+            // A policy authority keeps the account code.
+            let client = context.primary_client().unwrap();
+            let intent = intent(&root);
+            let policy = policy_authority(&f, AuthorityScope::Classic, f.now, 600_000);
+            assert_eq!(
+                resolve_soroban_intent(intent_request(&f, &context, &client, &intent, &policy))
+                    .await
+                    .unwrap_err(),
+                refusal,
+                "the intent refusal under a policy authority"
+            );
+            assert_eq!(f.wire(), before, "nothing is minted");
+        }
+    }
+
+    /// A writer that commits a native debit after this resolution's floor
+    /// read and before its mint is counted at the locked mint: the floor
+    /// that passed on the read refuses there with the committed exposure,
+    /// and only the competing authorization is stored.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn resolver_floor_admission_is_serial() {
+        let probe = floor_fixture(1);
+        let TransactionEnvelope::Tx(tx) =
+            TransactionEnvelope::from_xdr_base64(&probe.envelope, Limits::none()).unwrap()
+        else {
+            unreachable!()
+        };
+        let stellar_xdr::OperationBody::Payment(payment) = &tx.tx.operations[0].body else {
+            panic!("the fixture pays natively")
+        };
+        let spent = payment.amount + i64::from(tx.tx.fee);
+        drop(probe);
+        let f = floor_fixture(FIXTURE_BALANCE_STROOPS - spent - 25);
         cover(&f);
         let server = floor_server(&f).await;
         let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
         let client = context.primary_client().unwrap();
-        let approval = f.approval(&f.envelope, f.now, 600_000);
         let policy = policy_authority(&f, AuthorityScope::Classic, f.now, 600_000);
-        let before = f.wire();
-        for authority in [f.approval_authority(&approval), policy] {
-            let result = resolve_tx_sign(request(&f, &context, &client, &authority)).await;
-            assert_eq!(
-                result.unwrap_err(),
-                MainnetAuthorizationError::PolicyDenied(Box::new(DenyReason::AccountUnread)),
-                "a funded floor refuses without proved history coverage"
-            );
-        }
-        assert_eq!(f.wire(), before, "nothing is minted");
-        let methods = received_methods(&server).await;
+        let (window, profile) = (f.window.clone(), f.profile.clone());
+        let competing = retained_mint(&f, "competing-writer", 40, 10);
+        enabled::competing_writer::arm(move || {
+            window.mint_authorization(&profile, &competing).unwrap();
+        });
+        let result = resolve_tx_sign(request(&f, &context, &client, &policy)).await;
         assert_eq!(
-            methods.iter().filter(|m| *m == "getHealth").count(),
-            2,
-            "each resolution checks readiness for its observed read: {methods:?}"
+            result.unwrap_err(),
+            MainnetAuthorizationError::PolicyDenied(Box::new(DenyReason::AccountFloorRefused {
+                min_stroops: i128::from(FIXTURE_BALANCE_STROOPS - spent - 25),
+                balance_after_stroops: i128::from(FIXTURE_BALANCE_STROOPS - spent - 50),
+            })),
+            "the locked mint counts the competing writer's committed debit"
         );
+        let auths = f.wire()["authorizations"].as_array().unwrap().clone();
+        assert_eq!(auths.len(), 1, "only the competing writer commits");
+        drop((server, f));
+        // The intent mint rechecks the floor the same way.
+        let min = FIXTURE_BALANCE_STROOPS - 10 - 25;
+        let f = sac_fixture(Some(min));
+        cover(&f);
+        let server = floor_server(&f).await;
+        let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
+        let (window, profile) = (f.window.clone(), f.profile.clone());
+        let competing = retained_mint(&f, "competing-intent-writer", 40, 10);
+        enabled::competing_writer::arm(move || {
+            window.mint_authorization(&profile, &competing).unwrap();
+        });
+        let root = transfer_root(&f, &native_sac(), 10);
+        assert_eq!(
+            resolve_root(&f, &context, &root).await.unwrap_err(),
+            MainnetAuthorizationError::PolicyDenied(Box::new(DenyReason::AccountFloorRefused {
+                min_stroops: i128::from(min),
+                balance_after_stroops: i128::from(FIXTURE_BALANCE_STROOPS - 10 - 50),
+            })),
+            "the locked intent mint counts the competing writer's committed debit"
+        );
+        let auths = f.wire()["authorizations"].as_array().unwrap().clone();
+        assert_eq!(auths.len(), 1, "only the competing writer commits");
     }
 
     /// The resolver's floor counts the observed balance, the retained native
@@ -7438,50 +7968,9 @@ mod tests {
             i128::from(FIXTURE_BALANCE_STROOPS - debit - 157),
             "balance minus the debit and the envelope fee"
         );
-        let retained = crate::policy_state::MintRequest {
-            chain: f.profile.chain_id,
-            binding: crate::policy_state::DomainBinding::Transaction {
-                unsigned_envelope_sha256: [1; 32],
-                tx_hash: [2; 32],
-                source: stellar_strkey::ed25519::PublicKey(f.signer.public_key())
-                    .to_string()
-                    .to_string(),
-                sequence: 1,
-            },
-            consumer: MainnetConsumer::CliPay,
-            policy_sequence: f.policy.sequence(),
-            policy_digest: f.policy.digest(),
-            authority: crate::policy_state::MintAuthority::Approval {
-                nonce: "retained-floor".to_owned(),
-                expires_at_ms: f.now + 120_000,
-            },
-            chain_deadline_ms: None,
-            restriction_end_ms: None,
-            authorization_ttl_ms: 120_000,
-            bindings: super::super::digest::BindingFacts {
-                endpoint: None,
-                signer: f.signer.fact_digest(),
-                policy: f.policy.fact_digest(),
-                enablement: [4; 32],
-                witness: None,
-                reservation: None,
-                authority: [7; 32],
-                audit: [8; 32],
-                restriction: None,
-            },
-            holds: vec![],
-            parent: None,
-            operation: None,
-            intent_digest: None,
-            predecessor: None,
-            approval_operation: None,
-            native_reservation: Some(crate::policy_state::NativeReservation {
-                debit_stroops: 40,
-                fee_stroops: 10,
-            }),
-            floor: None,
-        };
-        f.window.mint_authorization(&f.profile, &retained).unwrap();
+        f.window
+            .mint_authorization(&f.profile, &retained_mint(&f, "retained-floor", 40, 10))
+            .unwrap();
         let approval = f.approval(&envelope, f.now, 600_000);
         assert_eq!(
             after(&f.approval_authority(&approval)).await,

@@ -160,6 +160,10 @@ fn floor_checked_input_uses_verified_first_rule_and_operating_source() {
             &f.context, &f.policy, &tool, evaluation, &f.signer, seen, &readiness, request,
         )
     };
+    let unread = |result: Result<Option<CheckedFloor>, WindowStoreError>| {
+        matches!(result, Err(WindowStoreError::PolicyDenied { reason })
+            if reason.wire_code() == "account.unread")
+    };
     let floor = checked(&observed, &evaluation, &request).unwrap().unwrap();
     assert_eq!(
         floor.minimum, 90,
@@ -168,28 +172,26 @@ fn floor_checked_input_uses_verified_first_rule_and_operating_source() {
     let mut wrong_rule = evaluation.clone();
     wrong_rule.rule_ordinal = Some(1);
     assert!(
-        checked(&observed, &wrong_rule, &request).is_err(),
+        unread(checked(&observed, &wrong_rule, &request)),
         "a later weaker rule cannot be selected"
     );
     let mut payee_view = view.clone();
     payee_view.account_id = f.source.destination().to_owned();
     assert!(
-        checked(
+        unread(checked(
             &ObservedAccount::new(payee_view, 100, f.now, f.now - 5_000),
             &evaluation,
             &request
-        )
-        .is_err(),
+        )),
         "payee is not the balance source"
     );
     for (ledger, close) in [(99, f.now - 5_000), (100, f.now - 10_000)] {
         assert!(
-            checked(
+            unread(checked(
                 &ObservedAccount::new(view.clone(), ledger, f.now, close),
                 &evaluation,
                 &request
-            )
-            .is_err(),
+            )),
             "readiness coverage"
         );
     }
@@ -203,7 +205,7 @@ fn floor_checked_input_uses_verified_first_rule_and_operating_source() {
             changed.consumer = MainnetConsumer::X402Create;
         }
         assert!(
-            checked(&observed, &evaluation, &changed).is_err(),
+            unread(checked(&observed, &evaluation, &changed)),
             "chain, policy and consumer binding"
         );
     }

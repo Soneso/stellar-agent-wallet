@@ -245,8 +245,10 @@ both.
 
 Paired preparation refuses an undecodable envelope with `simulation.divergence`.
 On mainnet, a rule with `balance_floor` adds an endpoint readiness check and an
-operating account read to the preparation and commit of `stellar_claim`,
-`stellar_trustline`, and `stellar_create_account`.
+operating account read to the preparation and commit of `stellar_pay`,
+`stellar_claim`, `stellar_trustline`, and `stellar_create_account`. A commit
+refuses `account.unread` when its rule's floor is missing or below the
+preparation rule's floor.
 A denied rule retains its wire code, `policy.deny.*` or a balance floor's
 `account.*`; an unknown decision uses
 `policy.unexpected_decision`. None of these refusals persists an approval.
@@ -1009,9 +1011,9 @@ and a failure after it as `sent_outcome_unknown`.
 Call 1 omits both approval arguments. It runs the entry and startup checks, the
 requirements, `chain_id`, the approval pair, and, for the authenticated tool,
 `home_domain` validation. It then loads the enrolled signer, checks `address`,
-computes the payment digest, and evaluates local policy. Local policy has no
-account-reserve view here. A matching `minimum_reserve` criterion fails closed
-with `policy.engine_required` before approval is stored. Under Allow, call 1 is
+computes the payment digest, and evaluates local policy. A matching
+`minimum_reserve` or `balance_floor` reads the enrolled payer first, and a
+breach refuses before approval is stored. Under Allow, call 1 is
 the signing call: it checks startup freshness and pays without an approval.
 Under RequireApproval, the pending approval is stored. That call reads
 enrollment and local policy state. It checks W eligibility with `getNetwork`,

@@ -204,9 +204,10 @@
 
 mod accounting;
 #[cfg(feature = "mainnet-write")]
-pub(crate) use accounting::unproved_floor_use;
+pub(crate) use accounting::uncovered_floor_use;
 pub use accounting::{
-    CheckedFloor, FloorSource, FloorSourceError, floor_rule_matches, refuse_unproved_floor,
+    CheckedFloor, FloorSource, FloorSourceError, PayerView, floor_rule_matches, floor_rule_minimum,
+    refuse_uncovered_floor, reserve_rule_matches,
 };
 pub mod approvals;
 pub mod budget;

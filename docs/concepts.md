@@ -296,11 +296,12 @@ refuses with `account.stale`. Any decision may carry the criterion.
 Provisional evaluation skips the floor; the strict evaluation before signing
 runs it. The criterion is enforceable only where a caller supplies an observed
 read with its reservation sum. No caller supplies the read off mainnet, so on
-testnet a strict evaluation of a matched floor refuses with `account.unread`. On mainnet, the CLI `pay`, `claim`, `trustline`,
-and `accounts create` verbs and the MCP claim, create-account, and trustline
-tools supply both. Signing resolution reads them again before the mint.
-MCP `stellar_pay` and the x402 tools supply a plain account view, so a matched
-floor refuses there with `account.unread`.
+testnet a strict evaluation of a matched floor refuses with `account.unread`.
+On mainnet, the CLI `pay`, `claim`, `trustline`, and `accounts create` verbs
+and the MCP pay, claim, create-account, and trustline tools supply both.
+Signing resolution reads them again before the mint. On mainnet, both x402
+tools also read the payer and its reservations, so a breach refuses with
+`account.floor_refused`.
 The SEP-43 transaction tools supply a plain account view for payment legs, and
 a matched floor refuses there with `account.unread` too.
 
@@ -315,10 +316,10 @@ first write that sets the marker requires a read closed at least 300 seconds
 later, past any envelope signed earlier. A transaction signed before the marker
 by a host whose clock later moved backward lies outside the coverage guarantee.
 A claimed obligation stored without amounts keeps floor use refused on its
-profile; use a new profile. A floor that passes on the retained reservations
-still refuses with `account.unread`. Only a breach that the retained
-reservations already show refuses with `account.floor_refused`. Re-signing and
-resetting do not reconstruct missing exposure.
+profile; use a new profile. A floor that passes on a covered store admits the
+action only if the mint, under its lock, finds the floor still met by the
+latest retained reservations. Re-signing and resetting do not reconstruct
+missing exposure.
 
 `memo_binding` requires the memo a destination expects, such as an exchange
 deposit's customer memo:

@@ -1079,9 +1079,9 @@ fn intent_total_version_floor_and_reader() {
             image.prepared = Some(Box::new(next));
         }
         f.store.seal_unchecked_for_test(&f.profile, &image);
-        DESTINATION_READER_CAP.set(Some(15));
+        READER_VERSION_CAP.set(Some(15));
         let result = f.store.read_for_inspection(&f.profile);
-        DESTINATION_READER_CAP.set(None);
+        READER_VERSION_CAP.set(None);
         assert!(
             matches!(result, Err(WindowStoreError::UnsupportedVersion)),
             "{result:?}"
