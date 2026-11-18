@@ -72,9 +72,10 @@ describe an attempted reset that did not take effect.
   required by most MCP tools. Where it is omittable (the SEP-43 read tools) it
   defaults to the active profile's chain; the wallet's default network is
   `stellar:testnet`.
-- Builds from this repository and releases from v0.1.0-alpha.14 on carry
-  `mainnet-write`. Mainnet writes require installation setup and per-action
-  approval. Excluded operations retain their refusal codes.
+- Default builds from this repository carry `mainnet-write`. Mainnet writes
+  require installation setup. `allow` signs under policy authority, and
+  `require_approval` needs a verified approval. Excluded operations refuse with
+  their own codes.
 - A single-use nonce is minted by the wallet at simulation time and must be passed
   back unchanged at commit time. Do not generate, cache across restarts, reuse, or
   mutate it.
@@ -112,7 +113,6 @@ operator processes. Root-owned wrappers constrain delegated commands and
 construct a clean environment. The fixed profile is `mainnet`.
 Wallet-user code can read keys while the keyring is unlocked.
 Unlock lasts until reboot or explicit lock; the operator unlocks after each boot.
-macOS behavior is validated by the real-host run.
 
 `profile policy-check` validates unsigned stdin without keyring or pin access.
 `--origin` exits 0 for local-only, 3 for a declared origin, and 65 for invalid input.
@@ -125,10 +125,8 @@ and one-shot approval. It prints one single-use URL on stderr and creates
 no browser handoff. Presence verification, expiry, and enrollment codes remain required.
 An installed body declaring a signed origin refuses before ceremony resources
 with `approval.origin_signed_remote`, even before signing.
-Use the signed-origin deployment forms only with integrated listener support.
 
-See the public dedicated-user deployment page and its host validation record
-before granting the wrappers through sudoers.
+See the [dedicated-user deployment page](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/dedicated-user.md) before granting the wrappers through sudoers.
 
 ## Self-custody and the platform keyring
 
@@ -213,8 +211,7 @@ window.
 
 ## Mainnet authorization boundaries
 
-Builds from this repository and releases from v0.1.0-alpha.14 on carry
-`mainnet-write`. With the feature on, only a typed
+Default builds from this repository carry `mainnet-write`. With the feature on, only a typed
 authorization issued for the action can satisfy the mainnet-write guard, and
 the binary attests its feature state. A build with `--no-default-features` has
 the feature off, and no code path in it can satisfy the guard.
@@ -246,7 +243,7 @@ Smart-account multicall independently requires V1 even on testnet.
 Mainnet selection requires an explicit profile. Writes require a dedicated
 nondefault profile and matching stored chain, endpoint, and installation binding.
 Friendbot remains scoped to testnet and futurenet. MPP, smart-account writes,
-DeFi, pool submission, generic signing, and toolset signing remain excluded.
+DeFi, pool submission, generic signing, and toolset signing are excluded on mainnet.
 
 Prepare and commit probe the endpoint before action reads on their client.
 Submission checks the sending client again. The endpoint network binds every
@@ -286,9 +283,10 @@ the text is cut at 200 characters. An error quotes the text.
 
 At the MCP boundary, account, strkey, and contract-id fields inside a deny reason
 are redacted before they cross the wire. Policy deny states that an attacker could
-otherwise probe are collapsed: the commit-path verifier maps the internal
-outcomes `Expired`, `NotFound`, and `AlreadyAttested` all onto the single wire
-code `policy.approval_required`, so a caller cannot tell which state a nonce is in.
+otherwise probe are collapsed. The commit-path verifier maps missing, expired,
+and invalid approvals onto `policy.approval_required`, so a caller cannot tell
+which of those states a nonce is in. Live rejected and consumed approvals keep
+`policy.approval_rejected` and `policy.approval_consumed`.
 
 Agent rule: do not depend on argument values appearing in the audit log; they do
 not. Correlate with `request_id`, the envelope hash, and `arg_keys`.
@@ -351,8 +349,8 @@ denial-of-service nuisance) but cannot forge an attestation, because the HMAC ke
 is in the keyring, not in the file. Rotating the attestation key invalidates all
 outstanding pending approvals; the operator must re-approve.
 
-Pending entries are kinded: `PaymentSimulated`, `TrustlineSimulated`, `ClaimSimulated`,
-`SignWithPasskey`, `RegisterPasskey`, `ToolsetFirstInvokeGate`,
+Pending entries are kinded: `X402Payment`, `PaymentSimulated`, `TrustlineSimulated`,
+`ClaimSimulated`, `SignWithPasskey`, `RegisterPasskey`, `ToolsetFirstInvokeGate`,
 `TrustlineClawbackOptIn`, `RuleProposalSimulated`, `MppChargeSimulated`, `Rejected`,
 and `Consumed`. The store
 holds a single exclusive lock, writes atomically with owner-only permissions, caps
@@ -364,9 +362,9 @@ Toolset-routed payments use two distinct controls, and only one is suppressible:
 
 - The **first-invoke gate** (`ToolsetFirstInvokeGate`) fires the first time a
   toolset uses a signing-adjacent capability with no matching grant. Once approved,
-  a time-boxed grant (default TTL 30 days) is persisted and matched on later
-  invocations by toolset, capability, destination, asset, and an amount range. The
-  grant suppresses only the first-invoke re-prompt.
+  a time-boxed grant (default TTL 30 days) is persisted. Later invocations match
+  the grant by toolset, installation, package version and digest, capability,
+  destination, asset, and amount range. The grant suppresses only the first-invoke re-prompt.
 - The **per-action payment approval** (`PaymentSimulated`) fires unconditionally on
   every toolset-routed payment, and its attestation binds the actual executed
   envelope.

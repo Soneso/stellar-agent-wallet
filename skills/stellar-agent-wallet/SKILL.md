@@ -48,10 +48,11 @@ separate checks; see
 Owner key re-enrollment needs no previous seed while the installation holds no
 policy pin or mainnet enablement nonce. Replacing an owner protected by these
 continuity records requires a rotation statement signed by the pinned owner.
-The profile's `[policy] engine` and `policy_owner_key_id` fields are unsigned.
-The halt marker has no MAC. `profile reset-window-state` requires the pinned
-owner's authorization on an installation enabled for mainnet, and no owner
-signature otherwise. These rules bind the wallet's commands; deleting or
+The profile's `policy_owner_key_id` field is unsigned. The profile's
+`[policy] engine` must match the engine the owner-signed policy selects.
+The halt marker has no MAC. `profile reset-window-state` needs the owner's
+signature when a policy pin or an enrolled owner exists, on every network.
+These rules bind the wallet's commands; deleting or
 rewriting keyring entries outside the wallet rests on the platform keyring.
 Same-user processes can read keyring entries on Linux (Secret Service) and
 Windows (Credential Manager). With the `headless-env` backend, any process that
@@ -109,8 +110,9 @@ Point your MCP client at the server name:
 
 The server serves the `default` profile unless another is named: pass
 `"args": ["--profile", "alice"]`, or set `STELLAR_AGENT_PROFILE` in the
-environment the client spawns it with. The flag wins over the variable. The
-selected profile binds at startup and stays bound; keys are resolved from the
+environment the client spawns it with. The flag wins over the variable. A
+mainnet profile loads only with `--profile <NAME>`, including `--profile
+default`; `STELLAR_AGENT_PROFILE` never selects one. The selected profile binds at startup and stays bound; keys are resolved from the
 platform keyring that profile names. After connecting, the client issues
 `initialize`, then
 `tools/list` and `resources/list`. The schemas returned by `tools/list` are the
@@ -159,7 +161,9 @@ wire-code table.
 
 Every tool requires a `chain_id` argument — the CAIP-2 chain id (`stellar:testnet`
 or `stellar:mainnet`) — that must match the active profile. Exceptions:
-`stellar_x402_parse_receipt` and `stellar_toolset_list` take none; the two SEP-43
+`stellar_x402_parse_receipt` and `stellar_toolset_list` take none.
+`stellar_signed_intents_list` and `stellar_approval_status` take none and refuse
+one as an unknown field. The two SEP-43
 read tools make it optional; `stellar_toolset_invoke` accepts an optional `chain_id`
 it forwards to the routed tool. The five `stellar_mpp_*` tools reject a `chain_id`
 field as unknown and act on the chain of the server's profile.
@@ -249,7 +253,8 @@ handshake:
 3. Re-invoke `stellar_pay_commit` with `approval_nonce` and `approval_attestation`
    added. The wallet verifies the attestation, then signs and submits.
 
-MCP exposes no attestation-minting tool. On `policy.approval_required`, ask the
+MCP mints no attestation. `stellar_approval_status` inspects an approval by its
+nonce without consuming it. On `policy.approval_required`, ask the
 operator to approve, then retry the commit with the attestation. Do not invoke
 CLI approval yourself or retry blindly.
 
@@ -307,8 +312,8 @@ transfer hand-off, SEP-43 wallet signing (`get_address`, `get_network`, `sign_tr
 SEP-53 signed messages. SEP-45 is library-only, with no CLI command or MCP tool.
 The wallet also signs x402 v2 Exact Stellar agent payments and testnet
 sponsored MPP charges.
-Builds from this repository and releases from v0.1.0-alpha.14 on carry
-`mainnet-write`. Both x402 payment tools support approved mainnet payments
+Builds with default features carry `mainnet-write`; a `--no-default-features`
+build omits it. Both x402 payment tools support approved mainnet payments
 in these builds. Authenticated payments bind their SEP-10 identity operation
 to the payment approval. MPP uses
 `stellar_mpp_charge_prepare` then one `stellar_mpp_charge_commit`; the trusted
@@ -336,8 +341,8 @@ Drive installed toolsets with `stellar_toolset_list` and `stellar_toolset_invoke
   `halted`. On either code, stop and report the message to the operator. Never
   run `stellar-agent profile resume` yourself, and do not retry under another
   profile; the halt is the operator's decision.
-- Builds from this repository and releases from v0.1.0-alpha.14 on carry
-  `mainnet-write`. The four classic full-mode CLI operations sign `Allow` without
+- Builds with default features carry `mainnet-write`, and `--version` reports
+  the compiled state. The four classic full-mode CLI operations sign `Allow` without
   a passkey ceremony; `RequireApproval` runs one. Setup and policy minimums remain required.
   Classic MCP commits require operator setup; `Allow` signs without an
   approval, and `RequireApproval` needs a verified approval. See
@@ -347,7 +352,7 @@ Drive installed toolsets with `stellar_toolset_list` and `stellar_toolset_invoke
   Noop refuses destructive mainnet decisions with `policy.engine_required`.
   Policy evaluation alone grants no signing authority. Signing and submission
   independently check sealed authorization. Smart-account writes, DeFi, pool
-  submission, MPP, generic signing, and toolset signing remain excluded.
+  submission, MPP, generic signing, and toolset signing are excluded on mainnet.
   Mainnet writes move real funds, and the operator uses the wallet at their
   own risk. Before the first mainnet write of a session, confirm that
   the operator intends mainnet, and suggest a testnet run and a small amount.
@@ -478,7 +483,8 @@ the signed approval origin.
 Never attempt the approval yourself. The version marker
 reports compiled state. `network.mainnet_write_forbidden` identifies an excluded
 operation, a feature-off build, or a missing admitted context. Resolver gaps
-use `network.mainnet_authorization_refused`; policy denials retain `policy.deny.*`.
+use `network.mainnet_authorization_refused`. Policy denials retain `policy.deny.*`,
+and balance floor denials retain `account.*`.
 Report authorization refusal to the operator. Do not switch networks. A retry
 needs fresh preparation and approval. Restart MCP after enablement or policy
 signing; stale startup bindings report the restart requirement.

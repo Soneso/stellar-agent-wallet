@@ -65,15 +65,23 @@ CLI engine construction preserves `profile.mainnet_enablement_invalid`,
 Other build errors use `policy.engine_unavailable`, or
 `trustline.policy_engine_unavailable` for trustline. Evaluation failures use
 `policy.engine_required`; unknown decisions use `policy.unexpected_decision`.
-Policy denials retain `policy.deny.*`.
+On mainnet, an accounting error keeps `policy.accounting_invalid` or
+`policy.accounting_overflow`.
+Policy denials retain `policy.deny.*`. A balance floor denial returns
+`account.unread`, `account.stale`, or `account.floor_refused`.
+
+On mainnet, a rule with `balance_floor` makes `pay`, `claim`, `trustline`, and
+sponsored `accounts create` check endpoint readiness and read the operating
+account before policy evaluation. `accounts create` reads the sponsoring
+account. A failed floor read returns that read's own error code.
 
 Fee refusals include `fees.percentile_exceeds_cap`,
 `validation.fee_total_overflow`, and `validation.mainnet_fee_cap_required`.
 Resolver fee failures use `network.mainnet_authorization_refused`.
 Endpoint probes preserve `network.endpoint_network_mismatch`,
 `network.endpoint_identity_unavailable`, `network.unsupported_protocol_version`,
-and `network.rpc_credential_refused`. `pay`, sponsored `accounts create`, and
-`trustline` refuse an endpoint that is not healthy or whose latest ledger closed
+and `network.rpc_credential_refused`. `pay`, `claim`, sponsored `accounts create`,
+and `trustline` refuse an endpoint that is not healthy or whose latest ledger closed
 more than 60 seconds from the host clock with `network.endpoint_not_ready`.
 
 ## Shared flags
@@ -106,7 +114,7 @@ Creates a new Stellar account in one of two mutually exclusive modes: a sponsore
 
 - **Signing.** Sponsored mode signs the `CreateAccount` operation with the sponsor's key. Friendbot mode performs no signing and touches no key.
 - **Policy (sponsored mode only).** After `--starting-balance` and the new account's public key are resolved and before signing, the sponsored `CreateAccount` is evaluated against `--profile`'s policy engine. This is the same evaluation the `stellar_create_account` MCP tool runs. When no profile was named and no `default.toml` exists, an in-memory `Noop`-engine testnet profile is synthesized. So sponsored mode works without an authored profile file until an operator opts into `policy.engine = "v1"`. A profile named through `--profile` or `STELLAR_AGENT_PROFILE` whose file does not exist is refused (`profile.load_failed`). A profile file whose owner-key coordinate names a DIFFERENT profile is refused (`profile.name_mismatch`). Friendbot mode is not gated: it debits no wallet-held funds.
-- **Network.** Builds from this repository and releases from v0.1.0-alpha.14 on carry `mainnet-write`. These builds admit configured mainnet sponsored creation. Friendbot mode refuses mainnet with `network.friendbot_mainnet_forbidden`. Friendbot funding is testnet-only. In Friendbot mode, an account at or above the Friendbot starting balance (10,000 XLM on the SDF testnet) exits `1` with `network.friendbot_account_already_funded`. Friendbot pays the starting balance to an existing account below it.
+- **Network.** Default builds enable the `mainnet-write` feature, and builds with `--no-default-features` omit it. These builds admit configured mainnet sponsored creation. Friendbot mode refuses mainnet with `network.friendbot_mainnet_forbidden`. Friendbot funding is testnet-only. The Friendbot server pays its starting balance to an existing account below it. When Friendbot refuses an already funded account, the command exits `1` with `network.friendbot_account_already_funded`.
 - **Account identity.** Provide the new account's G-strkey as the positional argument, or pass `--generate` to mint a fresh ed25519 keypair in-process. Exactly one is required.
 - **Secret-key discipline.** `--generate` returns the new S-strkey in the JSON envelope's `data.secret_key` field. It is never emitted in `--output table` and never logged. Capture it from the JSON output and store it securely. The command output holds the seed, so do not write it to a log or a shared terminal.
 
@@ -251,8 +259,8 @@ A version 2 policy's `memo_binding` criterion can also require an exact memo kin
 
 - **Signing.** By default the command builds, signs, and submits atomically. Three staged flags split the pipeline: `--build-only` emits the unsigned envelope XDR and exits (no signing); `--sign-only <XDR>` signs a prebuilt envelope and emits signed XDR; `--submit-only <XDR>` submits a pre-signed envelope. The stage flags are mutually exclusive. `--submit-only` requires an envelope that is already signed: handing it the unsigned XDR that `--build-only` emitted is refused with `network.envelope_unsigned` before anything is sent.
 - **Policy.** After the envelope is built and before signing (in both the full pipeline and `--build-only`), the amount/asset/destination are evaluated against `--profile`'s policy engine. This is the same evaluation the `stellar_pay` MCP tool runs. When no profile was named and no `default.toml` exists, an in-memory `Noop`-engine testnet profile is synthesized. So the command works without an authored profile file until an operator opts into `policy.engine = "v1"`. A profile named through `--profile` or `STELLAR_AGENT_PROFILE` whose file does not exist is refused (`profile.load_failed`). A profile file whose owner-key coordinate names a DIFFERENT profile is refused (`profile.name_mismatch`). The staged `--sign-only` and `--submit-only` flows are gated too. Each decodes the supplied envelope through the same decoder the MCP `stellar_pay_commit` path uses. It evaluates the decoded amount/asset/destination before signing (`--sign-only`) or before broadcasting (`--submit-only`). For `--submit-only`, the envelope arrives pre-signed, but broadcasting still spends funds. An envelope the decoder cannot classify into a sized shape follows the opaque-signing posture: under a matched value rule it denies `policy.deny.unsizable_value_effect` unless the rule sets `allow_opaque_signing = true`. The staged flows match policy rules under the `stellar_pay_commit` tool name (the same name the MCP commit phase matches). A ruleset that names only `stellar_pay` default-denies them, so author rules for both names, or `tool = "*"`, for uniform behavior. Under `policy.engine = "noop"` the staged flows are ungated, matching the rest of the command. Every stage that reads from the endpoint checks its identity first, on the client that later reads and sends. An `--rpc-url` pointing at a different network than `--network` is therefore refused before the policy gate and before the audit-key pre-flight. See [Endpoint identity before the first read](index.md#endpoint-identity-before-the-first-read).
-- **Network.** Builds from this repository and releases from v0.1.0-alpha.14
-  on carry `mainnet-write`. These builds admit configured mainnet writes in
+- **Network.** Default builds enable the `mainnet-write` feature, and builds
+  with `--no-default-features` omit it. These builds admit configured mainnet writes in
   full mode. Staged modes refuse with `network.mainnet_write_forbidden`.
   Endpoint identity and signature-network checks apply before sending. This
   release supports protocols 29 and 30. Outside them, testnet and other networks
@@ -405,8 +413,8 @@ The respective refusals are `claim.not_claimant`, `claim.predicate_not_satisfied
   a different network than `--network` is therefore refused before the policy
   gate and before the audit-key pre-flight. See
   [Endpoint identity before the first read](index.md#endpoint-identity-before-the-first-read).
-- **Network.** Builds from this repository and releases from v0.1.0-alpha.14
-  on carry `mainnet-write`. These builds admit configured mainnet writes in
+- **Network.** Default builds enable the `mainnet-write` feature, and builds
+  with `--no-default-features` omit it. These builds admit configured mainnet writes in
   full mode. Staged modes refuse with `network.mainnet_write_forbidden`.
   Endpoint identity and signature-network checks apply before sending. This
   release supports protocols 29 and 30. Outside them, testnet and other networks
@@ -501,7 +509,7 @@ Creates or removes a classic trustline (`ChangeTrust`) behind an ordered trust g
 
 - **Signing.** Signs via the profile's keyring signer; builds, signs, submits, and waits atomically. There is no staged pipeline.
 - **Timeout.** `--timeout-seconds`, else the profile's `submit_timeout_seconds`, else 60 seconds, bounds the send and the confirmation poll. The endpoint checks ahead of the issuer read and the submit layer's reads before the send each run under a fixed 30-second pre-send budget.
-- **Network.** Derived from the loaded profile (`rpc_url`, `network_passphrase`, `chain_id`). The profile file supplies the chain identity. There is no `--network` flag: the network comes from the profile configuration. The command goes through the same submit layer as every other verb, so it gets the same binding. The endpoint is asked which network it serves and that answer is authoritative. The envelope's signatures are verified against it. Builds from this repository and releases from v0.1.0-alpha.14 on carry `mainnet-write`. These builds admit configured mainnet trustline actions through authorized signing and submission. With the feature off, a mainnet profile refuses with `network.mainnet_write_forbidden` before the keyring store, the signer, and any RPC request. See [Submit-layer network binding](index.md#submit-layer-network-binding) for the wire codes.
+- **Network.** Derived from the loaded profile (`rpc_url`, `network_passphrase`, `chain_id`). The profile file supplies the chain identity. There is no `--network` flag: the network comes from the profile configuration. The command goes through the same submit layer as every other verb, so it gets the same binding. The endpoint is asked which network it serves and that answer is authoritative. The envelope's signatures are verified against it. Default builds enable the `mainnet-write` feature, and builds with `--no-default-features` omit it. These builds admit configured mainnet trustline actions through authorized signing and submission. With the feature off, a mainnet profile refuses with `network.mainnet_write_forbidden` before the keyring store, the signer, and any RPC request. See [Submit-layer network binding](index.md#submit-layer-network-binding) for the wire codes.
 - **USDT is hard-refused.** The denomination resolver rejects USDT outright; the command cannot create a USDT trustline.
 - **Limit.** `--limit-stroops 0` removes the trustline. When absent the Stellar default (`i64::MAX`, unlimited) applies.
 - **Asset grammar.** A bare code such as `USDC` resolves through the pin table; `CODE:ISSUER` names an explicit issuer; a 56-char `C...` SAC address is deferred and returns a typed error.
@@ -609,11 +617,11 @@ stellar-agent counterparty list --profile default
 
 ### `stellar-agent counterparty refresh <HOME_DOMAIN> [flags]`
 
-Force-fetches `https://<home-domain>/.well-known/stellar.toml`, HMAC-protects the body, and writes it to the cache atomically. Performs a network fetch and a keyring write; signs no transaction. The home domain must be strict ASCII, 1 to 32 characters; IDN and homoglyph domains are rejected to prevent counterparty-binding spoofing.
+Force-fetches `https://<home-domain>/.well-known/stellar.toml`, HMAC-protects the body, and writes it to the cache atomically. Performs a network fetch and a keyring write; signs no transaction. The home domain must be lowercase LDH ASCII, 1 to 255 bytes, with labels of 1 to 63 bytes. IDN and homoglyph domains are rejected to prevent counterparty-binding spoofing.
 
 | Flag / arg | Meaning | Required | Default |
 |---|---|---|---|
-| `<HOME_DOMAIN>` (positional) | Domain to refresh (strict ASCII, 1-32 chars) | yes | none |
+| `<HOME_DOMAIN>` (positional) | Domain to refresh: lowercase LDH ASCII, 1 to 255 bytes, each label 1 to 63 bytes | yes | none |
 | `--profile <NAME>` | Profile whose cache to update | optional | `STELLAR_AGENT_PROFILE`, else `default` |
 
 ```bash
@@ -783,7 +791,9 @@ covered by the operator's consent. Deadline expiry ends future execution;
 accounting continues through each affected spending window. Testnet envelopes
 can carry no bound. A confirmation after the deadline refuses with
 `network.mainnet_authorization_refused` (`deadline_elapsed`); run the command
-again for a fresh envelope.
+again for a fresh envelope. A send that starts within 30 seconds of the
+deadline refuses with `network.mainnet_authorization_refused`
+(`deadline_within_margin`).
 
 A reported failure or missing transaction does not release possible spending. Bounded uncertainty counts through the later of the signed deadline and the first local success observation, plus each affected spending window.
 

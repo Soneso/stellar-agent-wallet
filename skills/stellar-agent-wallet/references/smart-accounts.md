@@ -45,7 +45,7 @@ After the last of those examples, the operator runs `unset WALLET_SK` to remove 
 
 Operations authorized by smart-account context rules sign the auth digest, which binds the authorizing rule ids. Timelock writes use direct G-key Soroban authorization for the proposer, canceller, or executor.
 
-Shared flags available on most verbs: `--profile`, `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`, `--output` (`json` default or `table`). `--output` is available on `rules`, `execute`, `list-rules`, `list-verifiers`, `list-intents`, and the four `deploy-*` verbs. The `signers`, `timelock`, `migrate-verifier`, `multicall`, `register-multicall`, and `unregister-multicall` verbs do not accept it.
+Shared flags available on most verbs: `--profile`, `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`, `--output` (`json` default or `table`). `--output` is available on `rules`, `execute`, `list-rules`, `list-verifiers`, `list-intents`, and the four `deploy-*` verbs. `list-intents` accepts `--output table` but always prints JSON. The `signers`, `timelock`, `migrate-verifier`, `multicall`, `register-multicall`, and `unregister-multicall` verbs do not accept it.
 
 ## Context rules
 
@@ -327,7 +327,7 @@ stellar-agent smart-account timelock cancel \
 
 ## Agent-signed execute
 
-`smart-account execute` submits one `CallContract` invocation against an external contract, authorized by a named on-chain context rule and signed by an External-Ed25519 rule signer. It does not evaluate the wallet policy engine. This is the CLI surface for the agent-delegation flow (see `agent-delegation.md`). Testnet only; structurally refuses `mainnet` before any RPC call or key-material access. No MCP tool equivalent exists (see `mcp.md`'s "why there is no agent-facing execute tool"). The typed-tool consent model has no meaningful preview for an arbitrary-invocation verb.
+`smart-account execute` submits one `CallContract` invocation against an external contract, authorized by a named on-chain context rule and signed by an External-Ed25519 rule signer. It does not evaluate the wallet policy engine. This is the CLI surface for the agent-delegation flow; see the [agent delegation guide](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/agent-delegation.md) in the wallet repository's `docs/` directory. Testnet only; structurally refuses `mainnet` before any RPC call or key-material access. No MCP tool equivalent exists; see [why there is no agent-facing execute tool](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/mcp.md#why-there-is-no-agent-facing-execute-tool) in the MCP guide. The typed-tool consent model has no meaningful preview for an arbitrary-invocation verb.
 
 Two distinct signers: `--rule-signer-ed25519-secret-env <VAR>` (req) is the agent's own key that authorizes the call (full mlock ceremony; no funded account needed); the ordinary signer-source group (`--signer-secret-env` / `--sign-with-ledger`) is the fee-payer that pays the transaction fee and signs the envelope.
 
@@ -337,7 +337,7 @@ Two distinct signers: `--rule-signer-ed25519-secret-env <VAR>` (req) is the agen
 | `--contract <C>` | yes | External target contract (`target_contract`); usually different from `--account`. |
 | `--function <NAME>` | yes | Contract function to invoke. |
 | `--arg <SCVAL_BASE64>` | no, repeatable | One standard-base64 XDR `ScVal` per argument, in order. Bounded-decoded to validate only; never re-encoded. A malformed value names the failing index. |
-| `--auth-rule-id <U32>` | yes, repeatable | NO default (deviation from every other write verb). The delegation use case always names a specific scoped rule. |
+| `--auth-rule-id <U32>` | yes, repeatable | No default; name the scoped rule that authorizes the call. |
 | `--rule-signer-ed25519-secret-env <VAR>` | yes | The agent's S-strkey seed env var. |
 | `--expect-rule-signer <64_HEX>` | no | Fail closed before signing if the derived pubkey differs. |
 | `--verifier <C>` | no | Ed25519-verifier override; else resolves from the registry (`smart-account deploy-ed25519-verifier`). |

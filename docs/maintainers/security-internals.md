@@ -84,8 +84,8 @@ the envelope digest, forward asset proof and every stored contract summary fact.
 presence and witness verification also bind the context to the active chain.
 Malformed but safely shaped destinations remain listable, rejectable and
 collectable; using them refuses. Unsafe shapes and cross-kind context fields
-refuse file decoding. The store retains its exclusive sidecar lock and atomic
-file replacement; its recovery intervals and wire version remain unchanged.
+refuse file decoding. The store keeps its exclusive sidecar lock and atomic
+file replacement.
 An older reader may refuse files containing contract payment records.
 Compatibility covers existing G/M records read by this reader.
 
@@ -154,8 +154,8 @@ Charged inclusion was 100 throughout. Supplied mainnet rent and TTL calculations
 give 374,605 stroops for a new balance entry alone. Applying the measured
 testnet reservation ratio of approximately 1.28 gives an estimated 480,000
 stroops. Twice that estimate, rounded to one significant digit, motivates
-1,000,000 stroops (0.1 XLM) as the total cap that later policy work supplies by
-default; this module applies only a supplied cap. These mainnet figures are
+the 1,000,000 stroop (0.1 XLM) default cap. This module applies only a
+supplied cap. These mainnet figures are
 computed or estimated, not measured. Restoration was not measured.
 
 ## Two sessions on one profile
@@ -176,15 +176,16 @@ The table distinguishes tested properties from operational claims that are not p
 | Approval and MPP stores | Per store path. | Approval lifetime lock; MPP operation lock. | Exclusion refuses without waiting: core `approval::store::tests::second_opener_returns_writer_locked`; MPP `store::tests::lock_contention_fails_without_mutation`. Codes are `approval.writer_locked` and `mpp.state_unavailable`; wire mapping is not pinned by those store tests. | Durable state remains; actual restart is not pinned by these contention tests. | These locks do not authorize a transaction. That negative claim is not pinned. |
 | Counterparty cache | Per profile cache; default TTL is one hour on the host clock. Default duration: one hour (`DEFAULT_TTL`) in the four production callers; not pinned by a test. An entry whose fetch time lies more than five minutes in the future counts as expired. | Per refresh cache lock; `concurrent_refresh_second_gets_writer_locked` in network `counterparty_cache_integration.rs`. | Fetch time is authenticated: network `counterparty::cache::tests::hmac_v2_different_fetched_at_returns_mismatch`. The file time does not change it: `counterparty::cache::tests::touch_mtime_does_not_change_fetched_at`. Listing skips expired entries: `expired_cache_entry_is_skipped_by_list_cached`. Expiry at equality and the five-minute future-fetch tolerance: the `is_expired_*` unit tests and `future_fetch_tolerance_is_five_minutes`. Snapshot filtering: `snapshot_keeps_only_live_bindings`. | The disk cache persists; listing and snapshot construction enforce expiry on every read. Actual restart is not pinned. | The stale-return API has no production caller. Opt-in fallback on a transient failure until one TTL past expiry, the deadline included: `stale_if_error_returns_expired_hmac_verified_cache_entry` and `stale_fallback_permitted_at_grace_deadline`; caller absence is not pinned. Refusals: `stale_fallback_refused_one_nanosecond_past_grace_deadline`, `stale_if_error_refuses_entry_past_grace_bound`, `stale_if_error_refuses_permanent_fetch_failure`, `stale_read_refuses_an_entry_fetched_in_the_future`, and `stale_if_error_false_ignores_stale_cache_on_failure`. `stale_if_error_false_fail_closed_no_stale_return` pins that a failed fetch without a cached entry refuses. Expired fallback evidence cannot enter policy snapshots. |
 | Per-period admission | Classic reservations and testnet x402 authorization usage share persisted window accounting. Mainnet x402 intent minting reserves window headroom. Intent consumption records the debit before signed re-simulation. | Comparison and persistence under the window lock; not pinned. | Classic refusal: network `submission_record_integration::a_reservation_the_window_cannot_admit_is_refused_as_a_policy_denial`; testnet x402 refusal before signing: MCP `x402_audit_gate_integration::window_admission_refusal_precedes_signing`. | State is persisted; actual restart is not pinned by these admission tests. | A second reset handle cannot enter during the recorder: network `policy_state::store::tests::reset_holds_window_lock_during_recorder`. |
-| x402 usage after a later failure | On testnet, admitted usage stays charged; this is the beta contract. A consumed mainnet payment intent retains its debit after a later failure. An intent releases its holds through invalidation or expiry only before its signing claim. | The admission lock ends before the later payment attempt. Lifetime: not pinned. | A later testnet failure does not refund usage: MCP `x402_audit_gate_integration::post_admission_failure_keeps_spend`. | Actual restart after that failure: not pinned. | The admission-refusal test in the preceding row pins the before-signing boundary separately. |
+| x402 usage after a later failure | On testnet, admitted usage stays charged after a later failure. A consumed mainnet payment intent retains its debit after a later failure. An intent releases its holds through invalidation or expiry only before its signing claim. | The admission lock ends before the later payment attempt. Lifetime: not pinned. | A later testnet failure does not refund usage: MCP `x402_audit_gate_integration::post_admission_failure_keeps_spend`. | Actual restart after that failure: not pinned. | The admission-refusal test in the preceding row pins the before-signing boundary separately. |
 | Authorization per process with a durable record of single use | Per-profile authorization records and holds persist in the window store. `a_mint_records_the_authorization_its_holds_and_its_reservation` in network `policy_state::ledger`. | Mint, claim, consume, and invalidation run under the state lock. Claim retention: `an_invalidation_after_the_claim_keeps_the_holds` and `an_expired_claim_keeps_its_spend_counted`. Mint contention: `a_held_lock_refuses_a_mint`. Two store paths over one keyring entry: `two_paths_mint_one_approval_once`. Consume pin reread: `a_consume_rereads_the_pin_under_its_lock`. Invalidation under the lock: `every_store_transition_takes_the_entry_lock`. | A second consume refuses without rewriting the file: `a_second_consume_refuses`. An approval nonce stays single use while its approval can be presented: `an_approval_nonce_is_single_use_within_retention`. Through a reset and pruning: `a_reset_keeps_every_record_whose_approval_can_be_presented` and `a_reset_settles_a_record_minted_ahead_of_the_store_clock`. | A reopened store refuses a second claim and approval reuse: `a_reopened_store_cannot_claim_twice_or_mint_the_approval_again`. Actual process restart: not pinned. | Concurrent mints produce one open record: `concurrent_mints_of_one_content_yield_one_open_record`. Invalidation releases holds without reopening authority: `an_invalidation_releases_the_holds_and_never_reopens`. All named tests are in network `policy_state::ledger`. |
 
 The receipt store remains an unanchored map; a missing file reads as empty.
 It backs duplicate source-and-sequence refusal, duplicate-envelope refusal,
 approval-nonce checks, reconciliation identity, approval-consumption repair,
 and operator-clear state. The chain refuses a reused source sequence after
-receipt loss or rollback. At the MCP gate's approval-nonce check, the
-approval-store consumption tombstone refuses first. The receipt covers the
+receipt loss or rollback. At the MCP gate's approval-nonce check, the receipt
+hold refuses first. The approval-store consumption tombstone refuses next, with
+the same code. The receipt covers the
 window in which a tombstone write is still owed, and the approval's lifetime,
 the single-use commit nonce and the chain bound that window. The CLI has no
 approval-nonce gate.
@@ -215,15 +216,18 @@ When the operator runs `approve`, the wallet records an HMAC-SHA256 attestation 
 
 ### Canonical input
 
-`compute_attestation(key, binding, approval_nonce, envelope_sha256, process_uid)` feeds the HMAC in this order:
+`compute_attestation(key, binding, approval_nonce, envelope_sha256, process_uid, lifetime)` feeds the version 3 HMAC in this order:
 
 ```text
-mac.update(b"stellar-agent-approval-attestation:v2")
+mac.update(b"stellar-agent-approval-attestation:v3")
 mac.update(u32_be(len(profile_name)))   mac.update(profile_name)
 mac.update(u32_be(len(chain_id)))       mac.update(chain_id)
 mac.update(u32_be(len(approval_nonce))) mac.update(approval_nonce)
 mac.update(envelope_sha256)
 mac.update(u32_be(len(process_uid)))    mac.update(process_uid)
+mac.update(u32_be(len(kind)))           mac.update(kind)
+mac.update(u64_be(created_at_unix_ms))
+mac.update(u64_be(expires_at_unix_ms))
 ```
 
 Lengths count UTF-8 bytes, encoded as big-endian `u32` with saturation at `u32::MAX`.
@@ -232,7 +236,7 @@ The tag separates this HMAC from every other use of the key.
 The profile name and CAIP-2 chain id make a blob unverifiable under another profile or chain.
 A layout change bumps the tag; blobs under the previous tag do not verify.
 
-All four variable-length fields carry a big-endian `u32` length prefix. The prefixes encode every field boundary, so inputs that split into different fields hash differently. A known-answer test pins the exact layout so an accidental change to the preimage is caught.
+All five variable-length fields carry a big-endian `u32` length prefix. The prefixes encode every field boundary, so inputs that split into different fields hash differently. A known-answer test pins the exact layout so an accidental change to the preimage is caught.
 
 ### Key custody
 
@@ -266,7 +270,8 @@ Four approval kinds bind extra fields by hashing them into the 32-byte slot that
   The flag byte uses bit 0 for mutable verifiers and bit 1 for unknown verifiers.
 - `MppChargeSimulated`: the shared HMAC binds the prepared artifact hash. The store verifier also compares the stored profile and chain with the binding.
 
-The classic intent digest is separate from these four and binds no attestation yet.
+The classic intent digest is separate from these four.
+A version 6 mainnet consent binds it in the attestation's subject slot.
 `approval::intent::ClassicIntent` binds lasting classic facts through
 `SHA256("stellar-agent-wallet/classic-intent/v1" || canonical_bytes)`.
 The label and canonical bytes have no outer length prefixes.
@@ -277,11 +282,12 @@ The canonical layout encodes the base, then the payload, in declaration order:
 - CreateAccount (1): destination G strkey, starting balance.
 - Trustline (2): issuer G strkey, code, limit.
 - Claim (3): lowercase hexadecimal XDR balance id, asset, amount, claimant G strkey.
+- ContractPay (4): destination C strkey, classic asset, amount, optional explicit inclusion bid.
 - Asset: Native (0), or Issued (1) followed by code and issuer.
 - Memo: None (0), Text (1), Id (2), Hash (3), Return (4), followed by each variant's value.
 
 Enum tags occupy one byte. Integers occupy eight big-endian bytes.
-Signed integers use two's complement; the u32 fee bound is zero-extended.
+Signed integers use two's complement; the u32 fee bound and explicit bid are zero-extended.
 UTF-8 strings and byte arrays carry a u32 big-endian byte length and their bytes.
 An option carries tag 0 for absence, or tag 1 and its value.
 The balance id has 72 lowercase hexadecimal characters, with XDR discriminator zero.
@@ -699,7 +705,7 @@ Every `VerifyError` maps to one code from a fixed set; the line number and file 
 
 `audit.chain_broken`, `audit.rotation_gap`, `audit.hmac_mismatch`, `audit.hmac_sidecar_missing`, `audit.entry_tag_invalid`, `audit.too_many_rotated_files`, `audit.non_regular_file_log_path`, `audit.parse_error`, `audit.path_contract`, `audit.log_not_found`, `audit.io_error`, `audit.signer_set_canonical_body`, `audit.partial_rotation`, `audit.tip_anchor_mismatch`, `audit.tip_anchor_missing`.
 
-The writer adds its own refusals outside that set, carried in the envelope detail rather than as `VerifyError` codes. `audit.writer_locked` means another process holds the writer lock. `audit.rotation_bridge_unusable` means the newest archive cannot supply the cross-file chain seed. `audit.outbox_busy` means the audit outbox lock stays held past its wait. `audit.outbox_unusable` means a committed outbox line does not parse or is not an operator row (`approval_attested`, `approval_attested_remote`, `profile_halted`, or `profile_resumed`). `audit.tip_anchor_unavailable` means keyring-held audit state could not be read or written. `audit.row_too_large` refuses a row over the byte cap. `audit.outbox_rows_missing` refuses a missing or changed committed queue prefix, and a changed commitment of the outbox generation a carrier binding retired. `audit.outbox_loss_not_found` refuses an acknowledgement without a queued-row loss. `audit.outbox_full` and `audit.outbox_row_too_large` refuse a queued row at the outbox bounds described under [Writer lock and reader concurrency](#writer-lock-and-reader-concurrency). Each keeps its own code rather than `audit.chain_key_unavailable`. Two writer refusals reuse codes from the set above with their own reasons. `audit.tip_anchor_mismatch` with reason `unauthenticated_tail` refuses a tail past the anchor without valid entry tags. `audit.chain_key_unavailable` refuses an open without the audit key on a log that shows keying. The carrier refusals are `audit.carrier_replaced`, `audit.carriers_unbound`, `audit.carrier_identity_unavailable`, `audit.carriers_busy` and `audit.carrier_binding_incomplete`. They protect the writer, drain and outbox roles with handle identities recorded in the keyring. `audit bind-carriers` enrolls them with every wallet process stopped and isolates stale holders with generation-specific queues and commitments.
+The writer adds its own refusals outside that set, carried in the envelope detail rather than as `VerifyError` codes. `audit.writer_locked` means another process holds the writer lock. `audit.rotation_bridge_unusable` means the newest archive cannot supply the cross-file chain seed. `audit.outbox_busy` means the audit outbox lock stays held past its wait. `audit.outbox_unusable` means a queued outbox line does not parse, does not authenticate, sits out of place, or is not an operator row (`approval_attested`, `approval_attested_remote`, `profile_halted`, or `profile_resumed`). `audit.outbox_evidence_unusable` refuses consent evidence files that do not match the owner state. `audit.key_replaced` refuses a writer whose loaded audit key is not the stored key. `audit.tip_anchor_unavailable` means keyring-held audit state could not be read or written. `audit.row_too_large` refuses a row over the byte cap. `audit.outbox_rows_missing` refuses a missing or changed committed queue prefix, and a changed commitment of the outbox generation a carrier binding retired. `audit.outbox_loss_not_found` refuses an acknowledgement without a queued-row loss. `audit.outbox_full` and `audit.outbox_row_too_large` refuse a queued row at the outbox bounds described under [Writer lock and reader concurrency](#writer-lock-and-reader-concurrency). Each keeps its own code rather than `audit.chain_key_unavailable`. Two writer refusals reuse codes from the set above with their own reasons. `audit.tip_anchor_mismatch` with reason `unauthenticated_tail` refuses a tail past the anchor without valid entry tags. `audit.chain_key_unavailable` refuses an open without the audit key on a log that shows keying. The carrier refusals are `audit.carrier_replaced`, `audit.carriers_unbound`, `audit.carrier_identity_unavailable`, `audit.carriers_busy` and `audit.carrier_binding_incomplete`. They protect the writer, drain and outbox roles with handle identities recorded in the keyring. `audit bind-carriers` enrolls them with every wallet process stopped and isolates stale holders with generation-specific queues and commitments.
 
 The value-verb pre-flight surfaces those and the rest of the writer's failure classes the same way. It stays fail closed for all of them, and each refusal names the remedy for its own condition. A tip-anchor mismatch carries `audit.tip_anchor_mismatch` and a missing anchor carries `audit.tip_anchor_missing`; both name the repair verb. A changed audit binding carries `audit.log_binding_changed` and names `audit reanchor --acknowledge-binding-change`. A condition about the LOG (held lock, unusable bridge, broken chain, an anchor that cannot be read or written, busy or unusable outbox, missing or changed committed outbox rows, I/O) carries `audit.chain_key_unavailable`. The specific `audit.*` sub-code heads the detail, with a pointer to the recovery runbook. Only a registry path or key registration conflict keeps the wording about a conflicting registration. `audit verify`'s tip-anchor refusal carries the verifier's own message under `audit.tip_anchor_mismatch`, with the anchored and observed counts and offsets, rather than the signing-path wording; its missing-anchor failure carries `audit.tip_anchor_missing` with the evidence and the observed count and offset.
 
@@ -741,6 +747,7 @@ On mainnet, after release authorization is consumed, the tool consumes the pendi
 | MCP | `stellar_x402_create_payment`, `stellar_x402_authenticated_payment` | `x402_payment_authorized` (its own `EventKind` carrying legs, network, and scheme, plus a passed witness when the payment required one), fatal, before the signed re-simulation. `x402_authorization_withheld` follows a later failure, at a stage the paragraphs above list. Mainnet `x402_payment_authorized` rows record the governing Allow or RequireApproval decision before signed re-simulation. Later withholding rows identify the failed stage with the same request identifier. |
 | MCP | `stellar_sep43_sign_and_submit_transaction` | `value_action_pending` (the allowed payment legs; empty for a transaction without one) |
 | MCP | `stellar_sep43_sign_transaction` | `opaque_payload_signed` (the allowed payment legs; omitted when empty) |
+| MCP | `stellar_sep43_sign_auth_entry` | `opaque_payload_signed` (the allowed token legs; omitted when empty) with an `allow` decision |
 | CLI | `pay`, `claim`, `accounts create` (sponsored mode only), `trustline` | `value_action_pending` (sized legs) |
 | CLI | `trade`, `vault deposit`, `vault withdraw` | `value_action_pending` (sized legs) before the send; `sa_raw_invocation` on submit failure |
 | CLI | `pool init` | `value_action_pending` (empty legs) |
@@ -760,7 +767,7 @@ It collects every accounting entry before calling durable admission once.
 Admission holds the window-state lock while rereading authenticated state and checking all entries.
 A refused batch adds no usage, including when a later item cannot be sized.
 Preparation can change memory; the next dispatch clears it and reloads durable state.
-The singular authorization helper retains its existing contract.
+`record_authorized_window_state` admits one tool's effects through the same durable admission, lock, and checks.
 
 The batch helper's durable admission runs generation work under the window-state lock.
 The lock is released when durable admission returns.
@@ -770,10 +777,11 @@ No recovery verb repairs that mismatch; create a profile under a new name.
 
 Amount admission checks stored rows, fallback shares, bundle overlays, and proposed legs without saturation.
 Raw queries return typed overflow errors and keep the stored records.
-Callers with a governing period, total, or unlisted limit return that limit's denial code.
+Callers with a governing period or total limit return that limit's denial code.
+An unlisted overflow returns `policy.accounting_overflow`.
 Period and unlisted overflow payloads omit unrepresentable usage figures.
-Count, clock, and reporting projections retain their existing arithmetic.
-Authorized rows use existing window formats; the highest supported version remains 16.
+Count, clock, and reporting projections use saturating arithmetic.
+Authorized rows use the window formats described below. The highest supported version is 18.
 
 `opaque_signing_opted_in` reads the first matching rule's flag.
 It defaults to false and returns true for the Noop engine.
@@ -792,7 +800,9 @@ Admitted usage is durable before the signer loads and is never refunded.
 `sep43_effects_gate` in `crates/stellar-agent-mcp/src/tools/sep43_effects.rs`
 runs after the own rule allows and before the audit pre-flight:
 
-1. Decode with `transaction_effects` under the profile's wallet key. A key
+1. List the operation sources other than the wallet with
+   `transaction_source_candidates`, read their signer sets, then decode with
+   `transaction_effects_for_sources` under the profile's wallet key. A key
    that does not parse counts every source and fee payer as the wallet.
 2. Refuse decoder errors: malformed, legacy, negative-field and unreadable
    memo errors with `sep43.invalid_xdr`; merges and authority changes with
@@ -803,7 +813,8 @@ runs after the own rule allows and before the audit pre-flight:
    the classic cap at full width; and for a resource transaction, the full
    total under `check_contract_transfer_fee_cap`.
 5. Stage the own rule's count for the sign-only tool. Return here when no
-   payment leg exists, before any account read.
+   payment leg exists. The signer-set read of step 1 has run, and no balance
+   read follows.
 6. Read the wallet account once and each recipient base account once.
 7. Evaluate each payment leg in operation order with
    `evaluate_policy_in_snapshot` under the outer dispatch's frame. The
@@ -870,8 +881,8 @@ is the wallet key; no threshold is solved. `transaction_effects_for_sources`
 skips every other source's operations before `decode_operation`, so they add
 no leg, opt-in, refusal or memo refusal. Every read error refuses with its
 own code. A fee bump, a call without a wallet key and a parsed wallet-only
-transaction read nothing. Fee ownership and the wallet tests for inflows,
-claimants and sponsorship are unchanged. The set is the one observed for this
+transaction read nothing. Fee ownership and the tests for inflows, claimants
+and sponsorship compare against the wallet key, as the operation table states. The set is the one observed for this
 call and nothing caches it: a later signer change can make a retained
 signature relevant to a source this call excluded. Approval eligibility and
 binding use the original envelope, so two raw operations never qualify.
@@ -1061,7 +1072,7 @@ Windows Credential Manager requires an interactive logon session; a Windows serv
 
 ### Activation surface
 
-`stellar_agent_network::keyring::init_platform_keyring_store` checks the `STELLAR_AGENT_KEYRING_BACKEND` environment variable FIRST. It is called unchanged at every existing keyring-consuming call site across the CLI and MCP server (~25 sites). Unset: the platform keyring (unchanged default). Set to `"headless-env"` or `"headless-dpapi"`: the headless store is registered as the process default instead. Initialisation NEVER falls back to the platform keyring on any failure (missing/invalid key, unsupported platform, or state-directory resolution failure all refuse). There is no profile-file `[keyring] backend = ...` surface. Threading a `Profile` reference through every `init_platform_keyring_store()` call site was judged not worth it against an env var that already fully serves the deployment shape this feature targets. Most call sites have no loaded profile in scope at that point.
+`stellar_agent_network::keyring::init_platform_keyring_store` checks the `STELLAR_AGENT_KEYRING_BACKEND` environment variable FIRST. It is called unchanged at every existing keyring-consuming call site across the CLI and MCP server (~25 sites). Unset: the platform keyring (unchanged default). Set to `"headless-env"` or `"headless-dpapi"`: the headless store is registered as the process default instead. Initialisation NEVER falls back to the platform keyring on any failure (missing/invalid key, unsupported platform, or state-directory resolution failure all refuse). There is no profile-file `[keyring] backend = ...` surface. Only `STELLAR_AGENT_KEYRING_BACKEND` selects the backend, because most call sites have no loaded profile in scope.
 
 ### Protection modes and trust model
 
@@ -1130,7 +1141,7 @@ The domain constant versions the preimage layout, so a tag computed over any oth
 
 ### In-memory replay window and boot_nonce fail-closed
 
-`ReplayWindow` is a `HashMap`-backed single-use tracker with TTL eviction, held per `WalletServer` instance. It is not persisted across process restarts. The fail-closed-on-restart property comes from `boot_nonce`: a 16-byte `OsRng` value initialised once per process and never persisted. A nonce minted before a restart carries the old `boot_nonce` baked into its HMAC tag, so after restart the recomputed tag differs and the nonce is rejected (`HmacMismatch`). An in-memory-map-only design was rejected because an empty post-restart map would accept a pre-restart nonce on first presentation; a persistent counter was rejected because it would let an operator opt out of fail-closed-on-restart.
+`ReplayWindow` is a `HashMap`-backed single-use tracker with TTL eviction, held per `WalletServer` instance. It is not persisted across process restarts. The fail-closed-on-restart property comes from `boot_nonce`: a 16-byte `OsRng` value initialised once per process and never persisted. A nonce minted before a restart carries the old `boot_nonce` baked into its HMAC tag, so after restart the recomputed tag differs and the nonce is rejected (`HmacMismatch`). An empty post-restart replay map alone would accept a pre-restart nonce on first presentation, so the `boot_nonce` carries the restart check. No persistent counter exists, so no operator setting turns this check off.
 
 ### Key residency and rotation
 
@@ -1598,8 +1609,9 @@ A provider record can name a keyring entry and a placement for its role's endpoi
   the MCP handler prepares it, and the x402 crate receives it and builds no client. The
   authorized x402 path obtains its primary client from the bound context. It obtains the
   oracle witness through the bound network helper. The Friendbot path of `accounts create`, the MCP `stellar_friendbot`
-  tool, `stellar_sep43_sign_and_submit_transaction`, and the smart-account, DeFi, and MPP
-  clients carry no credential.
+  tool, the submit client of `stellar_sep43_sign_and_submit_transaction`, and the
+  smart-account, DeFi, and MPP clients carry no credential. The SEP-43 effects gate reads
+  through `NetworkContext::primary_client`.
 - The value goes from the keyring into a `Zeroizing<String>` and from there to the transport. A header value is marked sensitive, so its `Debug` form hides it. A query or path placement interpolates the value into the transport target; the client's `url()` returns the configured URL without it.
 - `StellarRpcClient` implements neither `Debug` nor `Clone`, because the inner transport prints its target URL.
 - Every error the client builds from transport or server text replaces the stored value and the form it sends with `[redacted]` before the URL scrub. For a header value with a scheme prefix, the token after the first space is replaced too when it holds at least 8 bytes. The `error` field of a simulation answer gets the same scrub. A value the server splits, truncates, or re-encodes is not caught.
@@ -1655,7 +1667,7 @@ Every signature must pass, and each signature set must have at least one. Hash-x
 
 ## Policy V1 evaluator
 
-`PolicyEngineV1` (`crates/stellar-agent-core/src/policy/v1/mod.rs`) is the signature-verified typed-criteria engine, active when `profile.policy.engine = V1` (the default for newly-minted profiles). The alternative, `NoopPolicyEngine` (`policy/mod.rs`), is selected by `engine = "noop"`. It supplies one policy boundary alongside entry, signing, and submit checks. Testnet allows all tools. Mainnet read-only (`destructive_hint = false`) allows. Mainnet destructive returns `Err(PolicyError::NotImplemented)`, surfaced as `policy.engine_required`.
+`PolicyEngineV1` (`crates/stellar-agent-core/src/policy/v1/mod.rs`) is the signature-verified typed-criteria engine, active when the profile's `[policy]` table sets `engine = "v1"` (the default for a new profile). The alternative, `NoopPolicyEngine` (`policy/mod.rs`), is selected by `engine = "noop"`. It supplies one policy boundary alongside entry, signing, and submit checks. Testnet allows all tools. Mainnet read-only (`destructive_hint = false`) allows. Mainnet destructive returns `Err(PolicyError::NotImplemented)`, surfaced as `policy.engine_required`.
 
 An enrolled owner authorizes the engine selection through the signed V2
 policy's optional top-level `engine`. It accepts `v1` or `noop`; omission means
@@ -1772,6 +1784,7 @@ The outer gate defers minimum_reserve and balance_floor to the routed live read.
 It reads the spending window and records nothing.
 The routed commit enforces approval and records once after confirmation.
 The outer gate has no identity view, so HOME_DOMAIN remains unverifiable.
+On mainnet, a toolset signing action refuses with `network.mainnet_write_forbidden` before the outer gate.
 
 `total_budget` entries carry the policy digest as their epoch, use the key
 `total:<asset>` with a zero window, and count regardless of age. The window
@@ -1884,8 +1897,8 @@ Stateful spending criteria read amounts and counts from `PolicyStateStore`. Conf
 - **Admission**: `record_pending` (the write that reserves a submission's spend, immediately before the send) re-applies the governing criterion's comparison under the lock it already holds, against the file it has just read and verified. Each entry carries the limit that governs its bucket (`WindowLimit::Amount { asset, window, max_stroops }` or `WindowLimit::Count { window, max_calls }`), derived from the same fields the criterion's `evaluate` compares against and never persisted. A batch any bucket can no longer admit is refused as `WindowStoreError::PolicyDenied`, carrying the `DenyReason` the criterion produces for that condition, and nothing is written; entries of one batch on one key accumulate against each other. A same-key pending record dated more than 30 seconds past the entry's own clock fails the gate's query closed, and admission refuses it as `policy.deny.evaluation_error`; the diagnostic names the host-clock offset. Confirmed ledger close times count toward the cap even when they are ahead of the host clock. The recorder maps that refusal to `WalletError::PolicyDenied`, which reports the gate's own `policy.deny.*` code at every surface, and unwinds the receipt, the pending audit row and the held sequence exactly as any other pre-send refusal does. The gate reads the window before the transaction is built and signed, so without this recheck two callers on one profile could each pass the gate against the same state and both spend against it. A total entry is admitted only under the pinned, unretired policy, and only when its limit and key agree. Rows and holds of its bucket and epoch count at any age. Every spelling of one asset, as any build stored it, counts in one bucket.
 - **Atomic write**: temp file + `sync_data` + rename + parent-directory fsync, the same discipline as the audit log's rotation `write_sidecar_atomic`.
 - **Retention**: confirmed entries older than the largest supported window (`1w` = 604,800s) are pruned on every write. Exposure remains through its execution and accounting horizon; missing bounds retain it indefinitely. Accounting expiry records survive ordinary pruning until audit acknowledgement and receipt projection both complete. An acknowledged, projected record is pruned only after its observation exceeds the retention interval. A counted total row never leaves the allocation by age. A final total row strictly older than the retention folds into the settled sum of its scope, canonical asset, and digest. The same commit removes the row, and the sum keeps its full amount. A final row whose decision's receipt projection is owed stays a row. A counted total row of an authorization whose retained attempt holds a checked success is final, whatever status it reached. Any other pending, exposed, or unresolved claimed row stays individual, and a negative legacy row is never folded. Sums exist for every digest and survive resets; they carry no row count. A sum that would overflow refuses the write as `Invalid` with `a total-budget sum overflows`, before any audit row. A released total row ages out with the retention once its decision's receipt projection is written. Operation capacity is measured after that pruning. Read-only operation status prunes its copy without folding.
-- **Failure posture**: a tampered (HMAC mismatch) or unparseable store file is fail closed. No verb recovers such state in this release; create a profile under a new name. File I/O failures refuse without changing state; retry after access is restored. `PolicyEngineV1`'s construction site hydrates the store BEFORE the engine is usable. A hydration failure refuses engine construction (`policy.engine_unavailable` / `BuildRegistryError::PolicyEngineError`) rather than silently starting with an empty store. On every chain, an authenticated file of a newer format version refuses reads with `UnsupportedVersion` and the reset with `profile.reset_window_state_newer_version`; use the build that wrote it. Loading pre-release state below version 12 retires its pinned digest for totals without reconstructing debits. A file from version 12 through 14 moves to version 15 without retirement or a new signature once it holds a final charge or a sum. Its confirmed total rows become final only when their origin is proved. A policy with a different signed digest starts at zero.
-- **Mainnet rule**: in a build with mainnet writes, a mainnet profile's store that cannot be verified refuses every read and write with `policy.window_state_unverifiable`, naming the defect: a missing file with a committed generation, a missing or unusable key beside an existing file, a malformed file, an HMAC mismatch, or a generation mismatch. No write mints a key or a file over such a state. A missing file with no committed generation is a genuine first run. No verb recovers such state in this release; create a profile under a new name. A verifiable store that still holds an effective open or claimed mainnet authorization refuses the reset with `profile.reset_window_state_open_authorizations` and changes nothing; expiry releases unclaimed holds and retains claimed spend in memory, and nothing is written before the audit row. Testnet profiles and builds without mainnet writes also refuse unverifiable history.
+- **Failure posture**: a tampered (HMAC mismatch) or unparseable store file is fail closed. No verb recovers a tampered or unparseable store; create a profile under a new name. File I/O failures refuse without changing state; retry after access is restored. `PolicyEngineV1`'s construction site hydrates the store BEFORE the engine is usable. A hydration failure refuses engine construction (`policy.engine_unavailable` / `BuildRegistryError::PolicyEngineError`) rather than silently starting with an empty store. On every chain, an authenticated file of a newer format version refuses reads with `UnsupportedVersion` and the reset with `profile.reset_window_state_newer_version`; use the build that wrote it. Loading pre-release state below version 12 retires its pinned digest for totals without reconstructing debits. A file from version 12 through 14 moves to version 15 without retirement or a new signature once it holds a final charge or a sum. Its confirmed total rows become final only when their origin is proved. A policy with a different signed digest starts at zero.
+- **Mainnet rule**: in a build with mainnet writes, a mainnet profile's store that cannot be verified refuses every read and write with `policy.window_state_unverifiable`, naming the defect: a missing file with a committed generation, a missing or unusable key beside an existing file, a malformed file, an HMAC mismatch, or a generation mismatch. No write mints a key or a file over such a state. A missing file with no committed generation is a genuine first run. No verb recovers an unverifiable mainnet store; create a profile under a new name. A verifiable store that still holds an effective open or claimed mainnet authorization refuses the reset with `profile.reset_window_state_open_authorizations` and changes nothing; expiry releases unclaimed holds and retains claimed spend in memory, and nothing is written before the audit row. Testnet profiles and builds without mainnet writes also refuse unverifiable history.
 - **Rotation**: `stellar-agent profile rotate-policy-state-key <name>` first verifies an existing store file's tag under the old key. It refuses the rotation, changing nothing, when the tag does not verify or the file exists without a minted old key. It then mints a fresh key and re-signs the store file's existing body under it. The re-sign itself needs no old key. This is the same "recompute the tag over the unchanged body" shape as `rotate-audit-key`'s chain-root sidecar re-sign, so accumulated history survives rotation.
 
 `PersistedWindowStore::total_usage` reports the committed use of one digest per scope and canonical bucket. It holds the existing shared window lock across the pin read and the authenticated state read. It requires the pin to name the requested digest. It reads every persisted hold, row, settled sum, and retained intent leg as admission counts them, and it sweeps, prunes, retires, and writes nothing. An absent store under that pin has no use. A missing pin or lock file, another pinned digest, history below version 12, a retired digest, a negative row, or an overflow reports no use with a typed reason. `profile enable-mainnet --check` reads the state without hydration and reports use only when the verified body's digest equals the inspected and the locked pin.
@@ -1895,7 +1908,7 @@ Stateful spending criteria read amounts and counts from `PolicyStateStore`. Conf
 - **Descriptors**: each rule lists its `per_tx_cap`, `per_period_cap`, `total_budget`, and unlisted `budget` bounds from the signed fields, through `Criterion::descriptors`. A total has no window.
 - **Buckets**: per rule, `used` sums settled rows and settled total sums, and `reserved` sums holds, pending and exposed rows, and signed intent legs, each representation once, as admission counts them. `remaining` is `max(0, cap - used - reserved)`. A total counts its policy epoch only. The unlisted bucket and a retired epoch report why they have no figures.
 - **Native obligations**: every authorization of every epoch and state lists its stored state and disposition. Its reservation is counted from the stored observation, never a live read. An `Always` row is not counted under any observation. Every other count needs a stored observation at or above both admissible floors; a bounded row releases at equality, and without a row the reservation counts, including after `Used`. The total adds debit plus fee once per counted authorization. An authorization without amounts counts zero and is listed as an unreserved legacy obligation.
-- **Limitations**: the projection carries recorded amounts only. An x402 authorization records a zero native debit. Earlier-epoch total figures and the unlisted allowance are deferred pending the accounting integration; live account figures and a reconciliation timestamp are not supplied by this snapshot. A period bucket whose used and reserved figures overflow together refuses with its own detail, distinct from the total-budget sum. Expiry is a view at the supplied clock; no read records a watermark. A stored observation dated after the clock refuses with `wallet.clock_error`.
+- **Limitations**: the projection carries recorded amounts only. An x402 authorization records a zero native debit. The projection reports no earlier-epoch total figures, no unlisted allowance, no live account figures, and no reconciliation timestamp. A period bucket whose used and reserved figures overflow together refuses with its own detail, distinct from the total-budget sum. Expiry is a view at the supplied clock; no read records a watermark. A stored observation dated after the clock refuses with `wallet.clock_error`.
 
 A total debit leaves its sum in four ways. An unclaimed hold is invalidated, or a committed sweep expires it. A checked failure or non-inclusion of its own attempt releases it once. The writer that reserved it cancels it before the signed bytes leave the process. Every other transition keeps it counted, including operator clears, accounting expiry, and other cancellations. A fee that a failed transaction paid stays charged.
 
@@ -1960,9 +1973,11 @@ Reset refuses while an intent remains open or retained. A closed and pruned inte
 
 An open intent without an authenticated purpose permanently blocks reset for this profile. Continue with a new profile.
 
-Retained intents close only through the profile's stored secondary endpoint. Add one to the profile.
+When an intent is open and the stored profile names no secondary endpoint, the reset explanation asks the operator to add one.
+Retained intents close only through the profile's stored secondary endpoint.
 
-The profile's stored endpoint configuration is unreadable. Retained intents close only through stored endpoints that load.
+When an intent is open and the stored endpoint configuration does not load, the reset explanation reports it as unreadable.
+Retained intents close only through stored endpoints that load.
 
 Stateful criteria derive window entries from the same `ValueEffects` used by evaluation and audit. Submission identity, chain scope, and the signed execution bound live in authenticated window state. Duplicate reservations refuse under the store lock.
 
@@ -2060,9 +2075,12 @@ The message tells the operator to build the action again.
 Reset refuses effective open or claimed authorizations with
 `profile.reset_window_state_open_authorizations`. Enabled-mainnet state that
 cannot be verified refuses with `policy.window_state_unverifiable`.
-No verb recovers such state in this release; create a profile under a new name.
-A reset of verified state requires `--owner-secret-env VAR` holding the pinned
-owner's seed on an enabled installation, in every build. The store reads the
+No verb recovers unverifiable enabled-mainnet state; create a profile under a new name.
+A reset of verified state requires the owner's signature whenever an enablement
+nonce, a pin, or an enrolled owner exists, on testnet and mainnet alike.
+`--owner-secret-env VAR` holds the pinned owner's seed, or the enrolled owner's
+seed when no pin exists. Only state without any owner authority permits an
+unsigned reset. The store reads the
 nonce and pin under its lock and verifies the owner's signature over the reset
 statement before the recorder runs, for every caller. The statement binds a
 challenge the store draws for each reset. The store refuses a profile name that
@@ -2241,8 +2259,8 @@ successor permission, receipt claim or stored schema. A later successful
 `tx status` repair clears the display flag. Missing provenance stays named;
 unreadable authenticated state returns the existing typed status error.
 Missing history, expired authority and the eight-attempt limit cannot be
-repaired by editing receipts. The CLI and MCP payloads retain their existing
-fields; progress is a library handoff.
+repaired by editing receipts. The CLI and MCP payloads do not carry this
+progress. It is returned to library callers only.
 
 `OperationStatus::select` resolves the status selectors before recovery from
 one authenticated image, and `OperationStatus::projection` reads one more
@@ -2258,7 +2276,7 @@ nor the outcome class.
 
 A new record refuses with `operation.capacity` when its envelope, intent slot
 or record exceeds its bound, when 16 records wait, or when the committed file
-reached 1,179,648 bytes. One record stays within 184,365 bytes. Free text is
+reached 1,048,576 bytes. One record stays within 192,685 bytes. Free text is
 measured in serialized bytes; an overlong text keeps its SHA-256 hex digest
 and `truncated: true`. A record keeps its first history entry and the latest
 31, up to eight evidence rows per attempt, and up to 36 commit identifiers.
@@ -2328,7 +2346,8 @@ extend neither clock.
 
 Transaction and Soroban resolvers read authenticated approval facts before
 checking witness bounds. A retained record refuses in this order: revoked,
-unconsented while waiting, expired, then bound to another operation.
+consumed by another operation, unconsented while waiting, expired, then bound
+to another operation.
 Expiry includes a released payload, time before consent, and the execution
 boundary. Envelope approvals also expire at their signed pending boundary.
 Nonce, kind, subject, signed times, policy digest and receipt digest each
@@ -2643,7 +2662,7 @@ keeps each domain it relies on live with a scheduled
 
 ### `minimum_reserve` is inapplicable to smart-account verbs
 
-`account_view` is populated only for classic-account tools (`stellar_pay`, `stellar_create_account`, `stellar_claim`) whose acting account is a plain Stellar account with a classic `AccountEntry`. The smart-account verbs (MCP `stellar_dex_trade` / `stellar_defindex_vault_deposit` / `stellar_defindex_vault_withdraw`, and the corresponding CLI `trade` / `vault` commands) act through a deployed smart-account contract (C-strkey). A contract has no classic `AccountEntry`, so there is no reserve state to fetch and `account_view` stays `None` on these tools by design. A rule that configures `minimum_reserve` on one of them fails closed on every call via the criterion's own `CriterionEvaluationFailed` path. The same applies to `identity_view` on these tools: the DeFi counterparty (pool / router / vault) is a contract, so a configured identity-class criterion (`home_domain_resolved`) is equally unanswerable and fails closed. Operators should not configure `minimum_reserve` or identity-class criteria on rules matching the smart-account verbs.
+`account_view` is populated only for classic-account tools (`stellar_pay`, `stellar_create_account`, `stellar_claim`, `stellar_trustline`) and the SEP-43 effects gate, whose acting account is a plain Stellar account with a classic `AccountEntry`. The smart-account verbs (MCP `stellar_dex_trade` / `stellar_defindex_vault_deposit` / `stellar_defindex_vault_withdraw`, and the corresponding CLI `trade` / `vault` commands) act through a deployed smart-account contract (C-strkey). A contract has no classic `AccountEntry`, so there is no reserve state to fetch and `account_view` stays `None` on these tools by design. A rule that configures `minimum_reserve` on one of them fails closed on every call via the criterion's own `CriterionEvaluationFailed` path. The same applies to `identity_view` on these tools: the DeFi counterparty (pool / router / vault) is a contract, so a configured identity-class criterion (`home_domain_resolved`) is equally unanswerable and fails closed. Operators should not configure `minimum_reserve` or identity-class criteria on rules matching the smart-account verbs.
 
 ### Fail-closed registry construction
 
@@ -2879,7 +2898,7 @@ The public `schedule_upgrade`, `execute`, and `cancel` operations preserve the r
 Audit and policy wire output never carry secrets or raw argument maps:
 
 - The audit log records raw argument key names only (`arg_keys`); raw argument values are never logged at any level. Typed value events retain each leg's amount, asset, and redacted destination.
-- Strkeys (`G` / `C` / `T` / `M` / `P`) in `decision_reason` are redacted to first-5-last-5 (for example `GABC...WXYZ`).
+- Strkeys (`G`, `C`, `T`, `M`, `W`, `P`) in `decision_reason` are redacted to first-5-last-5 (for example `GABC...WXYZ`).
 - Transaction hashes are redacted to first-8-last-8.
 - The `envelope_hash` is recorded unredacted because it is a SHA-256 digest with no user data.
 

@@ -6,9 +6,9 @@ Stellar Agent Wallet is a self-custodial Stellar wallet for AI agents, with keys
 An agent uses the `stellar-agent` command-line interface or `stellar-agent-mcp`, which speaks the Model Context Protocol (MCP), a tool-call protocol, over standard input and output.
 The operator configures policy and approves requests, while the host's keyring stores enrolled signing keys and integrity keys, secrets that authenticate records.
 Payment handlers connect policy checks, required approvals, signing, and audit records to Stellar RPC, the network's remote request interface.
-Testnet is the default. Builds from this repository and releases from v0.1.0-alpha.14 on carry `mainnet-write`. These builds admit only the mainnet operations in [Mainnet configurations and scope](getting-started.md#mainnet-configurations-and-scope), after operator setup.
+Testnet is the default. Default builds enable the `mainnet-write` feature. These builds admit only the mainnet operations in [Mainnet configurations and scope](getting-started.md#mainnet-configurations-and-scope), after operator setup.
 CLI mainnet value operations follow the governing decision: `allow` grants policy authority without a ceremony; `require_approval` requires passkey consent.
-Every MCP mainnet write requires approval. A build with the feature off refuses every mainnet write.
+MCP mainnet writes sign under an `allow` decision and need a verified operator approval under `require_approval`. A build with the feature off refuses every mainnet write.
 
 ## Actors and trust boundaries
 
@@ -81,7 +81,7 @@ CLI `approve serve` runs the local inbox, or the remote inbox with `--remote`; `
 | Boundary | What crosses it | Component that checks it |
 | --- | --- | --- |
 | Agent to wallet | Tool names and arguments | MCP transport limits each line to 1 MiB; handlers validate arguments and invoke policy gates. |
-| Agent running CLI commands as the operator's OS user | Command arguments and approval requests | `approve --yes` checks only OS user identity; such an agent can approve its own requests. |
+| Agent running CLI commands as the operator's OS user | Command arguments and approval requests | On testnet, `approve --yes` checks only the OS user, so such an agent can approve its own requests. Mainnet refuses `--yes` with `approve.yes_refused_on_mainnet`. |
 | Terminal to wallet | Approval identifier and confirmation | CLI renders the stored request and checks the operating-system user identity. |
 | Local browser to wallet | Approval decisions and WebAuthn, the browser passkey protocol | Listeners bound to the host check Host and Origin headers; approval and passkey handlers validate the request. |
 | Remote device to wallet | Encrypted requests and passkey assertions | Remote inbox requires TLS, a passkey session from an allowlisted credential, and a fresh assertion bound to the action. |

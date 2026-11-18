@@ -21,9 +21,11 @@ Facts that apply to every crate:
   description say what that does and does not mean.
 - The unpublished `stellar-agent-smart-account-acceptance` member holds live
   acceptance suites only. It has no tier and no row in the Crates table.
-- The `stellar-agent` and `stellar-agent-mcp` builds from this repository and
-  releases from v0.1.0-alpha.14 on carry `mainnet-write`. The library crates
-  leave it off by default. The mainnet column describes the scope of builds
+- Default builds of `stellar-agent` and `stellar-agent-mcp` from this repository
+  carry `mainnet-write`. Release v0.1.0-alpha.13 and earlier releases do not have
+  the feature. The CLI crate and
+  the `stellar-agent-mcp` library enable it by default. The other library
+  crates leave it off. The mainnet column describes the scope of builds
   with the feature on. See
   [Mainnet configurations and scope](../getting-started.md#mainnet-configurations-and-scope).
 - The `stellar-agent` and `stellar-agent-mcp` binaries bundle every surface
@@ -47,8 +49,8 @@ Facts that apply to every crate:
 - **Internal.** Workspace machinery published only because crates.io
   requires it. No API stability promise of any kind; do not depend on these
   directly. Each carries this language in its crate description.
-- **Removed.** Previously shipped, no longer part of the wallet. Published
-  versions remain installable on crates.io; no new versions are published.
+- **Removed.** A removed crate is not part of the wallet. Its published
+  versions remain installable on crates.io, and no new version is published.
 
 ## Crates
 
@@ -109,10 +111,10 @@ authority. These descriptions do not change maturity tiers.
 
 ## External dependents
 
-Verified 2026-09-02 against crates.io reverse dependencies: no crate in
-this workspace has an external dependent (the only registered dependents
-are workspace siblings). In particular `stellar-agent-approval-remote`,
-the crate most likely to attract external integration, has none. Its API
+On 2026-09-02, the crates.io reverse-dependency listing showed no external
+dependent for any crate in this workspace. Its only registered dependents
+were workspace siblings. No repository check repeats this query. In
+particular `stellar-agent-approval-remote`, the crate most likely to attract external integration, has none. Its API
 may evolve under Level 2 rules without external coordination.
 
 ## Intent, not yet implemented

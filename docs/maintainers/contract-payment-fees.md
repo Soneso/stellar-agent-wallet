@@ -12,9 +12,13 @@ zero. A rewritten body requires renewed owner signing.
 The bound covers the full transaction fee: inclusion, resources, and any
 restoration. The network determines the charged fee. The bound limits that fee;
 it is not a tariff. There is no separate resource ceiling.
-`soroban_resource_fee_cap` remains an unknown policy criterion.
+The loader refuses `soroban_resource_fee_cap` as an unknown criterion kind.
 
 ## Lookup and arithmetic API
+
+`sep43_fee_check` in `crates/stellar-agent-mcp/src/tools/sep43_effects.rs` is
+the single production caller of both functions. It applies them to every SEP-43
+transaction whose fee effect carries a resource fee.
 
 The network crate exports both functions from `fees` and its crate root:
 

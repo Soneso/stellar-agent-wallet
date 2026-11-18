@@ -7,7 +7,9 @@ approval nonce. Durable identities are internal storage keys.
 `read_pending_approval` uses the strict inbox loader, clones the first matching
 nonce and releases the inbox sidecar lock. It does not collect expired records.
 Every opening failure maps to `approval.store_open_failed` with a safe cause
-class. Existing approval commands keep their own error mapping.
+class. The `approve`, `approve gc`, and `approve list` paths map store-open
+failures through their own function, with distinct codes for permission, nonce
+length, and writer lock.
 
 `inspect_stored_approval` dispatches unsupported inbox kinds before loading
 verification context. It returns `None` for those kinds; a surface must display

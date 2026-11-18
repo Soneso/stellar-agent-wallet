@@ -63,7 +63,10 @@ Input is strict and bounded. Unknown members, duplicate JSON members or auth
 parameters, ambiguous supported challenges, non-canonical amounts, invalid
 addresses, cross-origin resources, unsupported modes, challenges without an
 `expires`, challenges that expire more than six minutes ahead, and expired or
-near-expiry challenges fail before signing. Examples use synthetic account
+near-expiry challenges fail before signing. A challenge without `expires`, or
+expiring more than six minutes ahead, refuses with `mpp.challenge_invalid`. A
+challenge with under 30 seconds left refuses with `mpp.challenge_expired`.
+Examples use synthetic account
 values; obtain real testnet terms from the server challenge.
 
 ## CLI workflow
@@ -80,6 +83,8 @@ audits, and returns one credential. If the prepare policy requires consent, it
 creates pending approval and returns `mpp.approval_required`, an authorization
 ID, and an approval ID. When only the commit rule requires approval, CLI MPP
 refuses with `mpp.approval_invalid` and creates no pending approval entry.
+When policy denies the charge, CLI MPP also refuses with `mpp.approval_invalid`.
+Its message says operator policy denied the authorization.
 
 The operator reviews and approves a pending request through the normal
 `approve` command or approval inbox; then resume only the stored authorization:
@@ -131,7 +136,7 @@ server, never through installed toolsets.
 | Tool | Arguments | Result and role |
 |---|---|---|
 | `stellar_mpp_charge_prepare` | `profile`, tagged `challenge` | Validates, simulates, evaluates policy, persists exact terms, and returns a preview plus commit nonce. Never signs. |
-| `stellar_mpp_charge_commit` | `authorization_id`, `nonce`, `expires_at_unix_ms` | Reloads stored terms, verifies approval and policy, signs once, re-simulates, audits, and returns one credential. |
+| `stellar_mpp_charge_commit` | `authorization_id`, `nonce`, `expires_at_unix_ms` (prepare's `nonce_expires_at_unix_ms`) | Reloads stored terms, verifies approval and policy, signs once, re-simulates, audits, and returns one credential. |
 | `stellar_mpp_record_receipt` | `authorization_id`, tagged `receipt` | Records a trusted-host observation. It does not prove settlement. |
 | `stellar_mpp_reconcile_transaction` | `authorization_id`, `transaction_hash` | Queries RPC and independently verifies the exact final direct or fee-bump transaction and payer signature. |
 | `stellar_mpp_authorization_status` | `authorization_id` | Returns redacted lifecycle, policy-accounting, receipt-observation, and ledger-outcome state. |
@@ -185,8 +190,9 @@ transaction. Never sign again for the same charge.
 Stable errors use the `mpp.*` namespace, including `mpp.challenge_invalid`,
 `mpp.challenge_ambiguous`, `mpp.challenge_mismatch`, `mpp.challenge_expired`,
 `mpp.unsupported_method`, `mpp.unsupported_intent`, `mpp.unsupported_mode`,
-`mpp.input_too_large`, `mpp.approval_invalid`, `mpp.network_forbidden`,
-`mpp.authorization_not_found`, `mpp.authorization_replayed`,
+`mpp.input_too_large`, `mpp.approval_required`, `mpp.approval_invalid`,
+`mpp.network_forbidden`, `mpp.authorization_not_found`,
+`mpp.authorization_replayed`, `mpp.authorization_indeterminate`,
 `mpp.state_unavailable`, `mpp.simulation_failed`, `mpp.signing_failed`,
 `mpp.credential_too_large`, `mpp.receipt_invalid`, `mpp.receipt_conflict`, and
 `mpp.reconciliation_unavailable`. A charge commit whose pending approval shows

@@ -11,7 +11,7 @@ Three principles shape every integration:
 - **Fail-closed.** Validation refuses on any failed check rather than proceeding on a guess. Unknown discriminants, ambiguous tokens, missing slippage floors, and stale oracle reads are refused before signing.
 - **Never auto-submit untrusted requests.** Inbound requests (a SEP-7 URI, a contract invocation) are parsed into a preview for the operator and policy engine. The wallet does not sign or submit on a dApp's behalf without going through the policy engine and [approval spine](concepts.md#the-approval-spine).
 
-The scope table defines mainnet admission for each build configuration. Public SEP-43 and generic SEP-45/53 signing remain excluded. Wallet entry guards use `network.mainnet_write_forbidden`; library refusals retain their namespaced codes. MPP refuses with `mpp.network_forbidden`. The wallet's own signing paths sign mainnet payloads only under mainnet authorization. The library signers enforce it too: every `Signer`, the public keyring handle included, signs a mainnet transaction or Soroban authorization payload only under a mainnet authorization. Code running as the same OS user with access to a keyring entry can read its seed directly. The keyring entry is the custody boundary. Ordinary submission refuses the declared mainnet passphrase or known mainnet host before RPC. In every build, submission verifies each signature under the network the endpoint reports. Authorized submission also requires the bound endpoint, the bound signer's signature, and the bound transaction hash, and records the authorization as consumed before sending.
+The scope table defines mainnet admission for each build configuration. Public SEP-43 signing and generic SEP-45 and SEP-53 signing are excluded on mainnet in every build. Wallet entry guards use `network.mainnet_write_forbidden`; library refusals retain their namespaced codes. MPP refuses with `mpp.network_forbidden`. The wallet's own signing paths sign mainnet payloads only under mainnet authorization. The library signers enforce it too: every `Signer`, the public keyring handle included, signs a mainnet transaction or Soroban authorization payload only under a mainnet authorization. Code running as the same OS user with access to a keyring entry can read its seed directly. The keyring entry is the custody boundary. Ordinary submission refuses the declared mainnet passphrase or known mainnet host before RPC. In every build, submission verifies each signature under the network the endpoint reports. Authorized submission also requires the bound endpoint, the bound signer's signature, and the bound transaction hash, and records the authorization as consumed before sending.
 
 ## SEP protocols
 
@@ -188,16 +188,13 @@ to a Payment challenge. See [Agent payments with MPP](agent-payments.md).
 
 Each DeFi venue is a signing adapter behind a common interface. They share a posture: no raw-vector or opaque-calldata signing, a venue/WASM pin verified before any signing, and predicted post-op figures shown for display only, never as a signing gate. See [DeFi and pool commands](cli-reference/defi-and-pool.md) for the CLI surface.
 
-### Blend: removed
+### Blend: not shipped
 
-The Blend lending integration was removed after the August 2026 incident in
-which the Comet pool holding Blend's backstop insurance capital was drained.
-The wallet's lending verb depended on that backstop for depositor protection,
-so the integration does not ship while the protocol's insurance layer is
-unavailable. Existing published `stellar-agent-blend` crate versions remain on
-crates.io; no new versions are published. Re-integration would require a
-published post-mortem, a backstop rebuilt on an audited AMM, and a fresh
-integration review of the rebuilt protocol.
+The wallet ships no Blend lending integration, and the project publishes no new
+`stellar-agent-blend` crate versions. A lending verb would depend on Blend's
+backstop insurance capital for depositor protection. Integration requires a
+published post-mortem, a backstop rebuilt on an audited AMM, and an integration
+review of the rebuilt protocol.
 
 ### Soroswap: trade (`trade`, `stellar_dex_quote`)
 
@@ -238,7 +235,7 @@ integration review of the rebuilt protocol.
 | x402 v2 Exact Stellar | Payer-side payment construction, authorized mainnet signing, and authorized payload release (Stellar-only, `exact`-only) | MCP |
 | x402 identity gate | Bound SEP-10 authentication for an approved x402 payment; returns a Bearer JWT companion outside the payment XDR | MCP |
 | MPP sponsored Stellar charge | Testnet G-account payer authorization; returns one HTTP/native-MCP credential, records a host receipt, and independently reconciles settlement | CLI, MCP |
-| Blend | removed (see above) | n/a |
+| Blend | not shipped (see above) | n/a |
 | Soroswap | `trade` (signing, CLI + MCP) and the read-only `stellar_dex_quote` (MCP only); absolute slippage floor, pre-sign re-verify, WASM-pinned | CLI, MCP |
 | DeFindex | `vault` deposit/withdraw; `min_out` required, role disclosure, `Upgradable:true` refused by default unless self-managed | CLI, MCP |
 
@@ -257,5 +254,6 @@ On testnet, a clock reading before approval creation refuses the approval withou
 When the policy requires approval, the x402 tools queue the payment and return
 `data.approval`. The owner approves with `stellar-agent approve`.
 Repeat with `approval_nonce` and `approval_attestation` to pay once.
+On mainnet each x402 payment call also needs `business_id`.
 Queueing signs nothing, reads no key, and runs no SEP-10.
 On mainnet, Allow without proof pays in one call; a supplied proof must verify.

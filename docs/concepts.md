@@ -27,7 +27,7 @@ A fifth control addresses a different risk: which tool definitions the agent may
 
 A sixth control stops an agent outright. The per-profile **emergency stop**, `stellar-agent profile halt`, refuses every action on the profile that signs or submits until the operator runs `stellar-agent profile resume`, with no server restart and no key or policy change. See [Emergency stop](#emergency-stop).
 
-The default network is `stellar:testnet`. A command with no named profile and no `default.toml` uses the zero-config testnet profile. Builds from this repository and releases from v0.1.0-alpha.14 on carry `mainnet-write`. Only a typed authorization issued for the action can satisfy the mainnet-write guard, and each binary attests its feature state. These builds admit only the scope-table operations, after setup and per-action approval. Policy evaluation, sealed authorization, signing checks, and submission checks are separate boundaries. The endpoint determines the network, and each envelope signature must verify under it. Read-only commands retain mainnet selection and key-scope requirements.
+The default network is `stellar:testnet`. A command with no named profile and no `default.toml` uses the zero-config testnet profile. Default builds enable the `mainnet-write` feature. Only a typed authorization issued for the action can satisfy the mainnet-write guard, and each binary attests its feature state. These builds admit only the scope-table operations, after setup and per-action approval. Policy evaluation, sealed authorization, signing checks, and submission checks are separate boundaries. The endpoint determines the network, and each envelope signature must verify under it. Read-only commands retain mainnet selection and key-scope requirements.
 
 ## Two account models
 
@@ -295,11 +295,14 @@ A missing or future-dated read refuses with `account.unread`, and a read older t
 refuses with `account.stale`. Any decision may carry the criterion.
 Provisional evaluation skips the floor; the strict evaluation before signing
 runs it. The criterion is enforceable only where a caller supplies an observed
-read with its reservation sum. On mainnet, the CLI `pay`, `claim`, `trustline`,
+read with its reservation sum. No caller supplies the read off mainnet, so on
+testnet a strict evaluation of a matched floor refuses with `account.unread`. On mainnet, the CLI `pay`, `claim`, `trustline`,
 and `accounts create` verbs and the MCP claim, create-account, and trustline
 tools supply both. Signing resolution reads them again before the mint.
 MCP `stellar_pay` and the x402 tools supply a plain account view, so a matched
 floor refuses there with `account.unread`.
+The SEP-43 transaction tools supply a plain account view for payment legs, and
+a matched floor refuses there with `account.unread` too.
 
 The store can recheck bound floor facts under the mint lock against its latest
 authenticated reservations. A retained value obligation with missing amounts,
@@ -311,7 +314,7 @@ that closed before its admissible floors, refuses with `account.unread`. The
 first write that sets the marker requires a read closed at least 300 seconds
 later, past any envelope signed earlier. A transaction signed before the marker
 by a host whose clock later moved backward lies outside the coverage guarantee.
-A legacy claimed obligation without amounts keeps floor use refused on its
+A claimed obligation stored without amounts keeps floor use refused on its
 profile; use a new profile. A floor that passes on the retained reservations
 still refuses with `account.unread`. Only a breach that the retained
 reservations already show refuses with `account.floor_refused`. Re-signing and
@@ -358,7 +361,7 @@ refuses such a body with `sign_policy.policy_body_invalid`.
 The commit tool's rule is binding, so the example carries the criterion on both pay tools.
 The threshold applies to its configured asset.
 A payment in another asset passes it, as it passes `per_tx_cap`.
-Single-shot tools and multicall refuse an escalation with their existing approval-required refusal.
+Single-shot tools refuse an escalation with `policy.approval_required_unsupported`, and multicall refuses it with `multicall.approval_required`.
 The SEP-43 transaction tools carry the escalation of a single payment, path payment, account creation or trustline change to a pending approval.
 A bundle is sized per inner transfer.
 
@@ -402,15 +405,17 @@ integer within the `u32` range. A call is denied with
 `policy.deny.rate_limit_exceeded` when the window already holds `max_calls`
 counted calls.
 A submission counts when the wallet reserves it immediately before the send.
-An x402 or MPP payment counts when the wallet records its authorization, before
-it signs.
+A testnet x402 or MPP payment counts when the wallet records its authorization,
+before it signs. A mainnet x402 intent reserves headroom when it is minted and
+records the debit when it is consumed.
 The policy gate only reads the count, so simulations and read-only calls do not
 count.
 A call refused before its submission is reserved or its authorization is
 recorded does not count either.
 A recorded x402 or MPP authorization stays counted when a later step fails,
 such as signing or delivering the credential.
-For x402 that includes a refused endpoint identity check.
+For testnet x402 that includes a refused endpoint identity check. On mainnet
+the endpoint identity check runs before the intent is minted.
 A sent submission keeps counting whatever the endpoint reports, a failure on
 chain or a refusal at the send included.
 A time-bounded one counts through its accounting horizon: the later of its
@@ -425,7 +430,7 @@ same window reads one shared count, whichever rule carries it.
 Each criterion compares that shared count against its own `max_calls`.
 `bundle_rate_limit` counts each inner call of a multicall bundle.
 
-Value criteria size a call through a typed value descriptor derived at the dispatch gate. A rule matching a value-moving tool constrains every debit leg, and per-asset caps aggregate across legs. A matched call whose value cannot be sized (including raw signing tools) denies fail-closed with `policy.deny.unsizable_value_effect` unless the rule sets `allow_opaque_signing = true`. `minimum_reserve` counts only native-XLM outflow legs. MCP pay/create-account/trustline/claim commits include envelope fees in `minimum_reserve`, as do CLI `pay`, `claim`, sponsored `accounts create`, and `trustline` for the envelope they build. A post-payment balance below reserve plus margin refuses with `policy.deny.minimum_reserve_breached`; equality passes. The initial MCP preparation check has no fee argument; its paired commit check uses the encoded envelope fee and can refuse preparation on mainnet. Cap amounts are i128 and cross the wire as decimal strings.
+Value criteria size a call through a typed value descriptor derived at the dispatch gate. A rule matching a value-moving tool constrains every debit leg, and per-asset caps aggregate across legs. A matched call whose value cannot be sized (including raw signing tools) denies fail-closed with `policy.deny.unsizable_value_effect` unless the rule sets `allow_opaque_signing = true`. `minimum_reserve` counts native debit legs only. Native aliases and the current network's native asset contract count alike. MCP pay/create-account/trustline/claim commits include envelope fees in `minimum_reserve`, as do CLI `pay`, `claim`, sponsored `accounts create`, and `trustline` for the envelope they build. A post-payment balance below reserve plus margin refuses with `policy.deny.minimum_reserve_breached`; equality passes. MCP classic preparation selects the fee before the policy gate, so its `minimum_reserve` check counts `total_fee_stroops`. Its paired commit check uses the encoded envelope fee and can refuse preparation on mainnet. Cap amounts are i128 and cross the wire as decimal strings.
 
 In a multicall bundle, every call other than a typed transfer from the smart account has an unsizable value effect.
 
@@ -454,13 +459,11 @@ Trustline approvals name the holder, asset code, full issuer, and limit.
 An absent limit means unlimited; zero means removal.
 The MCP commit gate accepts only the approval kind of its tool.
 
-Processes sharing an approval store upgrade together.
-An older binary rejects the whole approval file when it contains a
-`trustline_simulated` entry, including unrelated entries.
-Expiry alone does not make that file loadable by an older binary.
-Trustline approvals minted before the upgrade remain flat payment entries.
-The trustline commit gate returns `policy.approval_required` for them;
-simulate and approve again to create a trustline approval.
+Every process that shares an approval store must run a build that reads
+`trustline_simulated` entries.
+The trustline commit gate refuses a flat payment approval with
+`policy.approval_required`; simulate and approve again to create a trustline
+approval.
 
 ### What `approve` does
 
@@ -486,7 +489,8 @@ The profile name and CAIP-2 chain id make a blob unverifiable under another prof
 A layout change bumps the tag; blobs under the previous tag do not verify.
 Pending approvals use version 4 of this input, under the tag `stellar-agent-approval-attestation:v4`: the fields above, then the approval's kind, creation time and expiry, then the approver, which is the local operator or the operator credential the remote-approval listener verified.
 Every testnet commit requires version 4, so an approval recorded under an earlier layout needs fresh consent.
-Mainnet consent uses version 5, under the tag `stellar-agent-approval-attestation:v5`: the version 4 fields with a mainnet passkey approver, which names the approval credential's ID, followed by the SHA-256 digest of the stored presence receipt.
+Mainnet consent to an envelope uses version 5, under the tag `stellar-agent-approval-attestation:v5`: the version 4 fields with a mainnet passkey approver, which names the approval credential's ID, followed by the SHA-256 digest of the stored presence receipt.
+Mainnet consent to a canonical intent digest uses version 6, under the tag `stellar-agent-approval-attestation:v6`, with the 32-byte intent digest in the subject slot.
 The receipt holds a consent request ID, the random challenge input, the policy sequence, digest, and owner, the expected origin, the issue, expiry, and verification times, and the raw WebAuthn assertion.
 The consent request ID names one ceremony; the approval nonce names the pending action.
 The commit witness verifies the receipt again: it recomputes the challenge from the stored record and binding, checks the raw assertion under the credential key of the current signed policy, and requires that policy to be the one the receipt names.
@@ -497,6 +501,7 @@ Signed-origin login and decisions enforce counters once per assertion; equal non
 Receipt re-verification and commit do not update counters.
 Without a signed approval origin, mainnet consent uses the localhost passkey page.
 Headless consent, `--yes`, `--no-open` on the local inbox, and remote mainnet approval then refuse.
+Without a display, mainnet consent needs `--open-by-operator`, which prints the localhost URL for the operator to open.
 With a signed approval origin, the HTTPS listener serves consent using an owner-pinned credential.
 The CLI prints the signed approval link without opening a browser or requiring a display.
 Ledger signing also requires this passkey ceremony.
@@ -524,7 +529,7 @@ The CLI and both inboxes render consistent proposals in full, including account-
 
 Toolset-routed payments use two distinct controls, and only one of them is suppressible.
 
-- The **first-invoke gate** fires the first time a toolset uses a signing-adjacent capability with no matching grant. It queues a one-time `ToolsetFirstInvokeGate` entry. Once the operator approves it, a time-boxed toolset grant is persisted (default TTL 30 days) and matched on later invocations by the toolset, capability, destination, asset, and an amount range, plus its TTL.
+- The **first-invoke gate** fires the first time a toolset uses a signing-adjacent capability with no matching grant. It queues a one-time `ToolsetFirstInvokeGate` entry. Once the operator approves it, a time-boxed toolset grant is persisted (default TTL 30 days) and matched on later invocations by the toolset, its installation, package version and digest, capability, destination, asset, and an amount range, plus its TTL.
 - The grant suppresses **only** the first-invoke re-prompt. It does not stand in for payment approval.
 
 A matching grant requires a version 3 HMAC that verifies under the profile's attestation key and profile/chain binding. It must be unexpired, with a lifetime of at most 30 days, and issued no later than the current time and at or after the second following the current installation. An invalid install time honors no grant. Consent issued in the install second re-prompts once. A forged or edited grant suppresses nothing.
@@ -675,7 +680,7 @@ Passkey (WebAuthn) ceremonies use a browser handoff. Registration and signing en
 
 **Signer-set baseline.** Every signature authorized by a rule other than rule 0 compares the live signer set with the state in the profile's audit log. The comparison holds the rule's lock and reads both RPC endpoints, which must agree. Rule 0, the bootstrap rule, is exempt from the rule lock, the signer-set check, and the pin check.
 
-Version 2 covers a signer added, removed, swapped in any byte of key data, or reassociated to another id. It covers a Delegated contract-address signer replaced, a simple-threshold value changed, and the simple-threshold policy attached or detached outside the wallet. Version 1 state, recorded under an earlier release, keeps only the first 16 bytes of an `External` signer's key data. It cannot represent a contract delegate. `signers refresh` records version 2 state.
+Version 2 covers a signer added, removed, swapped in any byte of key data, or reassociated to another id. It covers a Delegated contract-address signer replaced, a simple-threshold value changed, and the simple-threshold policy attached or detached outside the wallet. Version 1 signer-set state keeps only the first 16 bytes of an `External` signer's key data. It cannot represent a contract delegate. `signers refresh` records version 2 state.
 
 On a rule with a pin record, each live verifier is compared with the verifier pin, and each live policy with the policy pins. All 32 bytes of the live code hash must equal the pinned hash, so two executables that share a hash prefix are two different codes. An external reference must also match its pinned reference identity and full resolved hash. A pin record that holds only eight-byte hash prefixes cannot authenticate code: signing under the rule refuses with `sa.wasm_pin_incomplete` until the rule is reinstalled through an independently authorized rule such as rule 0. An empty policy-pin list checks no policy code, so pins do not detect a policyless rule gaining a policy outside the wallet. During a `migrate-verifier` pair, the migrating rule skips its verifier pin check. The attached policy set itself is not recorded. A policy attached outside the wallet whose full code hash and reference identity match a pin is not detected by pins. A rule without a pin record has no code check.
 
@@ -733,6 +738,6 @@ Reset refuses while an intent remains open or retained. A closed and pruned inte
 
 An open intent without an authenticated purpose permanently blocks reset for this profile. Continue with a new profile.
 
-Retained intents close only through the profile's stored secondary endpoint. Add one to the profile.
+When an intent is open and the profile stores no `secondary_rpc_url`, the intent view reports that retained intents cannot close and asks for one.
 
-The profile's stored endpoint configuration is unreadable. Retained intents close only through stored endpoints that load.
+When an intent is open and the stored endpoint configuration cannot load, the intent view reports that only stored endpoints that load close retained intents.
