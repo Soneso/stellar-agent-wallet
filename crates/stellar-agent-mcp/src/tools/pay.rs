@@ -32,7 +32,7 @@ use stellar_agent_core::profile::schema::default_approval_dir;
 use stellar_agent_core::timefmt::now_unix_ms;
 use stellar_agent_network::{
     Asset, BASE_RESERVE_STROOPS, ClassicOpBuilder, fetch_account, parse_memo_fields,
-    sep29::check_memo_required, submit::SubmissionResult,
+    policy_state::FloorSource, sep29::check_memo_required, submit::SubmissionResult,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1161,7 +1161,19 @@ impl WalletServer {
         let total_fee_stroops =
             total_classic_fee_stroops(fee_per_op_stroops, CLASSIC_SINGLE_OPERATION_COUNT)?;
         args_value["total_fee_stroops"] = json!(total_fee_stroops);
+        let floor = match self
+            .classic_floor_source(
+                &client,
+                &args.source,
+                &["stellar_pay", "stellar_pay_commit"],
+            )
+            .await
+        {
+            Ok(floor) => floor,
+            Err(error) => return error.into_result(),
+        };
         let source_adapter = crate::policy_adapter::AccountViewAdapter::new(&account_view);
+        let source_view = FloorSource::view_or(floor.as_ref(), &source_adapter);
         let dest_adapter = dest_view
             .as_ref()
             .map(crate::policy_adapter::AccountViewAdapter::new);
@@ -1170,7 +1182,7 @@ impl WalletServer {
                 "stellar_pay",
                 &args_value,
                 &args.chain_id,
-                Some(&source_adapter),
+                Some(source_view),
                 dest_adapter
                     .as_ref()
                     .map(|a| a as &dyn stellar_agent_core::policy::v1::AccountIdentityView),
@@ -1398,7 +1410,7 @@ impl WalletServer {
                 &envelope_xdr,
                 "stellar_pay_commit",
                 &args.chain_id,
-                Some(&source_adapter),
+                Some(source_view),
                 dest_adapter
                     .as_ref()
                     .map(|a| a as &dyn stellar_agent_core::policy::v1::AccountIdentityView),
@@ -1858,7 +1870,19 @@ impl WalletServer {
             )) => None,
             Err(err) => return Ok(ledger_err_result(&err)),
         };
+        let floor = match self
+            .classic_floor_source(
+                &client,
+                &args.source,
+                &["stellar_pay_commit", "stellar_pay"],
+            )
+            .await
+        {
+            Ok(floor) => floor,
+            Err(error) => return error.into_result(),
+        };
         let source_adapter = crate::policy_adapter::AccountViewAdapter::new(&account_view);
+        let source_view = FloorSource::view_or(floor.as_ref(), &source_adapter);
         let dest_adapter = dest_view
             .as_ref()
             .map(crate::policy_adapter::AccountViewAdapter::new);
@@ -1875,7 +1899,7 @@ impl WalletServer {
                 "stellar_pay_commit",
                 &authoritative_args,
                 &args.chain_id,
-                Some(&source_adapter),
+                Some(source_view),
                 identity_view,
             )
             .await
@@ -1891,7 +1915,7 @@ impl WalletServer {
                 "stellar_pay",
                 &authoritative_args,
                 &args.chain_id,
-                Some(&source_adapter),
+                Some(source_view),
                 identity_view,
             )
             .await

@@ -1209,6 +1209,7 @@ async fn call_one_writes_the_pending_approval_without_a_request() {
             &serde_json::json!({"chain_id":"stellar:mainnet", "home_domain":HOME}),
             "stellar:mainnet",
             ValueClass::single(x402_value_leg(&requirements, 10)),
+            None,
             stellar_agent_core::mainnet::decision::EvaluationScope::X402Authenticated {
                 home_domain: HOME.to_owned(),
                 tool: TOOL.to_owned(),
@@ -1238,34 +1239,118 @@ async fn call_one_writes_the_pending_approval_without_a_request() {
     assert!(authorizations(&run.f).is_empty());
 }
 
-/// A `minimum_reserve` criterion on the authenticated tool's rule fails
-/// closed at call 1, before any account request and before an approval is
-/// written.
+/// A `minimum_reserve` criterion on the authenticated tool's rule reads
+/// the enrolled payer once at call 1. A funded payer proposes and writes
+/// its approval; an underfunded one refuses with the reserve denial
+/// before an approval is written or a message is signed.
 #[tokio::test]
 #[serial_test::serial(keyring)]
 #[serial_test::serial]
-async fn call_one_fails_closed_under_a_minimum_reserve_rule() {
-    let run = Run::with(|raw| {
-        authenticated_policy_with(&raw, |rule| {
-            let mut reserve = toml_edit::InlineTable::new();
-            reserve.insert("kind", "minimum_reserve".into());
-            reserve.insert("margin_stroops", 0.into());
-            rule["criteria"].as_array_mut().unwrap().push(reserve);
+async fn call_one_reads_the_payer_under_a_minimum_reserve_rule() {
+    for (margin, code) in [
+        (i64::MAX / 2, Some("policy.deny.minimum_reserve_breached")),
+        (0, None),
+    ] {
+        let run = Run::with(|raw| {
+            authenticated_policy_with(&raw, |rule| {
+                let mut reserve = toml_edit::InlineTable::new();
+                reserve.insert("kind", "minimum_reserve".into());
+                reserve.insert("margin_stroops", margin.into());
+                rule["criteria"].as_array_mut().unwrap().push(reserve);
+            })
         })
-    })
-    .await;
-    let clients = stellar_agent_network::client::constructions_on_this_thread();
-    let result = run.call_raw(run.args(HOME, None)).await;
-    assert_eq!(
-        crate::tools::common::assert_business_envelope(&result).0,
-        "policy.engine_required"
+        .await;
+        let result = run.call_raw(run.args(HOME, None)).await;
+        assert_eq!(run.control.count("getLedgerEntries"), 1, "one payer read");
+        match code {
+            Some(code) => {
+                assert_eq!(
+                    crate::tools::common::assert_business_envelope(&result).0,
+                    code
+                );
+                assert!(!approval_file_exists(&run.f));
+                assert!(authorizations(&run.f).is_empty(), "no message is signed");
+            }
+            None => {
+                let body = crate::tools::common::tests::mainnet::wire(&result);
+                assert_eq!(body["ok"], true, "{body}");
+                assert!(approval_file_exists(&run.f));
+            }
+        }
+    }
+}
+
+/// A `balance_floor` on the authenticated tool's rule reads the enrolled
+/// payer at both calls. Call 1: an uncovered window refuses
+/// `account.unread` and a balance below the floor `account.floor_refused`,
+/// with no approval written and nothing signed; a funded payer proposes.
+/// Call 2 after the payer's balance fell below the floor refuses
+/// `account.floor_refused` and consumes nothing: the approval stays, and no
+/// message or payment is minted or signed.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn authenticated_floor_reads_the_payer_at_both_calls() {
+    const BALANCE: i64 = 100_000_000_000;
+    let floored = |min: i64| {
+        move |raw: String| {
+            authenticated_policy_with(&raw, |rule| {
+                let mut floor = toml_edit::InlineTable::new();
+                floor.insert("kind", "balance_floor".into());
+                floor.insert("min_stroops", min.to_string().into());
+                rule["criteria"].as_array_mut().unwrap().push(floor);
+            })
+        }
+    };
+    for (min, covered, code) in [
+        (1, false, "account.unread"),
+        (BALANCE + 1, true, "account.floor_refused"),
+    ] {
+        let run = Run::with(floored(min)).await;
+        if covered {
+            crate::tools::common::tests::mainnet::cover_native_history(&run.f);
+        }
+        let result = run.call_raw(run.args(HOME, None)).await;
+        assert_eq!(
+            crate::tools::common::assert_business_envelope(&result).0,
+            code
+        );
+        assert!(!approval_file_exists(&run.f), "{code}: no approval");
+        assert!(authorizations(&run.f).is_empty(), "{code}: nothing minted");
+        assert!(signings().is_empty(), "{code}: nothing signed");
+    }
+    let run = Run::with(floored(1_000)).await;
+    crate::tools::common::tests::mainnet::cover_native_history(&run.f);
+    let approval = run.prepare().await;
+    // The payer's balance falls below the floor before call 2.
+    let payer = run.f.server.profile.mcp_signer_default.account.clone();
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"method": "getLedgerEntries"}),
+        ))
+        .respond_with(stellar_agent_test_support::EchoIdResponder::new(
+            serde_json::json!({
+                "entries": [{
+                    "key": stellar_agent_test_support::xdr_fixtures::account_ledger_key_xdr(&payer),
+                    "xdr": stellar_agent_test_support::xdr_fixtures::account_entry_xdr_with_seq(
+                        &payer, 500, 0, 1,
+                    ),
+                    "lastModifiedLedgerSeq": 100,
+                }],
+                "latestLedger": 100,
+            }),
+        ))
+        .with_priority(1)
+        .mount(&run._primary)
+        .await;
+    let result = run.pay(HOME, &approval).await;
+    assert_eq!(result["error"]["code"], "account.floor_refused", "{result}");
+    assert!(
+        stored_approval(&run.f, &approval.0).is_some(),
+        "the approval is not consumed"
     );
-    assert_eq!(
-        clients,
-        stellar_agent_network::client::constructions_on_this_thread()
-    );
-    assert!(run.control.methods().is_empty());
-    assert!(!approval_file_exists(&run.f));
+    assert!(authorizations(&run.f).is_empty(), "no message or payment");
+    assert!(signings().is_empty(), "nothing signed");
 }
 
 /// Call 1 refuses a home domain that is not lowercase LDH before the approval
@@ -1805,6 +1890,7 @@ impl Boundary {
                 &serde_json::json!({"chain_id":"stellar:mainnet", "home_domain":HOME}),
                 "stellar:mainnet",
                 ValueClass::single(x402_value_leg(&self.requirements, 10)),
+                None,
                 stellar_agent_core::mainnet::decision::EvaluationScope::X402Authenticated {
                     home_domain: HOME.to_owned(),
                     tool: TOOL.to_owned(),
@@ -1834,6 +1920,7 @@ impl Boundary {
                 &serde_json::json!({"chain_id":"stellar:mainnet", "home_domain":HOME}),
                 "stellar:mainnet",
                 ValueClass::single(x402_value_leg(&requirements, 10)),
+                None,
                 stellar_agent_core::mainnet::decision::EvaluationScope::X402Authenticated {
                     home_domain: HOME.to_owned(),
                     tool: TOOL.to_owned(),
@@ -1871,6 +1958,7 @@ impl Boundary {
                 &serde_json::json!({"chain_id":"stellar:mainnet", "home_domain":HOME}),
                 "stellar:mainnet",
                 ValueClass::single(x402_value_leg(&self.requirements, 10)),
+                None,
                 stellar_agent_core::mainnet::decision::EvaluationScope::X402Authenticated {
                     home_domain: HOME.to_owned(),
                     tool: TOOL.to_owned(),

@@ -666,8 +666,9 @@ Review it before you sign it with `profile sign-policy`:
 - Floor: `stellar_pay` and `stellar_pay_commit` carry a native balance floor.
   Mainnet `stellar-agent pay` reads the operating account for it and refuses
   `account.floor_refused` when the payment would breach the floor. A floor
-  the balance meets still refuses `account.unread`, because retained history
-  cannot prove that it counts every native obligation.
+  the balance meets refuses `account.unread` until the window store carries
+  its native coverage marker. The next store write sets the marker, and floor
+  use resumes with a balance read that closes 300 seconds later.
 - Approval: shop and business presets request approval for a payment above
   their threshold.
 

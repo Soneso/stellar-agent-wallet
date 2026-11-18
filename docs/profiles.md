@@ -1091,9 +1091,9 @@ decides `allow`, and sets `allow_opaque_signing = false`.
 - `stellar_pay` and `stellar_pay_commit` add `balance_floor` at `M`. The
   floor needs an observed account read with its reservation sum. Mainnet
   `stellar-agent pay` supplies both, so a payment that would breach the floor
-  refuses `account.floor_refused`. MCP `stellar_pay` supplies no read, and
-  every matched floor that passes still refuses `account.unread` while
-  retained history cannot prove complete native exposure.
+  refuses `account.floor_refused`. Mainnet MCP `stellar_pay` reads both as
+  well. On either path a floor that passes still refuses `account.unread`
+  while the window store lacks the native coverage marker.
 - Each payment rule's `counterparty_allowlist` selects `G_ACCOUNT` and
   `C_ACCOUNT` with `allowlist = []`. G, M, and C recipients share that one
   list, and no listed recipient is paid until one is added. A G address

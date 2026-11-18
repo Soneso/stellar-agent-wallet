@@ -835,7 +835,7 @@ fn legacy_unlinked_rows_refuse_floor_use_forever() {
 #[serial]
 fn native_coverage_writes_version_18_and_older_max_refuses() {
     use super::super::store::{
-        DESTINATION_READER_CAP, WIRE_VERSION_CANONICAL_LINEAGE, WIRE_VERSION_NATIVE_COVERAGE,
+        READER_VERSION_CAP, WIRE_VERSION_CANONICAL_LINEAGE, WIRE_VERSION_NATIVE_COVERAGE,
     };
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
@@ -850,10 +850,10 @@ fn native_coverage_writes_version_18_and_older_max_refuses() {
     assert_eq!(wire.version, WIRE_VERSION_NATIVE_COVERAGE);
     assert_eq!(WIRE_VERSION_NATIVE_COVERAGE, 18);
     let bytes = l.bytes();
-    DESTINATION_READER_CAP.set(Some(WIRE_VERSION_CANONICAL_LINEAGE));
+    READER_VERSION_CAP.set(Some(WIRE_VERSION_CANONICAL_LINEAGE));
     let read = l.store.read_for_inspection(&l.profile).map(|_| ());
     let mint = l.mint(&l.request(tx(2), vec![])).map(|_| ());
-    DESTINATION_READER_CAP.set(None);
+    READER_VERSION_CAP.set(None);
     for result in [read, mint] {
         assert!(
             matches!(result, Err(WindowStoreError::UnsupportedVersion)),
@@ -1017,9 +1017,12 @@ fn marker_establishment_matrix() {
             established + ESTABLISHMENT_ALLOWANCE_MS
         };
         assert_eq!(
-            wire.native_coverage.map(|marker| marker.since_ms),
-            Some(established),
-            "{case}: the write establishes the marker"
+            wire.native_coverage,
+            Some(super::super::store::NativeCoverage {
+                since_generation: wire.generation,
+                since_ms: established,
+            }),
+            "{case}: the write establishes the marker at its own generation"
         );
         assert_eq!(
             wire.admissible_floor_close_time_ms,

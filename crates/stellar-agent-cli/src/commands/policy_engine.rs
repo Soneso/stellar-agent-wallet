@@ -71,7 +71,9 @@ use stellar_agent_network::MainnetWriteContext;
 use stellar_agent_network::policy_engine::{
     BuiltPolicyEngine, PolicyEngineBuildError, ProfileSelection, build_policy_engine,
 };
-use stellar_agent_network::policy_state::{FloorSource, floor_rule_matches, refuse_unproved_floor};
+use stellar_agent_network::policy_state::{
+    FloorSource, floor_rule_matches, refuse_uncovered_floor,
+};
 
 /// A policy build refusal with its stable business code.
 #[derive(Debug)]
@@ -653,7 +655,7 @@ pub(crate) fn evaluate_mainnet_policy(
                 },
             )
         })
-        .and_then(|decision| refuse_unproved_floor(policy, decision))
+        .and_then(|decision| refuse_uncovered_floor(policy, decision, account_view))
         .map_err(AuthorityRefusal::Refusal)?;
     let verdict = match decision.decision() {
         Decision::Allow => MainnetVerdict::Allow,

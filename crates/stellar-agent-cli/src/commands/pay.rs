@@ -9063,15 +9063,15 @@ pub(crate) mod tests {
 
         /// A matched balance floor reads the operating account after the
         /// build over a covered window. A balance the debit and fee take
-        /// below the floor refuses `account.floor_refused`; a funded one
-        /// refuses `account.unread`, as no public path binds a passing floor
-        /// into locked admission. Neither confirms, records, nor sends.
+        /// below the floor refuses `account.floor_refused` and neither
+        /// confirms, records, nor sends. A funded one signs and sends once,
+        /// through the resolver's locked floor admission.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
         async fn the_floor_reads_the_observed_account_on_mainnet() {
             for (name, min_stroops, code) in [
                 ("mainnet-pay-floor-low", BALANCE, "account.floor_refused"),
-                ("mainnet-pay-floor-funded", 1, "account.unread"),
+                ("mainnet-pay-floor-funded", 1, ""),
             ] {
                 let agent =
                     stellar_agent_test_support::signed_envelope::account_id_for_seed(AGENT_SEED);
@@ -9087,6 +9087,12 @@ pub(crate) mod tests {
 
                 let run = run(&fixture, &memo_args(&fixture)).await;
 
+                if code.is_empty() {
+                    assert_eq!(run.code, 0, "{}", run.envelope);
+                    assert_eq!(records(&fixture).len(), 1, "one authorization record");
+                    assert_eq!(fixture.sent_envelopes().await.len(), 1, "sent once");
+                    continue;
+                }
                 assert_refused_before_confirmation(&fixture, &run, code).await;
                 let methods = fixture.primary_methods().await;
                 assert_eq!(
@@ -9096,6 +9102,36 @@ pub(crate) mod tests {
                      resolution: {methods:?}"
                 );
             }
+            // The floor reads the source, not the payee: a payee holding
+            // twice the source's balance would pass this floor.
+            let agent =
+                stellar_agent_test_support::signed_envelope::account_id_for_seed(AGENT_SEED);
+            let fixture = Spec::new("mainnet-pay-floor-rich-payee")
+                .primary(
+                    ClassicRpc::mainnet(&[&agent, ISSUER])
+                        .with_entry(
+                            crate::test_rpc::account_key(DESTINATION),
+                            stellar_agent_test_support::xdr_fixtures::account_entry_xdr_with_seq(
+                                DESTINATION,
+                                2 * BALANCE,
+                                0,
+                                1,
+                            ),
+                        )
+                        .entries_at_readiness_ledger(),
+                )
+                .rules(vec![pay_rule("allow", &balance_floor(BALANCE))])
+                .build()
+                .await;
+            fixture.cover_native_history();
+            let run = run(&fixture, &memo_args(&fixture)).await;
+            assert_refused_before_confirmation(&fixture, &run, "account.floor_refused").await;
+            let methods = fixture.primary_methods().await;
+            assert_eq!(
+                methods.iter().filter(|m| *m == "getHealth").count(),
+                2,
+                "the source's floor read refuses before signing resolution: {methods:?}"
+            );
         }
 
         /// A testnet payment from the fixture's agent through its primary,

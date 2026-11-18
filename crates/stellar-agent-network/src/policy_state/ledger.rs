@@ -1017,19 +1017,21 @@ pub(super) fn prune_history(wire: &mut WireFile, cutoff: u64, now_ms: u64) {
     });
 }
 
-/// The authorization records a window state reset keeps: every record whose
-/// authority can still be presented at `now_ms`, by the approval's expiry or
-/// a policy authority's governing end, and every record an operation links,
-/// or of a value-holding or fee-holding domain, that has no release row. A
-/// record that holds, was never claimed and that no committed exposure names
-/// is unused, which releases it. The
-/// other records leave `wire` through [`operations::remove_authorizations`],
-/// so their release bounds raise its admissible floors. The successor holds
-/// no holds, so a record that holds capacity becomes expired at `now_ms`. As
-/// in the sweep, a record that was never claimed and that no committed
-/// exposure names also becomes unused with an `Always` release row. A record
-/// linking a retained operation that has not ended stays as it is, since the
-/// reset keeps no operation audit.
+/// The authorization records a window state reset keeps. It keeps every
+/// record whose authority can still be presented at `now_ms`, by the
+/// approval's expiry or a policy authority's governing end, and every record
+/// without a release row that an operation links. It keeps every
+/// value-holding or fee-holding record without a release row, except an
+/// unused one that no operation links and that was never claimed. The other
+/// records leave `wire` through
+/// [`operations::remove_authorizations`], so their release bounds raise its
+/// admissible floors. Removing such an unused record clears the native
+/// coverage marker. The
+/// successor holds no holds, so a kept record that holds capacity becomes
+/// expired at `now_ms`; a kept one that was never claimed and that no
+/// committed exposure names also becomes unused with an `Always` release row.
+/// A record linking a retained operation that has not ended stays as it is,
+/// since the reset keeps no operation audit.
 pub(super) fn reset_survivors(wire: &mut WireFile, now_ms: u64) -> Vec<WireAuthorization> {
     let commit = CommitId::random();
     let exposed = operations::exposed_authorizations(wire);
@@ -1253,9 +1255,9 @@ pub struct MintRequest {
     /// The native amounts the authorization reserves, stored with the
     /// record whether or not it holds window entries.
     pub native_reservation: Option<NativeReservation>,
-    /// Checked observed facts for a signed balance floor. Public callers
-    /// refuse a passing floor during evaluation, as
-    /// [`super::refuse_unproved_floor`] states, and pass `None`.
+    /// Checked observed facts for a signed balance floor, rechecked against
+    /// the locked image. The resolver sets it whenever the first rule
+    /// matching the tool carries a floor.
     pub floor: Option<super::accounting::CheckedFloor>,
 }
 

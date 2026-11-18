@@ -320,48 +320,127 @@ fn rule_floor(rule: &PolicyRule) -> Option<i128> {
 /// [`FloorSource`].
 #[must_use]
 pub fn floor_rule_matches(engine: &PolicyEngineV1, tool: &ToolDescriptor) -> bool {
+    floor_rule_minimum(engine, tool).is_some()
+}
+
+/// The strongest native `balance_floor` of the first effective rule
+/// matching `tool`, in stroops, or `None` when that rule carries none.
+#[must_use]
+pub fn floor_rule_minimum(engine: &PolicyEngineV1, tool: &ToolDescriptor) -> Option<i128> {
     engine
         .effective_rules()
         .into_iter()
         .find(|rule| rule.matches_tool(tool))
         .and_then(rule_floor)
-        .is_some()
+}
+
+/// Whether the first effective rule matching `tool` carries a
+/// `minimum_reserve`, so that a strict evaluation of `tool` needs the
+/// operating account's view.
+#[must_use]
+pub fn reserve_rule_matches(engine: &PolicyEngineV1, tool: &ToolDescriptor) -> bool {
+    use stellar_agent_core::policy::v1::criteria::minimum_reserve::MinimumReserveCriterion;
+    engine
+        .effective_rules()
+        .into_iter()
+        .find(|rule| rule.matches_tool(tool))
+        .is_some_and(|rule| {
+            rule.criteria.iter().any(|criterion| {
+                (criterion.as_ref() as &dyn std::any::Any)
+                    .downcast_ref::<MinimumReserveCriterion>()
+                    .is_some()
+            })
+        })
+}
+
+/// The account input of an x402 preparation: a [`FloorSource`] under a
+/// `balance_floor`, and a plain read of the payer under a
+/// `minimum_reserve` alone.
+#[derive(Debug)]
+pub enum PayerView {
+    /// The observed payer and its retained native exposure.
+    Floor(FloorSource),
+    /// The payer's account, read within the readiness deadline.
+    Plain(AccountView),
+}
+
+impl AccountReservesView for PayerView {
+    fn reserves_stroops(&self, base_reserve_stroops: i64) -> i64 {
+        match self {
+            Self::Floor(floor) => floor.reserves_stroops(base_reserve_stroops),
+            Self::Plain(view) => crate::policy_view::AccountViewAdapter::new(view)
+                .reserves_stroops(base_reserve_stroops),
+        }
+    }
+
+    fn balance_stroops(
+        &self,
+    ) -> Result<i64, stellar_agent_core::policy::v1::AccountReserveLookupError> {
+        match self {
+            Self::Floor(floor) => floor.balance_stroops(),
+            Self::Plain(view) => {
+                crate::policy_view::AccountViewAdapter::new(view).balance_stroops()
+            }
+        }
+    }
+
+    fn observation(&self) -> Option<stellar_agent_core::policy::v1::AccountObservation> {
+        match self {
+            Self::Floor(floor) => floor.observation(),
+            Self::Plain(_) => None,
+        }
+    }
+
+    fn effective_native_reservations_stroops(&self) -> Option<u64> {
+        match self {
+            Self::Floor(floor) => floor.effective_native_reservations_stroops(),
+            Self::Plain(_) => None,
+        }
+    }
 }
 
 /// The refusal of a permitting strict decision whose deciding rule, at
 /// `rule_ordinal` among the effective rules, carries a `balance_floor`, as
-/// [`refuse_unproved_floor`] states.
+/// [`refuse_uncovered_floor`] states.
 #[must_use]
-pub(crate) fn unproved_floor_use(
+pub(crate) fn uncovered_floor_use(
     engine: &PolicyEngineV1,
     rule_ordinal: usize,
+    account_view: Option<&dyn AccountReservesView>,
 ) -> Option<DenyReason> {
+    let covered = account_view.is_some_and(|view| {
+        view.observation().is_some() && view.effective_native_reservations_stroops().is_some()
+    });
     engine
         .effective_rules()
         .get(rule_ordinal)
         .and_then(|rule| rule_floor(rule))
+        .filter(|_| !covered)
         .map(|_| DenyReason::AccountUnread)
 }
 
 /// Refuses a permitting mainnet `decision` of `policy` whose deciding rule
-/// carries a `balance_floor`.
+/// carries a `balance_floor`, unless `account_view` carries an observation
+/// and the retained native exposure at it.
 ///
-/// The native coverage marker shows at store level that a retained image
-/// counts every native obligation still in effect, but no public caller
-/// binds a passing floor into locked mint admission. A floor that passes
-/// refuses its use with `account.unread`.
+/// Only a [`FloorSource`] carries that exposure, and its projection refuses
+/// unless the verified image carries the native coverage marker and the
+/// observation lies at or past both admissible floors. The mint repeats the
+/// projection on its locked image through [`CheckedFloor`]. Every other
+/// floor that passes refuses its use with `account.unread`.
 ///
 /// # Errors
 ///
 /// [`MainnetRefusal::Denied`] with `account.unread` and the deciding rule.
-pub fn refuse_unproved_floor(
+pub fn refuse_uncovered_floor(
     policy: &VerifiedPolicy,
     decision: MainnetDecision,
+    account_view: Option<&dyn AccountReservesView>,
 ) -> Result<MainnetDecision, MainnetRefusal> {
     let rule_index = decision.rule_index();
     match usize::try_from(rule_index)
         .ok()
-        .and_then(|ordinal| unproved_floor_use(&policy.engine(), ordinal))
+        .and_then(|ordinal| uncovered_floor_use(&policy.engine(), ordinal, account_view))
     {
         Some(reason) => Err(MainnetRefusal::Denied {
             rule_index: Some(rule_index),
@@ -377,6 +456,7 @@ pub fn refuse_unproved_floor(
 pub struct FloorSource {
     observed: ObservedAccount<AccountView>,
     reserved_stroops: u64,
+    readiness: crate::operational::OperationalReport,
 }
 
 /// Why a [`FloorSource`] could not be read.
@@ -438,7 +518,39 @@ impl FloorSource {
         Ok(Self {
             observed,
             reserved_stroops,
+            readiness: report,
         })
+    }
+
+    /// The [`CheckedFloor`] that binds this read to `request` at its locked
+    /// mint, as [`CheckedFloor::for_mint`] states.
+    ///
+    /// # Errors
+    ///
+    /// The refusals of [`CheckedFloor::for_mint`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "forwards the independent checked proofs"
+    )]
+    pub fn checked_floor(
+        &self,
+        context: &crate::MainnetWriteContext,
+        policy: &VerifiedPolicy,
+        tool: &ToolDescriptor,
+        evaluation: &stellar_agent_core::policy::Evaluation,
+        signer: &crate::keyring::EnrolledSigner,
+        request: &ledger::MintRequest,
+    ) -> Result<Option<CheckedFloor>, WindowStoreError> {
+        CheckedFloor::for_mint(
+            context,
+            policy,
+            tool,
+            evaluation,
+            signer,
+            &self.observed,
+            &self.readiness,
+            request,
+        )
     }
 
     /// `floor` when the evaluation reads one, and `plain` otherwise.

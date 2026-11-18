@@ -1259,8 +1259,8 @@ A crash after spending keeps the approval spent, even before transmission.
 The store, audit log, and RPC share no atomic transaction.
 A spent approval does not prove the RPC receives a signature.
 The counterparty can stop honoring requirements while the owner waits.
-Account-reserve and account-identity criteria lack account-view inputs and fail closed.
-A matched `balance_floor` refuses with `account.unread`.
+Account-identity criteria lack account-view inputs and fail closed.
+On mainnet, `minimum_reserve` and `balance_floor` read the enrolled payer; off mainnet `minimum_reserve` fails closed and a matched `balance_floor` refuses with `account.unread`.
 The SEP-43 auth-entry and message tools, SEP-53 signing, and the DeFi tools refuse an approval requirement with `policy.approval_required_unsupported`.
 
 
@@ -1386,9 +1386,11 @@ stores the pending approval:
 6. The enrolled signer is loaded, and an `address` that names another key
    refuses with `x402.invalid_payment_required`.
 7. The payment root and its intent digest are computed.
-8. Local policy evaluation runs without an account-reserve view. A matching
-   `minimum_reserve` criterion refuses with `policy.engine_required` before
-   approval is stored. A matching `balance_floor` refuses with `account.unread`.
+8. Local policy evaluation reads the enrolled payer first when the matching
+   rule carries `minimum_reserve` or `balance_floor`. A breach refuses with
+   `policy.deny.minimum_reserve_breached` or `account.floor_refused` before
+   approval is stored, and a floor without the native coverage marker refuses
+   with `account.unread`.
 9. An Allow verdict makes this call the signing call. It continues with
    the signing call's step 2 and skips the attestation step.
 10. Under RequireApproval, the pending approval is stored and returned.

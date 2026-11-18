@@ -487,6 +487,54 @@ async fn mainnet_refusals_precede_the_contract_payment_refusal() {
     }
 }
 
+/// A toolset payment commit on mainnet keeps the commit floor rule: a floor
+/// on `stellar_pay` alone refuses the commit with `account.unread`, nothing
+/// is sent or minted; equal floors on both names commit and submit once.
+#[tokio::test]
+#[serial_test::serial(keyring, mainnet_clock)]
+#[serial_test::serial]
+async fn toolset_commit_keeps_the_commit_floor_rule() {
+    use super::common::tests::mainnet::{cover_native_history, with_floor};
+    for (names, ok) in [
+        (&["stellar_pay"][..], false),
+        (&["stellar_pay", "stellar_pay_commit"][..], true),
+    ] {
+        let run = Run::with_policy(
+            "allow",
+            "allow",
+            &["propose-transaction", "sign-payment"],
+            |raw| {
+                names
+                    .iter()
+                    .fold(raw, |raw, name| with_floor(&raw, name, 1))
+            },
+        )
+        .await;
+        cover_native_history(&run.f);
+        let args = Tool::Pay.prepare_args(&run.f);
+        let prepared = wire(&Tool::Pay.prepare(&run.f.server, &args).await);
+        assert_eq!(prepared["ok"], true, "{names:?}: {prepared}");
+        run.grant(args["destination"].as_str().unwrap());
+        let commit = run.commit_args(args, &prepared);
+        let result = run.invoke("stellar_pay_commit", commit).await;
+        if ok {
+            assert_eq!(result["ok"], true, "{names:?}: {result}");
+            assert_eq!(run.control.sent().len(), 1, "{names:?}: submitted once");
+            assert_eq!(authorizations(&run.f).len(), 1, "{names:?}");
+        } else {
+            assert_eq!(
+                result["error"]["code"], "account.unread",
+                "{names:?}: {result}"
+            );
+            assert!(run.control.sent().is_empty(), "{names:?}: nothing sent");
+            assert!(
+                authorizations(&run.f).is_empty(),
+                "{names:?}: nothing minted"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 #[serial_test::serial(keyring, mainnet_clock)]
 #[serial_test::serial]

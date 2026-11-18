@@ -274,9 +274,9 @@ fn reservations_carry_destinations_at_the_current_version() {
         let body = serde_json::to_vec(wire).unwrap();
         let mut bytes = compute_tag(state_key.as_ref(), &body).unwrap().to_vec();
         bytes.extend(body);
-        DESTINATION_READER_CAP.set(Some(WIRE_VERSION_DESTINATION - 1));
+        READER_VERSION_CAP.set(Some(WIRE_VERSION_DESTINATION - 1));
         let result = store.verify_with_key(&state_key, &bytes);
-        DESTINATION_READER_CAP.set(None);
+        READER_VERSION_CAP.set(None);
         result
     };
     assert!(capped(&legacy).is_ok());
