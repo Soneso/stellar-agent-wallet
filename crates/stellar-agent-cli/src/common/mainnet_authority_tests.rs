@@ -1408,10 +1408,13 @@ impl SignedBrowser {
 /// On every mainnet value verb, an approval given at the signed HTTPS
 /// origin commits. The signed policy names the origin and the pin of the
 /// listener's certificate; the verb binds that listener, the fixture passkey
-/// consents on its page, and the verb records its own version 5 consent,
+/// consents on its page, and the verb records its own version 6 consent,
 /// with origin `cli-mainnet-confirm`, whose presence names the signed origin
-/// and relying party. It signs once and sends once.
+/// and relying party. It signs once and sends once. The canonical send keeps
+/// the approval unconsumed; the repair at the operation's execution end
+/// writes its tombstone.
 #[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(mainnet_clock)]
 #[serial_test::serial]
 async fn every_value_verb_commits_on_consent_at_the_signed_origin() {
     for (verb, name) in Verb::ALL.into_iter().zip([
@@ -1425,7 +1428,8 @@ async fn every_value_verb_commits_on_consent_at_the_signed_origin() {
         fixture.present_at_signed_origin();
         crate::common::mainnet_presence::bound_listener::take();
         let before = signer_resolutions_on_this_thread();
-        let run = verb.run(&fixture);
+        let id = crate::common::business_entry::fresh_business_id();
+        let run = verb.run_as(&fixture, Some(&id));
         let browser = async {
             let browser = SignedBrowser::login().await;
             let nonce = fixture.pending_entries()[0].approval_nonce.clone();
@@ -1467,20 +1471,90 @@ async fn every_value_verb_commits_on_consent_at_the_signed_origin() {
             stellar_agent_core::approval::mainnet_fixtures::SIGNED_RP_ID,
             "{context}: {rows:?}"
         );
+        // The canonical send keeps its approval for a successor attempt:
+        // the operation is neither terminal nor past its execution end
+        // (`policy_state/operations.rs`, `approval_kept_for_retry`), so the
+        // send's repair returns before the tombstone
+        // (`submission_record.rs`, `repair_approval_consumption`).
+        let simulated = match verb {
+            Verb::Pay | Verb::Create => "PaymentSimulated",
+            Verb::Claim => "ClaimSimulated",
+            Verb::Trustline => "TrustlineSimulated",
+        };
         let entries = fixture.pending_entries();
         assert_eq!(entries.len(), 1, "{context}: {entries:?}");
-        assert_eq!(entries[0].kind_name, "Consumed", "{context}");
+        assert_eq!(
+            entries[0].kind_name, simulated,
+            "{context}: the send keeps the approval"
+        );
         let store = stellar_agent_core::approval::open_with_retry(
             &fixture.approval_store_path(),
             stellar_agent_core::approval::DEFAULT_RETRY_ATTEMPTS,
             stellar_agent_core::approval::DEFAULT_RETRY_BACKOFF,
         )
         .unwrap();
+        // A canonical entry's subject is the intent digest
+        // (`operation_entry/preparation.rs`, `stage_pending`), whose mainnet
+        // consent layout is version 6 (`approval/attestation.rs`,
+        // `MAINNET_INTENT_ATTESTATION_VERSION`, chosen by
+        // `mainnet_attestation_version`).
         assert_eq!(
             store.get(&nonce).unwrap().attestation_version,
-            5,
-            "{context}: the consent is a version 5 attestation"
+            6,
+            "{context}: the consent is a version 6 intent attestation"
         );
+        drop(store);
+
+        // The repair `tx status` runs, with the arguments it passes, at the
+        // last millisecond of the operation's execution window and at its end.
+        let window =
+            stellar_agent_network::policy_state::PersistedWindowStore::for_profile(fixture.name);
+        let profile = fixture.profile();
+        let end = stellar_agent_network::policy_state::OperationStatus::new(&window, &profile)
+            .view(&stellar_agent_network::policy_state::BusinessId::parse(&id).unwrap())
+            .unwrap()
+            .unwrap_or_else(|| panic!("{context}: the run opened a record"))
+            .execution_expires_at_ms
+            .unwrap_or_else(|| panic!("{context}: the consent set the execution end"));
+        let receipts =
+            stellar_agent_core::profile::receipt::ReceiptStore::open(fixture.name).unwrap();
+        let held: Vec<_> = receipts
+            .all()
+            .unwrap()
+            .into_iter()
+            .filter(|receipt| receipt.approval_nonce.as_deref() == Some(nonce.as_str()))
+            .collect();
+        assert_eq!(held.len(), 1, "{context}: the sent receipt holds the nonce");
+        let approval_dir = fixture.approval_store_path().parent().unwrap().to_owned();
+        let clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(end - 1);
+        let repair = || {
+            stellar_agent_network::submission_record::repair_approval_consumption(
+                &receipts,
+                &held[0].envelope_hash,
+                &approval_dir,
+                fixture.name,
+                Some((&window, &profile)),
+            )
+        };
+        repair().unwrap_or_else(|e| panic!("{context}: {e}"));
+        // Inside the execution window the hold stands: `now < end` in
+        // `approval_kept_for_retry`.
+        assert_eq!(
+            fixture.pending_entries()[0].kind_name,
+            simulated,
+            "{context}: the tombstone stays owed inside the execution window"
+        );
+        clock.set(end);
+        repair().unwrap_or_else(|e| panic!("{context}: {e}"));
+        // At the execution end the hold ends (`now < end` is false), so the
+        // repair writes the tombstone
+        // (`record_sent_consumption` in `repair_approval_consumption`).
+        assert_eq!(
+            fixture.pending_entries()[0].kind_name,
+            "Consumed",
+            "{context}: the repair at the execution end consumes the approval"
+        );
+        drop(clock);
     }
 }
 
