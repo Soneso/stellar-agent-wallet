@@ -123,10 +123,6 @@ pub(crate) fn open_record(
 
 /// A writer over the audit log of `profile` with the keyed, anchored access
 /// of profile `name`.
-#[allow(
-    dead_code,
-    reason = "the CLI integration target includes this file and uses only open_record"
-)]
 pub(crate) fn keyed_writer(
     profile: &stellar_agent_core::profile::Profile,
     name: &str,
@@ -145,11 +141,79 @@ pub(crate) fn keyed_writer(
     .unwrap()
 }
 
+/// Gives `profile` the keyed audit log and initialized consent evidence that
+/// mainnet enablement and the first integrated request leave behind. The
+/// writer is dropped before the call returns, so a child process can open
+/// the log.
+#[allow(
+    dead_code,
+    reason = "only the CLI integration target, whose children run the wallet binary, calls this"
+)]
+pub(crate) fn initialize_consent_scope(profile: &stellar_agent_core::profile::Profile, name: &str) {
+    keyed_writer(profile, name)
+        .initialize_consent_evidence()
+        .unwrap();
+}
+
+/// Gives `profile` only the keyed audit log that mainnet enablement leaves
+/// behind, without consent evidence. The writer is dropped before the call
+/// returns.
+#[allow(
+    dead_code,
+    reason = "only the CLI integration target, whose children run the wallet binary, calls this"
+)]
+pub(crate) fn open_unevidenced_scope(profile: &stellar_agent_core::profile::Profile, name: &str) {
+    drop(keyed_writer(profile, name));
+}
+
+/// Gives `profile` a keyed audit log whose consent evidence holds one
+/// migration pin: a queued approval row of nonce `foreign`, drained before
+/// the evidence initialization. No grant of `profile` names that row, so
+/// the pin stays unresolved. The writer is dropped before the call returns.
+#[allow(
+    dead_code,
+    reason = "only the CLI integration target, whose children run the wallet binary, calls this"
+)]
+pub(crate) fn initialize_pinned_consent_scope(
+    profile: &stellar_agent_core::profile::Profile,
+    name: &str,
+    foreign: &str,
+) {
+    let mut writer = keyed_writer(profile, name);
+    let outbox = stellar_agent_network::policy_state::approvals::consent_evidence_outbox(
+        profile,
+        name,
+        stellar_agent_core::audit_log::BindingCheck::Enforce,
+    )
+    .unwrap();
+    let reference = outbox
+        .append_queued(
+            &stellar_agent_core::audit_log::AuditEntry::new_approval_attested(
+                "PaymentSimulated",
+                "stellar_pay_commit",
+                None,
+                foreign,
+                "cli",
+                "v1",
+            ),
+        )
+        .unwrap();
+    writer.drain_outbox().unwrap();
+    writer.initialize_consent_evidence().unwrap();
+    assert!(
+        outbox
+            .evidence()
+            .unwrap()
+            .unwrap()
+            .holds_migration_pin(&reference)
+    );
+}
+
 /// Seeds `count` reserved evidence slots of foreign identities, each
 /// beginning with the byte `tag`, in the keyed audit log of `profile`.
 #[allow(
     dead_code,
-    reason = "the CLI integration target includes this file and uses only open_record"
+    reason = "the CLI integration target includes this file and does not seed evidence"
 )]
 pub(crate) fn seed_foreign_evidence(
     profile: &stellar_agent_core::profile::Profile,

@@ -633,6 +633,17 @@ fn start_integrated(
                 }));
             }
         };
+        // The entry's subject kind selects the subject, as the approver does.
+        let subject = if linked.subject_kind
+            == stellar_agent_core::approval::subject::SubjectKind::IntentDigest
+        {
+            handle.intent().intent_digest()
+        } else {
+            stellar_agent_core::approval::mainnet_consent_subject(
+                &linked,
+                &AttestationBinding::new(name, profile.chain_id.caip2_str()),
+            )?
+        };
         if pending_approval_facts(
             &linked,
             handle,
@@ -640,10 +651,7 @@ fn start_integrated(
             record.subject,
             record.rule_ttl_ms,
         ) != record.facts()
-            || stellar_agent_core::approval::mainnet_consent_subject(
-                &linked,
-                &AttestationBinding::new(name, profile.chain_id.caip2_str()),
-            )? != record.subject
+            || subject != record.subject
         {
             return Err(WalletError::Approval(ApprovalFailure::AttestationInvalid {
                 detail: "the approval does not match the signed inbox facts".to_owned(),
@@ -1480,10 +1488,16 @@ pub(crate) mod tests {
         assert!(!output.contains('\u{7}'), "{output:?}");
     }
 
+    /// The consent fixture of the confirmation tests, opted out of every
+    /// kind's enforcement.
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) type ConfirmationFixture =
+        crate::common::unenforced_fixture::Unenforced<MainnetConsentFixture>;
+
     #[cfg(feature = "mainnet-write")]
     pub(crate) fn confirmation_fixture(
         name: &str,
-    ) -> (MainnetConsentFixture, MainnetWriteContext, String) {
+    ) -> (ConfirmationFixture, MainnetWriteContext, String) {
         confirmation_fixture_with(name, |_| {})
     }
     /// An enabled mainnet profile whose owner-signed policy admits the
@@ -1493,7 +1507,7 @@ pub(crate) mod tests {
     fn confirmation_fixture_with(
         name: &str,
         edit: impl FnOnce(&mut stellar_agent_core::profile::schema::Profile),
-    ) -> (MainnetConsentFixture, MainnetWriteContext, String) {
+    ) -> (ConfirmationFixture, MainnetWriteContext, String) {
         use stellar_agent_core::profile::name::ResolvedProfileName;
         // The served source account is at sequence 1, so its next
         // transaction carries sequence 2.
@@ -1520,6 +1534,7 @@ pub(crate) mod tests {
             stellar_agent_network::MainnetEndpointFlags::default(),
         )
         .unwrap();
+        let fixture = ConfirmationFixture::new(fixture, context.profile_name());
         (fixture, context, envelope.envelope_xdr().to_owned())
     }
 

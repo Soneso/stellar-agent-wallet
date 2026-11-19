@@ -168,9 +168,16 @@ pub(crate) fn sign_presence_policy(home: &Path, name: &str, profile: &Profile) {
 }
 
 /// A mainnet profile with its attestation and audit keys in a headless
-/// keyring under `home`, its owner-signed presence policy, and one pending
-/// payment in its store. Returns the profile and the entry's nonce.
+/// keyring under `home`, a keyed audit log with initialized consent
+/// evidence, its owner-signed presence policy, and one pending payment in
+/// its store. Returns the profile and the entry's nonce.
 fn mainnet_home(home: &std::path::Path) -> (Profile, String) {
+    mainnet_home_with(home, crate::approval_fixture::initialize_consent_scope)
+}
+
+/// [`mainnet_home`] with the consent scope that `scope` gives the profile
+/// before the pending record opens.
+fn mainnet_home_with(home: &std::path::Path, scope: fn(&Profile, &str)) -> (Profile, String) {
     assert!(
         home.join(stellar_agent_test_support::sandbox::MARKER)
             .is_file(),
@@ -248,6 +255,7 @@ fn mainnet_home(home: &std::path::Path) -> (Profile, String) {
     .unwrap();
     let nonce = entry.approval_nonce.clone();
     let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home);
+    scope(&profile, NAME);
     crate::approval_fixture::open_record(NAME, &profile, &entry);
     let mut approvals =
         PendingApprovalStore::open(home.join("approvals").join(format!("{NAME}.toml"))).unwrap();
@@ -310,6 +318,7 @@ fn mainnet_presence_stdin_cannot_supply_signed_authority() {
     let (profile, nonce) = mainnet_home(home);
     let pending = home.join("approvals").join(format!("{NAME}.toml"));
     let before = std::fs::read(&pending).unwrap();
+    let log = std::fs::read(&profile.audit_log_path).ok();
 
     for typed in ["y\n", "yes\n", &format!("{NAME}\n")] {
         let (code, json, stderr) = approve(home, &nonce, &[], typed);
@@ -349,10 +358,62 @@ fn mainnet_presence_stdin_cannot_supply_signed_authority() {
     let entry = store.get(&nonce).expect("the entry stays pending");
     assert!(entry.attestation_blob_b64.is_none());
     assert!(entry.mainnet_presence.is_none());
-    assert!(
-        !profile.audit_log_path.exists(),
+    assert_eq!(
+        std::fs::read(&profile.audit_log_path).ok(),
+        log,
         "no consent row is written"
     );
+}
+
+/// A consent scope without evidence and one with an unresolved migration pin
+/// refuse a pending payment's `approve --id` before presence, under one code
+/// and a reason that names the cause. The pending file and the audit log
+/// stay byte-identical.
+#[cfg(feature = "test-helpers")]
+#[test]
+#[serial]
+fn mainnet_approve_names_the_unusable_evidence_cause() {
+    fn pinned(profile: &Profile, name: &str) {
+        crate::approval_fixture::initialize_pinned_consent_scope(profile, name, "foreign-nonce");
+    }
+    type Scope = fn(&Profile, &str);
+    let cases: [(&str, Scope, &str); 2] = [
+        (
+            "absent",
+            crate::approval_fixture::open_unevidenced_scope,
+            "consent evidence not initialized",
+        ),
+        ("pinned", pinned, "unresolved migration pin"),
+    ];
+    for (case, scope, reason) in cases {
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let home = dir.path();
+        let (profile, nonce) = mainnet_home_with(home, scope);
+        let pending = home.join("approvals").join(format!("{NAME}.toml"));
+        let before = std::fs::read(&pending).unwrap();
+        let log = std::fs::read(&profile.audit_log_path).unwrap();
+
+        let (code, json, stderr) = approve(home, &nonce, &[], "y\n");
+        assert_eq!(code, 1, "{case}: {json} {stderr}");
+        assert_eq!(
+            json["error"]["code"], "audit.outbox_evidence_unusable",
+            "{case}: {json}"
+        );
+        let message = json["error"]["message"].as_str().unwrap();
+        assert!(message.contains(reason), "{case}: {message}");
+        for (other, _, other_reason) in cases {
+            if other != case {
+                assert!(!message.contains(other_reason), "{case}: {message}");
+            }
+        }
+        assert!(!stderr.contains("local browser"), "{case}: {stderr}");
+        assert_eq!(std::fs::read(&pending).unwrap(), before, "{case}");
+        assert_eq!(
+            std::fs::read(&profile.audit_log_path).unwrap(),
+            log,
+            "{case}"
+        );
+    }
 }
 
 /// Mainnet startup refusals precede TLS, keyring, and listener setup.

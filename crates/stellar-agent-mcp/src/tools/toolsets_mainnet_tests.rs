@@ -64,6 +64,9 @@ struct Run {
     _oracle: wiremock::MockServer,
     root: tempfile::TempDir,
     grants: std::path::PathBuf,
+    /// Opt-outs that keep the legacy-attested run unenforced for every
+    /// kind; a test's later enforcement guard overrides them.
+    _unenforced: Vec<stellar_agent_network::policy_state::approvals::ConsentEvidenceDisableGuard>,
 }
 
 impl Run {
@@ -117,7 +120,9 @@ impl Run {
             .set_toolsets_root_for_test(root.path().to_path_buf());
         f.server.set_toolset_pin_key_for_test(pin);
         f.server.set_grant_store_path_for_test(grants.clone());
+        let unenforced = super::common::tests::mainnet::unenforced(&f);
         Self {
+            _unenforced: unenforced,
             f,
             control,
             oracle_control,
@@ -820,8 +825,8 @@ async fn public_commit_queue_opens_the_durable_record_proof_delivery_reads() {
         )
         .unwrap()
     };
-    // The integrated consent writer is closed in production, so the
-    // fixture seeds the record's direct-anchored delivery facts.
+    // The fixture's legacy attestation records no delivery, so the fixture
+    // seeds the record's direct-anchored delivery facts.
     run.f
         .server
         .approval_step(|recorder| {

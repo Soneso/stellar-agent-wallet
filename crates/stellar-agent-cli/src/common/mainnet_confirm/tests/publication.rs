@@ -236,7 +236,7 @@ mod tests {
                 ConsentEvidenceEnforcementGuard::new(context.profile_name(), summary.kind);
             clear_shown_summaries();
             let _presence = driver::install(driver::fixture_credential());
-            let handle = prepared_operation(&context, "inventory", &summary.envelope);
+            let handle = prepared_operation(&context, "unready", &summary.envelope);
             let unreadable = UnreadableSiblingProfile::plant();
             let result = confirm_mainnet_write(
                 &summary,
@@ -286,6 +286,49 @@ mod tests {
                     .unwrap()
                     .is_none(),
                 "disabled producers never initialize evidence"
+            );
+            // A fresh scope without the legacy grant above, under the
+            // compiled capabilities.
+            drop(context);
+            drop(fixture);
+            let (mut fixture, context, _) =
+                confirmation_fixture(&format!("publication-production-{verb}"));
+            fixture.enforce_listed();
+            assert!(
+                stellar_agent_network::policy_state::approvals::consent_evidence_enforced(
+                    summary.kind
+                ),
+                "verb {verb}: the production capability is on"
+            );
+            let production = prepared_operation(&context, "production", &summary.envelope);
+            confirm_mainnet_write(
+                &summary,
+                ConfirmDecision::RequireApproval { ttl_ms: 300_000 },
+                &context,
+                &fixture.current_policy(),
+                &fixture.store_path(),
+                Some(&production),
+                PolicyDecision::RequireApproval,
+                &governing(&context, &fixture.current_policy(), 300_000),
+            )
+            .await
+            .unwrap();
+            assert!(
+                consent_outbox(context.profile(), context.profile_name())
+                    .unwrap()
+                    .evidence()
+                    .unwrap()
+                    .is_some(),
+                "verb {verb}: the listed kind's producer initializes evidence"
+            );
+            assert!(
+                durable_record(&context, &production)
+                    .unwrap()
+                    .consent
+                    .unwrap()
+                    .delivery
+                    .is_some(),
+                "verb {verb}: the listed kind's producer publishes delivery"
             );
         }
     }

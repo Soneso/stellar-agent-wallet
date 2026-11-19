@@ -1157,7 +1157,12 @@ pub enum VerifiedConsentDelivery {
 
 /// The approval kinds whose production paths all enforce consent delivery.
 /// The capability and the floor and maintenance gates read only this list.
-const ENFORCED_KINDS: &[ApprovedKind] = &[];
+const ENFORCED_KINDS: &[ApprovedKind] = &[
+    ApprovedKind::Claim,
+    ApprovedKind::Trustline,
+    ApprovedKind::Payment,
+    ApprovedKind::X402Payment,
+];
 
 /// Whether all production paths of this kind enforce consent delivery.
 #[must_use]
@@ -1168,7 +1173,7 @@ pub fn consent_evidence_enforced(kind: ApprovedKind) -> bool {
 /// Requires stored proof that the owner scope of `profile`'s consent
 /// evidence holds no grant the evidence cannot account for, before an
 /// integrated request is admitted. The proof takes no window lock and
-/// writes nothing.
+/// writes nothing to the window.
 ///
 /// The scope is proven from the profiles directory and the profile's
 /// authenticated window. It refuses when a sibling profile names one of the
@@ -1316,12 +1321,12 @@ pub(crate) fn adopt_consent_evidence_pins(
 }
 
 /// Whether this profile's producers and consumers use integrated consent
-/// for `kind`. Production capabilities remain closed until every route is ready.
+/// for `kind`. A kind's production capability opens only once all its routes are ready.
 #[must_use]
 pub fn delivery_enforced(profile: &str, kind: ApprovedKind) -> bool {
     #[cfg(any(test, feature = "test-helpers"))]
-    if delivery_test_override::enabled(profile, kind) {
-        return true;
+    if let Some(enabled) = delivery_test_override::overridden(profile, kind) {
+        return enabled;
     }
     let _ = profile;
     consent_evidence_enforced(kind)
@@ -1737,55 +1742,115 @@ impl<'a> ApprovalStatus<'a> {
 mod delivery_test_override {
     use super::*;
     use std::sync::{Mutex, PoisonError};
-    static ENABLED: Mutex<Vec<(String, u8)>> = Mutex::new(Vec::new());
+    /// Installed overrides in order: profile, kind tag, and whether it enables.
+    static OVERRIDES: Mutex<Vec<(String, u8, bool)>> = Mutex::new(Vec::new());
 
-    pub(super) fn enabled(profile: &str, kind: ApprovedKind) -> bool {
-        ENABLED
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .any(|(name, tag)| name == profile && *tag == kind.tag())
+    /// The setting of the latest override of `profile` and `kind`.
+    pub(super) fn overridden(profile: &str, kind: ApprovedKind) -> Option<bool> {
+        latest(
+            &OVERRIDES.lock().unwrap_or_else(PoisonError::into_inner),
+            profile,
+            kind.tag(),
+        )
     }
 
     pub(super) fn enables_any(profile: &str) -> bool {
-        ENABLED
+        let overrides = OVERRIDES.lock().unwrap_or_else(PoisonError::into_inner);
+        overrides.iter().any(|(name, tag, _)| {
+            name == profile && latest(&overrides, profile, *tag) == Some(true)
+        })
+    }
+
+    fn latest(overrides: &[(String, u8, bool)], profile: &str, tag: u8) -> Option<bool> {
+        overrides
+            .iter()
+            .rev()
+            .find(|(name, t, _)| name == profile && *t == tag)
+            .map(|&(_, _, enables)| enables)
+    }
+
+    fn install(profile: &str, kind: ApprovedKind, enables: bool) -> (String, u8, bool) {
+        let entry = (profile.to_owned(), kind.tag(), enables);
+        OVERRIDES
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .any(|(name, _)| name == profile)
+            .push(entry.clone());
+        entry
+    }
+
+    fn remove(entry: &(String, u8, bool)) {
+        let mut overrides = OVERRIDES.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(index) = overrides.iter().rposition(|e| e == entry) {
+            overrides.remove(index);
+        }
     }
 
     /// Enables one profile and kind for a fixture, restoring its previous setting on drop.
+    /// The latest installed override of a profile and kind decides.
     #[derive(Debug)]
-    pub struct ConsentEvidenceEnforcementGuard(String, u8);
+    pub struct ConsentEvidenceEnforcementGuard((String, u8, bool));
 
     impl ConsentEvidenceEnforcementGuard {
         /// Installs a profile-scoped override. Production builds exclude this API.
         #[must_use]
         pub fn new(profile: &str, kind: ApprovedKind) -> Self {
-            ENABLED
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push((profile.to_owned(), kind.tag()));
-            Self(profile.to_owned(), kind.tag())
+            Self(install(profile, kind, true))
         }
     }
 
     impl Drop for ConsentEvidenceEnforcementGuard {
         fn drop(&mut self) {
-            let mut enabled = ENABLED.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Some(index) = enabled
+            remove(&self.0);
+        }
+    }
+
+    /// Disables one profile and kind for a fixture, listed or not, restoring
+    /// its previous setting on drop. The latest installed override of a
+    /// profile and kind decides.
+    #[derive(Debug)]
+    pub struct ConsentEvidenceDisableGuard((String, u8, bool));
+
+    impl ConsentEvidenceDisableGuard {
+        /// Installs a profile-scoped opt-out. Production builds exclude this API.
+        #[must_use]
+        pub fn new(profile: &str, kind: ApprovedKind) -> Self {
+            Self(install(profile, kind, false))
+        }
+
+        /// One opt-out per approval kind for `profile`.
+        #[must_use]
+        pub fn every_kind(profile: &str) -> Vec<Self> {
+            [
+                ApprovedKind::Payment,
+                ApprovedKind::Claim,
+                ApprovedKind::Trustline,
+                ApprovedKind::X402Payment,
+            ]
+            .into_iter()
+            .map(|kind| Self::new(profile, kind))
+            .collect()
+        }
+
+        /// Whether any opt-out is installed for any profile.
+        #[must_use]
+        pub fn any_active() -> bool {
+            OVERRIDES
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
                 .iter()
-                .rposition(|entry| entry == &(self.0.clone(), self.1))
-            {
-                enabled.remove(index);
-            }
+                .any(|&(_, _, enables)| !enables)
+        }
+    }
+
+    impl Drop for ConsentEvidenceDisableGuard {
+        fn drop(&mut self) {
+            remove(&self.0);
         }
     }
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
-pub use delivery_test_override::ConsentEvidenceEnforcementGuard;
+pub use delivery_test_override::{ConsentEvidenceDisableGuard, ConsentEvidenceEnforcementGuard};
 
 /// Whether retained intent consent keeps a linked operation waiting.
 pub(super) fn keeps_waiting(
@@ -1970,6 +2035,13 @@ pub(in crate::policy_state) mod tests {
         pub(in crate::policy_state) witness: ApprovalWitness,
         pub(in crate::policy_state) payload: ConsentPayload,
         pub(in crate::policy_state) entry: PendingApproval,
+        /// Keeps the unkeyed fixture's payment unenforced; a test's later
+        /// enforcement guard decides over it, and a test of the compiled
+        /// capability drops it.
+        pub(in crate::policy_state) unpublished: Option<ConsentEvidenceDisableGuard>,
+        /// The x402 fixture's legacy grant runs unenforced; a test's later
+        /// enforcement guard overrides the opt-out.
+        _unenforced: Option<ConsentEvidenceDisableGuard>,
     }
 
     pub(in crate::policy_state) fn proof(
@@ -2117,7 +2189,12 @@ pub(in crate::policy_state) mod tests {
                     amount: "10".to_owned(),
                 },
             };
-            Self::with_entry(fixture, entry, ttl, intent, Some(ttl))
+            let unenforced =
+                ConsentEvidenceDisableGuard::new(fixture.name(), ApprovedKind::X402Payment);
+            Self {
+                _unenforced: Some(unenforced),
+                ..Self::with_entry(fixture, entry, ttl, intent, Some(ttl))
+            }
         }
 
         fn with_entry(
@@ -2127,6 +2204,8 @@ pub(in crate::policy_state) mod tests {
             intent: IntentSlot,
             rule_ttl_ms: Option<u64>,
         ) -> Self {
+            let unpublished =
+                ConsentEvidenceDisableGuard::new(fixture.name(), ApprovedKind::Payment);
             let intent_digest = intent.intent_digest();
             let x402 = matches!(intent, IntentSlot::X402 { .. });
             entry.process_uid = "1000".to_owned();
@@ -2181,6 +2260,8 @@ pub(in crate::policy_state) mod tests {
                 witness,
                 payload,
                 entry,
+                unpublished: Some(unpublished),
+                _unenforced: None,
             }
         }
 
@@ -2519,7 +2600,10 @@ pub(in crate::policy_state) mod tests {
             ApprovedKind::Trustline,
             ApprovedKind::X402Payment,
         ] {
-            assert!(!consent_evidence_enforced(kind));
+            assert!(
+                consent_evidence_enforced(kind),
+                "{kind:?}: the production capability is on"
+            );
         }
         assert_eq!(fx.classify().unwrap(), VerifiedConsentDelivery::Unenforced);
         let enabled =
@@ -2552,6 +2636,45 @@ pub(in crate::policy_state) mod tests {
         );
         let _other = ConsentEvidenceEnforcementGuard::new("other-profile", ApprovedKind::Payment);
         assert_eq!(fx.classify().unwrap(), VerifiedConsentDelivery::Unenforced);
+    }
+
+    /// A disable guard opts one profile out of a listed kind, for routes and
+    /// for the floor and maintenance gates, until dropped. The latest
+    /// override of a profile and kind decides, and other profiles keep the
+    /// production capability.
+    #[test]
+    #[serial]
+    fn disable_guard_opts_a_profile_out_of_a_listed_kind() {
+        let listed = ENFORCED_KINDS[0];
+        assert!(consent_evidence_enforced(listed));
+        assert!(delivery_enforced("opt-out", listed));
+        let opted_out = ConsentEvidenceDisableGuard::every_kind("opt-out");
+        assert!(ConsentEvidenceDisableGuard::any_active());
+        assert!(!delivery_enforced("opt-out", listed), "the opt-out holds");
+        assert!(
+            !enforces_any_kind("opt-out"),
+            "no floor or maintenance read"
+        );
+        assert!(delivery_enforced("other-profile", listed));
+        let enabled = ConsentEvidenceEnforcementGuard::new("opt-out", ApprovedKind::Payment);
+        assert!(delivery_enforced("opt-out", ApprovedKind::Payment));
+        assert!(!delivery_enforced("opt-out", listed));
+        assert!(enforces_any_kind("opt-out"));
+        drop(enabled);
+        assert!(
+            !enforces_any_kind("opt-out"),
+            "dropping restores the opt-out"
+        );
+        let again = ConsentEvidenceEnforcementGuard::new("opt-out", listed);
+        assert!(
+            delivery_enforced("opt-out", listed),
+            "the later guard decides"
+        );
+        drop(again);
+        drop(opted_out);
+        assert!(!ConsentEvidenceDisableGuard::any_active());
+        assert!(delivery_enforced("opt-out", listed));
+        assert!(enforces_any_kind("opt-out"));
     }
 
     #[test]

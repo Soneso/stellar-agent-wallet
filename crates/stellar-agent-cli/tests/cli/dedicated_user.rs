@@ -68,6 +68,7 @@ fn fixture() -> MainnetConsentFixture {
         .unwrap();
     std::fs::create_dir_all(fixture.audit_path().parent().unwrap()).unwrap();
     std::fs::write(fixture.audit_path(), "").unwrap();
+    crate::approval_fixture::initialize_consent_scope(fixture.profile(), NAME);
     fixture
 }
 

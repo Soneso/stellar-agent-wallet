@@ -257,6 +257,34 @@ pub(crate) fn header(
     }
 }
 
+/// [`header`] with the store access its expiry check reads, for a fixture
+/// that holds no keyring of its own. While any kind enforces delivery,
+/// the check of an Approval header reads [`ClaimTarget::store`], which
+/// needs its window key. The guard installs a fresh in-memory keyring as
+/// the process default, so the test that holds it never relies on a
+/// keyring another test installed, and it restores the previous default
+/// store when it drops. Keep it for as long as the header is checked.
+///
+/// # Panics
+///
+/// Panics when the in-memory store cannot be created.
+pub(crate) fn approval_header(
+    claim: ClaimTarget,
+    profile: &str,
+    endpoint: Option<(String, u64)>,
+    writer: &AuditWriterHandle,
+    facts: VerifiedTipFacts,
+    now: u64,
+) -> (
+    Header,
+    stellar_agent_test_support::keyring_mock::DefaultStoreGuard,
+) {
+    let store: Arc<keyring_core::CredentialStore> =
+        keyring_core::mock::Store::new().expect("in-memory keyring store");
+    let access = stellar_agent_test_support::keyring_mock::DefaultStoreGuard::install(store);
+    (header(claim, profile, endpoint, writer, facts, now), access)
+}
+
 /// A transaction authorization over `header` and `binding`.
 pub(crate) fn tx_authorization(
     header: Header,
@@ -282,17 +310,54 @@ pub(crate) fn soroban_authorization(
     signature_expiration_ledger: u32,
     now: u64,
 ) -> MainnetSorobanIntentAuthorization {
-    use sha2::{Digest as _, Sha256};
+    let header = header(claim, "fixture", None, writer, soroban_facts(), now);
+    soroban_over(header, invocation, nonce, signature_expiration_ledger)
+}
 
-    let facts = VerifiedTipFacts {
+/// [`soroban_authorization`] over the header of [`approval_header`], with
+/// the guard of its store access, for a fixture that holds no keyring of
+/// its own.
+pub(crate) fn soroban_approval(
+    claim: ClaimTarget,
+    writer: &AuditWriterHandle,
+    invocation: &stellar_xdr::SorobanAuthorizedInvocation,
+    nonce: i64,
+    signature_expiration_ledger: u32,
+    now: u64,
+) -> (
+    MainnetSorobanIntentAuthorization,
+    stellar_agent_test_support::keyring_mock::DefaultStoreGuard,
+) {
+    let (header, access) = approval_header(claim, "fixture", None, writer, soroban_facts(), now);
+    (
+        soroban_over(header, invocation, nonce, signature_expiration_ledger),
+        access,
+    )
+}
+
+/// The audit tip facts of the fixture's Soroban authorizations.
+fn soroban_facts() -> VerifiedTipFacts {
+    VerifiedTipFacts {
         segment_start_hash: [0; 32],
         entry_count: 0,
         tip_hash: [0; 32],
         log_path_sha256: [5; 32],
         anchor_covers_tip: true,
         entry_tags_in_force: true,
-    };
-    let mut header = header(claim, "fixture", None, writer, facts, now);
+    }
+}
+
+/// The Soroban intent authorization over `header`, made a Soroban
+/// `X402Create` header, binding `invocation`, `nonce` and
+/// `signature_expiration_ledger`.
+fn soroban_over(
+    mut header: Header,
+    invocation: &stellar_xdr::SorobanAuthorizedInvocation,
+    nonce: i64,
+    signature_expiration_ledger: u32,
+) -> MainnetSorobanIntentAuthorization {
+    use sha2::{Digest as _, Sha256};
+
     header.domain = AuthorizationDomain::Soroban;
     header.consumer = MainnetConsumer::X402Create;
     let mainnet: [u8; 32] = Sha256::digest(MAINNET_PASSPHRASE.as_bytes()).into();

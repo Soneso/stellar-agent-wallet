@@ -162,10 +162,12 @@ mod tests {
     }
 
     /// An intent authorization for `X402Create` over the approved invocation
-    /// under [`NONCE`] and [`EXPIRATION_LEDGER`] on mainnet, valid at [`NOW`].
+    /// under [`NONCE`] and [`EXPIRATION_LEDGER`] on mainnet, valid at [`NOW`],
+    /// with the store access its expiry check reads.
     struct Case {
         _dir: TempDir,
         authorization: MainnetSorobanIntentAuthorization,
+        _store: stellar_agent_test_support::keyring_mock::DefaultStoreGuard,
     }
 
     impl Case {
@@ -174,7 +176,7 @@ mod tests {
             let writer = Arc::new(Mutex::new(
                 AuditWriter::open(dir.path().join("audit.jsonl"), None).unwrap(),
             ));
-            let authorization = fixtures::soroban_authorization(
+            let (authorization, store) = fixtures::soroban_approval(
                 fixtures::claim_target(dir.path(), "fixture"),
                 &writer,
                 &approved_invocation(),
@@ -185,6 +187,7 @@ mod tests {
             Self {
                 _dir: dir,
                 authorization,
+                _store: store,
             }
         }
 

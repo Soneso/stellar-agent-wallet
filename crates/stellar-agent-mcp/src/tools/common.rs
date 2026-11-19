@@ -7992,7 +7992,7 @@ pub(crate) mod tests {
 
             /// Attests `entry` on mainnet as [`Self::attest`] does and leaves
             /// its durable record without consent.
-            fn attest_unrecorded(
+            pub(crate) fn attest_unrecorded(
                 &self,
                 entry: &stellar_agent_core::approval::PendingApproval,
             ) -> String {
@@ -8921,6 +8921,7 @@ pub(crate) mod tests {
                     args,
                     entry,
                     prepared,
+                    _unenforced: Vec::new(),
                 };
                 let result = run.commit().await;
                 assert_eq!(result["ok"], true, "{tool:?}: {result}");
@@ -8989,6 +8990,8 @@ pub(crate) mod tests {
             use stellar_agent_core::approval::subject::approval_subject_classic;
             let mut cases = Vec::new();
             for require in [false, true] {
+                // Both runs opt out of every kind: the gate cases attest the
+                // legacy way.
                 let run = if require {
                     ClassicRun::new(Tool::Pay).await
                 } else {
@@ -9410,6 +9413,7 @@ pub(crate) mod tests {
         #[serial_test::serial]
         async fn mainnet_gate_returns_a_real_classic_witness_and_checks_subject() {
             use stellar_agent_core::approval::subject::approval_subject_classic;
+            // The run opts out of every kind: the gate attests the legacy way.
             let run = ClassicRun::new(Tool::Pay).await;
             let (args, entry) = run.recorded_approval(3_600_000);
             let operation = Some(run.operation_of(args["business_id"].as_str().unwrap()));
@@ -10440,11 +10444,49 @@ pub(crate) mod tests {
             pub entry: stellar_agent_core::approval::PendingApproval,
             /// The preparation's result data.
             pub prepared: serde_json::Value,
+            /// Opt-outs that keep the legacy-attested run unenforced for
+            /// every kind; a test's later enforcement guard overrides them.
+            _unenforced:
+                Vec<stellar_agent_network::policy_state::approvals::ConsentEvidenceDisableGuard>,
         }
 
         impl ClassicRun {
-            fn delivery_fixture(
+            pub(crate) fn delivery_fixture(
                 &self,
+                queued: bool,
+                dropped: bool,
+            ) -> Option<stellar_agent_core::audit_log::OutboxRowRef> {
+                let kind = match self.tool {
+                    Tool::Pay | Tool::CreateAccount => {
+                        stellar_agent_core::approval::witness::ApprovedKind::Payment
+                    }
+                    Tool::Claim => stellar_agent_core::approval::witness::ApprovedKind::Claim,
+                    Tool::Trustline => {
+                        stellar_agent_core::approval::witness::ApprovedKind::Trustline
+                    }
+                };
+                Self::deliver_consent(
+                    &self.f,
+                    self.args["business_id"].as_str().unwrap(),
+                    &self.entry.approval_nonce,
+                    kind,
+                    self.tool.commit_name(),
+                    queued,
+                    dropped,
+                )
+            }
+
+            /// Records the attested consent of `nonce`, the approval of the
+            /// operation `business_id` names, with delivery facts: it
+            /// initializes evidence, reserves the record's slot, and appends
+            /// a `queued` or anchored row for `tool`. `dropped` tears the
+            /// queued row's outbox generation.
+            pub(crate) fn deliver_consent(
+                f: &Fixture,
+                business_id: &str,
+                nonce: &str,
+                kind: stellar_agent_core::approval::witness::ApprovedKind,
+                tool: &str,
                 queued: bool,
                 dropped: bool,
             ) -> Option<stellar_agent_core::audit_log::OutboxRowRef> {
@@ -10460,11 +10502,11 @@ pub(crate) mod tests {
                 use stellar_agent_network::policy_state::{
                     ApprovalStatus, BusinessId, OperationStatus,
                 };
-                let server = &self.f.server;
+                let server = &f.server;
                 let profile = server.security_profile();
                 let name = server.profile_name_for_approval();
                 let operation = OperationStatus::new(&server.window_store, profile)
-                    .view(&BusinessId::parse(self.args["business_id"].as_str().unwrap()).unwrap())
+                    .view(&BusinessId::parse(business_id).unwrap())
                     .unwrap()
                     .unwrap();
                 let inbox = stellar_agent_core::approval::PendingApprovalStore::open(
@@ -10474,7 +10516,7 @@ pub(crate) mod tests {
                         .join(format!("{name}.toml")),
                 )
                 .unwrap();
-                let entry = inbox.get(&self.entry.approval_nonce).unwrap().clone();
+                let entry = inbox.get(nonce).unwrap().clone();
                 let attestation = base64::engine::general_purpose::URL_SAFE_NO_PAD
                     .decode(entry.attestation_blob_b64.as_ref().unwrap())
                     .unwrap()
@@ -10488,15 +10530,6 @@ pub(crate) mod tests {
                     ),
                 )
                 .unwrap();
-                let kind = match self.tool {
-                    Tool::Pay | Tool::CreateAccount => {
-                        stellar_agent_core::approval::witness::ApprovedKind::Payment
-                    }
-                    Tool::Claim => stellar_agent_core::approval::witness::ApprovedKind::Claim,
-                    Tool::Trustline => {
-                        stellar_agent_core::approval::witness::ApprovedKind::Trustline
-                    }
-                };
                 let witness = verify_approval(
                     &inbox,
                     profile,
@@ -10566,7 +10599,7 @@ pub(crate) mod tests {
                         .with_evidence_reservation(token)
                         .append_queued(&AuditEntry::new_approval_attested(
                             kind.kind_name(),
-                            self.tool.commit_name(),
+                            tool,
                             None,
                             witness.nonce(),
                             "mcp",
@@ -10580,7 +10613,7 @@ pub(crate) mod tests {
                         .unwrap()
                         .write_anchored(AuditEntry::new_approval_attested(
                             kind.kind_name(),
-                            self.tool.commit_name(),
+                            tool,
                             None,
                             witness.nonce(),
                             "mcp",
@@ -10665,7 +10698,8 @@ pub(crate) mod tests {
             }
 
             /// `consent` is `None` under `Allow`; otherwise it says whether
-            /// the attestation completes the durable record.
+            /// the attestation completes the durable record. The run opts
+            /// out of consent delivery for every kind.
             pub(crate) async fn build(
                 tool: Tool,
                 consent: Option<bool>,
@@ -10673,6 +10707,25 @@ pub(crate) mod tests {
                 profile: impl FnOnce(&mut Profile),
                 prepare: impl FnOnce(&mut serde_json::Value),
             ) -> Self {
+                Self::build_scoped(tool, consent, policy, profile, prepare, true).await
+            }
+
+            /// A run under the compiled kind capabilities, which installs no
+            /// opt-out. `complete` says whether the legacy attestation
+            /// completes the durable record.
+            pub(crate) async fn production(tool: Tool, complete: bool) -> Self {
+                Self::build_scoped(tool, Some(complete), |raw| raw, |_| {}, |_| {}, false).await
+            }
+
+            async fn build_scoped(
+                tool: Tool,
+                consent: Option<bool>,
+                policy: impl FnOnce(String) -> String,
+                profile: impl FnOnce(&mut Profile),
+                prepare: impl FnOnce(&mut serde_json::Value),
+                unenforced: bool,
+            ) -> Self {
+                use stellar_agent_network::policy_state::approvals::ConsentEvidenceDisableGuard;
                 let require_approval = consent.is_some();
                 let primary = wiremock::MockServer::start().await;
                 let oracle = wiremock::MockServer::start().await;
@@ -10695,6 +10748,11 @@ pub(crate) mod tests {
                 );
                 let control = mount_rpc(&f, &primary).await;
                 let oracle_control = mount_rpc(&f, &oracle).await;
+                let unenforced = if unenforced {
+                    ConsentEvidenceDisableGuard::every_kind(&f.server.profile_name_for_approval())
+                } else {
+                    Vec::new()
+                };
                 let mut args = tool.prepare_args(&f);
                 prepare(&mut args);
                 if args
@@ -10718,6 +10776,7 @@ pub(crate) mod tests {
                     args,
                     entry,
                     prepared,
+                    _unenforced: unenforced,
                 }
             }
 
@@ -12008,6 +12067,11 @@ pub(crate) mod tests {
                     .parse()
                     .unwrap();
                 let _clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(now);
+                // Each process legacy-attests, so it runs unenforced for every kind.
+                let _unenforced =
+                    stellar_agent_network::policy_state::approvals::ConsentEvidenceDisableGuard::every_kind(
+                        "operator",
+                    );
                 let mut args: serde_json::Value =
                     serde_json::from_slice(&std::fs::read(root.join("request.json")).unwrap())
                         .unwrap();
@@ -12128,6 +12192,10 @@ pub(crate) mod tests {
                     &primary,
                     &oracle,
                 );
+                let _unenforced =
+                    stellar_agent_network::policy_state::approvals::ConsentEvidenceDisableGuard::every_kind(
+                        &f.server.profile_name_for_approval(),
+                    );
                 let control = mount_rpc(&f, &primary).await;
                 let _oracle_control = mount_rpc(&f, &oracle).await;
                 control.transaction_unknown.store(unknown, Ordering::SeqCst);
@@ -14631,6 +14699,17 @@ pub(crate) mod tests {
             }
         }
 
+        /// Opt-outs of every kind for `f`'s profile, which keep a
+        /// legacy-attested run unenforced.
+        pub(crate) fn unenforced(
+            f: &Fixture,
+        ) -> Vec<stellar_agent_network::policy_state::approvals::ConsentEvidenceDisableGuard>
+        {
+            stellar_agent_network::policy_state::approvals::ConsentEvidenceDisableGuard::every_kind(
+                &f.server.profile_name_for_approval(),
+            )
+        }
+
         /// An x402 payment after its preparation call, approved and ready for
         /// its payment call.
         pub(crate) struct X402Run {
@@ -14639,6 +14718,10 @@ pub(crate) mod tests {
             pub control: Arc<RpcControl>,
             pub nonce: String,
             pub attestation: String,
+            /// Opt-outs that keep the legacy-attested run unenforced for
+            /// every kind; a test's later enforcement guard overrides them.
+            _unenforced:
+                Vec<stellar_agent_network::policy_state::approvals::ConsentEvidenceDisableGuard>,
         }
 
         impl X402Run {
@@ -14661,6 +14744,7 @@ pub(crate) mod tests {
                     &rpc,
                 );
                 let control = mount_rpc(&f, &rpc).await;
+                let opt_out = unenforced(&f);
                 let (nonce, attestation) = Self::approve(&f, &control).await;
                 Self {
                     f,
@@ -14668,6 +14752,7 @@ pub(crate) mod tests {
                     control,
                     nonce,
                     attestation,
+                    _unenforced: opt_out,
                 }
             }
 
@@ -14678,6 +14763,7 @@ pub(crate) mod tests {
                 let f = routed_fixture(|raw| raw, &rpc);
                 let control = mount_rpc(&f, &rpc).await;
                 Self {
+                    _unenforced: unenforced(&f),
                     f,
                     _rpc: rpc,
                     control,
@@ -15591,11 +15677,16 @@ pub(crate) mod tests {
             network_id: [u8; 32],
             /// The first attempt of the operation the durable record binds.
             link: stellar_agent_network::policy_state::OperationLink,
+            /// Opt-outs that keep the legacy-attested approval unenforced
+            /// for every kind.
+            _unenforced:
+                Vec<stellar_agent_network::policy_state::approvals::ConsentEvidenceDisableGuard>,
         }
 
         impl<'a> X402Approval<'a> {
             async fn new(f: &'a Fixture) -> Self {
                 use stellar_agent_core::approval::{PendingApproval, process_uid_for_attestation};
+                let opt_out = crate::tools::common::tests::mainnet::unenforced(f);
                 let requirements = f.requirements();
                 let root =
                     stellar_agent_x402::exact::payment_root(&requirements, f.envelope.source())
@@ -15679,6 +15770,7 @@ pub(crate) mod tests {
                     root,
                     network_id,
                     link,
+                    _unenforced: opt_out,
                 }
             }
 
@@ -16571,7 +16663,8 @@ pub(crate) mod tests {
                 MainnetAuthorizationError, MainnetConsumer, MainnetPrecondition,
             };
             // A consented durable record keeps the approval's signed lifetime
-            // of one hour, longer than the 600-second rule.
+            // of one hour, longer than the 600-second rule. The run opts out
+            // of every kind: the gate attests the legacy way.
             let run = ClassicRun::new(Tool::Pay).await;
             let (args, entry) = run.recorded_approval(3_600_000);
             let operation = run.operation_of(args["business_id"].as_str().unwrap());

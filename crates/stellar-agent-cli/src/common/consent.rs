@@ -21,7 +21,8 @@ pub(crate) fn consent_outbox(profile: &Profile, name: &str) -> Result<AuditOutbo
 }
 
 /// Verifies the original receipt and handoff while admitted, then releases
-/// both guards before constructing the durable publication.
+/// both guards before constructing the durable publication. An entry with
+/// an authenticated stored intent verifies as an intent consent.
 pub(crate) fn publication_completion(
     pending: stellar_agent_core::approval::PendingApprovalStore,
     profile: &Profile,
@@ -32,10 +33,10 @@ pub(crate) fn publication_completion(
 ) -> Result<stellar_agent_network::operation_entry::ConsentCompletion, WalletError> {
     use stellar_agent_core::approval::{
         AttestationBinding, load_attestation_key, verify_consent_publication,
-        witness::{ApprovalExpectation, verify_approval_admitted},
+        witness::{ApprovalExpectation, verify_approval_admitted, verify_intent_consent_admitted},
     };
     use stellar_agent_network::operation_entry::{
-        operation_refusal, persisted_attestation, witnessed_publication_completion,
+        consent_intent, operation_refusal, persisted_attestation, witnessed_publication_completion,
     };
     use stellar_agent_network::policy_state::{
         ApprovalStatus, ConsentPayload, ConsentRow, PersistedWindowStore,
@@ -56,24 +57,40 @@ pub(crate) fn publication_completion(
     let receipt = entry.mainnet_presence.clone().ok_or(WalletError::Approval(
         stellar_agent_core::ApprovalFailure::PresenceRequired,
     ))?;
-    let witness = verify_approval_admitted(
-        &pending,
-        profile,
-        name,
-        nonce,
-        &attestation,
-        &ApprovalExpectation {
-            kind: record.kind,
-            subject: record.subject,
-        },
-        policy,
-        stellar_agent_core::timefmt::now_unix_ms().map_err(|error| {
-            WalletError::Approval(stellar_agent_core::ApprovalFailure::ClockError {
-                detail: error.to_string(),
-            })
-        })?,
-        &admission,
-    )?;
+    let now = stellar_agent_core::timefmt::now_unix_ms().map_err(|error| {
+        WalletError::Approval(stellar_agent_core::ApprovalFailure::ClockError {
+            detail: error.to_string(),
+        })
+    })?;
+    // An authenticated stored intent verifies as an intent consent, as the
+    // unpublished completion does; any other entry as an envelope consent.
+    let witness = match consent_intent(&window, profile, entry, policy)? {
+        Some(intent) => verify_intent_consent_admitted(
+            &pending,
+            profile,
+            name,
+            nonce,
+            &attestation,
+            &intent,
+            policy,
+            now,
+            &admission,
+        )?,
+        None => verify_approval_admitted(
+            &pending,
+            profile,
+            name,
+            nonce,
+            &attestation,
+            &ApprovalExpectation {
+                kind: record.kind,
+                subject: record.subject,
+            },
+            policy,
+            now,
+            &admission,
+        )?,
+    };
     let key = load_attestation_key(
         &profile.attestation_key_id,
         &stellar_agent_core::profile::owner_key::OwnerKeyContext::for_profile(name, profile),

@@ -4708,6 +4708,8 @@ mod tests {
                 600,
             )
         });
+        // The legacy-attested gate runs unenforced for every kind.
+        let _unenforced = crate::tools::common::tests::mainnet::unenforced(&f);
         let requirements = f.requirements();
         let root =
             stellar_agent_x402::exact::payment_root(&requirements, f.envelope.source()).unwrap();
@@ -4784,6 +4786,8 @@ mod tests {
                 600,
             )
         });
+        // The legacy-attested gate runs unenforced for every kind.
+        let _unenforced = crate::tools::common::tests::mainnet::unenforced(&f);
         let requirements = f.requirements();
         let root =
             stellar_agent_x402::exact::payment_root(&requirements, f.envelope.source()).unwrap();
