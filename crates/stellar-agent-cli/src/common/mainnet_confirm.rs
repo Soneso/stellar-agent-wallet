@@ -634,15 +634,22 @@ fn start_integrated(
             }
         };
         // The entry's subject kind selects the subject, as the approver does.
-        let subject = if linked.subject_kind
+        // An intent entry's record subject is the intent digest; its
+        // challenge is the operation's stored envelope. An envelope entry's
+        // challenge is the record subject itself.
+        let view = stellar_agent_core::approval::mainnet_consent_subject(
+            &linked,
+            &AttestationBinding::new(name, profile.chain_id.caip2_str()),
+        )?;
+        let (subject, challenge) = if linked.subject_kind
             == stellar_agent_core::approval::subject::SubjectKind::IntentDigest
         {
-            handle.intent().intent_digest()
+            (
+                handle.intent().intent_digest(),
+                handle.envelope_xdr().map(approval_subject_classic),
+            )
         } else {
-            stellar_agent_core::approval::mainnet_consent_subject(
-                &linked,
-                &AttestationBinding::new(name, profile.chain_id.caip2_str()),
-            )?
+            (view, Some(record.subject))
         };
         if pending_approval_facts(
             &linked,
@@ -652,6 +659,7 @@ fn start_integrated(
             record.rule_ttl_ms,
         ) != record.facts()
             || subject != record.subject
+            || Some(view) != challenge
         {
             return Err(WalletError::Approval(ApprovalFailure::AttestationInvalid {
                 detail: "the approval does not match the signed inbox facts".to_owned(),
@@ -1017,7 +1025,7 @@ fn clock_now() -> Result<u64, WalletError> {
 
 /// Writes the rendered summary to stderr.
 #[cfg(not(test))]
-fn show_summary(rendered: &[u8]) -> Result<(), WalletError> {
+pub(crate) fn show_summary(rendered: &[u8]) -> Result<(), WalletError> {
     let mut stderr = std::io::stderr();
     stderr
         .write_all(rendered)
@@ -1038,7 +1046,7 @@ thread_local! {
     clippy::unnecessary_wraps,
     reason = "the signature of the stderr implementation"
 )]
-fn show_summary(rendered: &[u8]) -> Result<(), WalletError> {
+pub(crate) fn show_summary(rendered: &[u8]) -> Result<(), WalletError> {
     SHOWN_SUMMARIES.with(|shown| {
         shown
             .borrow_mut()

@@ -891,25 +891,36 @@ mod tests {
             fixture.primary_methods().await,
             fixture.oracle_methods().await,
         ));
-        // Identity and readiness once, the verb's reads and probes, the send.
-        let probes = [
-            "getNetwork",
-            "getLedgerEntries",
+        // Identity and readiness once, the verb's reads, the rebuild's
+        // readiness check and source read, the resolver's probe and reads
+        // (a claim rereads its balance), the submit probe, the send.
+        let rebuild = ["getHealth", "getLedgers", "getLedgerEntries"];
+        let send = [
             "getNetwork",
             "getLedgerEntries",
             "sendTransaction",
             "getTransaction",
         ];
         let start = ["getNetwork", "getHealth", "getLedgers"];
-        let primary_of = |reads: &[&str]| -> Vec<String> {
+        let primary_of = |reads: &[&str], resolver: &[&str]| -> Vec<String> {
             start
                 .iter()
                 .chain(reads)
-                .chain(&probes)
+                .chain(&rebuild)
+                .chain(&["getNetwork"])
+                .chain(resolver)
+                .chain(&send)
                 .map(|method| (*method).to_owned())
                 .collect()
         };
-        let cross_check = ["getNetwork", "getLedgerEntries"];
+        let account = ["getLedgerEntries"];
+        // The preparation's oracle check, then the rebuild's.
+        let cross_check = [
+            "getNetwork",
+            "getLedgerEntries",
+            "getNetwork",
+            "getLedgerEntries",
+        ];
         let oracle_of = |base: &[&str]| -> Vec<String> {
             base.iter()
                 .chain(&BOUND)
@@ -919,20 +930,30 @@ mod tests {
         let expected = [
             (
                 "pay",
-                primary_of(&["getLedgerEntries", "getLedgerEntries", "getLedgerEntries"]),
+                primary_of(
+                    &["getLedgerEntries", "getLedgerEntries", "getLedgerEntries"],
+                    &account,
+                ),
                 oracle_of(&cross_check),
             ),
             (
                 "claim",
-                primary_of(&["getLedgerEntries", "getLedgerEntries"]),
+                primary_of(
+                    &["getLedgerEntries", "getLedgerEntries"],
+                    &["getLedgerEntries", "getLedgerEntries"],
+                ),
                 oracle_of(&cross_check),
             ),
             (
                 "trustline",
-                primary_of(&["getLedgerEntries", "getLedgerEntries"]),
+                primary_of(&["getLedgerEntries", "getLedgerEntries"], &account),
                 oracle_of(&cross_check),
             ),
-            ("create", primary_of(&["getLedgerEntries"]), oracle_of(&[])),
+            (
+                "create",
+                primary_of(&["getLedgerEntries"], &account),
+                oracle_of(&[]),
+            ),
         ];
         for ((verb, primary, oracle), (expected_verb, base, bound)) in lists.iter().zip(&expected) {
             assert_eq!(verb, expected_verb);

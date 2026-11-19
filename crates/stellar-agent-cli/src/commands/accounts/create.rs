@@ -157,8 +157,8 @@ use crate::commands::policy_engine::{
     mainnet_floor_source, with_total_fee,
 };
 use crate::common::business_entry::{
-    BoundEnvelope, ClassicStart, bind_envelope, classic_start, entry_business_id,
-    mainnet_business_id, print_replay, signing_envelope,
+    Bound, ClassicStart, Staging, bind_signing, classic_start, entry_business_id,
+    mainnet_business_id, print_replay,
 };
 use crate::common::mainnet_write::{
     MainnetWriteRequest, authorize_and_submit, mainnet_context, mainnet_profiles_dir,
@@ -1537,19 +1537,18 @@ where
         Ok(id) => id,
         Err(e) => return fail(&Envelope::<()>::err(&e)),
     };
+    let payload = stellar_agent_core::approval::IntentPayload::CreateAccount {
+        destination: new_account.g_strkey.clone(),
+        starting_balance_stroops: starting_balance.as_stroops(),
+    };
     let operation = match classic_start(
         &context,
-        &policy,
+        &policy.verified,
         business_id,
         &sponsor,
         fee_choice,
         &stellar_xdr::Memo::None,
-        stellar_agent_network::operation_entry::IdentityFacts::Intent(
-            stellar_agent_core::approval::IntentPayload::CreateAccount {
-                destination: new_account.g_strkey.clone(),
-                starting_balance_stroops: starting_balance.as_stroops(),
-            },
-        ),
+        stellar_agent_network::operation_entry::IdentityFacts::Intent(payload.clone()),
     ) {
         Ok(ClassicStart::Proceed(operation)) => operation,
         Ok(ClassicStart::Replay(view)) => return print_replay(&view, args.output),
@@ -1567,24 +1566,8 @@ where
         Ok(xdr) => xdr,
         Err(e) => return fail(&Envelope::<()>::err(&e)),
     };
-    // The record binds the envelope the run signs: a waiting record's
-    // stored envelope, or the one just built.
-    let handle = match bind_envelope(
-        &context,
-        operation,
-        OperationTool::CliAccountsCreate,
-        OperationKind::CreateAccount,
-        &envelope_xdr,
-    ) {
-        Ok(BoundEnvelope::Sign(handle)) => handle,
-        Ok(BoundEnvelope::Replay(view)) => return print_replay(&view, args.output),
-        Err(e) => return fail(&Envelope::<()>::err(&e)),
-    };
-    let (unsigned_xdr, fee_per_op_stroops) = match signing_envelope(&handle) {
-        Ok(signing) => signing,
-        Err(e) => return fail(&Envelope::<()>::err(&e)),
-    };
-    let total_fee = match envelope_total_fee(unsigned_xdr) {
+    let candidate = operation.candidate(&envelope_xdr);
+    let total_fee = match envelope_total_fee(&candidate) {
         Ok(fee) => fee,
         Err(e) => return fail(&Envelope::<()>::err(&e)),
     };
@@ -1625,10 +1608,26 @@ where
             ));
         }
     };
+    let signing = match bind_signing(
+        &context,
+        operation,
+        Staging {
+            policy: &policy.verified,
+            tool: OperationTool::CliAccountsCreate,
+            kind: OperationKind::CreateAccount,
+            built: &envelope_xdr,
+            payload,
+            verdict: evaluation.verdict,
+        },
+    ) {
+        Ok(Bound::Sign(signing)) => signing,
+        Ok(Bound::Replay(view)) => return print_replay(&view, args.output),
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
 
     let body = &policy.body;
     if let Err(e) = check_classic_fee_cap_signed(
-        fee_per_op_stroops,
+        signing.fee_per_op_stroops(),
         classic_fee_source(fee_choice, FeeSource::CommandDefault),
         profile,
         Some(body.classic_max_fee_per_op_stroops),
@@ -1658,8 +1657,10 @@ where
             asset: &CanonicalAsset::Native,
             base_units: i128::from(starting_balance_stroops),
         },
-        CreateAccountWitnessInputs { source },
-        unsigned_xdr,
+        CreateAccountWitnessInputs {
+            source: source.clone(),
+        },
+        signing.checked(),
         &thresholds,
         "stellar_create_account",
     )
@@ -1675,7 +1676,7 @@ where
         verb: "accounts create",
         tool: "stellar_create_account",
         consumer: MainnetConsumer::CliCreateAccount,
-        unsigned_xdr,
+        unsigned_xdr: signing.stored(),
         client: &client,
         probe_deadline: budget,
         submit_timeout: submit_timeout(args.timeout_seconds, profile),
@@ -1687,7 +1688,13 @@ where
         effective_cap,
         witness: cross_check.witness(),
         ledger: operational,
-        operation: Some(&handle),
+        operation: Some(signing.handle()),
+        rebuild: signing.rebuild(
+            fee_choice,
+            DEFAULT_FEE_STROOPS,
+            CreateAccountWitnessInputs { source },
+            &thresholds,
+        ),
     })
     .await
     {
@@ -1699,9 +1706,11 @@ where
                 tx_hash: Some(submitted.result.tx_hash.clone()),
                 ledger: Some(submitted.result.ledger),
                 friendbot_url_used: None,
-                selected_fee_per_op_stroops: Some(fee_per_op_stroops),
+                selected_fee_per_op_stroops: Some(
+                    submitted.fee_per_op_stroops(signing.fee_per_op_stroops()),
+                ),
                 selected_fee_percentile: Some(fee_selection.selected_fee_percentile),
-                cross_check: Some(cross_check.view()),
+                cross_check: Some(submitted.cross_check(&cross_check).view()),
                 business_id: None,
             };
             print_success(&Envelope::ok(result), args.output);
@@ -3990,19 +3999,18 @@ pub(crate) mod tests {
             );
             assert!(fixture.open_authorizations(now()).is_empty());
             assert!(invalidations_on_this_thread().is_empty());
-            let entries = fixture.pending_entries();
-            assert_eq!(entries.len(), 1);
-            assert_eq!(entries[0].kind_name, "Consumed");
+            crate::common::mainnet_authority_tests::assert_consumption_owed(&fixture);
         }
 
-        /// Elapsed bound: a confirmation one second past the envelope's
-        /// on-chain deadline refuses at the resolver with `deadline_elapsed`,
-        /// before any signer is resolved: the Ledger never signs and nothing
-        /// is sent.
+        /// Elapsed bound: a confirmation one second past the prepared
+        /// envelope's on-chain deadline covers the stored intent, so the
+        /// verb rebuilds the envelope with a deadline from the confirmation
+        /// time and the Ledger signs it once; no refusal is logged and
+        /// nothing is invalidated.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial(mainnet_clock)]
         #[serial_test::serial]
-        async fn mainnet_time_bounds_sponsored_accounts_create_elapsed_refuses_before_signing() {
+        async fn mainnet_time_bounds_sponsored_accounts_create_elapsed_rebuilds_after_consent() {
             let mut fixture = Spec::new("mainnet-create-elapsed").build().await;
             let clock = Rc::new(stellar_agent_network::mainnet::clock::set_now_ms_for_test(
                 now() + CLOCK_LEAD_MS,
@@ -4012,32 +4020,20 @@ pub(crate) mod tests {
             let mut args = mainnet_args(&fixture);
             args.sign_with_ledger = true;
             let resolutions = signer_resolutions_on_this_thread();
-            let kinds = submission_kinds_on_this_thread().len();
             let (capture, _guard) = WarningCapture::capture(None);
 
             let run = run(&fixture, &args).await;
 
+            let confirmed_at_ms = stellar_agent_network::mainnet::clock::now_ms().unwrap();
             drop(clock);
-            assert_eq!(run.code, 1, "{}", run.envelope);
-            assert_eq!(
-                run.code(),
-                "network.mainnet_authorization_refused",
-                "{}",
-                run.envelope
-            );
-            assert_eq!(
-                refusal_warnings(&capture, "resolve_tx_sign"),
-                vec!["\"deadline_elapsed\"".to_owned()]
-            );
-            assert!(records(&fixture).is_empty(), "no authorization record");
-            let entries = fixture.pending_entries();
-            assert_eq!(entries.len(), 1, "{entries:?}");
-            assert_eq!(entries[0].kind_name, "PaymentSimulated");
-            assert!(fixture.sent_envelopes().await.is_empty(), "nothing is sent");
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            assert!(refusal_warnings(&capture, "resolve_canonical_tx_sign").is_empty());
+            let sent = fixture.sent_envelopes().await;
+            assert_eq!(sent.len(), 1, "signed once");
+            crate::common::mainnet_write_fixture::assert_deadline_bound(&sent[0], confirmed_at_ms);
             assert!(invalidations_on_this_thread().is_empty());
-            assert!(!calls.lock().unwrap().contains(&"sign_tx_payload"));
-            assert_eq!(signer_resolutions_on_this_thread(), resolutions);
-            assert_eq!(submission_kinds_on_this_thread().len(), kinds);
+            assert!(calls.lock().unwrap().contains(&"sign_tx_payload"));
+            assert_eq!(signer_resolutions_on_this_thread(), resolutions + 1);
         }
 
         /// Engine kind: a Noop profile refuses at the engine check.

@@ -150,7 +150,10 @@ confirmation ceremony. A retained operation prints its stored state and does
 no new work. Its `data` holds `status: "replayed"`, `business_id`, `operation`
 (`id`, `state`, `tx_hash`, `ledger`, `error_code`) and `next`.
 `--output table` prints one line, and `trustline` prints JSON only. The run
-exits `0` for a succeeded operation and `1` otherwise. A waiting record signs its stored envelope. Another intent
+exits `0` for a succeeded operation and `1` otherwise. A waiting record continues
+with its stored intent and signs an envelope rebuilt after the confirmation; a
+record that an earlier version opened over its exact envelope signs that stored
+envelope. Another intent
 under the same id refuses with `operation.business_id_conflict`. A claim names
 its balance id and claimant, so a rerun prints the stored claim after the
 balance left or its predicate expired.

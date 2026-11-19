@@ -21,8 +21,10 @@ pub(crate) fn consent_outbox(profile: &Profile, name: &str) -> Result<AuditOutbo
 }
 
 /// Verifies the original receipt and handoff while admitted, then releases
-/// both guards before constructing the durable publication. An entry with
-/// an authenticated stored intent verifies as an intent consent.
+/// both guards before constructing the durable publication. An entry whose
+/// operation stores an authenticated canonical intent verifies as a consent
+/// to that intent, any other entry as a consent to the record's envelope
+/// subject.
 pub(crate) fn publication_completion(
     pending: stellar_agent_core::approval::PendingApprovalStore,
     profile: &Profile,

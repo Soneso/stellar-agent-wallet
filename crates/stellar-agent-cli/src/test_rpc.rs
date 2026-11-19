@@ -78,7 +78,7 @@ pub(crate) struct ClassicRpc {
     /// The status `getHealth` reports.
     health_status: Arc<Mutex<String>>,
     /// The latest ledger `getLedgerEntries` reports.
-    entries_ledger: u32,
+    entries_ledger: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl ClassicRpc {
@@ -109,7 +109,7 @@ impl ClassicRpc {
             close_clock: now_secs,
             health_lead_secs: Arc::default(),
             health_status: Arc::new(Mutex::new("healthy".to_owned())),
-            entries_ledger: 1001,
+            entries_ledger: Arc::new(std::sync::atomic::AtomicU32::new(1001)),
             accounts: Arc::new(accounts.iter().map(|a| (*a).to_owned()).collect()),
             accepted_sends: Arc::default(),
             entries: Arc::new(
@@ -161,6 +161,18 @@ impl ClassicRpc {
         *self.stall.lock().unwrap() = Some((rpc_method.to_owned(), asked + prompt, delay));
     }
 
+    /// Reports `account`'s sequence `sends` higher from now on, as accepted
+    /// sends from another wallet would.
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) fn advance_sequence(&self, account: &str, sends: i64) {
+        *self
+            .accepted_sends
+            .lock()
+            .unwrap()
+            .entry(account.to_owned())
+            .or_insert(0) += sends;
+    }
+
     /// Reports `passphrase` from every later `getNetwork`.
     pub(crate) fn report(&self, passphrase: &str) {
         *self.network.lock().unwrap() = passphrase.to_owned();
@@ -197,9 +209,16 @@ impl ClassicRpc {
     /// Answers `getLedgerEntries` at the readiness ledger 2000, as an
     /// endpoint whose account reads cover its readiness report does.
     #[cfg(feature = "mainnet-write")]
-    pub(crate) fn entries_at_readiness_ledger(mut self) -> Self {
-        self.entries_ledger = 2000;
+    pub(crate) fn entries_at_readiness_ledger(self) -> Self {
+        self.report_entries_ledger(2000);
         self
+    }
+
+    /// Answers every later `getLedgerEntries` at `ledger`.
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) fn report_entries_ledger(&self, ledger: u32) {
+        self.entries_ledger
+            .store(ledger, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Uses the test's clock for readiness ledger close times.
@@ -244,7 +263,12 @@ impl ClassicRpc {
                 json!({ "key": key, "xdr": entry, "lastModifiedLedgerSeq": 1000 })
             })
             .collect();
-        json!({ "entries": entries, "latestLedger": self.entries_ledger })
+        json!({
+            "entries": entries,
+            "latestLedger": self
+                .entries_ledger
+                .load(std::sync::atomic::Ordering::SeqCst)
+        })
     }
 }
 

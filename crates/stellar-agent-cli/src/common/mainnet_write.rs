@@ -9,11 +9,15 @@
 //! 1. the enrolled signer proof, which reads the identity record and never a
 //!    seed;
 //! 2. decision authority, with passkey confirmation for approval rules;
-//!    its summary names the latest ledger from the operational check;
-//! 3. the consent drain, the audit readiness, and the recorder preparation;
-//! 4. the authorization mint, then the operation attempt, committed as
-//!    `Sending` before any signature;
-//! 5. the signer, the authorized attach, and the authorized submit.
+//!    an envelope record's summary names the latest ledger from the
+//!    operational check, and a canonical record's shows its stored intent;
+//! 3. for a canonical record, the rebuild of its envelope from the stored
+//!    intent with a fresh sequence, fee, deadline and oracle check;
+//! 4. the consent drain, the audit readiness, and the recorder preparation;
+//! 5. the authorization mint and the operation attempt, committed as
+//!    `Sending` before any signature: a canonical record mints inside the
+//!    attempt's begin, an envelope record mints, then begins;
+//! 6. the signer, the authorized attach, and the authorized submit.
 //!
 //! No step before the mint touches a seed or a device, and no refusal there
 //! leaves a record. A refusal after the mint invalidates the open
@@ -24,19 +28,26 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use stellar_agent_core::approval::witness::ApprovalWitness;
+use stellar_agent_core::cross_check::ThresholdSet;
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
 use stellar_agent_core::mainnet::oracle::require_mainnet_oracle;
 use stellar_agent_core::profile::Profile;
 use stellar_agent_core::profile::name::ResolvedProfileName;
 use stellar_agent_network::cross_check::CrossCheckWitness;
+use stellar_agent_network::cross_check::{ClassicInputs, CrossCheckOutcome};
+use stellar_agent_network::fees::ClassicFeeChoice;
 use stellar_agent_network::keyring::{EnrolledRole, enrolled_signer};
 use stellar_agent_network::mainnet::audit_readiness::audit_readiness;
 use stellar_agent_network::mainnet::resolve::{
-    InvalidationStage, TxSignRequest, invalidate_unconsumed, resolve_tx_sign,
+    InvalidationStage, TxSignRequest, invalidate_unconsumed, resolve_canonical_tx_sign,
+    resolve_tx_sign,
 };
 use stellar_agent_network::mainnet::{AuthorizationId, MainnetAuthorizationError, MainnetConsumer};
-use stellar_agent_network::operation_entry::{begin_classic_attempt, next_attempt_link};
+use stellar_agent_network::operation_entry::{
+    CanonicalRebuild, CanonicalRebuildRequest, begin_canonical_attempt, begin_classic_attempt,
+    next_attempt_link, preparation_intent, rebuild_canonical,
+};
 use stellar_agent_network::operational::OperationalReport;
 use stellar_agent_network::policy_state::{OperationHandle, PersistedWindowStore};
 use stellar_agent_network::signing::envelope_signing::attach_signature_authorized;
@@ -274,9 +285,26 @@ pub(crate) struct MainnetWriteRequest<'a> {
     /// ledger.
     pub(crate) ledger: OperationalReport,
     /// The operation record the run signs under, opened before the
-    /// confirmation; its next attempt opens after the mint and commits
+    /// confirmation; its next attempt opens with the mint and commits
     /// `Sending` before the signature.
     pub(crate) operation: Option<&'a OperationHandle>,
+    /// The inputs that rebuild a canonical record's envelope after the
+    /// confirmation. Without them the run signs `unsigned_xdr`, which the
+    /// resolver refuses for a canonical record.
+    pub(crate) rebuild: Option<RebuildInputs<'a>>,
+}
+
+/// The verb's inputs to [`rebuild_canonical`] besides the stored intent.
+pub(crate) struct RebuildInputs<'a> {
+    /// The caller's fee choice.
+    pub(crate) fee_choice: ClassicFeeChoice,
+    /// The fee per operation a profile-default choice gives.
+    pub(crate) default_fee_per_op_stroops: u32,
+    /// The oracle observations of the operation; the rebuild's fresh source
+    /// read replaces their source observation.
+    pub(crate) witness_inputs: ClassicInputs,
+    /// The cross-check thresholds.
+    pub(crate) thresholds: &'a ThresholdSet<'a>,
 }
 
 /// A mainnet write the network confirmed.
@@ -286,6 +314,29 @@ pub(crate) struct MainnetSubmitted {
     pub(crate) signed_xdr: String,
     /// What the network answered.
     pub(crate) result: SubmissionResult,
+    /// The rebuild the signed envelope came from, for a canonical record.
+    pub(crate) rebuilt: Option<CanonicalRebuild>,
+}
+
+impl MainnetSubmitted {
+    /// The fee per operation of the signed envelope: the rebuild's, else
+    /// `stored`, the fee of the record's envelope.
+    pub(crate) fn fee_per_op_stroops(&self, stored: u32) -> u32 {
+        self.rebuilt
+            .as_ref()
+            .map_or(stored, |rebuilt| rebuilt.fee_per_op_stroops)
+    }
+
+    /// The oracle outcome bound to the signed envelope: the rebuild's, else
+    /// `stored`, the one bound to the record's envelope.
+    pub(crate) fn cross_check<'a>(
+        &'a self,
+        stored: &'a CrossCheckOutcome,
+    ) -> &'a CrossCheckOutcome {
+        self.rebuilt
+            .as_ref()
+            .map_or(stored, |rebuilt| &rebuilt.cross_check)
+    }
 }
 
 /// How a refusal from the consent drain on is reported.
@@ -307,9 +358,10 @@ enum PipelineStep {
     Readiness,
     /// The recorder preparation.
     RecorderPreparation,
-    /// The authorization resolver.
+    /// The rebuild of a canonical envelope, or the authorization resolver.
     Resolver,
-    /// The operation attempt after the mint.
+    /// The operation attempt: after the mint for an envelope record, and
+    /// with the mint for a canonical record.
     Attempt,
     /// The signer constructor after the mint.
     SignerConstruction,
@@ -455,15 +507,20 @@ fn refused(
 
 /// Runs a mainnet write from the signer choice to the submit.
 ///
-/// The enrolled proof and the confirmation run before the consent drain, the
-/// readiness proof, the recorder preparation and the mint, and the signer is
-/// constructed only after the mint.
+/// The enrolled proof and the confirmation run before the rebuild of a
+/// canonical record's envelope, the consent drain, the readiness proof, the
+/// recorder preparation and the mint, and the signer is constructed only
+/// after the mint. The confirmation's challenge is `unsigned_xdr`, the
+/// record's stored envelope; for a canonical record it shows and covers the
+/// stored intent. A canonical record signs the rebuilt envelope, with the
+/// oracle outcome bound to it, and returns the rebuild in
+/// [`MainnetSubmitted::rebuilt`].
 ///
 /// # Errors
 ///
-/// A refusal before the consent drain renders with its own code. From the
-/// consent drain on, every refusal renders through
-/// [`render_mainnet_refusal`] at the stage [`refusal_stage`] selects.
+/// A refusal before the rebuild renders with its own code. From the rebuild
+/// on, every refusal renders through [`render_mainnet_refusal`] at the stage
+/// [`refusal_stage`] selects.
 pub(crate) async fn authorize_and_submit(
     req: MainnetWriteRequest<'_>,
 ) -> Result<MainnetSubmitted, Envelope<()>> {
@@ -486,6 +543,7 @@ pub(crate) async fn authorize_and_submit(
         witness: cross_check_witness,
         ledger,
         operation,
+        rebuild,
     } = req;
     stellar_agent_network::signing::envelope_signing::check_envelope_address_forms(unsigned_xdr)
         .map_err(|e| Envelope::<()>::err(&e))?;
@@ -541,6 +599,51 @@ pub(crate) async fn authorize_and_submit(
     .await
     .map_err(|r| render_authority_refusal(verb, r))?;
 
+    // A canonical record signs an envelope rebuilt after the confirmation,
+    // so a slow consent leaves no stale sequence, fee, deadline or oracle
+    // observation; the confirmation covered the stored intent.
+    let canonical = match (operation, rebuild) {
+        (Some(handle), Some(inputs)) => preparation_intent(handle, profile, &policy.verified)
+            .map_err(|e| refused(PipelineStep::Resolver, &e, "", verb, None))?
+            .map(|intent| (handle, intent, inputs)),
+        _ => None,
+    };
+    let rebuilt = match &canonical {
+        Some((_, intent, inputs)) => Some(
+            rebuild_canonical(CanonicalRebuildRequest {
+                profile,
+                network: &context.network_context(),
+                client,
+                deadline: stellar_agent_network::operational::readiness_deadline(),
+                intent,
+                fee_choice: inputs.fee_choice,
+                default_fee_per_op_stroops: inputs.default_fee_per_op_stroops,
+                fee_cap_stroops: effective_cap,
+                witness_inputs: inputs.witness_inputs.clone(),
+                thresholds: inputs.thresholds,
+                tool,
+                authority_end_ms: match &authority {
+                    stellar_agent_network::mainnet::authority::MainnetAuthority::Approval(
+                        approval,
+                    ) => approval.expires_at_ms(),
+                    stellar_agent_network::mainnet::authority::MainnetAuthority::Policy(policy) => {
+                        policy.governing_until_ms()
+                    }
+                },
+            })
+            .await
+            .map_err(|e| refused(PipelineStep::Resolver, &e, "", verb, None))?,
+        ),
+        None => None,
+    };
+    let (unsigned_xdr, cross_check_witness) = match &rebuilt {
+        Some(rebuilt) => (
+            rebuilt.unsigned_envelope_b64.as_str(),
+            rebuilt.cross_check.witness(),
+        ),
+        None => (unsigned_xdr, cross_check_witness),
+    };
+
     drain_consent_rows_before_signing(profile, name)
         .map_err(|e| refused(PipelineStep::ConsentDrain, &e, "", verb, None))?;
     consent_delivered(
@@ -569,7 +672,7 @@ pub(crate) async fn authorize_and_submit(
     .map_err(|e| refused(PipelineStep::RecorderPreparation, &e, "", verb, None))?;
 
     let window_store = PersistedWindowStore::for_profile(name);
-    let auth = resolve_tx_sign(TxSignRequest {
+    let request = TxSignRequest {
         context,
         consumer,
         unsigned_envelope_xdr: unsigned_xdr,
@@ -585,9 +688,8 @@ pub(crate) async fn authorize_and_submit(
         operation: operation.map(next_attempt_link),
         restriction: None,
         sac_payment_context: None,
-    })
-    .await
-    .map_err(|e: MainnetAuthorizationError| {
+    };
+    let resolver_refused = |e: MainnetAuthorizationError| {
         refused(
             PipelineStep::Resolver,
             &WalletError::from(e),
@@ -595,30 +697,54 @@ pub(crate) async fn authorize_and_submit(
             verb,
             None,
         )
-    })?;
-    let id = auth.id();
-    let minted = Minted {
-        store: &window_store,
-        context,
-        id,
     };
-
-    // The attempt commits `Sending` under the minted authorization before
-    // any signature, so a crash from here on never reads as a run that
-    // signed nothing.
-    let attempt = match operation {
-        Some(handle) => Some(
-            begin_classic_attempt(
-                &window_store,
-                profile,
+    // The attempt commits `Sending` with its authorization before any
+    // signature, so a crash from here on never reads as a run that signed
+    // nothing. A canonical record's mint, approval consumption and attempt
+    // commit together, so a refused begin leaves no authorization to
+    // invalidate.
+    let (auth, attempt) = match &canonical {
+        Some((handle, _, _)) => {
+            let pending = resolve_canonical_tx_sign(request)
+                .await
+                .map_err(resolver_refused)?;
+            let (attempt, auth) = begin_canonical_attempt(
                 prepared.audit_writer(),
                 prepared.request_id(),
                 handle,
                 unsigned_xdr,
+                pending,
             )
-            .map_err(|e| refused(PipelineStep::Attempt, &e, "", verb, Some(&minted)))?,
-        ),
-        None => None,
+            .map_err(|e| refused(PipelineStep::Attempt, &e, "", verb, None))?;
+            (auth, Some(attempt))
+        }
+        None => {
+            let auth = resolve_tx_sign(request).await.map_err(resolver_refused)?;
+            let minted = Minted {
+                store: &window_store,
+                context,
+                id: auth.id(),
+            };
+            let attempt = operation
+                .map(|handle| {
+                    begin_classic_attempt(
+                        &window_store,
+                        profile,
+                        prepared.audit_writer(),
+                        prepared.request_id(),
+                        handle,
+                        unsigned_xdr,
+                    )
+                    .map_err(|e| refused(PipelineStep::Attempt, &e, "", verb, Some(&minted)))
+                })
+                .transpose()?;
+            (auth, attempt)
+        }
+    };
+    let minted = Minted {
+        store: &window_store,
+        context,
+        id: auth.id(),
     };
     let signer = match mainnet_signer(&choice, &enrolled, source, source_flag).await {
         Ok(signer) => signer,
@@ -698,7 +824,11 @@ pub(crate) async fn authorize_and_submit(
         recorder.end_refused_attempt(e.code());
         envelope
     })?;
-    Ok(MainnetSubmitted { signed_xdr, result })
+    Ok(MainnetSubmitted {
+        signed_xdr,
+        result,
+        rebuilt,
+    })
 }
 
 /// Returns `context` with the test route map of this thread, when a test set
@@ -949,6 +1079,7 @@ mod tests {
                     close_lag_seconds: 0,
                 },
                 operation: None,
+                rebuild: None,
             })
             .await;
             let Err(envelope) = result else {

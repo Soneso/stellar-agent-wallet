@@ -2,18 +2,24 @@
 //!
 //! A mainnet value run names itself with `--business-id`. Before the
 //! confirmation ceremony the run looks the id up and opens the record that
-//! binds its envelope. A retained operation answers with its stored state. A
-//! waiting record signs its stored envelope. An unknown id opens a record for
-//! the envelope the run built. Off mainnet a supplied id is validated and
-//! echoed, and no record exists.
+//! binds its canonical intent. A retained operation answers with its stored
+//! state. A waiting record continues: a canonical record is rebuilt after the
+//! confirmation, and an envelope record signs its stored envelope. An unknown
+//! id opens a canonical record for the intent, the decision and the envelope
+//! the run built. Off mainnet a supplied id is validated and echoed, and no
+//! record exists.
 
 use std::io::Write;
 
+use stellar_agent_core::approval::{IntentPayload, MemoFact};
+use stellar_agent_core::cross_check::ThresholdSet;
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::{InternalError, WalletError};
+use stellar_agent_core::mainnet::verified_policy::VerifiedPolicy;
 use stellar_agent_core::profile::Profile;
 use stellar_agent_core::profile::receipt::PaymentDestinations;
 use stellar_agent_network::MainnetWriteContext;
+use stellar_agent_network::cross_check::ClassicInputs;
 use stellar_agent_network::fees::ClassicFeeChoice;
 use stellar_agent_network::operation_entry::{
     self, ClassicEntry, IdentityFacts, IntentBaseFacts, OpenedEntry, Preparation,
@@ -21,10 +27,12 @@ use stellar_agent_network::operation_entry::{
 use stellar_agent_network::policy_state::{
     ApprovalRecorder, BusinessId, OperationAudit, OperationHandle, OperationKind,
     OperationRecorder, OperationState, OperationTool, OperationView, PersistedWindowStore,
+    SlotKind,
 };
 
-use crate::commands::policy_engine::MainnetPolicy;
+use crate::commands::policy_engine::MainnetVerdict;
 use crate::commands::submission_record::accounting_audit_writer;
+use crate::common::mainnet_write::RebuildInputs;
 use crate::common::profile_access::ProfileOrigin;
 use crate::common::render::{exit_code_after_output, render_json, write_envelope};
 
@@ -62,8 +70,159 @@ pub(crate) fn mainnet_business_id(raw: Option<&str>) -> Result<BusinessId, Walle
 #[derive(Debug)]
 pub(crate) struct ClassicOperation {
     business_id: BusinessId,
-    preparation: Preparation,
+    base: StagedBase,
     resume: Option<OperationHandle>,
+}
+
+impl ClassicOperation {
+    /// The envelope the policy evaluates: a waiting record's stored
+    /// envelope, otherwise `built`, the envelope the run just built.
+    pub(crate) fn candidate(&self, built: &str) -> String {
+        self.resume
+            .as_ref()
+            .and_then(OperationHandle::envelope_xdr)
+            .unwrap_or(built)
+            .to_owned()
+    }
+}
+
+/// What a classic mainnet run binds under its record.
+pub(crate) struct Staging<'a> {
+    /// The verified mainnet policy the intent names.
+    pub(crate) policy: &'a VerifiedPolicy,
+    /// The operation's tool.
+    pub(crate) tool: OperationTool,
+    /// The operation's kind.
+    pub(crate) kind: OperationKind,
+    /// The envelope the run just built from its fresh reads.
+    pub(crate) built: &'a str,
+    /// The intent payload of the request.
+    pub(crate) payload: IntentPayload,
+    /// The policy's verdict on the candidate envelope.
+    pub(crate) verdict: MainnetVerdict,
+}
+
+/// The envelopes a classic mainnet run continues with under its record.
+#[derive(Debug)]
+pub(crate) struct Signing {
+    handle: OperationHandle,
+    built: String,
+    fee_per_op_stroops: u32,
+}
+
+impl Signing {
+    /// The operation record the run signs under.
+    pub(crate) fn handle(&self) -> &OperationHandle {
+        &self.handle
+    }
+
+    /// The record's stored envelope: the confirmation's challenge, and the
+    /// envelope an envelope record signs.
+    pub(crate) fn stored(&self) -> &str {
+        self.handle.envelope_xdr().unwrap_or_default()
+    }
+
+    /// The fee per operation of the stored envelope.
+    pub(crate) fn fee_per_op_stroops(&self) -> u32 {
+        self.fee_per_op_stroops
+    }
+
+    /// The envelope the verb's oracle check before the confirmation binds.
+    /// A canonical record binds the envelope the run just built, whose
+    /// sequence is that of the account read it was built from; a resumed
+    /// record's stored envelope may name a sequence the account has passed.
+    /// An envelope record binds its stored envelope, the one it signs.
+    pub(crate) fn checked(&self) -> &str {
+        if self.is_canonical() {
+            &self.built
+        } else {
+            self.stored()
+        }
+    }
+
+    fn is_canonical(&self) -> bool {
+        self.handle.intent().kind() == SlotKind::Canonical
+    }
+
+    /// The inputs that rebuild a canonical record's envelope after the
+    /// confirmation; `None` for an envelope record, which signs its stored
+    /// envelope.
+    pub(crate) fn rebuild<'a>(
+        &self,
+        fee_choice: ClassicFeeChoice,
+        default_fee_per_op_stroops: u32,
+        witness_inputs: impl Into<ClassicInputs>,
+        thresholds: &'a ThresholdSet<'a>,
+    ) -> Option<RebuildInputs<'a>> {
+        self.is_canonical().then(|| RebuildInputs {
+            fee_choice,
+            default_fee_per_op_stroops,
+            witness_inputs: witness_inputs.into(),
+            thresholds,
+        })
+    }
+}
+
+/// How a bound classic mainnet run proceeds.
+#[derive(Debug)]
+pub(crate) enum Bound {
+    /// Sign under the record.
+    Sign(Signing),
+    /// The operation needs no further work; the run prints its stored state.
+    Replay(OperationView),
+}
+
+/// Binds `operation` with [`bind_envelope`] and reads the envelope the
+/// record holds.
+///
+/// # Errors
+///
+/// The refusals of [`bind_envelope`], and `internal.unexpected_state` for a
+/// record without an envelope or with a malformed one.
+pub(crate) fn bind_signing(
+    context: &MainnetWriteContext,
+    operation: ClassicOperation,
+    staging: Staging<'_>,
+) -> Result<Bound, WalletError> {
+    let handle = match bind_envelope(
+        context,
+        staging.policy,
+        operation,
+        staging.tool,
+        staging.kind,
+        staging.built,
+        staging.payload,
+        staging.verdict,
+    )? {
+        BoundEnvelope::Sign(handle) => handle,
+        BoundEnvelope::Replay(view) => return Ok(Bound::Replay(view)),
+    };
+    let fee_per_op_stroops = signing_envelope(&handle)?.1;
+    Ok(Bound::Sign(Signing {
+        handle,
+        built: staging.built.to_owned(),
+        fee_per_op_stroops,
+    }))
+}
+
+/// The request facts of a classic run's intent besides its payload.
+#[derive(Debug, Clone)]
+struct StagedBase {
+    source: String,
+    fee_choice: ClassicFeeChoice,
+    memo: MemoFact,
+}
+
+impl StagedBase {
+    fn facts<'a>(&'a self, profile: &Profile, policy: &VerifiedPolicy) -> IntentBaseFacts<'a> {
+        IntentBaseFacts::new(
+            profile,
+            &self.source,
+            policy,
+            self.fee_choice,
+            self.memo.clone(),
+        )
+    }
 }
 
 /// How a classic mainnet run proceeds under its business id.
@@ -91,7 +250,7 @@ pub(crate) enum BoundEnvelope {
 ///
 /// `internal.unexpected_state` for a record without an envelope or with a
 /// malformed one.
-pub(crate) fn signing_envelope(handle: &OperationHandle) -> Result<(&str, u32), WalletError> {
+fn signing_envelope(handle: &OperationHandle) -> Result<(&str, u32), WalletError> {
     let xdr = handle.envelope_xdr().ok_or_else(|| {
         WalletError::Internal(InternalError::UnexpectedState {
             detail: "a classic operation record holds no envelope".to_owned(),
@@ -158,8 +317,10 @@ fn with_accounting_audit<T>(
 /// Looks `business_id` up before a classic mainnet run does any network
 /// work.
 ///
-/// The identity is the [`operation_entry::operation_identity`] of `facts`
-/// under the verified mainnet policy.
+/// The lookup is [`operation_entry::lookup_canonical`] of `facts` under the
+/// verified mainnet `policy`, so a claim answers from its balance and
+/// claimant alone. A record prepared with its exact envelope continues with
+/// that envelope and is never rebuilt.
 ///
 /// # Errors
 ///
@@ -168,33 +329,25 @@ fn with_accounting_audit<T>(
 /// store's refusals.
 pub(crate) fn classic_start(
     context: &MainnetWriteContext,
-    policy: &MainnetPolicy,
+    policy: &VerifiedPolicy,
     business_id: BusinessId,
     source: &str,
     fee_choice: ClassicFeeChoice,
     memo: &stellar_xdr::Memo,
     facts: IdentityFacts,
 ) -> Result<ClassicStart, WalletError> {
-    let identity = operation_entry::operation_identity(
-        IntentBaseFacts::new(
-            context.profile(),
-            source,
-            &policy.verified,
-            fee_choice,
-            operation_entry::memo_fact(memo),
-        ),
-        facts,
-    )?;
-    start_preparation(context, business_id, Preparation::Envelope(identity))
-}
-
-fn start_preparation(
-    context: &MainnetWriteContext,
-    business_id: BusinessId,
-    preparation: Preparation,
-) -> Result<ClassicStart, WalletError> {
+    let base = StagedBase {
+        source: source.to_owned(),
+        fee_choice,
+        memo: operation_entry::memo_fact(memo),
+    };
     let entry = operation_step(context, |recorder| {
-        preparation.lookup(recorder, &business_id)
+        operation_entry::lookup_canonical(
+            recorder,
+            &business_id,
+            base.facts(context.profile(), policy),
+            facts,
+        )
     })?;
     let resume = match entry {
         ClassicEntry::Build => None,
@@ -203,37 +356,54 @@ fn start_preparation(
     };
     Ok(ClassicStart::Proceed(ClassicOperation {
         business_id,
-        preparation,
+        base,
         resume,
     }))
 }
 
 /// Binds the envelope a classic mainnet run signs under `operation`.
 ///
-/// A waiting record signs its stored envelope. Otherwise `candidate`, the
-/// envelope the run just built, opens the record that binds it. A record
-/// another run opened between the lookup and this open answers as the lookup
-/// would have.
+/// A waiting record continues with its stored envelope. Otherwise
+/// `candidate`, the envelope the run just built, opens a canonical record for
+/// the intent of `payload` and the request facts under `policy`, with the
+/// decision and the rule lifetime of `verdict`. A record another run opened
+/// between the lookup and this open answers as the lookup would have.
 ///
 /// # Errors
 ///
 /// `operation.business_id_conflict`, `operation.capacity`, the decode
-/// refusal of a malformed envelope, and the store's refusals.
+/// refusal of a malformed envelope, the intent's refusals, and the store's
+/// refusals.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the record binds the intent, the decision and the envelope together"
+)]
 pub(crate) fn bind_envelope(
     context: &MainnetWriteContext,
+    policy: &VerifiedPolicy,
     operation: ClassicOperation,
     tool: OperationTool,
     kind: OperationKind,
     candidate: &str,
+    payload: IntentPayload,
+    verdict: MainnetVerdict,
 ) -> Result<BoundEnvelope, WalletError> {
     if let Some(handle) = operation.resume {
         return Ok(BoundEnvelope::Sign(handle));
     }
+    let intent =
+        operation_entry::classic_intent(operation.base.facts(context.profile(), policy), payload)?;
+    let preparation = Preparation::Canonical {
+        intent: Box::new(intent),
+        decision: verdict.audit_decision(),
+        rule_ttl_ms: match verdict {
+            MainnetVerdict::RequireApproval { ttl_ms } => Some(ttl_ms),
+            MainnetVerdict::Allow => None,
+        },
+    };
     Ok(
         match operation_step(context, |recorder| {
-            operation
-                .preparation
-                .open(recorder, operation.business_id, tool, kind, candidate)
+            preparation.open(recorder, operation.business_id, tool, kind, candidate)
         })? {
             OpenedEntry::Resume(handle) => BoundEnvelope::Sign(handle),
             OpenedEntry::Replay(view) => BoundEnvelope::Replay(view),
@@ -364,7 +534,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn canonical_staging_keeps_the_winning_handle() {
-        use stellar_agent_core::approval::{IntentAsset, IntentPayload, MemoFact};
+        use stellar_agent_core::approval::IntentAsset;
         let (fixture, context, envelope) =
             crate::common::mainnet_confirm::tests::confirmation_fixture("canonical-staging");
         let args = stellar_agent_core::envelope_decode::decode_authoritative_args(
@@ -372,45 +542,65 @@ mod tests {
             "stellar_pay_commit",
         )
         .unwrap();
+        let source = args["source"].as_str().unwrap().to_owned();
+        let policy = fixture.current_policy();
+        let payload = IntentPayload::Pay {
+            destination: args["destination"].as_str().unwrap().into(),
+            asset: IntentAsset::Native,
+            amount_stroops: 17,
+        };
         let intent = operation_entry::classic_intent(
             IntentBaseFacts::new(
                 context.profile(),
-                args["source"].as_str().unwrap(),
-                &fixture.current_policy(),
+                &source,
+                &policy,
                 ClassicFeeChoice::Explicit(500),
                 MemoFact::None,
             ),
-            IntentPayload::Pay {
-                destination: args["destination"].as_str().unwrap().into(),
-                asset: IntentAsset::Native,
-                amount_stroops: 17,
-            },
+            payload.clone(),
         )
         .unwrap();
-        let preparation = Preparation::Canonical {
-            intent: Box::new(intent.clone()),
-            decision: stellar_agent_core::audit_log::PolicyDecision::Allow,
-            rule_ttl_ms: None,
+        let start = |id: &BusinessId, facts: IdentityFacts| {
+            classic_start(
+                &context,
+                &policy,
+                id.clone(),
+                &source,
+                ClassicFeeChoice::Explicit(500),
+                &stellar_xdr::Memo::None,
+                facts,
+            )
+            .unwrap()
+        };
+        let bind = |operation, tool, kind, candidate: &str, payload| {
+            bind_envelope(
+                &context,
+                &policy,
+                operation,
+                tool,
+                kind,
+                candidate,
+                payload,
+                MainnetVerdict::Allow,
+            )
+            .unwrap()
         };
         let id = BusinessId::parse("winning-handle").unwrap();
-        let ClassicStart::Proceed(first) =
-            start_preparation(&context, id.clone(), preparation.clone()).unwrap()
+        let ClassicStart::Proceed(first) = start(&id, IdentityFacts::Intent(payload.clone()))
         else {
             unreachable!()
         };
-        let ClassicStart::Proceed(stale) =
-            start_preparation(&context, id.clone(), preparation.clone()).unwrap()
+        let ClassicStart::Proceed(stale) = start(&id, IdentityFacts::Intent(payload.clone()))
         else {
             unreachable!()
         };
-        let BoundEnvelope::Sign(winner) = bind_envelope(
-            &context,
+        let BoundEnvelope::Sign(winner) = bind(
             first,
             OperationTool::CliPay,
             OperationKind::Pay,
             &envelope,
-        )
-        .unwrap() else {
+            payload.clone(),
+        ) else {
             unreachable!()
         };
         assert_eq!(
@@ -426,14 +616,13 @@ mod tests {
             stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1000 + 120,
         )
         .unwrap();
-        let BoundEnvelope::Sign(raced) = bind_envelope(
-            &context,
+        let BoundEnvelope::Sign(raced) = bind(
             stale,
             OperationTool::CliPay,
             OperationKind::Pay,
             &other,
-        )
-        .unwrap() else {
+            payload.clone(),
+        ) else {
             unreachable!()
         };
         assert_eq!(
@@ -446,18 +635,17 @@ mod tests {
             Some(envelope.as_str()),
             "CLI concurrent open retains original envelope"
         );
-        let ClassicStart::Proceed(resumed) = start_preparation(&context, id, preparation).unwrap()
+        let ClassicStart::Proceed(resumed) = start(&id, IdentityFacts::Intent(payload.clone()))
         else {
             unreachable!()
         };
-        let BoundEnvelope::Sign(resumed) = bind_envelope(
-            &context,
+        let BoundEnvelope::Sign(resumed) = bind(
             resumed,
             OperationTool::CliPay,
             OperationKind::Pay,
             &other,
-        )
-        .unwrap() else {
+            payload.clone(),
+        ) else {
             unreachable!()
         };
         assert_eq!(
@@ -470,22 +658,33 @@ mod tests {
             winner.intent(),
             "CLI resume retains full intent"
         );
-        let ClassicStart::Proceed(legacy) = start_preparation(
-            &context,
-            BusinessId::parse("legacy-binding").unwrap(),
-            Preparation::Envelope(*intent.digest().as_bytes()),
-        )
-        .unwrap() else {
+        let legacy_id = BusinessId::parse("legacy-binding").unwrap();
+        operation_step(&context, |recorder| {
+            Preparation::Envelope(*intent.digest().as_bytes()).open(
+                recorder,
+                legacy_id.clone(),
+                OperationTool::CliPay,
+                OperationKind::Pay,
+                &envelope,
+            )
+        })
+        .unwrap();
+        let ClassicStart::Proceed(legacy) = start(&legacy_id, IdentityFacts::Intent(payload))
+        else {
             unreachable!()
         };
-        let BoundEnvelope::Sign(legacy) = bind_envelope(
-            &context,
+        assert_eq!(legacy.candidate(&other), envelope);
+        let BoundEnvelope::Sign(legacy) = bind(
             legacy,
             OperationTool::CliPay,
             OperationKind::Pay,
-            &envelope,
-        )
-        .unwrap() else {
+            &other,
+            IntentPayload::Pay {
+                destination: args["destination"].as_str().unwrap().into(),
+                asset: IntentAsset::Native,
+                amount_stroops: 17,
+            },
+        ) else {
             unreachable!()
         };
         assert_eq!(
@@ -493,31 +692,29 @@ mod tests {
             SlotKind::Envelope,
             "CLI legacy preparation stays Envelope"
         );
+        let claim_payload = IntentPayload::Claim {
+            balance_id: format!("00000000{}", "09".repeat(32)),
+            claimant: source.clone(),
+            asset: IntentAsset::Native,
+            amount_stroops: 17,
+        };
         let claim = operation_entry::classic_intent(
             IntentBaseFacts::new(
                 context.profile(),
-                intent.base().source(),
-                &fixture.current_policy(),
+                &source,
+                &policy,
                 ClassicFeeChoice::Explicit(500),
                 MemoFact::None,
             ),
-            IntentPayload::Claim {
-                balance_id: format!("00000000{}", "09".repeat(32)),
-                claimant: intent.base().source().into(),
-                asset: IntentAsset::Native,
-                amount_stroops: 17,
-            },
+            claim_payload.clone(),
         )
         .unwrap();
-        let id = BusinessId::parse("retained-claim").unwrap();
-        let staged = Preparation::Canonical {
-            intent: Box::new(claim.clone()),
-            decision: stellar_agent_core::audit_log::PolicyDecision::Allow,
-            rule_ttl_ms: Some(300_000),
+        let claim_facts = || IdentityFacts::Claim {
+            balance_id: format!("00000000{}", "09".repeat(32)),
+            claimant: source.clone(),
         };
-        let ClassicStart::Proceed(operation) =
-            start_preparation(&context, id.clone(), staged).unwrap()
-        else {
+        let id = BusinessId::parse("retained-claim").unwrap();
+        let ClassicStart::Proceed(operation) = start(&id, claim_facts()) else {
             unreachable!()
         };
         let xdr = operation_entry::intent_envelope(
@@ -528,33 +725,20 @@ mod tests {
             stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1000 + 120,
         )
         .unwrap();
-        bind_envelope(
-            &context,
+        bind(
             operation,
             OperationTool::CliClaim,
             OperationKind::Claim,
             &xdr,
-        )
-        .unwrap();
-        let partial = operation_step(&context, |recorder| {
-            operation_entry::lookup_canonical(
-                recorder,
-                &id,
-                IntentBaseFacts::new(
-                    context.profile(),
-                    claim.base().source(),
-                    &fixture.current_policy(),
-                    ClassicFeeChoice::Explicit(500),
-                    MemoFact::None,
-                ),
-                IdentityFacts::Claim {
-                    balance_id: format!("00000000{}", "09".repeat(32)),
-                    claimant: claim.base().source().into(),
-                },
-            )
-        });
+            claim_payload,
+        );
+        let ClassicStart::Proceed(partial) = start(&id, claim_facts()) else {
+            unreachable!()
+        };
         assert!(
-            matches!(partial, Ok(ClassicEntry::Resume(h)) if h.intent().intent_digest() == *claim.digest().as_bytes()),
+            partial
+                .resume
+                .is_some_and(|h| h.intent().intent_digest() == *claim.digest().as_bytes()),
             "CLI partial claim retains full digest without an RPC client"
         );
     }
