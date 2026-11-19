@@ -1068,23 +1068,36 @@ async fn trustline_commit_counts_the_opened_reserve() {
 
 /// The source holds one USDC trustline: 1.6 XLM against a reserve of
 /// 1.5 XLM. Removing it with limit 0 at margin 0 opens no subentry, so
-/// prepare and commit admit it and the envelope is sent.
+/// prepare and commit admit it and the envelope is sent, however the caller
+/// spells the asset the resolver accepts.
 #[tokio::test]
 #[serial]
 async fn removing_a_held_trustline_adds_no_reserve() {
-    use stellar_agent_test_support::xdr_fixtures::{
-        account_entry_xdr, trustline_entry_xdr, trustline_ledger_key_xdr,
-    };
     let _data_root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(217);
-    let seed = [0x4f; 32];
-    let source = gstrkey_for_seed(seed);
+    // One signer per spelling, so each removal is its own envelope.
+    for (seed, spelling) in [
+        ([0x4f; 32], "USDC".to_owned()),
+        ([0x50; 32], "usdc".to_owned()),
+        ([0x51; 32], format!("usdc:{USDC_TESTNET_ISSUER}")),
+    ] {
+        remove_held_trustline(seed, &spelling).await;
+    }
+}
+
+/// Prepares and commits the removal of the held USDC trustline of the
+/// signer of `seed`, with the asset spelled `spelling`.
+async fn remove_held_trustline(seed: [u8; 32], spelling: &str) {
+    use stellar_agent_test_support::xdr_fixtures::{
+        account_entry_xdr, trustline_entry_xdr, trustline_ledger_key_xdr,
+    };
     keyring_core::Entry::new("svc", "acct")
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
     crate::common::store_signer_identity("svc", "acct", seed);
+    let source = gstrkey_for_seed(seed);
     let rpc = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(HeldTrustlineResponder {
@@ -1108,12 +1121,13 @@ async fn removing_a_held_trustline_adds_no_reserve() {
         ),
     ));
     let mut args = trustline_args(&source);
+    args.asset = spelling.to_owned();
     args.limit_stroops = Some("0".to_owned());
     let prepared = server.call_stellar_trustline(args).await.unwrap();
     assert_ne!(
         prepared.is_error,
         Some(true),
-        "the removal needs no added reserve: {}",
+        "the removal of {spelling} needs no added reserve: {}",
         call_result_text(&prepared)
     );
     let data = call_result_json(&prepared)["data"].clone();
@@ -1133,13 +1147,14 @@ async fn removing_a_held_trustline_adds_no_reserve() {
     assert_ne!(
         committed.is_error,
         Some(true),
-        "the commit of the removal needs no added reserve: {}",
+        "the commit of the removal of {spelling} needs no added reserve: {}",
         call_result_text(&committed)
     );
     let methods = crate::common::received_methods(&rpc).await;
     assert_eq!(
         methods.iter().filter(|m| *m == "sendTransaction").count(),
-        1
+        1,
+        "{spelling}"
     );
 }
 

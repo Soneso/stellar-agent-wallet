@@ -675,10 +675,9 @@ impl WalletServer {
         // ── Step 3: Fetch source account (feeds the policy gate's
         // account_view; sequence number consumed by the envelope build at
         // Step 8) ──────────────────────────────────────────────────────────
-        // The read requests the trustline, so the view tells whether it exists.
-        let requested: Vec<Asset> = Asset::from_code_and_issuer(&resolved.code, &resolved.issuer)
-            .into_iter()
-            .collect();
+        let requested = Asset::trustline_request(&resolved.code, &resolved.issuer);
+        // The leg names the asset the envelope carries: the resolved code and issuer.
+        args_value["asset"] = json!(format!("{}:{}", resolved.code, resolved.issuer));
         let source_account_view =
             match crate::sequence_floor::fetch_account_with_sequence_catchup_within(
                 &self.sequence_floor,
@@ -1324,11 +1323,7 @@ impl WalletServer {
             Err(result) => return Ok(result),
         };
 
-        // The read requests the trustline, so the view tells whether it exists.
-        let requested: Vec<Asset> =
-            Asset::from_code_and_issuer(&auth_asset_code, &auth_asset_issuer)
-                .into_iter()
-                .collect();
+        let requested = Asset::trustline_request(&auth_asset_code, &auth_asset_issuer);
         let source_account_view = match crate::sequence_floor::fetch_account_with_sequence_catchup(
             &self.sequence_floor,
             &client,

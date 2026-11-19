@@ -263,6 +263,25 @@ fn other_source_trustline(operation: &ValuedOperation, wallet: &str) -> bool {
             .is_some_and(|source| source.base_account() != wallet)
 }
 
+/// The trustline operation that decides `count` pool share trustlines the
+/// `wallet` opens in a transaction without another leg: one trustline leg
+/// without an asset each.
+fn pool_share_trustline_operation(count: u32, wallet: &str) -> ValuedOperation {
+    let leg = ValueLeg {
+        kind: ActionKind::Trustline,
+        amount: None,
+        asset: None,
+        destination: None,
+    };
+    let legs = vec![leg; usize::try_from(count).unwrap_or(usize::MAX)];
+    ValuedOperation {
+        operation_index: 0,
+        route: PaymentRoute::Trustline,
+        policy_args: serde_json::json!({ "source": wallet, "total_fee_stroops": 0 }),
+        value: Some(ValueEffects::new(legs)),
+    }
+}
+
 /// The account view after the wallet's fee, earlier native debits, and the
 /// subentries earlier operations open.
 ///
@@ -393,8 +412,7 @@ impl WalletServer {
                 effects.payment_legs(),
                 chain_id,
                 spent_stroops,
-                i64::from(effects.pool_share_trustlines)
-                    .saturating_mul(POOL_SHARE_TRUSTLINE_SUBENTRIES),
+                effects.pool_share_trustlines,
                 shape.as_ref(),
                 snapshot,
                 client,
@@ -625,10 +643,13 @@ impl WalletServer {
     /// `spent_stroops` is the native amount the wallet already pays, such as
     /// the fee. Each native debit reduces the balance later legs see, and
     /// each trustline an allowed leg opens on the wallet raises the reserve
-    /// later legs see. `opened_subentries` starts that count. A wallet
-    /// account the profile names is read once, with the trustlines its own
-    /// operations name; each recipient base account at most once. Without a
-    /// leg, nothing is read.
+    /// later legs see. Each of the `pool_share_trustlines` the wallet opens
+    /// adds [`POOL_SHARE_TRUSTLINE_SUBENTRIES`] to that count for every leg.
+    /// Without a leg, those trustlines are decided as one trustline
+    /// operation, so the reserve check still runs. A wallet account the
+    /// profile names is read once, with the trustlines its own operations
+    /// name; each recipient base account at most once. Without a leg or a
+    /// pool share trustline, nothing is read.
     ///
     /// An approval requirement of a leg is returned with the `approvable`
     /// shape; without one it refuses with
@@ -640,20 +661,30 @@ impl WalletServer {
     )]
     async fn sep43_decide_legs<'shape>(
         &self,
-        payment_legs: Vec<&ValuedOperation>,
+        mut payment_legs: Vec<&ValuedOperation>,
         chain_id: &str,
         mut spent_stroops: i128,
-        mut opened: i64,
+        pool_share_trustlines: u32,
         approvable: Option<&'shape Approvable>,
         snapshot: &GateSnapshot,
         client: Option<StellarRpcClient>,
         gated: &mut Sep43Effects,
     ) -> Result<Option<OperationRequirement<'shape>>, ToolError> {
         let mut operation_requirement = None;
+        let account = &self.profile.mcp_signer_default.account;
+        let pool_shares = i64::from(pool_share_trustlines);
+        let mut opened = pool_shares.saturating_mul(POOL_SHARE_TRUSTLINE_SUBENTRIES);
+        let pool_share_operation;
+        if payment_legs.is_empty() && pool_share_trustlines > 0 {
+            // Each leg is a trustline the account read cannot show, so the
+            // reserve counts one subentry for it; the view carries the rest.
+            pool_share_operation = pool_share_trustline_operation(pool_share_trustlines, account);
+            payment_legs.push(&pool_share_operation);
+            opened = pool_shares.saturating_mul(POOL_SHARE_TRUSTLINE_SUBENTRIES - 1);
+        }
         if payment_legs.is_empty() {
             return Ok(operation_requirement);
         }
-        let account = &self.profile.mcp_signer_default.account;
         let wallet = stellar_strkey::ed25519::PublicKey::from_string(account).ok();
         let client = match client {
             Some(client) => client,

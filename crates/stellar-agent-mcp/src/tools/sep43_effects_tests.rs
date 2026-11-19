@@ -1794,6 +1794,30 @@ async fn a_held_trustline_adds_no_reserve() {
     }
 }
 
+/// A trustline an earlier operation opens counts as held for a later one:
+/// opening USDC and then changing its limit needs the reserve of one
+/// trustline, to the stroop.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn a_trustline_opened_earlier_counts_as_held() {
+    let fx = Fixture::new(trustline_reserve_rules()).await;
+    let base = stellar_agent_core::BASE_RESERVE_STROOPS;
+    let open_then_change = || {
+        fx.tx(vec![
+            trustline_on(*b"USDC", 100 * XLM),
+            trustline_on(*b"USDC", 200 * XLM),
+        ])
+    };
+    fx.account(fx.key, RESERVE + base + 200, None);
+    signed(&fx.sign(open_then_change()).await);
+    fx.account(fx.key, RESERVE + base + 199, None);
+    assert_eq!(
+        refused(&fx.sign(open_then_change()).await).0,
+        "policy.deny.minimum_reserve_breached"
+    );
+}
+
 /// A `ChangeTrust` whose operation source is another account opens no
 /// subentry on the wallet: the wallet's pre-call reserve and fee suffice.
 #[tokio::test]
@@ -1834,6 +1858,76 @@ async fn a_pool_share_trustline_adds_two_base_reserves() {
         refused(&fx.sign(pooled()).await).0,
         "policy.deny.minimum_reserve_breached"
     );
+}
+
+/// A pool share `ChangeTrust` with a nonzero limit.
+fn pool_share_trustline() -> OperationBody {
+    OperationBody::ChangeTrust(stellar_xdr::ChangeTrustOp {
+        line: stellar_xdr::ChangeTrustAsset::PoolShare(
+            stellar_xdr::LiquidityPoolParameters::default(),
+        ),
+        limit: 100 * XLM,
+    })
+}
+
+/// Checks a transaction whose only operation is `body` through both tools:
+/// at `boundary` the sign tool signs and the submit tool reaches the send;
+/// one stroop under, both refuse with the reserve breach and sign nothing.
+async fn assert_only_operation_boundary(fx: &Fixture, body: OperationBody, boundary: i64) {
+    let only = fx.tx(vec![body]);
+    fx.account(fx.key, boundary, None);
+    let [sign, submit] = both(fx, &only).await;
+    signed(&sign);
+    sent(&submit);
+    let sends = fx.ledger.sends.load(Ordering::SeqCst);
+    fx.account(fx.key, boundary - 1, None);
+    for result in both(fx, &only).await {
+        assert_eq!(refused(&result).0, "policy.deny.minimum_reserve_breached");
+    }
+    assert_eq!(
+        fx.ledger.sends.load(Ordering::SeqCst),
+        sends,
+        "nothing sent"
+    );
+}
+
+/// A transaction whose only operation opens a credit trustline needs one
+/// base reserve more than the account's reserve and fee, to the stroop.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn a_credit_trustline_alone_is_checked_at_the_reserve() {
+    let fx = Fixture::new(trustline_reserve_rules()).await;
+    let base = stellar_agent_core::BASE_RESERVE_STROOPS;
+    let credit = trustline_on(*b"USDC", 100 * XLM);
+    assert_only_operation_boundary(&fx, credit, RESERVE + base + 100).await;
+}
+
+/// A transaction whose only operation opens a pool share trustline is
+/// decided by the trustline rule and needs two base reserves more, to the
+/// stroop.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn a_pool_share_trustline_alone_is_checked_at_the_reserve() {
+    let fx = Fixture::new(trustline_reserve_rules()).await;
+    let base = stellar_agent_core::BASE_RESERVE_STROOPS;
+    assert_only_operation_boundary(&fx, pool_share_trustline(), RESERVE + 2 * base + 100).await;
+}
+
+/// A pool share `ChangeTrust` whose source is another account opens nothing
+/// on the wallet: the wallet's reserve and fee alone sign it.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn another_sources_pool_share_trustline_adds_no_reserve() {
+    let fx = Fixture::new(trustline_reserve_rules()).await;
+    fx.source(B, true);
+    fx.account(fx.key, RESERVE + 100, None);
+    let foreign = fx.ops(vec![from(B, None, pool_share_trustline())]);
+    let [sign, submit] = both(&fx, &foreign).await;
+    signed(&sign);
+    sent(&submit);
 }
 
 /// The wallet fee reduces the reserve balance exactly once.

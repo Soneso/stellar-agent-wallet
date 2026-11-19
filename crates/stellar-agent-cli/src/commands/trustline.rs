@@ -430,10 +430,7 @@ where
 
     // ── GATE 3: Fetch source account (feeds the policy gate's account_view;
     // sequence number also consumed by the envelope build below) ────────────
-    // The read requests the trustline, so the view tells whether it exists.
-    let requested: Vec<Asset> = Asset::from_code_and_issuer(&resolved.code, &resolved.issuer)
-        .into_iter()
-        .collect();
+    let requested = Asset::trustline_request(&resolved.code, &resolved.issuer);
     let source_account_view = match fetch_account(&rpc_client, &args.from, &requested).await {
         Ok(v) => v,
         Err(e) => {
@@ -512,7 +509,9 @@ where
             );
         }
     };
-    let policy_args = with_total_fee(trustline_policy_args(&args.from, &args.asset), total_fee);
+    // The leg names the asset the envelope carries: the resolved code and issuer.
+    let leg_asset = format!("{}:{}", resolved.code, resolved.issuer);
+    let policy_args = with_total_fee(trustline_policy_args(&args.from, &leg_asset), total_fee);
     // `account_view` is the fetched source account (feeds `minimum_reserve`).
     // `identity_view` stays `None`, matching the MCP twin: the issuer's
     // self-asserted `home_domain` must not feed allowlist matching, so
@@ -1326,10 +1325,7 @@ where
     let issuer_flags: Option<AccountFlagsView> = issuer_account_view
         .as_ref()
         .and_then(|v| v.account_flags.clone());
-    // The read requests the trustline, so the view tells whether it exists.
-    let requested: Vec<Asset> = Asset::from_code_and_issuer(&asset.code, &asset.issuer)
-        .into_iter()
-        .collect();
+    let requested = Asset::trustline_request(&asset.code, &asset.issuer);
     let source_account_view = match read_within_readiness_deadline(
         readiness_deadline,
         fetch_account(&client, &args.from, &requested),
@@ -1456,7 +1452,9 @@ where
         Ok(fee) => fee,
         Err(e) => return write_envelope(out, &Envelope::<()>::err(&e), 1),
     };
-    let policy_args = with_total_fee(trustline_policy_args(&args.from, &args.asset), total_fee);
+    // The leg names the asset the envelope carries: the resolved code and issuer.
+    let leg_asset = format!("{}:{}", asset.code, asset.issuer);
+    let policy_args = with_total_fee(trustline_policy_args(&args.from, &leg_asset), total_fee);
     let floor = match mainnet_floor_source_requesting(
         &context,
         &client,
@@ -3687,15 +3685,26 @@ pub(crate) mod tests {
 
         /// The agent holds one USDC trustline: 1.6 XLM against a reserve of
         /// 1.5 XLM. Removing it with limit 0 at margin 0 opens no subentry,
-        /// so it signs and sends on mainnet and on testnet.
+        /// so it signs and sends on mainnet and on testnet, however the
+        /// caller spells the asset the resolver accepts.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
         async fn removing_a_held_trustline_adds_no_reserve() {
             let agent = agent();
-            for (name, mainnet, issuer) in [
-                ("mainnet-trustline-held-removal", true, ISSUER),
-                ("testnet-trustline-held-removal", false, TESTNET_ISSUER),
+            // The code as the caller spells it, and whether it names the issuer.
+            for (name, mainnet, code, with_issuer) in [
+                ("mainnet-trustline-held-removal", true, "USDC", true),
+                ("mainnet-trustline-held-lower", true, "usdc", true),
+                ("mainnet-trustline-held-bare", true, "usdc", false),
+                ("testnet-trustline-held-removal", false, "USDC", true),
+                ("testnet-trustline-held-lower", false, "usdc", true),
             ] {
+                let issuer = if mainnet { ISSUER } else { TESTNET_ISSUER };
+                let spelling = if with_issuer {
+                    format!("{code}:{issuer}")
+                } else {
+                    code.to_owned()
+                };
                 let (key, entry) = crate::test_rpc::trustline_xdr(&agent, "USDC", issuer, 0, 1, 0);
                 let endpoint = || {
                     ledger(mainnet, 0)
@@ -3714,7 +3723,7 @@ pub(crate) mod tests {
                 .build()
                 .await;
                 let mut args = mainnet_args(&fixture);
-                args.asset = asset;
+                args.asset = spelling;
                 args.limit_stroops = Some(0);
 
                 let run = run(&fixture, &args).await;
