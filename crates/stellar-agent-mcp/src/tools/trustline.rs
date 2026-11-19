@@ -675,12 +675,15 @@ impl WalletServer {
         // ── Step 3: Fetch source account (feeds the policy gate's
         // account_view; sequence number consumed by the envelope build at
         // Step 8) ──────────────────────────────────────────────────────────
+        let requested = Asset::trustline_request(&resolved.code, &resolved.issuer);
+        // The leg names the asset the envelope carries: the resolved code and issuer.
+        args_value["asset"] = json!(format!("{}:{}", resolved.code, resolved.issuer));
         let source_account_view =
             match crate::sequence_floor::fetch_account_with_sequence_catchup_within(
                 &self.sequence_floor,
                 &client,
                 &args.from,
-                &[],
+                &requested,
                 deadline,
             )
             .await
@@ -717,9 +720,10 @@ impl WalletServer {
             total_classic_fee_stroops(fee_per_op_stroops, CLASSIC_SINGLE_OPERATION_COUNT)?;
         args_value["total_fee_stroops"] = json!(total_fee_stroops);
         let floor = match self
-            .classic_floor_source(
+            .classic_floor_source_requesting(
                 &client,
                 &source_account_view.account_id,
+                &requested,
                 &["stellar_trustline", "stellar_trustline_commit"],
             )
             .await
@@ -1319,11 +1323,12 @@ impl WalletServer {
             Err(result) => return Ok(result),
         };
 
+        let requested = Asset::trustline_request(&auth_asset_code, &auth_asset_issuer);
         let source_account_view = match crate::sequence_floor::fetch_account_with_sequence_catchup(
             &self.sequence_floor,
             &client,
             &args.from,
-            &[],
+            &requested,
         )
         .await
         {
@@ -1346,9 +1351,10 @@ impl WalletServer {
         // `home_domain`, which must not feed allowlist matching; identity-class
         // criteria configured on this verb fail closed.
         let floor = match self
-            .classic_floor_source(
+            .classic_floor_source_requesting(
                 &client,
                 &source_account_view.account_id,
+                &requested,
                 &["stellar_trustline_commit", "stellar_trustline"],
             )
             .await

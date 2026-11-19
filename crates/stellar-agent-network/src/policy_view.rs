@@ -40,11 +40,12 @@
 //! `PolicyError::CriterionEvaluationFailed` when its view is absent, denying
 //! rather than allowing the call).
 
+use stellar_agent_core::policy::v1::asset_equivalence::assets_equivalent;
 use stellar_agent_core::policy::v1::{
     AccountIdentityView, AccountReserveLookupError, AccountReservesView,
 };
 
-use crate::AccountView;
+use crate::{AccountView, AssetView};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // AccountViewAdapter
@@ -162,6 +163,36 @@ impl AccountReservesView for AccountViewAdapter<'_> {
                 })
             })
     }
+
+    /// `Some(true)` when a non-native entry of `AccountView.balances` is
+    /// `asset`, `Some(false)` when the read requested `asset` and listed no
+    /// entry for it, and `None` otherwise.
+    ///
+    /// The view lists only the trustlines its read requested, so an asset
+    /// the read did not request is unknown.
+    fn holds_trustline(&self, asset: &str, network_passphrase: &str) -> Option<bool> {
+        let is_asset = |view: &AssetView| {
+            view.issuer.as_deref().is_some_and(|issuer| {
+                assets_equivalent(
+                    &format!("{}:{issuer}", view.asset_type),
+                    asset,
+                    network_passphrase,
+                )
+            })
+        };
+        if self
+            .0
+            .balances
+            .iter()
+            .any(|b| b.asset.asset_type != "native" && is_asset(&b.asset))
+        {
+            Some(true)
+        } else if self.0.requested_trustlines.iter().any(is_asset) {
+            Some(false)
+        } else {
+            None
+        }
+    }
 }
 
 /// An owned account view, the form an
@@ -174,6 +205,10 @@ impl AccountReservesView for AccountView {
 
     fn balance_stroops(&self) -> Result<i64, AccountReserveLookupError> {
         AccountViewAdapter(self).balance_stroops()
+    }
+
+    fn holds_trustline(&self, asset: &str, network_passphrase: &str) -> Option<bool> {
+        AccountViewAdapter(self).holds_trustline(asset, network_passphrase)
     }
 }
 
@@ -283,6 +318,113 @@ mod tests {
             None,
             None,
         )
+    }
+
+    /// A listed trustline answers `Some(true)`, a requested one without an
+    /// entry `Some(false)`, and one the read did not request is unknown.
+    #[test]
+    fn account_view_adapter_holds_only_listed_trustlines() {
+        const ISSUER: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
+        let passphrase = stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
+        let mut view = make_view("100.0000000", 1);
+        let adapter = AccountViewAdapter::new(&view);
+        assert_eq!(
+            adapter.holds_trustline(&format!("USDC:{ISSUER}"), passphrase),
+            None
+        );
+        view.balances.push(BalanceView::new(
+            AssetView::credit("USDC", ISSUER),
+            "0.0000000".to_owned(),
+            Some("100.0000000".to_owned()),
+            "0.0000000".to_owned(),
+            "0.0000000".to_owned(),
+        ));
+        let adapter = AccountViewAdapter::new(&view);
+        assert_eq!(
+            adapter.holds_trustline(&format!("USDC:{ISSUER}"), passphrase),
+            Some(true)
+        );
+        assert_eq!(
+            adapter.holds_trustline(&format!("EURC:{ISSUER}"), passphrase),
+            None
+        );
+        assert_eq!(
+            view.holds_trustline(&format!("USDC:{ISSUER}"), passphrase),
+            Some(true)
+        );
+        view.requested_trustlines = vec![
+            AssetView::credit("USDC", ISSUER),
+            AssetView::credit("EURC", ISSUER),
+        ];
+        let adapter = AccountViewAdapter::new(&view);
+        assert_eq!(
+            adapter.holds_trustline(&format!("USDC:{ISSUER}"), passphrase),
+            Some(true)
+        );
+        assert_eq!(
+            adapter.holds_trustline(&format!("EURC:{ISSUER}"), passphrase),
+            Some(false)
+        );
+        assert_eq!(
+            adapter.holds_trustline(&format!("USDT:{ISSUER}"), passphrase),
+            None
+        );
+    }
+
+    /// A read that requests a trustline records it: the listed one answers
+    /// `Some(true)` and the absent one `Some(false)`.
+    #[tokio::test]
+    async fn a_requested_trustline_answers_present_or_absent() {
+        use stellar_agent_test_support::xdr_fixtures::{
+            account_entry_xdr, account_ledger_key_xdr, trustline_entry_xdr,
+            trustline_ledger_key_xdr,
+        };
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer};
+        const OWNER: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+        const ISSUER: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(stellar_agent_test_support::EchoIdResponder::new(
+                serde_json::json!({
+                    "entries": [
+                        {
+                            "key": account_ledger_key_xdr(OWNER),
+                            "xdr": account_entry_xdr(OWNER, 70_000_000, 1),
+                            "lastModifiedLedgerSeq": 6,
+                        },
+                        {
+                            "key": trustline_ledger_key_xdr(OWNER, "USDC", ISSUER),
+                            "xdr": trustline_entry_xdr(OWNER, "USDC", ISSUER, 0),
+                            "lastModifiedLedgerSeq": 6,
+                        },
+                    ],
+                    "latestLedger": 300,
+                }),
+            ))
+            .mount(&server)
+            .await;
+        let client = crate::StellarRpcClient::new(&server.uri()).unwrap();
+        let requested = [
+            crate::Asset::from_code_and_issuer("USDC", ISSUER).unwrap(),
+            crate::Asset::from_code_and_issuer("EURC", ISSUER).unwrap(),
+        ];
+        let view = crate::fetch_account(&client, OWNER, &requested)
+            .await
+            .unwrap();
+        let passphrase = stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
+        assert_eq!(
+            view.holds_trustline(&format!("USDC:{ISSUER}"), passphrase),
+            Some(true)
+        );
+        assert_eq!(
+            view.holds_trustline(&format!("EURC:{ISSUER}"), passphrase),
+            Some(false)
+        );
+        assert_eq!(
+            view.holds_trustline(&format!("USDT:{ISSUER}"), passphrase),
+            None
+        );
     }
 
     // ── account_view_adapter_reserves_stroops_passes_through ─────────────────

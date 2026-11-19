@@ -277,6 +277,9 @@ pub struct TransactionEffects {
     pub unvalued: Vec<UnvaluedOperation>,
     /// The memo of a `Tx` envelope; `None` for a fee bump and for a text memo that is not UTF-8.
     pub memo: Option<ClassicMemo>,
+    /// The wallet-sourced pool share `ChangeTrust` operations with a nonzero limit.
+    /// Each can open a pool share trustline, two subentries under CAP-38.
+    pub pool_share_trustlines: u32,
 }
 
 impl TransactionEffects {
@@ -714,6 +717,7 @@ fn prepare(
                 valued: Vec::new(),
                 unvalued: Vec::new(),
                 memo: None,
+                pool_share_trustlines: 0,
             }));
         }
     };
@@ -734,6 +738,7 @@ fn prepare(
         valued: Vec::new(),
         unvalued: Vec::new(),
         memo,
+        pool_share_trustlines: 0,
     };
     // Refuse the whole transaction before deriving any operation's value.
     validate_amounts(&tx)?;
@@ -799,6 +804,37 @@ fn invocation_operation(
     }
 }
 
+/// The argument of a pool share trustline operation that marks it.
+pub const POOL_SHARE_ARG: &str = "pool_share";
+
+/// The trustline operation of a wallet-sourced pool share `ChangeTrust` at
+/// `operation_index`. Its one trustline leg carries no asset, since no policy
+/// asset id names a liquidity pool, and its arguments set [`POOL_SHARE_ARG`].
+fn pool_share_operation(
+    tx: &Transaction,
+    source: &MuxedAccount,
+    limit: i64,
+    operation_index: u32,
+) -> ValuedOperation {
+    let leg = ValueLeg {
+        kind: ActionKind::Trustline,
+        amount: None,
+        asset: None,
+        destination: None,
+    };
+    ValuedOperation {
+        operation_index,
+        route: PaymentRoute::Trustline,
+        policy_args: serde_json::json!({
+            "source": format!("{}", stellar_strkey::ed25519::PublicKey(*base_key(source))),
+            "total_fee_stroops": tx.fee,
+            "limit_stroops": limit.to_string(),
+            POOL_SHARE_ARG: true,
+        }),
+        value: Some(ValueEffects::single(leg)),
+    }
+}
+
 /// Whether an operation carries no value effect whatever its source is.
 fn has_no_effect(body: &OperationBody) -> bool {
     match body {
@@ -830,14 +866,31 @@ fn decode_operation(
 ) -> Result<(), TransactionEffectsError> {
     #[cfg(test)]
     tests::record_operation();
-    if has_no_effect(&operation.body) {
-        return Ok(());
-    }
     let source = operation
         .source_account
         .as_ref()
         .unwrap_or(&tx.source_account);
     let other_source = !is_wallet(source, wallet);
+    if let OperationBody::ChangeTrust(trust) = &operation.body
+        && matches!(trust.line, ChangeTrustAsset::PoolShare(_))
+    {
+        // Another source's pool share trustline is no effect of the wallet.
+        if !other_source {
+            if trust.limit > 0 {
+                effects.pool_share_trustlines = effects.pool_share_trustlines.saturating_add(1);
+            }
+            effects.valued.push(pool_share_operation(
+                tx,
+                source,
+                trust.limit,
+                operation_index,
+            ));
+        }
+        return Ok(());
+    }
+    if has_no_effect(&operation.body) {
+        return Ok(());
+    }
     let incoming = |destination: &MuxedAccount| other_source && is_wallet(destination, wallet);
     let mut value = |route| -> Result<(), TransactionEffectsError> {
         effects
@@ -2376,6 +2429,7 @@ mod tests {
                     valued: Vec::new(),
                     unvalued: Vec::new(),
                     memo: Some(ClassicMemo::None),
+                    pool_share_trustlines: 0,
                 };
                 match fixture(kind).1 {
                     Outcome::Valued(route) => {
@@ -3003,10 +3057,13 @@ mod tests {
                 matches!(outcome, Outcome::None).then_some(operation(body))
             })
             .collect();
-        operations.push(operation(OperationBody::ChangeTrust(ChangeTrustOp {
+        // Another source's pool share trustline is no effect of the wallet.
+        let mut other_pool = operation(OperationBody::ChangeTrust(ChangeTrustOp {
             line: ChangeTrustAsset::PoolShare(LiquidityPoolParameters::default()),
             limit: 100,
-        })));
+        }));
+        other_pool.source_account = Some(muxed(THIRD, None));
+        operations.push(other_pool);
         operations.push(operation(OperationBody::Clawback(ClawbackOp {
             from: muxed(THIRD, None),
             amount: 500,
@@ -3019,6 +3076,39 @@ mod tests {
             empty(&decode(&transaction(vec![op.clone()])));
         }
         empty(&decode(&transaction(operations)));
+    }
+
+    /// A wallet-sourced pool share `ChangeTrust` with a nonzero limit counts;
+    /// a removal and another source's operation count none.
+    #[test]
+    fn pool_share_trustlines_count_the_wallet_openings() {
+        let pool = |limit| {
+            operation(OperationBody::ChangeTrust(ChangeTrustOp {
+                line: ChangeTrustAsset::PoolShare(LiquidityPoolParameters::default()),
+                limit,
+            }))
+        };
+        let mut other = pool(100);
+        other.source_account = Some(muxed(THIRD, None));
+        let effects = decode(&transaction(vec![
+            pool(100),
+            pool(0),
+            other,
+            pool(i64::MAX),
+        ]));
+        assert_eq!(effects.pool_share_trustlines, 2);
+        // Each wallet-sourced one is a trustline operation at its own index,
+        // the removal too, with one leg that carries no asset.
+        let indices: Vec<u32> = effects.valued.iter().map(|op| op.operation_index).collect();
+        assert_eq!(indices, [0, 1, 3]);
+        for valued in &effects.valued {
+            assert_eq!(valued.route, PaymentRoute::Trustline);
+            assert_eq!(valued.policy_args[POOL_SHARE_ARG], true);
+            let legs = valued.value.as_ref().unwrap().legs();
+            assert_eq!(legs.len(), 1);
+            assert_eq!(legs[0].kind, ActionKind::Trustline);
+            assert_eq!(legs[0].asset, None);
+        }
     }
 
     #[test]

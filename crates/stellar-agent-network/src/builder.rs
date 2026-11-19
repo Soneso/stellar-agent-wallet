@@ -225,6 +225,16 @@ impl Asset {
         })
     }
 
+    /// The trustlines an account read requests so its view tells whether the
+    /// account holds `code:issuer`: that asset, or none when it is not a
+    /// valid credit asset.
+    #[must_use]
+    pub fn trustline_request(code: &str, issuer: &str) -> Vec<Self> {
+        Self::from_code_and_issuer(code, issuer)
+            .into_iter()
+            .collect()
+    }
+
     /// Converts to the `stellar-baselib` `Asset` type used for operation construction.
     ///
     /// # Errors

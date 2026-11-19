@@ -27,6 +27,11 @@ pub use crate::amount::STROOPS_PER_XLM;
 ///
 pub const BASE_RESERVE_STROOPS: i64 = 5_000_000;
 
+/// The subentries a liquidity pool share trustline counts toward its
+/// account's reserve under
+/// [CAP-0038](https://github.com/stellar/stellar-protocol/blob/master/core/cap-0038.md).
+pub const POOL_SHARE_TRUSTLINE_SUBENTRIES: i64 = 2;
+
 /// Default classic-operation fee in stroops (100 stroops = 0.00001 XLM).
 ///
 /// The Stellar protocol minimum base fee per operation is 100 stroops per

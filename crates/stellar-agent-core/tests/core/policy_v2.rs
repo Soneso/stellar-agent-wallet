@@ -2256,6 +2256,37 @@ fn verified_sequence_is_a_positive_toml_integer() {
         .is_ok()
     );
 }
+/// A trustline leg without an asset is a liquidity pool share, which no
+/// allowlist entry can name, so the allowlist refuses it.
+#[test]
+#[serial_test::serial]
+fn asset_allowlist_refuses_an_assetless_trustline() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    use stellar_agent_core::policy::DenyReason;
+    use stellar_agent_core::policy::v1::criteria::{
+        Criterion, asset_allowlist::AssetAllowlistCriterion,
+    };
+    use stellar_agent_core::policy::v1::value::{ActionKind, ValueClass, ValueLeg};
+    let profile = profile(false);
+    let tool = tool();
+    let state = PolicyStateStore::new();
+    let args = serde_json::json!({});
+    let context = ctx(&tool, &profile, &args, &state).with_value(ValueClass::single(ValueLeg {
+        kind: ActionKind::Trustline,
+        amount: None,
+        asset: None,
+        destination: None,
+    }));
+    assert_eq!(
+        AssetAllowlistCriterion::new(vec!["native".into()])
+            .unwrap()
+            .evaluate(&context)
+            .unwrap(),
+        Some(DenyReason::AssetNotAllowlisted)
+    );
+}
 #[test]
 #[serial_test::serial]
 fn asset_allowlist_leaves_assetless_claims_unrestricted() {

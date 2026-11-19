@@ -94,6 +94,8 @@ mod rpc_error_text_redaction;
 mod smart_account_signer_free;
 #[path = "cli/staged_submit_probe_ordering.rs"]
 mod staged_submit_probe_ordering;
+#[path = "cli/trustline_held_reserve.rs"]
+mod trustline_held_reserve;
 #[path = "cli/tx_receipt_clear_integration.rs"]
 mod tx_receipt_clear_integration;
 #[path = "cli/usage_error_envelope.rs"]

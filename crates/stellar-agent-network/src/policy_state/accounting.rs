@@ -496,12 +496,34 @@ impl FloorSource {
         profile: &Profile,
         deadline: tokio::time::Instant,
     ) -> Result<Self, FloorSourceError> {
+        Self::read_requesting(client, account_id, &[], store, profile, deadline).await
+    }
+
+    /// [`FloorSource::read`] whose account read also requests the trustlines
+    /// of `trustline_assets`, so the source tells whether each exists.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`FloorSource::read`].
+    pub async fn read_requesting(
+        client: &crate::StellarRpcClient,
+        account_id: &str,
+        trustline_assets: &[crate::Asset],
+        store: &super::PersistedWindowStore,
+        profile: &Profile,
+        deadline: tokio::time::Instant,
+    ) -> Result<Self, FloorSourceError> {
         let report = crate::operational::operational_check_single(client, deadline)
             .await
             .map_err(FloorSourceError::Read)?;
         let observed = crate::operational::read_within_readiness_deadline(
             deadline,
-            crate::account::fetch_account_observed(client, account_id, &report),
+            crate::account::fetch_account_observed_requesting(
+                client,
+                account_id,
+                trustline_assets,
+                &report,
+            ),
         )
         .await
         .map_err(FloorSourceError::Read)?;
@@ -591,6 +613,10 @@ impl AccountReservesView for FloorSource {
 
     fn effective_native_reservations_stroops(&self) -> Option<u64> {
         self.input().effective_native_reservations_stroops()
+    }
+
+    fn holds_trustline(&self, asset: &str, network_passphrase: &str) -> Option<bool> {
+        self.input().holds_trustline(asset, network_passphrase)
     }
 }
 
@@ -683,3 +709,46 @@ pub(super) enum Admission {
 #[cfg(all(test, feature = "mainnet-write"))]
 #[path = "accounting_floor_tests.rs"]
 mod floor_tests;
+
+#[cfg(test)]
+mod floor_source_tests {
+    use super::*;
+    use crate::account::{AssetView, BalanceView, ThresholdsView};
+
+    /// The floor source answers the trustline question of the account it read.
+    #[test]
+    fn the_floor_source_answers_the_observed_trustlines() {
+        const ISSUER: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
+        let trustline = BalanceView::new(
+            AssetView::credit("USDC", ISSUER),
+            "0".to_owned(),
+            None,
+            "0".to_owned(),
+            "0".to_owned(),
+        );
+        let view = AccountView::new(
+            ISSUER.to_owned(),
+            1,
+            1,
+            vec![trustline],
+            ThresholdsView::new(1, 1, 1, 1),
+            vec![],
+            None,
+            None,
+        );
+        let source = FloorSource {
+            observed: ObservedAccount::new(view, 100, 1_000, 900),
+            reserved_stroops: 0,
+            readiness: crate::operational::OperationalReport {
+                latest_ledger: 100,
+                close_time_unix: 1,
+                close_lag_seconds: 0,
+            },
+        };
+        let passphrase = stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
+        assert_eq!(
+            source.holds_trustline(&format!("USDC:{ISSUER}"), passphrase),
+            Some(true)
+        );
+    }
+}

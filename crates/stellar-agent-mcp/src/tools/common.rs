@@ -2207,6 +2207,23 @@ impl WalletServer {
         source: &str,
         tools: &[&'static str],
     ) -> Result<Option<stellar_agent_network::policy_state::FloorSource>, ToolError> {
+        self.classic_floor_source_requesting(client, source, &[], tools)
+            .await
+    }
+
+    /// [`Self::classic_floor_source`] whose account read also requests the
+    /// trustlines of `trustline_assets`.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::classic_floor_source`].
+    pub(crate) async fn classic_floor_source_requesting(
+        &self,
+        client: &stellar_agent_network::StellarRpcClient,
+        source: &str,
+        trustline_assets: &[stellar_agent_network::Asset],
+        tools: &[&'static str],
+    ) -> Result<Option<stellar_agent_network::policy_state::FloorSource>, ToolError> {
         use stellar_agent_network::policy_state::{FloorSource, floor_rule_matches};
         let Some(policy) = self.mainnet_evaluation_policy() else {
             return Ok(None);
@@ -2219,9 +2236,10 @@ impl WalletServer {
         {
             return Ok(None);
         }
-        FloorSource::read(
+        FloorSource::read_requesting(
             client,
             source,
+            trustline_assets,
             &self.window_store,
             self.security_profile(),
             stellar_agent_network::operational::readiness_deadline(),
@@ -13270,6 +13288,81 @@ pub(crate) mod tests {
                     "{tool:?}: {result}"
                 );
             }
+        }
+
+        /// Under a met balance floor and `minimum_reserve` at margin 0 on
+        /// both trustline names, the preparation and the commit read the
+        /// floor source, which requests the trustline too. The source holds
+        /// the trustline: 1.6 XLM against a reserve of 1.5 XLM. Its removal
+        /// prepares, commits and sends once.
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        #[serial_test::serial]
+        async fn mainnet_floored_removal_of_a_held_trustline_adds_no_reserve() {
+            use stellar_agent_test_support::xdr_fixtures::{
+                account_ledger_key_xdr, trustline_entry_xdr, trustline_ledger_key_xdr,
+            };
+            use stellar_xdr::{LedgerEntryData, Limits, ReadXdr, WriteXdr};
+            let primary = wiremock::MockServer::start().await;
+            let oracle = wiremock::MockServer::start().await;
+            let f = routed_fixture_with(
+                |raw| {
+                    let mut raw = classic_policy(&raw);
+                    for name in ["stellar_trustline", "stellar_trustline_commit"] {
+                        raw = with_floor(&raw, name, 1);
+                        raw = with_criterion(
+                            &raw,
+                            name,
+                            "minimum_reserve",
+                            "margin_stroops",
+                            &toml_edit::Value::from(0),
+                        );
+                    }
+                    raw
+                },
+                |_| {},
+                &primary,
+                &oracle,
+            );
+            let source = f.envelope.source().to_owned();
+            let issuer = stellar_agent_test_support::signed_envelope::account_id_for_seed([7; 32]);
+            let source_key = account_ledger_key_xdr(&source);
+            let mut entries = fixture_entries(&f);
+            for entry in &mut entries {
+                if entry["key"] == source_key.as_str() {
+                    let mut data = LedgerEntryData::from_xdr_base64(
+                        entry["xdr"].as_str().unwrap(),
+                        Limits::none(),
+                    )
+                    .unwrap();
+                    let LedgerEntryData::Account(account) = &mut data else {
+                        panic!("account expected")
+                    };
+                    account.balance = 16_000_000;
+                    account.num_sub_entries = 1;
+                    entry["xdr"] = data.to_xdr_base64(Limits::none()).unwrap().into();
+                }
+            }
+            entries.push(serde_json::json!({
+                "key": trustline_ledger_key_xdr(&source, "USD", &issuer),
+                "xdr": trustline_entry_xdr(&source, "USD", &issuer, 0),
+                "lastModifiedLedgerSeq": 100,
+            }));
+            let control = mount_rpc(&f, &primary).await;
+            let oracle_control = mount_rpc(&f, &oracle).await;
+            *control.entries.lock().unwrap() = Some(entries.clone());
+            *oracle_control.entries.lock().unwrap() = Some(entries);
+            cover_native_history(&f);
+            let mut args = Tool::Trustline.prepare_args(&f);
+            args["limit_stroops"] = "0".into();
+            let prepared = wire(&Tool::Trustline.prepare(&f.server, &args).await);
+            assert_eq!(prepared["ok"], true, "{prepared}");
+            for field in ["envelope_xdr", "nonce", "expires_at_unix_ms"] {
+                args[field] = prepared["data"][field].clone();
+            }
+            let committed = wire(&Tool::Trustline.commit(&f.server, args).await.unwrap());
+            assert_eq!(committed["ok"], true, "{committed}");
+            assert_eq!(control.count("sendTransaction"), 1);
         }
 
         /// `stellar_pay` under a floor on either name reads the source

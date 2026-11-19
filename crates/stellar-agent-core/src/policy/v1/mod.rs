@@ -454,6 +454,17 @@ pub trait AccountReservesView: Send + Sync {
     fn effective_native_reservations_stroops(&self) -> Option<u64> {
         None
     }
+
+    /// Returns whether the account holds a trustline for `asset`, a canonical
+    /// policy asset id compared under `network_passphrase`.
+    ///
+    /// `Some(true)` when the view shows the trustline, `Some(false)` when the
+    /// view shows that it is absent, and `None` when the view cannot tell.
+    /// The `minimum_reserve` criterion adds one base reserve for a trustline
+    /// leg unless the answer is `Some(true)`.
+    fn holds_trustline(&self, _asset: &str, _network_passphrase: &str) -> Option<bool> {
+        None
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -565,6 +576,10 @@ impl<V: AccountReservesView> AccountReservesView for ObservedAccount<V> {
             close_time_floor_ms: self.close_time_floor_ms,
         })
     }
+
+    fn holds_trustline(&self, asset: &str, network_passphrase: &str) -> Option<bool> {
+        self.view.holds_trustline(asset, network_passphrase)
+    }
 }
 
 /// The account input of the `balance_floor` criterion: an observed account
@@ -620,6 +635,10 @@ impl<V: AccountReservesView> AccountReservesView for FloorInput<'_, V> {
 
     fn effective_native_reservations_stroops(&self) -> Option<u64> {
         Some(self.effective_reservations_stroops)
+    }
+
+    fn holds_trustline(&self, asset: &str, network_passphrase: &str) -> Option<bool> {
+        self.observed.holds_trustline(asset, network_passphrase)
     }
 }
 
@@ -2572,6 +2591,37 @@ mod tests {
 
     struct ReserveOnlyView;
     struct WithIdentityView;
+
+    /// A view that holds a trustline for every asset.
+    struct TrustingView;
+
+    impl AccountReservesView for TrustingView {
+        fn reserves_stroops(&self, base_reserve_stroops: i64) -> i64 {
+            base_reserve_stroops.saturating_mul(3)
+        }
+
+        fn balance_stroops(&self) -> Result<i64, AccountReserveLookupError> {
+            Ok(100_000_000)
+        }
+
+        fn holds_trustline(&self, _asset: &str, _network_passphrase: &str) -> Option<bool> {
+            Some(true)
+        }
+    }
+
+    /// The observed account and the floor input answer the trustline
+    /// question of the view they wrap.
+    #[test]
+    fn observed_and_floor_views_answer_the_wrapped_trustlines() {
+        let observed = ObservedAccount::new(TrustingView, 100, 1_000, 900);
+        let input = FloorInput {
+            observed: &observed,
+            effective_reservations_stroops: 0,
+        };
+        let passphrase = crate::profile::caip2::TESTNET_PASSPHRASE;
+        assert_eq!(observed.holds_trustline("USDC:G", passphrase), Some(true));
+        assert_eq!(input.holds_trustline("USDC:G", passphrase), Some(true));
+    }
 
     impl AccountReservesView for ReserveOnlyView {
         fn reserves_stroops(&self, base_reserve_stroops: i64) -> i64 {
