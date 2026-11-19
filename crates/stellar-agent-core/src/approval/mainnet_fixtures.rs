@@ -65,6 +65,11 @@ pub const ENABLEMENT_NONCE: &str = "mainnet-consent-fixture-nonce";
 /// The account the fixture policy allows payments to.
 pub const ALLOWED_DESTINATION: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
 
+/// The issuer of the `USD` asset the fixture policy allows trust lines to.
+/// It differs from [`ALLOWED_DESTINATION`], so a test that retargets the
+/// payment destination in the policy text leaves the trust line rule valid.
+pub const TRUSTLINE_ISSUER: &str = "GADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOZPI";
+
 /// The signed approval origin of the fixture's signed-origin policies.
 pub const SIGNED_ORIGIN: &str = "https://approve.example.invalid:8443";
 
@@ -105,7 +110,7 @@ fn put(entry: &KeyringEntryRef, text: &str) {
 /// [`ENABLEMENT_NONCE`], admitting `credentials` as approval credentials,
 /// with one require-approval payment rule to [`ALLOWED_DESTINATION`], then
 /// one require-approval claim rule and one trust line rule for `USD` of
-/// that issuer.
+/// [`TRUSTLINE_ISSUER`].
 #[must_use]
 pub fn policy_body_for(
     name: &str,
@@ -169,7 +174,7 @@ pub fn policy_body_with_origin(
         "[[rules]]".to_owned(),
         "match = { tool = \"stellar_trustline\", chain = \"stellar:mainnet\" }".to_owned(),
         format!(
-            "criteria = [{{ kind = \"asset_allowlist\", assets = [\"USD:{ALLOWED_DESTINATION}\"] }}, {{ kind = \"rate_limit\", window = \"1d\", max_calls = 10 }}]"
+            "criteria = [{{ kind = \"asset_allowlist\", assets = [\"USD:{TRUSTLINE_ISSUER}\"] }}, {{ kind = \"rate_limit\", window = \"1d\", max_calls = 10 }}]"
         ),
         "decision = \"require_approval\"".to_owned(),
         "ttl_secs = 3600".to_owned(),
@@ -458,7 +463,7 @@ impl MainnetConsentFixture {
 
     /// An unattested approval of `kind` that lives `ttl_ms` from now: the
     /// payment of [`Self::payment`], a claim of a 10-stroop XLM balance, a
-    /// trust line of 10 stroops to `USD` issued by [`ALLOWED_DESTINATION`],
+    /// trust line of 10 stroops to `USD` issued by [`TRUSTLINE_ISSUER`],
     /// or the x402 transfer of [`Self::x402`]. The policy body holds a
     /// require-approval rule for each classic kind.
     ///
@@ -484,7 +489,7 @@ impl MainnetConsentFixture {
             ApprovedKind::Trustline => super::fixtures::trustline_pending(
                 &source,
                 "USD",
-                ALLOWED_DESTINATION,
+                TRUSTLINE_ISSUER,
                 Some(10),
                 100,
                 7,
