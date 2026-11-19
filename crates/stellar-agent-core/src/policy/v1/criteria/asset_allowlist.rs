@@ -4,7 +4,7 @@ use super::Criterion;
 use crate::policy::v1::{
     EvalContext,
     asset_equivalence::{assets_equivalent, pinned_asset},
-    value::{ValueGate, classify_value},
+    value::{ActionKind, ValueGate, classify_value},
 };
 use crate::policy::{DenyReason, PolicyError};
 
@@ -40,7 +40,15 @@ impl Criterion for AssetAllowlistCriterion {
             ValueGate::Deny(reason) => return Ok(Some(reason)),
             ValueGate::Effects(effects) => effects,
         };
-        for asset in effects.legs().iter().filter_map(|leg| leg.asset.as_deref()) {
+        for leg in effects.legs() {
+            let Some(asset) = leg.asset.as_deref() else {
+                // A trustline leg without an asset is a liquidity pool share,
+                // which no allowlist entry can name.
+                if leg.kind == ActionKind::Trustline {
+                    return Ok(Some(DenyReason::AssetNotAllowlisted));
+                }
+                continue;
+            };
             if !self
                 .assets
                 .iter()

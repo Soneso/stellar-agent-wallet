@@ -38,9 +38,9 @@ use stellar_agent_core::envelope_decode::{
 use stellar_agent_core::error::FeeSource;
 use stellar_agent_core::payment_accounts::PaymentAccount;
 use stellar_agent_core::policy::transaction_effects::{
-    FeeEffect, PaymentRoute, RefusedEffect, SourceCandidates, SourceMembership, TransactionEffects,
-    TransactionEffectsError, UnvaluedEffect, ValuedOperation, authorized_invocation_effects,
-    transaction_effects_for_sources, transaction_source_candidates,
+    FeeEffect, POOL_SHARE_ARG, PaymentRoute, RefusedEffect, SourceCandidates, SourceMembership,
+    TransactionEffects, TransactionEffectsError, UnvaluedEffect, ValuedOperation,
+    authorized_invocation_effects, transaction_effects_for_sources, transaction_source_candidates,
 };
 use stellar_agent_core::policy::v1::asset_equivalence::assets_equivalent;
 use stellar_agent_core::policy::v1::criteria::minimum_reserve::opened_subentries;
@@ -263,23 +263,10 @@ fn other_source_trustline(operation: &ValuedOperation, wallet: &str) -> bool {
             .is_some_and(|source| source.base_account() != wallet)
 }
 
-/// The trustline operation that decides `count` pool share trustlines the
-/// `wallet` opens in a transaction without another leg: one trustline leg
-/// without an asset each.
-fn pool_share_trustline_operation(count: u32, wallet: &str) -> ValuedOperation {
-    let leg = ValueLeg {
-        kind: ActionKind::Trustline,
-        amount: None,
-        asset: None,
-        destination: None,
-    };
-    let legs = vec![leg; usize::try_from(count).unwrap_or(usize::MAX)];
-    ValuedOperation {
-        operation_index: 0,
-        route: PaymentRoute::Trustline,
-        policy_args: serde_json::json!({ "source": wallet, "total_fee_stroops": 0 }),
-        value: Some(ValueEffects::new(legs)),
-    }
+/// Whether `operation` is the trustline operation of a pool share
+/// `ChangeTrust`.
+fn is_pool_share(operation: &ValuedOperation) -> bool {
+    operation.policy_args[POOL_SHARE_ARG] == true
 }
 
 /// The account view after the wallet's fee, earlier native debits, and the
@@ -645,11 +632,11 @@ impl WalletServer {
     /// each trustline an allowed leg opens on the wallet raises the reserve
     /// later legs see. Each of the `pool_share_trustlines` the wallet opens
     /// adds [`POOL_SHARE_TRUSTLINE_SUBENTRIES`] to that count for every leg.
-    /// Without a leg, those trustlines are decided as one trustline
-    /// operation, so the reserve check still runs. A wallet account the
-    /// profile names is read once, with the trustlines its own operations
-    /// name; each recipient base account at most once. Without a leg or a
-    /// pool share trustline, nothing is read.
+    /// A pool share operation is decided like any trustline operation; its
+    /// own leg adds nothing more, since the count holds its subentries. A
+    /// wallet account the profile names is read once, with the trustlines
+    /// its own operations name; each recipient base account at most once.
+    /// Without a leg, nothing is read.
     ///
     /// An approval requirement of a leg is returned with the `approvable`
     /// shape; without one it refuses with
@@ -661,7 +648,7 @@ impl WalletServer {
     )]
     async fn sep43_decide_legs<'shape>(
         &self,
-        mut payment_legs: Vec<&ValuedOperation>,
+        payment_legs: Vec<&ValuedOperation>,
         chain_id: &str,
         mut spent_stroops: i128,
         pool_share_trustlines: u32,
@@ -672,16 +659,8 @@ impl WalletServer {
     ) -> Result<Option<OperationRequirement<'shape>>, ToolError> {
         let mut operation_requirement = None;
         let account = &self.profile.mcp_signer_default.account;
-        let pool_shares = i64::from(pool_share_trustlines);
-        let mut opened = pool_shares.saturating_mul(POOL_SHARE_TRUSTLINE_SUBENTRIES);
-        let pool_share_operation;
-        if payment_legs.is_empty() && pool_share_trustlines > 0 {
-            // Each leg is a trustline the account read cannot show, so the
-            // reserve counts one subentry for it; the view carries the rest.
-            pool_share_operation = pool_share_trustline_operation(pool_share_trustlines, account);
-            payment_legs.push(&pool_share_operation);
-            opened = pool_shares.saturating_mul(POOL_SHARE_TRUSTLINE_SUBENTRIES - 1);
-        }
+        let mut opened =
+            i64::from(pool_share_trustlines).saturating_mul(POOL_SHARE_TRUSTLINE_SUBENTRIES);
         if payment_legs.is_empty() {
             return Ok(operation_requirement);
         }
@@ -748,10 +727,13 @@ impl WalletServer {
                 None => None,
             };
             let identity = recipient.map(AccountViewAdapter::new);
+            // The criterion counts one subentry for the asset-less leg of a
+            // pool share operation; `opened` already holds its subentries.
+            let pool_share = is_pool_share(operation);
             let spent = source.as_ref().map(|inner| SpentAccountView {
                 inner,
                 spent_stroops,
-                opened_subentries: opened,
+                opened_subentries: opened.saturating_sub(i64::from(pool_share)),
                 opened_trustlines: &opened_trustlines,
                 other_source: other_source_trustline(operation, account),
             });
@@ -793,8 +775,9 @@ impl WalletServer {
             let Some(value) = evaluation.value_effects else {
                 continue;
             };
-            // The trustlines this leg opens count toward the reserve of later legs.
-            if let Some(view) = spent {
+            // The trustlines this leg opens count toward the reserve of later
+            // legs; a pool share trustline is counted for every leg already.
+            if let Some(view) = spent.filter(|_| !pool_share) {
                 let holds = |asset: &str| view.holds_trustline(asset, passphrase) == Some(true);
                 let assets: Vec<String> = value
                     .legs()

@@ -169,18 +169,15 @@ impl AccountReservesView for AccountViewAdapter<'_> {
     /// entry for it, and `None` otherwise.
     ///
     /// The view lists only the trustlines its read requested, so an asset
-    /// the read did not request is unknown. A bare asset code names the
-    /// requested trustline of that code: a trustline call resolves the code
-    /// to one issuer and requests that trustline.
+    /// the read did not request is unknown.
     fn holds_trustline(&self, asset: &str, network_passphrase: &str) -> Option<bool> {
         let is_asset = |view: &AssetView| {
             view.issuer.as_deref().is_some_and(|issuer| {
-                view.asset_type == asset
-                    || assets_equivalent(
-                        &format!("{}:{issuer}", view.asset_type),
-                        asset,
-                        network_passphrase,
-                    )
+                assets_equivalent(
+                    &format!("{}:{issuer}", view.asset_type),
+                    asset,
+                    network_passphrase,
+                )
             })
         };
         if self
@@ -372,9 +369,6 @@ mod tests {
             adapter.holds_trustline(&format!("USDT:{ISSUER}"), passphrase),
             None
         );
-        assert_eq!(adapter.holds_trustline("USDC", passphrase), Some(true));
-        assert_eq!(adapter.holds_trustline("EURC", passphrase), Some(false));
-        assert_eq!(adapter.holds_trustline("USDT", passphrase), None);
     }
 
     /// A read that requests a trustline records it: the listed one answers

@@ -1837,12 +1837,13 @@ async fn another_sources_trustline_adds_no_reserve() {
 }
 
 /// A pool share trustline the wallet opens counts two base reserves toward
-/// every leg: a later payment needs the reserve of both subentries.
+/// every leg: a later payment needs the reserve of both subentries. The
+/// trustline rule judges the pool share operation itself.
 #[tokio::test]
 #[serial_test::serial(keyring)]
 #[serial_test::serial]
 async fn a_pool_share_trustline_adds_two_base_reserves() {
-    let fx = Fixture::new(reserve_rules()).await;
+    let fx = Fixture::new(trustline_reserve_rules()).await;
     let base = stellar_agent_core::BASE_RESERVE_STROOPS;
     let pool = OperationBody::ChangeTrust(stellar_xdr::ChangeTrustOp {
         line: stellar_xdr::ChangeTrustAsset::PoolShare(
@@ -1858,6 +1859,124 @@ async fn a_pool_share_trustline_adds_two_base_reserves() {
         refused(&fx.sign(pooled()).await).0,
         "policy.deny.minimum_reserve_breached"
     );
+}
+
+/// After a dust payment the trustline rule still judges a pool share
+/// `ChangeTrust`: its `minimum_reserve` refuses one stroop under the
+/// reserve of the two subentries, and without a trustline rule the
+/// transaction refuses `policy.deny.no_matching_rule`.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn a_pool_share_trustline_after_a_payment_is_judged_by_the_trustline_rule() {
+    let mut rules = pay_rule(vec![]);
+    rules.push(rule(
+        "stellar_trustline_commit",
+        vec![Box::new(
+            stellar_agent_core::policy::v1::criteria::minimum_reserve::MinimumReserveCriterion::new(
+                0,
+            ),
+        )],
+        false,
+    ));
+    let fx = Fixture::new(rules).await;
+    let base = stellar_agent_core::BASE_RESERVE_STROOPS;
+    let dust_then_pool = || fx.tx(vec![payment(muxed(A, None), 1), pool_share_trustline()]);
+    fx.account(fx.key, RESERVE + 2 * base + 200 + 1, None);
+    signed(&fx.sign(dust_then_pool()).await);
+    fx.account(fx.key, RESERVE + 2 * base + 200, None);
+    assert_eq!(
+        refused(&fx.sign(dust_then_pool()).await).0,
+        "policy.deny.minimum_reserve_breached"
+    );
+    drop(fx);
+
+    let fx = Fixture::new(pay_rule(vec![])).await;
+    let dust_then_pool = fx.tx(vec![payment(muxed(A, None), 1), pool_share_trustline()]);
+    assert_eq!(
+        refused(&fx.sign(dust_then_pool).await).0,
+        "policy.deny.no_matching_rule"
+    );
+}
+
+/// Each pool share `ChangeTrust` is its own trustline call: two in one
+/// transaction charge two calls to the rule's `rate_limit`, so a third
+/// call refuses at a limit of two.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn each_pool_share_trustline_charges_one_call() {
+    let mut rules = tools(false);
+    rules.push(rule("stellar_trustline_commit", vec![rate(2)], false));
+    let fx = Fixture::new(rules).await;
+    signed(
+        &fx.sign(fx.tx(vec![pool_share_trustline(), pool_share_trustline()]))
+            .await,
+    );
+    assert_eq!(fx.usage("rate_limit").1, 2);
+    assert_eq!(
+        refused(&fx.sign(fx.tx(vec![pool_share_trustline()])).await).0,
+        "policy.deny.rate_limit_exceeded"
+    );
+}
+
+/// The audit record names each pool share operation in transaction order
+/// as a trustline leg without an asset, beside the payment between them.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn the_audit_record_names_each_pool_share_operation() {
+    let mut rules = pay_rule(vec![]);
+    rules.push(rule("stellar_trustline_commit", vec![], false));
+    let fx = Fixture::new(rules).await;
+    signed(
+        &fx.sign(fx.tx(vec![
+            pool_share_trustline(),
+            payment(muxed(A, None), XLM),
+            pool_share_trustline(),
+        ]))
+        .await,
+    );
+    let rows = fx.rows("opaque_payload_signed");
+    let legs = rows[0]["legs"].as_array().unwrap();
+    let kinds: Vec<&str> = legs
+        .iter()
+        .map(|leg| leg["action"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["trustline", "payment", "trustline"], "{legs:?}");
+    for index in [0, 2] {
+        assert!(legs[index].get("asset").is_none(), "{legs:?}");
+    }
+    assert_eq!(legs[1]["asset"], "native", "{legs:?}");
+}
+
+/// An `asset_allowlist` on the trustline rule refuses a pool share
+/// `ChangeTrust`, alone and after a payment: no entry can name a pool.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn the_asset_allowlist_refuses_a_pool_share_trustline() {
+    let mut rules = pay_rule(vec![]);
+    rules.push(rule(
+        "stellar_trustline_commit",
+        vec![Box::new(
+            stellar_agent_core::policy::v1::criteria::asset_allowlist::AssetAllowlistCriterion::new(
+                vec!["native".into()],
+            )
+            .unwrap(),
+        )],
+        false,
+    ));
+    let fx = Fixture::new(rules).await;
+    for bodies in [
+        vec![pool_share_trustline()],
+        vec![payment(muxed(A, None), XLM), pool_share_trustline()],
+    ] {
+        assert_eq!(
+            refused(&fx.sign(fx.tx(bodies)).await).0,
+            "policy.deny.asset_not_allowlisted"
+        );
+    }
 }
 
 /// A pool share `ChangeTrust` with a nonzero limit.
@@ -1876,9 +1995,10 @@ fn pool_share_trustline() -> OperationBody {
 async fn assert_only_operation_boundary(fx: &Fixture, body: OperationBody, boundary: i64) {
     let only = fx.tx(vec![body]);
     fx.account(fx.key, boundary, None);
+    let before = fx.sends();
     let [sign, submit] = both(fx, &only).await;
     signed(&sign);
-    sent(&submit);
+    sent(fx, before, &submit);
     let sends = fx.ledger.sends.load(Ordering::SeqCst);
     fx.account(fx.key, boundary - 1, None);
     for result in both(fx, &only).await {
@@ -1925,9 +2045,10 @@ async fn another_sources_pool_share_trustline_adds_no_reserve() {
     fx.source(B, true);
     fx.account(fx.key, RESERVE + 100, None);
     let foreign = fx.ops(vec![from(B, None, pool_share_trustline())]);
+    let before = fx.sends();
     let [sign, submit] = both(&fx, &foreign).await;
     signed(&sign);
-    sent(&submit);
+    sent(&fx, before, &submit);
 }
 
 /// The wallet fee reduces the reserve balance exactly once.
@@ -3979,10 +4100,11 @@ async fn both(fx: &Fixture, xdr: &str) -> [CallToolResult; 2] {
 }
 
 /// The submit result reached the send: the fixture endpoint refuses it.
-fn sent(result: &CallToolResult) {
+fn sent(fx: &Fixture, before: usize, result: &CallToolResult) {
     let text = &result.content[0].as_text().unwrap().text;
     assert!(!text.contains("policy."), "{text}");
     assert!(!text.contains("network.account_not_found"), "{text}");
+    assert_eq!(fx.sends(), before + 1, "one send: {text}");
 }
 
 #[tokio::test]
@@ -3992,9 +4114,10 @@ async fn both_tools_use_attributed_effects_and_original_approval_shape() {
     let fx = Fixture::approving(tools(false)).await;
     fx.source(SOURCE, false);
     let foreign = fx.ops(vec![from(SOURCE, None, payment(muxed(B, None), 5 * XLM))]);
+    let before = fx.sends();
     let [sign, submit] = both(&fx, &foreign).await;
     signed(&sign);
-    sent(&submit);
+    sent(&fx, before, &submit);
     assert_eq!(fx.sends(), 1);
     // One membership read per call; submit's network binding reads once more.
     assert_eq!(fx.reads(SOURCE), 3);
@@ -4160,7 +4283,8 @@ async fn selected_sources_alone_reach_windows_and_audit() {
     );
     drop(fx);
     let fx = Fixture::new(rules(SUBMIT)).await;
-    sent(&fx.submit(ten(&fx)).await);
+    let before = fx.sends();
+    sent(&fx, before, &fx.submit(ten(&fx)).await);
     assert_eq!(
         fx.usage("native"),
         (10 * i128::from(XLM), 2),
