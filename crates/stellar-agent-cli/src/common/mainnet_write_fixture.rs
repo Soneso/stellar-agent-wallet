@@ -216,6 +216,61 @@ pub(crate) fn balance_floor(min_stroops: i64) -> String {
     format!("{{ kind = \"balance_floor\", min_stroops = \"{min_stroops}\" }},\n")
 }
 
+/// A writer another handle takes on a profile's audit log in the middle of a
+/// run, at the first request of one method the run sends to its endpoint
+/// after [`LateWriter::arm`].
+///
+/// The take drops the registry's cached writer of the profile and opens a
+/// second handle on the log, as a writer of another process would hold it.
+#[derive(Clone, Default)]
+pub(crate) struct LateWriter {
+    target: Arc<Mutex<Option<(Profile, &'static str)>>>,
+    held: Arc<Mutex<Option<Result<stellar_agent_core::audit_log::AuditWriter, String>>>>,
+}
+
+impl LateWriter {
+    /// `rpc`, answering as before, whose first `method` request after the
+    /// arm takes the writer of the armed profile.
+    pub(crate) fn on(&self, rpc: ClassicRpc, method: &'static str) -> ClassicRpc {
+        let this = self.clone();
+        rpc.with_script(move |seen, _, _| {
+            if seen == method {
+                this.take();
+            }
+            None
+        })
+    }
+
+    /// Names the profile whose writer the next take holds.
+    pub(crate) fn arm(&self, fixture: &MainnetFixture) {
+        *self.target.lock().unwrap() = Some((fixture.profile(), fixture.name));
+    }
+
+    fn take(&self) {
+        let Some((profile, name)) = self.target.lock().unwrap().take() else {
+            return;
+        };
+        stellar_agent_core::audit_log::AuditWriterRegistry::remove_for_test(name);
+        let writer = crate::commands::value_audit::open_best_effort_audit_writer(
+            &profile,
+            name,
+            crate::common::profile_access::ProfileOrigin::Persisted,
+        )
+        .map_err(|error| error.to_string());
+        *self.held.lock().unwrap() = Some(writer);
+    }
+
+    /// Whether the take ran and holds the writer; the open's error when it
+    /// failed.
+    pub(crate) fn held(&self) -> Result<bool, String> {
+        match &*self.held.lock().unwrap() {
+            None => Ok(false),
+            Some(Ok(_)) => Ok(true),
+            Some(Err(error)) => Err(error.clone()),
+        }
+    }
+}
+
 /// How the fixture's profile and policy are set up.
 pub(crate) struct Spec {
     name: &'static str,
@@ -231,6 +286,7 @@ pub(crate) struct Spec {
     testnet: bool,
     submit_timeout_seconds: Option<u64>,
     record_keys: bool,
+    signed_origin: bool,
 }
 
 impl Spec {
@@ -257,7 +313,16 @@ impl Spec {
             testnet: false,
             submit_timeout_seconds: None,
             record_keys: false,
+            signed_origin: false,
         }
+    }
+
+    /// Serves consent at the signed HTTPS origin: the profile's remote
+    /// listener binds a loopback port with a test certificate, and the
+    /// signed policy names the origin and the certificate's pin.
+    pub(crate) fn signed_origin(mut self) -> Self {
+        self.signed_origin = true;
+        self
     }
 
     /// Removes `oracle_provider_url` and the oracle provider record from
@@ -380,6 +445,8 @@ pub(crate) struct MainnetFixture {
     /// The oracle endpoint.
     pub(crate) oracle: MockServer,
     calls: Rc<Cell<usize>>,
+    /// The certificate files of the signed-origin listener.
+    _signed_files: Option<tempfile::TempDir>,
     presence: Option<DriverGuard>,
     listener_presence: Option<crate::common::mainnet_presence::listener_driver::Guard>,
     tty: Option<TestTty>,
@@ -466,7 +533,7 @@ impl MainnetFixture {
             .policy_engine(PolicyEngineKind::V1)
             .build();
             loader::save_to_dir(name, &profile, &default_profile_dir().unwrap()).unwrap();
-            Self::ceremony(&spec, &agent, &owner).await;
+            Self::ceremony(&spec, &agent, &owner, None).await;
             return Self::assemble(
                 name,
                 agent,
@@ -508,10 +575,32 @@ impl MainnetFixture {
         if let Some(seconds) = spec.submit_timeout_seconds {
             profile.submit_timeout_seconds = Some(seconds);
         }
+        let signed = spec.signed_origin.then(|| {
+            use stellar_agent_core::approval::mainnet_fixtures::SIGNED_RP_ID;
+            let files = tempfile::tempdir().unwrap();
+            let leaf = stellar_agent_approval_remote::signed_origin_test_leaf(SIGNED_RP_ID);
+            let cert = files.path().join("cert.pem");
+            let key = files.path().join("key.pem");
+            std::fs::write(&cert, leaf.chain_pem()).unwrap();
+            std::fs::write(&key, &leaf.key_pem).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            profile.remote_approval = Some(
+                serde_json::from_value(serde_json::json!({
+                    "enabled": true, "bind": "127.0.0.1:0", "rp_id": SIGNED_RP_ID,
+                    "cert_path": cert, "key_path": key
+                }))
+                .unwrap(),
+            );
+            (files, leaf.pin)
+        });
         loader::save_to_dir(name, &profile, &default_profile_dir().unwrap()).unwrap();
 
         if spec.engine == PolicyEngineKind::V1 {
-            Self::ceremony(&spec, &agent, &owner).await;
+            Self::ceremony(&spec, &agent, &owner, signed.as_ref().map(|(_, pin)| *pin)).await;
         }
         if spec.oracle_removed {
             let directory = default_profile_dir().unwrap();
@@ -522,7 +611,7 @@ impl MainnetFixture {
             }
             loader::save_to_dir(name, &stored, &directory).unwrap();
         }
-        Self::assemble(
+        let mut fixture = Self::assemble(
             name,
             agent,
             owner,
@@ -533,7 +622,9 @@ impl MainnetFixture {
             profile_var,
             home_guard,
             home,
-        )
+        );
+        fixture._signed_files = signed.map(|(files, _)| files);
+        fixture
     }
 
     #[allow(
@@ -560,6 +651,7 @@ impl MainnetFixture {
             primary,
             oracle,
             calls,
+            _signed_files: None,
             presence: Some(driver::install(driver::fixture_credential())),
             listener_presence: None,
             tty: Some(test_tty(true, true)),
@@ -577,8 +669,15 @@ impl MainnetFixture {
         }
     }
 
-    /// Runs the enrollment ceremony through the public runners.
-    async fn ceremony(spec: &Spec, agent: &EnvSigner, owner: &EnvSigner) {
+    /// Runs the enrollment ceremony through the public runners. With
+    /// `signed_pin`, the final signed policy names the signed approval
+    /// origin and that certificate pin.
+    async fn ceremony(
+        spec: &Spec,
+        agent: &EnvSigner,
+        owner: &EnvSigner,
+        signed_pin: Option<[u8; 32]>,
+    ) {
         let name = spec.name;
         let profile = Some(name.to_owned());
         require_runner(
@@ -709,6 +808,12 @@ impl MainnetFixture {
         let mut credentials = toml_edit::Array::new();
         credentials.push(credential);
         doc["mainnet"]["approval_credentials"] = toml_edit::value(credentials);
+        if let Some(pin) = signed_pin {
+            doc["mainnet"]["approval_origin"] =
+                toml_edit::value(stellar_agent_core::approval::mainnet_fixtures::SIGNED_ORIGIN);
+            doc["mainnet"]["approval_cert_spki_sha256"] =
+                toml_edit::value(stellar_agent_core::hex::encode(&pin));
+        }
         let sequence = doc
             .get("sequence")
             .and_then(toml_edit::Item::as_integer)
@@ -719,6 +824,13 @@ impl MainnetFixture {
             "sign-policy after enable-mainnet",
             sign_policy::run(&sign).await,
         );
+    }
+
+    /// Leaves every later presence ceremony to the profile's real signed
+    /// origin listener, with no test driver.
+    pub(crate) fn present_at_signed_origin(&mut self) {
+        self.presence = None;
+        self.listener_presence = None;
     }
 
     /// Answers every later presence ceremony through `driver`, starting

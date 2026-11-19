@@ -13519,7 +13519,8 @@ pub(crate) mod tests {
             drop(run);
             // A commit-name floor below the preparation-name floor refuses
             // `account.unread`: the locked mint would recheck only the
-            // weaker floor. Nothing is minted or sent.
+            // weaker floor. No approval entry is written, nothing is minted,
+            // charged, or sent.
             let run = ClassicRun::covered(Tool::Pay, |raw| {
                 with_floor(
                     &with_floor(&raw, "stellar_pay_commit", 1),
@@ -13528,12 +13529,28 @@ pub(crate) mod tests {
                 )
             })
             .await;
+            let inbox = run
+                .f
+                .server
+                .resolve_approval_dir()
+                .unwrap()
+                .join("operator.toml");
+            let entries = std::fs::read(&inbox).unwrap();
             let result = run.commit().await;
             assert_eq!(
                 result["error"]["code"], "account.unread",
                 "a weaker commit floor refuses: {result}"
             );
+            assert_eq!(
+                std::fs::read(&inbox).unwrap(),
+                entries,
+                "a weaker commit floor: no entry"
+            );
             assert!(authorizations(&run.f).is_empty(), "nothing minted");
+            assert!(
+                window_records(&run.f).is_empty(),
+                "a weaker commit floor: nothing charged"
+            );
             assert_eq!(run.control.count("sendTransaction"), 0);
             drop(run);
             // Equal floors on both names: the first commit signs, and the
@@ -14826,6 +14843,28 @@ pub(crate) mod tests {
 
             pub(crate) fn simulations(&self) -> usize {
                 self.control.count("simulateTransaction")
+            }
+
+            /// Starts a new server on the current files and keyring, routed
+            /// to the run's server for both hosts, in place of the running
+            /// one, as [`ClassicRun::restart`] does.
+            ///
+            /// # Errors
+            ///
+            /// The startup refusal of the new server; the running one stays.
+            pub(crate) fn restart(
+                &mut self,
+            ) -> Result<(), stellar_agent_core::policy::BuildRegistryError> {
+                self.f.server = WalletServer::new_with_selection_and_routes_for_test(
+                    (*self.f.server.profile).clone(),
+                    ProfileNameSource::Flag,
+                    &default_profile_dir().unwrap(),
+                    &[
+                        ("rpc.example.invalid", self._rpc.uri().as_str()),
+                        ("oracle.example.invalid", self._rpc.uri().as_str()),
+                    ],
+                )?;
+                Ok(())
             }
         }
 

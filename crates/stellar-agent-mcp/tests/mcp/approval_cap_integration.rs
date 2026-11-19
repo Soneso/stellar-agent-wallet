@@ -3127,3 +3127,550 @@ async fn split_approval_commit_evaluation_error_leaves_simulate_allowed() {
         "{result}"
     );
 }
+
+// The approval cells of the release proof matrix on its MCP commit rows.
+// Each test drives every row of its cell through the row's tool handler: the
+// four classic commits through `Harness`, and both x402 payments through the
+// approval fixture of `x402_audit_gate_integration`. A restart builds a new
+// server over the same profile, policy directory and approval directory.
+
+use crate::x402_audit_gate_integration as x402;
+
+/// The x402 rows of the matrix.
+const X402_TOOLS: [x402::Tool; 2] = [x402::Tool::CreatePayment, x402::Tool::AuthenticatedPayment];
+
+/// The domain of the authenticated x402 session.
+const X402_DOMAIN: &str = "merchant.example";
+
+/// A classic harness of `pair` under a policy that allows its preparation and
+/// requires approval for its commit.
+async fn approval_harness(pair: ClassicPair, name: &str) -> Harness {
+    Harness::with_rules(
+        name,
+        Outcome::Success,
+        &split_rules(pair, "allow", "require_approval", ""),
+    )
+    .await
+}
+
+/// Commits `pair` over the preparation `data` with `fields` set on the
+/// arguments, and returns the result.
+async fn classic_commit_with(
+    pair: ClassicPair,
+    h: &Harness,
+    data: &Value,
+    fields: &[(&str, Value)],
+) -> Value {
+    let mut args = pair.args(h);
+    for field in ["nonce", "expires_at_unix_ms", "envelope_xdr"] {
+        args[field] = data[field].clone();
+    }
+    for (field, value) in fields {
+        args[*field] = value.clone();
+    }
+    let result = match pair {
+        ClassicPair::Pay => {
+            h.server
+                .call_stellar_pay_commit(serde_json::from_value(args).unwrap())
+                .await
+        }
+        ClassicPair::CreateAccount => {
+            h.server
+                .call_stellar_create_account_commit(serde_json::from_value(args).unwrap())
+                .await
+        }
+        ClassicPair::Trustline => {
+            h.server
+                .call_stellar_trustline_commit(serde_json::from_value(args).unwrap())
+                .await
+        }
+        ClassicPair::Claim => {
+            h.server
+                .call_stellar_claim_commit(serde_json::from_value(args).unwrap())
+                .await
+        }
+    }
+    .unwrap();
+    result_json(&result)
+}
+
+/// The approval nonce a preparation returned.
+fn approval_nonce(prepared: &Value) -> String {
+    prepared["data"]["approval"]["approval_nonce"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the preparation requests approval: {prepared}"))
+        .to_owned()
+}
+
+/// Every stored fact of the approval `nonce` at `path`: its kind, state,
+/// lifetime and attestation.
+fn stored_at(path: &std::path::Path, nonce: &str) -> String {
+    let store = PendingApprovalStore::open(path.to_path_buf()).unwrap();
+    format!("{:?}", store.get(nonce).expect("the approval is stored"))
+}
+
+/// Whether the approval `nonce` at `path` is a consumed tombstone.
+fn consumed_at(path: &std::path::Path, nonce: &str) -> bool {
+    matches!(
+        PendingApprovalStore::open(path.to_path_buf())
+            .unwrap()
+            .get(nonce)
+            .expect("the approval is stored")
+            .kind,
+        stellar_agent_core::approval::ApprovalKind::Consumed { .. }
+    )
+}
+
+impl Harness {
+    fn store_path(&self) -> std::path::PathBuf {
+        self.approval_dir.path().join(format!("{}.toml", self.name))
+    }
+
+    fn reads(&self) -> i64 {
+        self.signer_reads.load(Ordering::SeqCst)
+    }
+
+    /// Replaces the server with one built over the same profile, policy
+    /// directory and approval directory.
+    fn restart(&mut self) {
+        let restarted = WalletServer::new_with_policy_dir_for_test(
+            self.profile.clone(),
+            self.policy_dir.path(),
+        )
+        .unwrap();
+        drop(std::mem::replace(&mut self.server, restarted));
+        self.server
+            .set_approval_dir_for_test(self.approval_dir.path().to_owned());
+    }
+
+    /// Stores an attested copy of the approval `nonce` under the nonce
+    /// `copy`, whose lifetime ends at its creation when `expired`, and
+    /// returns its proof.
+    fn attested_copy(
+        &self,
+        envelope: &str,
+        nonce: &str,
+        copy: &str,
+        expired: bool,
+    ) -> (String, String) {
+        let mut store = PendingApprovalStore::open(self.store_path()).unwrap();
+        let mut entry = store.get(nonce).unwrap().clone();
+        entry.approval_nonce = copy.to_owned();
+        if expired {
+            entry.expires_at_unix_ms = entry.created_at_unix_ms;
+        }
+        let blob = compute_attestation_v4(
+            &ATTESTATION_KEY,
+            &stellar_agent_core::approval::AttestationBinding::new(&self.name, "stellar:testnet"),
+            &entry.approval_nonce,
+            &envelope_sha256(envelope.as_bytes()),
+            &process_uid_for_attestation().unwrap(),
+            &entry.attested_lifetime(),
+            &stellar_agent_core::approval::AttestedApprover::Local,
+        );
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob);
+        entry.attestation_blob_b64 = Some(encoded.clone());
+        entry.attested_approver = Some(stellar_agent_core::approval::AttestedApprover::Local);
+        let proof = (entry.approval_nonce.clone(), encoded);
+        store.insert(entry, now_unix_ms().unwrap()).unwrap();
+        proof
+    }
+}
+
+/// Calls the x402 `tool` of `approved` with `proof` and returns the result.
+async fn x402_call(
+    approved: &x402::ApprovedFixture,
+    tool: x402::Tool,
+    proof: (Option<&str>, Option<&str>),
+) -> Value {
+    x402::result_json(
+        &x402::proof_call(
+            &approved.fixture,
+            tool,
+            proof,
+            x402::payment_required(),
+            None,
+            X402_DOMAIN,
+        )
+        .await,
+    )
+}
+
+/// Replaces the server of `approved` with one built over the same profile and
+/// approval directory, with the fixture's policy engine and session.
+fn restart_x402(approved: &mut x402::ApprovedFixture) {
+    let session = stellar_strkey::ed25519::PublicKey(
+        SigningKey::from_bytes(&[0x01; 32])
+            .verifying_key()
+            .to_bytes(),
+    )
+    .to_string()
+    .to_string();
+    let mut server = WalletServer::new(approved.fixture.profile.clone()).unwrap();
+    server.set_x402_identity_session_for_test(
+        "header.payload.signature".to_owned(),
+        session,
+        Vec::new(),
+    );
+    server.set_approval_dir_for_test(approved.store_path.parent().unwrap().to_owned());
+    server.set_policy_engine_for_test(Arc::new(
+        crate::common::policy_mock::MockPolicyEngine::require_approval(),
+    ));
+    drop(std::mem::replace(&mut approved.fixture.server, server));
+}
+
+/// The signed transmissions the x402 endpoint of `approved` received.
+fn transmitted(approved: &x402::ApprovedFixture) -> usize {
+    approved
+        .fixture
+        .rpc
+        .observed
+        .lock()
+        .unwrap()
+        .transmitted
+        .len()
+}
+
+fn payer_reads(approved: &x402::ApprovedFixture) -> usize {
+    approved.signer_reads.load(Ordering::SeqCst)
+}
+
+/// Under a decision that requires approval, every MCP commit row withholds
+/// its commit for each proof that is not a valid attestation. A classic
+/// commit refuses `policy.approval_required` without a proof. An x402
+/// payment without a proof answers `ok: true` with the approval it queues and
+/// no payment signature. On every row, a nonce or an attestation alone, a
+/// zero attestation, the attestation of another approval, an unrecorded
+/// nonce, and, on a classic row, an expired attested approval refuse
+/// `policy.approval_required`. No call reads the signing key or sends
+/// anything, and the attested approval of the same preparation commits.
+#[tokio::test]
+#[serial]
+async fn every_commit_row_refuses_without_a_valid_attestation_before_key_access() {
+    let zero = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0; 32]);
+    for pair in CLASSIC_PAIRS {
+        let h = approval_harness(pair, "cell-required").await;
+        let first = pair.simulate(&h).await;
+        let nonce = approval_nonce(&first);
+        let data = &first["data"];
+        let envelope = data["envelope_xdr"].as_str().unwrap();
+        let (_, other_attestation) = h.attested_copy(envelope, &nonce, &"O".repeat(22), false);
+        let (expired_nonce, expired_attestation) =
+            h.attested_copy(envelope, &nonce, &"E".repeat(22), true);
+        let reads = h.reads();
+        for (case, fields) in [
+            ("no proof", vec![]),
+            ("nonce only", vec![("approval_nonce", json!(nonce))]),
+            (
+                "attestation only",
+                vec![("approval_attestation", json!(zero))],
+            ),
+            (
+                "zero attestation",
+                vec![
+                    ("approval_nonce", json!(nonce)),
+                    ("approval_attestation", json!(zero)),
+                ],
+            ),
+            (
+                "another approval's attestation",
+                vec![
+                    ("approval_nonce", json!(nonce)),
+                    ("approval_attestation", json!(other_attestation)),
+                ],
+            ),
+            (
+                "unrecorded nonce",
+                vec![
+                    ("approval_nonce", json!("U".repeat(22))),
+                    ("approval_attestation", json!(zero)),
+                ],
+            ),
+            (
+                "expired approval",
+                vec![
+                    ("approval_nonce", json!(expired_nonce)),
+                    ("approval_attestation", json!(expired_attestation)),
+                ],
+            ),
+        ] {
+            let context = format!("{pair:?} {case}");
+            let result = classic_commit_with(pair, &h, data, &fields).await;
+            assert_eq!(
+                result["error"]["code"], "policy.approval_required",
+                "{context}: {result}"
+            );
+            assert_eq!(h.reads(), reads, "{context}: the signing key stays unread");
+            assert!(h.sends.lock().unwrap().is_empty(), "{context}: no send");
+        }
+        let approval = h.attest_nonce(&nonce, envelope);
+        let result = pair.commit(&h, data, Some(approval)).await;
+        assert_eq!(result["ok"], true, "{pair:?} attested: {result}");
+        assert!(h.reads() > reads, "{pair:?}: the attested commit signs");
+        assert_eq!(h.sends.lock().unwrap().len(), 1, "{pair:?}");
+    }
+    for tool in X402_TOOLS {
+        let approved = x402::approval_fixture(tool, |_| {}).await;
+        let queued = x402_call(&approved, tool, (None, None)).await;
+        // The x402 routes answer a call without a proof with the approval
+        // they queue, not with a refusal code.
+        assert_eq!(queued["ok"], true, "{tool:?} no proof: {queued}");
+        assert!(queued.get("error").is_none(), "{tool:?} no proof: {queued}");
+        assert!(
+            queued["data"]["approval"]["approval_nonce"].is_string(),
+            "{tool:?} no proof: {queued}"
+        );
+        assert!(
+            queued["data"].get("paymentSignature").is_none(),
+            "{tool:?} no proof: {queued}"
+        );
+        assert_eq!(
+            payer_reads(&approved),
+            0,
+            "{tool:?} no proof: the payer key stays unread"
+        );
+        assert_eq!(
+            transmitted(&approved),
+            0,
+            "{tool:?} no proof: nothing transmitted"
+        );
+        let other_nonce = approval_nonce(&queued);
+        let other = x402::attest_pending(&approved.fixture, &approved.store_path, &other_nonce);
+        let nonce = approved.nonce.as_str();
+        let attestation = approved.attestation.as_str();
+        for (case, proof) in [
+            ("nonce only", (Some(nonce), None)),
+            ("attestation only", (None, Some(attestation))),
+            ("zero attestation", (Some(nonce), Some(zero.as_str()))),
+            (
+                "another approval's attestation",
+                (Some(nonce), Some(other.as_str())),
+            ),
+            ("unrecorded nonce", (Some("absent"), Some(attestation))),
+        ] {
+            let context = format!("{tool:?} {case}");
+            let result = x402_call(&approved, tool, proof).await;
+            assert_eq!(
+                result["error"]["code"], "policy.approval_required",
+                "{context}: {result}"
+            );
+            assert!(
+                result["data"].get("paymentSignature").is_none(),
+                "{context}"
+            );
+            assert_eq!(
+                payer_reads(&approved),
+                0,
+                "{context}: the payer key stays unread"
+            );
+            assert_eq!(transmitted(&approved), 0, "{context}: nothing transmitted");
+        }
+        let result = x402::result_json(&approved.pay(tool).await);
+        assert!(
+            result["data"]["paymentSignature"].is_string(),
+            "{tool:?} attested: {result}"
+        );
+        assert!(
+            payer_reads(&approved) > 0,
+            "{tool:?}: the attested call signs"
+        );
+        assert_eq!(transmitted(&approved), 1, "{tool:?}");
+    }
+}
+
+/// A commit spends its approval, and a second commit under the spent
+/// approval refuses `policy.approval_consumed` without reading the signing
+/// key or sending anything, on every MCP commit row. A classic row presents
+/// the spent approval with a fresh preparation; an x402 row repeats its
+/// call.
+#[tokio::test]
+#[serial]
+async fn every_commit_row_refuses_a_second_commit_under_a_consumed_approval() {
+    for pair in CLASSIC_PAIRS {
+        let h = approval_harness(pair, "cell-single-use").await;
+        let first = pair.simulate(&h).await;
+        let approval = h.attest(&first["data"]);
+        let result = pair
+            .commit(&h, &first["data"], Some(approval.clone()))
+            .await;
+        assert_eq!(result["ok"], true, "{pair:?} first commit: {result}");
+        assert!(
+            consumed_at(&h.store_path(), &approval.0),
+            "{pair:?}: the commit spends its approval"
+        );
+        let second = pair.simulate(&h).await;
+        assert_eq!(second["ok"], true, "{pair:?}: {second}");
+        let reads = h.reads();
+        let refused = pair.commit(&h, &second["data"], Some(approval)).await;
+        assert_eq!(
+            refused["error"]["code"], "policy.approval_consumed",
+            "{pair:?} second commit: {refused}"
+        );
+        assert_eq!(h.reads(), reads, "{pair:?}: the signing key stays unread");
+        assert_eq!(h.sends.lock().unwrap().len(), 1, "{pair:?}: one send");
+    }
+    for tool in X402_TOOLS {
+        let approved = x402::approval_fixture(tool, |_| {}).await;
+        let result = x402::result_json(&approved.pay(tool).await);
+        assert!(
+            result["data"]["paymentSignature"].is_string(),
+            "{tool:?} first call: {result}"
+        );
+        assert!(
+            consumed_at(&approved.store_path, &approved.nonce),
+            "{tool:?}: the call spends its approval"
+        );
+        let reads = payer_reads(&approved);
+        let refused = x402::result_json(&approved.pay(tool).await);
+        assert_eq!(
+            refused["error"]["code"], "policy.approval_consumed",
+            "{tool:?} second call: {refused}"
+        );
+        assert!(
+            refused["data"].get("paymentSignature").is_none(),
+            "{tool:?}"
+        );
+        assert_eq!(
+            payer_reads(&approved),
+            reads,
+            "{tool:?}: the payer key stays unread"
+        );
+        assert_eq!(transmitted(&approved), 1, "{tool:?}: one transmission");
+    }
+}
+
+/// An approval keeps its state and its lifetime window across a restart on
+/// every MCP commit row. A pending approval stays pending and refuses a
+/// commit without proof; an attested approval stays attested, refuses at the
+/// end of its stored window under the restarted server, and commits inside
+/// it after another restart; a consumed approval stays consumed and refuses
+/// a second commit. Each restart leaves every stored fact of the approval
+/// unchanged.
+#[tokio::test]
+#[serial]
+async fn every_commit_row_keeps_its_approval_state_and_window_across_restart() {
+    for pair in CLASSIC_PAIRS {
+        let mut h = approval_harness(pair, "cell-durable").await;
+        let first = pair.simulate(&h).await;
+        let nonce = approval_nonce(&first);
+        let path = h.store_path();
+
+        let pending = stored_at(&path, &nonce);
+        h.restart();
+        assert_eq!(
+            stored_at(&path, &nonce),
+            pending,
+            "{pair:?}: pending across restart"
+        );
+        let refused = pair.commit(&h, &first["data"], None).await;
+        assert_eq!(
+            refused["error"]["code"], "policy.approval_required",
+            "{pair:?} pending after restart: {refused}"
+        );
+
+        let approval = h.attest(&first["data"]);
+        let attested = stored_at(&path, &nonce);
+        h.restart();
+        assert_eq!(
+            stored_at(&path, &nonce),
+            attested,
+            "{pair:?}: attested across restart"
+        );
+        let end = PendingApprovalStore::open(path.clone())
+            .unwrap()
+            .get(&nonce)
+            .unwrap()
+            .expires_at_unix_ms;
+        h.server
+            .set_clock_for_test(Arc::new(MockClock::new(move || Ok(end))));
+        let refused = pair
+            .commit(&h, &first["data"], Some(approval.clone()))
+            .await;
+        assert_eq!(
+            refused["error"]["code"], "policy.approval_required",
+            "{pair:?} at the end of the stored window: {refused}"
+        );
+        assert!(h.sends.lock().unwrap().is_empty(), "{pair:?}: no send");
+        assert_eq!(
+            stored_at(&path, &nonce),
+            attested,
+            "{pair:?}: nothing spent"
+        );
+
+        h.restart();
+        let result = pair
+            .commit(&h, &first["data"], Some(approval.clone()))
+            .await;
+        assert_eq!(result["ok"], true, "{pair:?} inside the window: {result}");
+        let consumed = stored_at(&path, &approval.0);
+        assert!(consumed_at(&path, &approval.0), "{pair:?}");
+        h.restart();
+        assert_eq!(
+            stored_at(&path, &approval.0),
+            consumed,
+            "{pair:?}: consumed across restart"
+        );
+        let third = pair.simulate(&h).await;
+        let refused = pair.commit(&h, &third["data"], Some(approval)).await;
+        assert_eq!(
+            refused["error"]["code"], "policy.approval_consumed",
+            "{pair:?} consumed after restart: {refused}"
+        );
+        assert_eq!(h.sends.lock().unwrap().len(), 1, "{pair:?}: one send");
+    }
+    for tool in X402_TOOLS {
+        let mut approved = x402::approval_fixture(tool, |_| {}).await;
+        let queued = x402_call(&approved, tool, (None, None)).await;
+        let ending = approval_nonce(&queued);
+        let path = approved.store_path.clone();
+        let nonces = [approved.nonce.clone(), ending.clone()];
+        let snapshot = |nonces: &[String; 2]| nonces.clone().map(|nonce| stored_at(&path, &nonce));
+
+        let before = snapshot(&nonces);
+        restart_x402(&mut approved);
+        assert_eq!(snapshot(&nonces), before, "{tool:?}: across restart");
+        let refused = x402_call(&approved, tool, (Some(&ending), None)).await;
+        assert_eq!(
+            refused["error"]["code"], "policy.approval_required",
+            "{tool:?} pending after restart: {refused}"
+        );
+
+        let end = PendingApprovalStore::open(path.clone())
+            .unwrap()
+            .get(&approved.nonce)
+            .unwrap()
+            .expires_at_unix_ms;
+        approved
+            .fixture
+            .server
+            .set_clock_for_test(Arc::new(MockClock::new(move || Ok(end))));
+        let refused = x402::result_json(&approved.pay(tool).await);
+        assert_eq!(
+            refused["error"]["code"], "policy.approval_required",
+            "{tool:?} at the end of the stored window: {refused}"
+        );
+        assert_eq!(transmitted(&approved), 0, "{tool:?}: nothing transmitted");
+        assert_eq!(snapshot(&nonces), before, "{tool:?}: nothing spent");
+
+        restart_x402(&mut approved);
+        let result = x402::result_json(&approved.pay(tool).await);
+        assert!(
+            result["data"]["paymentSignature"].is_string(),
+            "{tool:?} inside the window: {result}"
+        );
+        let consumed = stored_at(&path, &approved.nonce);
+        assert!(consumed_at(&path, &approved.nonce), "{tool:?}");
+        restart_x402(&mut approved);
+        assert_eq!(
+            stored_at(&path, &approved.nonce),
+            consumed,
+            "{tool:?}: consumed across restart"
+        );
+        let refused = x402::result_json(&approved.pay(tool).await);
+        assert_eq!(
+            refused["error"]["code"], "policy.approval_consumed",
+            "{tool:?} consumed after restart: {refused}"
+        );
+        assert_eq!(transmitted(&approved), 1, "{tool:?}: one transmission");
+    }
+}

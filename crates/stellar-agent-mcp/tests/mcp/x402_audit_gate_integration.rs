@@ -102,7 +102,7 @@ enum NetworkAnswer {
 
 /// What the mock observed, shared with the test.
 #[derive(Default)]
-struct Observed {
+pub(crate) struct Observed {
     signed_entries_sha256: Vec<[u8; 32]>,
     /// `x402_payment_authorized` rows in the log when each signed
     /// re-simulation arrived.
@@ -111,14 +111,14 @@ struct Observed {
     signed: Vec<bool>,
     /// Per signed request, the expiration ledger, the address, and the
     /// invocation of the signed authorization entry it carried.
-    transmitted: Vec<(u32, ScAddress, InvokeContractArgs)>,
+    pub(crate) transmitted: Vec<(u32, ScAddress, InvokeContractArgs)>,
     /// The method of every request, in the order they arrived.
     methods: Vec<String>,
 }
 
 /// Simulate endpoint for the x402 Exact flow.
 #[derive(Clone)]
-struct X402Rpc {
+pub(crate) struct X402Rpc {
     payer: ScAddress,
     log_path: PathBuf,
     first: FirstSimulate,
@@ -137,7 +137,7 @@ struct X402Rpc {
     /// gate, so the gate's own acquisition drains it.
     queue_on_first: Arc<Mutex<Option<stellar_agent_core::audit_log::AuditEntry>>>,
     outbox_store: Arc<Mutex<Option<Arc<dyn stellar_agent_core::audit_log::TipAnchorStore>>>>,
-    observed: Arc<Mutex<Observed>>,
+    pub(crate) observed: Arc<Mutex<Observed>>,
 }
 
 impl X402Rpc {
@@ -510,7 +510,7 @@ fn payer_sc_address(payer: &str) -> ScAddress {
 
 /// Which x402 tool a case drives.
 #[derive(Clone, Copy, Debug)]
-enum Tool {
+pub(crate) enum Tool {
     CreatePayment,
     AuthenticatedPayment,
 }
@@ -529,11 +529,11 @@ impl Tool {
 /// The payer seed names the payer account, and the shared test audit log is
 /// named after that account. A seed therefore belongs to one profile name in
 /// the whole test binary: the tests here use seeds no other suite uses.
-struct Fixture {
-    profile: Profile,
-    server: WalletServer,
+pub(crate) struct Fixture {
+    pub(crate) profile: Profile,
+    pub(crate) server: WalletServer,
     mock: MockServer,
-    rpc: X402Rpc,
+    pub(crate) rpc: X402Rpc,
     _home_guard: StellarAgentHomeGuard,
     _home: stellar_agent_test_support::sandbox::StateSandbox,
 }
@@ -615,7 +615,7 @@ async fn build_fixture(
     }
 }
 
-fn payment_required() -> String {
+pub(crate) fn payment_required() -> String {
     serde_json::json!({
         "scheme": "exact", "network": "stellar:testnet", "asset": ASSET,
         "amount": "10000000", "payTo": PAY_TO, "maxTimeoutSeconds": 300,
@@ -654,7 +654,7 @@ async fn call(fixture: &Fixture, tool: Tool) -> rmcp::model::CallToolResult {
     }
 }
 
-fn result_json(result: &rmcp::model::CallToolResult) -> serde_json::Value {
+pub(crate) fn result_json(result: &rmcp::model::CallToolResult) -> serde_json::Value {
     let text = result
         .content
         .iter()
@@ -679,17 +679,20 @@ fn x402_rows(profile: &Profile) -> (Vec<serde_json::Value>, Vec<serde_json::Valu
 
 type PayerBarrier = Arc<(Mutex<usize>, std::sync::Condvar)>;
 
-struct ApprovedFixture {
-    fixture: Fixture,
-    nonce: String,
-    attestation: String,
-    store_path: PathBuf,
-    signer_reads: Arc<std::sync::atomic::AtomicUsize>,
+pub(crate) struct ApprovedFixture {
+    pub(crate) fixture: Fixture,
+    pub(crate) nonce: String,
+    pub(crate) attestation: String,
+    pub(crate) store_path: PathBuf,
+    pub(crate) signer_reads: Arc<std::sync::atomic::AtomicUsize>,
     signer_barrier: Arc<Mutex<Option<PayerBarrier>>>,
     requirements: String,
 }
 
-async fn approval_fixture(tool: Tool, configure: impl FnOnce(&mut X402Rpc)) -> ApprovedFixture {
+pub(crate) async fn approval_fixture(
+    tool: Tool,
+    configure: impl FnOnce(&mut X402Rpc),
+) -> ApprovedFixture {
     approval_fixture_with_terms(tool, payment_required(), configure).await
 }
 
@@ -775,7 +778,11 @@ async fn approval_fixture_with_terms(
     }
 }
 
-fn attest_pending(fixture: &Fixture, store_path: &std::path::Path, nonce: &str) -> String {
+pub(crate) fn attest_pending(
+    fixture: &Fixture,
+    store_path: &std::path::Path,
+    nonce: &str,
+) -> String {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use stellar_agent_core::approval::{
         AttestationBinding, AttestedApprover, ConsentAuthorization, PendingApprovalStore,
@@ -832,7 +839,7 @@ fn attest_pending(fixture: &Fixture, store_path: &std::path::Path, nonce: &str) 
     attestation
 }
 
-async fn proof_call(
+pub(crate) async fn proof_call(
     fixture: &Fixture,
     tool: Tool,
     proof: (Option<&str>, Option<&str>),
@@ -891,7 +898,7 @@ impl ApprovedFixture {
             .clone()
     }
 
-    async fn pay(&self, tool: Tool) -> rmcp::model::CallToolResult {
+    pub(crate) async fn pay(&self, tool: Tool) -> rmcp::model::CallToolResult {
         proof_call(
             &self.fixture,
             tool,

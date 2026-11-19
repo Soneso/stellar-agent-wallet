@@ -117,5 +117,7 @@ mod tx_status_wire_guard;
 #[path = "cli/value_verb_wire_guard.rs"]
 mod value_verb_wire_guard;
 
+#[path = "cli/proof_row_claims.rs"]
+mod proof_row_claims;
 #[path = "cli/proof_rows.rs"]
 mod proof_rows;
