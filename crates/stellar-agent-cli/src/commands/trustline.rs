@@ -119,7 +119,7 @@ use stellar_agent_network::{ClassicFeeChoice, MainnetEndpointFlags};
 
 use crate::commands::policy_engine::{
     build_v1_policy_engine, effective_classic_fee_cap, envelope_total_fee, evaluate_mainnet_policy,
-    evaluate_value_moving_policy, load_mainnet_policy_engine, mainnet_floor_source,
+    evaluate_value_moving_policy, load_mainnet_policy_engine, mainnet_floor_source_requesting,
     trustline_policy_args, with_total_fee,
 };
 
@@ -430,7 +430,8 @@ where
 
     // ── GATE 3: Fetch source account (feeds the policy gate's account_view;
     // sequence number also consumed by the envelope build below) ────────────
-    let source_account_view = match fetch_account(&rpc_client, &args.from, &[]).await {
+    let requested = Asset::trustline_request(&resolved.code, &resolved.issuer);
+    let source_account_view = match fetch_account(&rpc_client, &args.from, &requested).await {
         Ok(v) => v,
         Err(e) => {
             return write_envelope(
@@ -508,7 +509,9 @@ where
             );
         }
     };
-    let policy_args = with_total_fee(trustline_policy_args(&args.from, &args.asset), total_fee);
+    // The leg names the asset the envelope carries: the resolved code and issuer.
+    let leg_asset = format!("{}:{}", resolved.code, resolved.issuer);
+    let policy_args = with_total_fee(trustline_policy_args(&args.from, &leg_asset), total_fee);
     // `account_view` is the fetched source account (feeds `minimum_reserve`).
     // `identity_view` stays `None`, matching the MCP twin: the issuer's
     // self-asserted `home_domain` must not feed allowlist matching, so
@@ -1322,9 +1325,10 @@ where
     let issuer_flags: Option<AccountFlagsView> = issuer_account_view
         .as_ref()
         .and_then(|v| v.account_flags.clone());
+    let requested = Asset::trustline_request(&asset.code, &asset.issuer);
     let source_account_view = match read_within_readiness_deadline(
         readiness_deadline,
-        fetch_account(&client, &args.from, &[]),
+        fetch_account(&client, &args.from, &requested),
     )
     .await
     {
@@ -1448,13 +1452,16 @@ where
         Ok(fee) => fee,
         Err(e) => return write_envelope(out, &Envelope::<()>::err(&e), 1),
     };
-    let policy_args = with_total_fee(trustline_policy_args(&args.from, &args.asset), total_fee);
-    let floor = match mainnet_floor_source(
+    // The leg names the asset the envelope carries: the resolved code and issuer.
+    let leg_asset = format!("{}:{}", asset.code, asset.issuer);
+    let policy_args = with_total_fee(trustline_policy_args(&args.from, &leg_asset), total_fee);
+    let floor = match mainnet_floor_source_requesting(
         &context,
         &client,
         &policy.verified,
         "stellar_trustline",
         &source_account_view.account_id,
+        &requested,
     )
     .await
     {
@@ -3629,9 +3636,132 @@ pub(crate) mod tests {
             assert!(fixture.sent_envelopes().await.is_empty());
         }
 
+        /// The base reserve the new trustline adds to the source's reserve.
+        const ADDED_RESERVE: i64 = stellar_agent_core::BASE_RESERVE_STROOPS;
+
         /// The margin at which the trustline, which debits nothing, passes
-        /// the reserve alone and crosses it with any fee.
-        const FEE_CROSSING_MARGIN: i64 = BALANCE - RESERVE;
+        /// the reserve it opens alone and crosses it with any fee.
+        const FEE_CROSSING_MARGIN: i64 = BALANCE - RESERVE - ADDED_RESERVE;
+
+        /// The envelope fee of the one-operation trustline.
+        const TRUSTLINE_FEE: i64 = 100;
+
+        /// The trustline opens a subentry on mainnet: at the raised reserve
+        /// plus the fee it signs and sends, and one stroop under it refuses
+        /// before any signer is resolved and sends nothing.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_opened_trustline_counts_toward_the_reserve_on_mainnet() {
+            let boundary = FEE_CROSSING_MARGIN - TRUSTLINE_FEE;
+            for (name, margin) in [
+                ("mainnet-trustline-opened-reserve", boundary),
+                ("mainnet-trustline-opened-reserve-under", boundary + 1),
+            ] {
+                let fixture = spec(name)
+                    .rules(vec![trustline_rule("allow", &minimum_reserve(margin))])
+                    .build()
+                    .await;
+                let args = mainnet_args(&fixture);
+                let before = signer_resolutions_on_this_thread();
+
+                let run = run(&fixture, &args).await;
+
+                if margin == boundary {
+                    assert_eq!(run.code, 0, "{}", run.envelope);
+                    assert_eq!(fixture.sent_envelopes().await.len(), 1);
+                    assert_eq!(signer_resolutions_on_this_thread(), before + 1);
+                } else {
+                    assert_eq!(
+                        run.code(),
+                        "policy.deny.minimum_reserve_breached",
+                        "{}",
+                        run.envelope
+                    );
+                    assert_eq!(signer_resolutions_on_this_thread(), before);
+                    assert!(fixture.sent_envelopes().await.is_empty());
+                }
+            }
+        }
+
+        /// The agent holds one USDC trustline: 1.6 XLM against a reserve of
+        /// 1.5 XLM. Removing it with limit 0 at margin 0 opens no subentry,
+        /// so it signs and sends on mainnet and on testnet, however the
+        /// caller spells the asset the resolver accepts.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn removing_a_held_trustline_adds_no_reserve() {
+            let agent = agent();
+            // The code as the caller spells it, and whether it names the issuer.
+            for (name, mainnet, code, with_issuer) in [
+                ("mainnet-trustline-held-removal", true, "USDC", true),
+                ("mainnet-trustline-held-lower", true, "usdc", true),
+                ("mainnet-trustline-held-bare", true, "usdc", false),
+                ("testnet-trustline-held-removal", false, "USDC", true),
+                ("testnet-trustline-held-lower", false, "usdc", true),
+            ] {
+                let issuer = if mainnet { ISSUER } else { TESTNET_ISSUER };
+                let spelling = if with_issuer {
+                    format!("{code}:{issuer}")
+                } else {
+                    code.to_owned()
+                };
+                let (key, entry) = crate::test_rpc::trustline_xdr(&agent, "USDC", issuer, 0, 1, 0);
+                let endpoint = || {
+                    ledger(mainnet, 0)
+                        .with_account(&agent, 16_000_000, 1)
+                        .with_entry(key.clone(), entry.clone())
+                };
+                let asset = format!("USDC:{issuer}");
+                let spec = Spec::new(name).primary(endpoint()).rules(vec![
+                    trustline_rule("allow", &minimum_reserve(0)).replace(TRUSTLINE_ASSET, &asset),
+                ]);
+                let fixture = if mainnet {
+                    spec.oracle(endpoint())
+                } else {
+                    spec.testnet()
+                }
+                .build()
+                .await;
+                let mut args = mainnet_args(&fixture);
+                args.asset = spelling;
+                args.limit_stroops = Some(0);
+
+                let run = run(&fixture, &args).await;
+
+                assert_eq!(run.code, 0, "{name}: {}", run.envelope);
+                assert_eq!(fixture.sent_envelopes().await.len(), 1, "{name}");
+            }
+        }
+
+        /// Under a met balance floor the gate and the resolver read the
+        /// floor source, which requests the trustline too: removing the
+        /// held trustline at 1.6 XLM against 1.5 XLM signs and sends.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn removing_a_held_trustline_under_a_floor_adds_no_reserve() {
+            let agent = agent();
+            let (key, entry) = crate::test_rpc::trustline_xdr(&agent, "USDC", ISSUER, 0, 1, 0);
+            let endpoint = || {
+                ledger(true, 0)
+                    .with_account(&agent, 16_000_000, 1)
+                    .with_entry(key.clone(), entry.clone())
+            };
+            let criteria = format!("{}{}", minimum_reserve(0), balance_floor(1));
+            let fixture = Spec::new("mainnet-trustline-floored-removal")
+                .primary(endpoint().entries_at_readiness_ledger())
+                .oracle(endpoint())
+                .rules(vec![trustline_rule("allow", &criteria)])
+                .build()
+                .await;
+            fixture.cover_native_history();
+            let mut args = mainnet_args(&fixture);
+            args.limit_stroops = Some(0);
+
+            let run = run(&fixture, &args).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            assert_eq!(fixture.sent_envelopes().await.len(), 1);
+        }
 
         /// Fee in the policy arguments, mainnet.
         #[tokio::test(flavor = "current_thread")]

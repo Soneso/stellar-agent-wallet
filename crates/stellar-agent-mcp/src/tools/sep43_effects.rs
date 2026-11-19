@@ -38,17 +38,20 @@ use stellar_agent_core::envelope_decode::{
 use stellar_agent_core::error::FeeSource;
 use stellar_agent_core::payment_accounts::PaymentAccount;
 use stellar_agent_core::policy::transaction_effects::{
-    FeeEffect, PaymentRoute, RefusedEffect, SourceCandidates, SourceMembership, TransactionEffects,
-    TransactionEffectsError, UnvaluedEffect, ValuedOperation, authorized_invocation_effects,
-    transaction_effects_for_sources, transaction_source_candidates,
+    FeeEffect, POOL_SHARE_ARG, PaymentRoute, RefusedEffect, SourceCandidates, SourceMembership,
+    TransactionEffects, TransactionEffectsError, UnvaluedEffect, ValuedOperation,
+    authorized_invocation_effects, transaction_effects_for_sources, transaction_source_candidates,
 };
-use stellar_agent_core::policy::v1::value::{ValueLeg, derive_value_class};
+use stellar_agent_core::policy::v1::asset_equivalence::assets_equivalent;
+use stellar_agent_core::policy::v1::criteria::minimum_reserve::opened_subentries;
+use stellar_agent_core::policy::v1::value::{ActionKind, ValueLeg, derive_value_class};
 use stellar_agent_core::policy::v1::{
     AccountObservation, AccountReserveLookupError, AccountReservesView, ValueClass, ValueEffects,
 };
 use stellar_agent_core::policy::{ApprovalRequest, Decision, DenyReason, ToolDescriptor};
+use stellar_agent_core::protocol_consts::POOL_SHARE_TRUSTLINE_SUBENTRIES;
 use stellar_agent_network::policy_state::{WindowStoreError, record_authorized_window_states};
-use stellar_agent_network::{AccountView, StellarRpcClient};
+use stellar_agent_network::{AccountView, Asset, StellarRpcClient};
 use stellar_xdr::{AccountId, PublicKey, ScAddress, Uint256};
 
 use crate::policy_adapter::AccountViewAdapter;
@@ -250,7 +253,24 @@ fn auth_entry_leg(account: &str, leg: ValueLeg) -> ValuedOperation {
     }
 }
 
-/// The account view after the wallet's fee and earlier native debits.
+/// Whether `operation` changes a trustline whose operation source is an
+/// account other than `wallet`.
+fn other_source_trustline(operation: &ValuedOperation, wallet: &str) -> bool {
+    operation.route == PaymentRoute::Trustline
+        && operation.policy_args["source"]
+            .as_str()
+            .and_then(|source| PaymentAccount::parse(source).ok())
+            .is_some_and(|source| source.base_account() != wallet)
+}
+
+/// Whether `operation` is the trustline operation of a pool share
+/// `ChangeTrust`.
+fn is_pool_share(operation: &ValuedOperation) -> bool {
+    operation.policy_args[POOL_SHARE_ARG] == true
+}
+
+/// The account view after the wallet's fee, earlier native debits, and the
+/// subentries earlier operations open.
 ///
 /// The `balance_floor` and `minimum_reserve` criteria read the fee from
 /// their own arguments too, so each evaluation copy carries a zero fee and
@@ -258,11 +278,20 @@ fn auth_entry_leg(account: &str, leg: ValueLeg) -> ValuedOperation {
 struct SpentAccountView<'a> {
     inner: &'a dyn AccountReservesView,
     spent_stroops: i128,
+    /// The subentries earlier operations and pool share trustlines open.
+    opened_subentries: i64,
+    /// The assets of the trustlines earlier operations open.
+    opened_trustlines: &'a [String],
+    /// The operation changes a trustline of another account, so it opens
+    /// none on the wallet and the view answers that the trustline is held.
+    other_source: bool,
 }
 
 impl AccountReservesView for SpentAccountView<'_> {
     fn reserves_stroops(&self, base_reserve_stroops: i64) -> i64 {
-        self.inner.reserves_stroops(base_reserve_stroops)
+        self.inner
+            .reserves_stroops(base_reserve_stroops)
+            .saturating_add(self.opened_subentries.saturating_mul(base_reserve_stroops))
     }
 
     fn balance_stroops(&self) -> Result<i64, AccountReserveLookupError> {
@@ -281,6 +310,17 @@ impl AccountReservesView for SpentAccountView<'_> {
 
     fn effective_native_reservations_stroops(&self) -> Option<u64> {
         self.inner.effective_native_reservations_stroops()
+    }
+
+    fn holds_trustline(&self, asset: &str, network_passphrase: &str) -> Option<bool> {
+        let opened = self
+            .opened_trustlines
+            .iter()
+            .any(|opened| assets_equivalent(opened, asset, network_passphrase));
+        if self.other_source || opened {
+            return Some(true);
+        }
+        self.inner.holds_trustline(asset, network_passphrase)
     }
 }
 
@@ -359,6 +399,7 @@ impl WalletServer {
                 effects.payment_legs(),
                 chain_id,
                 spent_stroops,
+                effects.pool_share_trustlines,
                 shape.as_ref(),
                 snapshot,
                 client,
@@ -494,6 +535,7 @@ impl WalletServer {
             legs.iter().collect(),
             chain_id,
             0,
+            0,
             None,
             snapshot,
             None,
@@ -586,9 +628,15 @@ impl WalletServer {
     /// stages the returned effects of every allowed leg in `gated`.
     ///
     /// `spent_stroops` is the native amount the wallet already pays, such as
-    /// the fee. Each native debit reduces the balance later legs see. A
-    /// wallet account the profile names is read once; each recipient base
-    /// account at most once. Without a leg, nothing is read.
+    /// the fee. Each native debit reduces the balance later legs see, and
+    /// each trustline an allowed leg opens on the wallet raises the reserve
+    /// later legs see. Each of the `pool_share_trustlines` the wallet opens
+    /// adds [`POOL_SHARE_TRUSTLINE_SUBENTRIES`] to that count for every leg.
+    /// A pool share operation is decided like any trustline operation; its
+    /// own leg adds nothing more, since the count holds its subentries. A
+    /// wallet account the profile names is read once, with the trustlines
+    /// its own operations name; each recipient base account at most once.
+    /// Without a leg, nothing is read.
     ///
     /// An approval requirement of a leg is returned with the `approvable`
     /// shape; without one it refuses with
@@ -603,37 +651,49 @@ impl WalletServer {
         payment_legs: Vec<&ValuedOperation>,
         chain_id: &str,
         mut spent_stroops: i128,
+        pool_share_trustlines: u32,
         approvable: Option<&'shape Approvable>,
         snapshot: &GateSnapshot,
         client: Option<StellarRpcClient>,
         gated: &mut Sep43Effects,
     ) -> Result<Option<OperationRequirement<'shape>>, ToolError> {
         let mut operation_requirement = None;
+        let account = &self.profile.mcp_signer_default.account;
+        let mut opened =
+            i64::from(pool_share_trustlines).saturating_mul(POOL_SHARE_TRUSTLINE_SUBENTRIES);
         if payment_legs.is_empty() {
             return Ok(operation_requirement);
         }
-        let wallet = stellar_strkey::ed25519::PublicKey::from_string(
-            &self.profile.mcp_signer_default.account,
-        )
-        .ok();
+        let wallet = stellar_strkey::ed25519::PublicKey::from_string(account).ok();
         let client = match client {
             Some(client) => client,
             None => self.sep43_probed_client().await?,
         };
+        let mut requested: Vec<Asset> = Vec::new();
+        for operation in &payment_legs {
+            let args = &operation.policy_args;
+            if operation.route == PaymentRoute::Trustline
+                && !other_source_trustline(operation, account)
+                && let (Some(code), Some(issuer)) =
+                    (args["asset_code"].as_str(), args["asset_issuer"].as_str())
+                && let Ok(asset) = Asset::from_code_and_issuer(code, issuer)
+                && !requested.contains(&asset)
+            {
+                requested.push(asset);
+            }
+        }
         let source = match wallet {
             Some(_) => Some(
-                stellar_agent_network::fetch_account(
-                    &client,
-                    &self.profile.mcp_signer_default.account,
-                    &[],
-                )
-                .await
-                .map_err(|error| refusal(ledger_err_result(&error)))?,
+                stellar_agent_network::fetch_account(&client, account, &requested)
+                    .await
+                    .map_err(|error| refusal(ledger_err_result(&error)))?,
             ),
             None => None,
         };
         let source = source.as_ref().map(AccountViewAdapter::new);
         let mut recipients: HashMap<String, Option<AccountView>> = HashMap::new();
+        let passphrase = self.context.network_passphrase();
+        let mut opened_trustlines: Vec<String> = Vec::new();
 
         for operation in payment_legs {
             let route_tool = operation.route.commit_tool();
@@ -667,9 +727,15 @@ impl WalletServer {
                 None => None,
             };
             let identity = recipient.map(AccountViewAdapter::new);
+            // The criterion counts one subentry for the asset-less leg of a
+            // pool share operation; `opened` already holds its subentries.
+            let pool_share = is_pool_share(operation);
             let spent = source.as_ref().map(|inner| SpentAccountView {
                 inner,
                 spent_stroops,
+                opened_subentries: opened.saturating_sub(i64::from(pool_share)),
+                opened_trustlines: &opened_trustlines,
+                other_source: other_source_trustline(operation, account),
             });
             let evaluation = self
                 .evaluate_policy_in_snapshot(
@@ -709,6 +775,20 @@ impl WalletServer {
             let Some(value) = evaluation.value_effects else {
                 continue;
             };
+            // The trustlines this leg opens count toward the reserve of later
+            // legs; a pool share trustline is counted for every leg already.
+            if let Some(view) = spent.filter(|_| !pool_share) {
+                let holds = |asset: &str| view.holds_trustline(asset, passphrase) == Some(true);
+                let assets: Vec<String> = value
+                    .legs()
+                    .iter()
+                    .filter(|leg| leg.kind == ActionKind::Trustline)
+                    .filter_map(|leg| leg.asset.clone())
+                    .filter(|asset| !holds(asset))
+                    .collect();
+                opened = opened.saturating_add(opened_subentries(&value, &view, passphrase));
+                opened_trustlines.extend(assets);
+            }
             for leg in value.legs() {
                 gated.legs.push(ValueLegRecord::from(leg));
                 if let Some(amount) = leg.amount.filter(|_| leg.is_native_debit()) {
