@@ -168,8 +168,8 @@ use crate::commands::policy_engine::{
     mainnet_floor_source, pay_policy_args, with_total_fee,
 };
 use crate::common::business_entry::{
-    BoundEnvelope, ClassicStart, bind_envelope, classic_start, entry_business_id,
-    mainnet_business_id, print_replay, signing_envelope,
+    Bound, ClassicStart, Staging, bind_signing, classic_start, entry_business_id,
+    mainnet_business_id, print_replay,
 };
 use crate::common::mainnet_write::{
     MainnetWriteRequest, authorize_and_submit, mainnet_context, mainnet_profiles_dir,
@@ -2477,20 +2477,19 @@ where
         Ok(id) => id,
         Err(e) => return fail(&Envelope::<()>::err(&e)),
     };
+    let payload = stellar_agent_core::approval::IntentPayload::Pay {
+        destination: args.destination.clone(),
+        asset: stellar_agent_network::operation_entry::intent_asset(&inputs.asset),
+        amount_stroops: inputs.amount.as_stroops(),
+    };
     let operation = match classic_start(
         &context,
-        &policy,
+        &policy.verified,
         business_id,
         inputs.source,
         inputs.fee_choice,
         &memo,
-        stellar_agent_network::operation_entry::IdentityFacts::Intent(
-            stellar_agent_core::approval::IntentPayload::Pay {
-                destination: args.destination.clone(),
-                asset: stellar_agent_network::operation_entry::intent_asset(&inputs.asset),
-                amount_stroops: inputs.amount.as_stroops(),
-            },
-        ),
+        stellar_agent_network::operation_entry::IdentityFacts::Intent(payload.clone()),
     ) {
         Ok(ClassicStart::Proceed(operation)) => operation,
         Ok(ClassicStart::Replay(view)) => return print_replay(&view, args.output),
@@ -2510,24 +2509,8 @@ where
         Ok(built) => built,
         Err(e) => return fail(&Envelope::<()>::err(&e)),
     };
-    // The record binds the envelope the run signs: a waiting record's
-    // stored envelope, or the one just built.
-    let handle = match bind_envelope(
-        &context,
-        operation,
-        OperationTool::CliPay,
-        OperationKind::Pay,
-        &built.envelope_xdr,
-    ) {
-        Ok(BoundEnvelope::Sign(handle)) => handle,
-        Ok(BoundEnvelope::Replay(view)) => return print_replay(&view, args.output),
-        Err(e) => return fail(&Envelope::<()>::err(&e)),
-    };
-    let (unsigned_xdr, fee_per_op_stroops) = match signing_envelope(&handle) {
-        Ok(signing) => signing,
-        Err(e) => return fail(&Envelope::<()>::err(&e)),
-    };
-    let total_fee = match envelope_total_fee(unsigned_xdr) {
+    let candidate = operation.candidate(&built.envelope_xdr);
+    let total_fee = match envelope_total_fee(&candidate) {
         Ok(fee) => fee,
         Err(e) => return fail(&Envelope::<()>::err(&e)),
     };
@@ -2572,10 +2555,26 @@ where
             ));
         }
     };
+    let signing = match bind_signing(
+        &context,
+        operation,
+        Staging {
+            policy: &policy.verified,
+            tool: OperationTool::CliPay,
+            kind: OperationKind::Pay,
+            built: &built.envelope_xdr,
+            payload,
+            verdict: evaluation.verdict,
+        },
+    ) {
+        Ok(Bound::Sign(signing)) => signing,
+        Ok(Bound::Replay(view)) => return print_replay(&view, args.output),
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
 
     let body = &policy.body;
     if let Err(e) = check_classic_fee_cap_signed(
-        fee_per_op_stroops,
+        signing.fee_per_op_stroops(),
         classic_fee_source(built.fee_choice, FeeSource::CommandDefault),
         profile,
         Some(body.classic_max_fee_per_op_stroops),
@@ -2617,8 +2616,8 @@ where
             asset: &witness.asset,
             base_units: witness.base_units,
         },
-        witness.inputs,
-        unsigned_xdr,
+        witness.inputs.clone(),
+        signing.checked(),
         &thresholds,
         "stellar_pay",
     )
@@ -2634,7 +2633,7 @@ where
         verb: "pay",
         tool: "stellar_pay",
         consumer: MainnetConsumer::CliPay,
-        unsigned_xdr,
+        unsigned_xdr: signing.stored(),
         client: &client,
         probe_deadline: budget,
         submit_timeout: submit_timeout(args.timeout_seconds, profile),
@@ -2646,20 +2645,28 @@ where
         effective_cap,
         witness: cross_check.witness(),
         ledger: operational,
-        operation: Some(&handle),
+        operation: Some(signing.handle()),
+        rebuild: signing.rebuild(
+            built.fee_choice,
+            DEFAULT_FEE_STROOPS,
+            witness.inputs,
+            &thresholds,
+        ),
     })
     .await
     {
         Ok(submitted) => {
             let result = PayResult {
                 destinations: result_fields(&submitted.signed_xdr),
+                selected_fee_per_op_stroops: Some(
+                    submitted.fee_per_op_stroops(signing.fee_per_op_stroops()),
+                ),
+                cross_check: Some(submitted.cross_check(&cross_check).view()),
                 envelope_xdr: submitted.signed_xdr,
                 tx_hash: Some(submitted.result.tx_hash.clone()),
                 ledger: Some(submitted.result.ledger),
                 stage: "build+sign+submit".to_owned(),
-                selected_fee_per_op_stroops: Some(fee_per_op_stroops),
                 selected_fee_percentile: Some(built.fee_selection.selected_fee_percentile),
-                cross_check: Some(cross_check.view()),
                 business_id: None,
             };
             print_success(&Envelope::ok(result), args.output);
@@ -7398,17 +7405,41 @@ pub(crate) mod tests {
 
         /// Accept: a payment with a memo below the threshold needs no
         /// witness. It is sent once, signed by the enrolled key over the
-        /// mainnet payload, consumes its authorization, tombstones its
-        /// confirmation entry and never reaches the oracle.
+        /// mainnet payload, consumes its authorization, keeps its
+        /// confirmation entry's tombstone owed and never reaches the oracle.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial(mainnet_clock)]
         #[serial_test::serial]
         async fn mainnet_time_bounds_pay() {
-            let fixture = Spec::new("mainnet-pay-accept-memo").build().await;
+            // The status rule lets `tx status` reconcile the send below.
+            let status_rule = "[[rules]]\nmatch = { tool = \"stellar_transaction_status\", \
+                               chain = \"stellar:mainnet\" }\ncriteria = []\n\
+                               decision = \"allow\"\n";
+            // After the run both endpoints report the sent transaction
+            // included with a success result, the evidence recovery needs.
+            let evidence = std::sync::Arc::new(std::sync::Mutex::new(None::<Value>));
+            let reporting = |rpc: ClassicRpc| {
+                let evidence = std::sync::Arc::clone(&evidence);
+                rpc.with_script(move |method, _, _| {
+                    (method == "getTransaction")
+                        .then(|| evidence.lock().unwrap().clone())
+                        .flatten()
+                })
+            };
+            let endpoints = [reporting(accounts()), reporting(accounts())];
+            let fixture = Spec::new("mainnet-pay-accept-memo")
+                .rules(vec![
+                    pay_rule("require_approval", ""),
+                    status_rule.to_owned(),
+                ])
+                .primary(endpoints[0].clone())
+                .oracle(endpoints[1].clone())
+                .build()
+                .await;
 
             let built_at_ms =
                 stellar_agent_network::mainnet::clock::now_ms().unwrap() + CLOCK_LEAD_MS;
-            let _clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(built_at_ms);
+            let clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(built_at_ms);
             let run = run(&fixture, &memo_args(&fixture)).await;
 
             assert_eq!(run.code, 0, "{}", run.envelope);
@@ -7425,14 +7456,85 @@ pub(crate) mod tests {
             assert_eq!(data["cross_check"]["status"], "not_required");
             assert!(fixture.open_authorizations(now()).is_empty());
             assert!(invalidations_on_this_thread().is_empty());
-            let entries = fixture.pending_entries();
-            assert_eq!(entries.len(), 1, "{entries:?}");
-            assert_eq!(entries[0].kind_name, "Consumed");
+            crate::common::mainnet_authority_tests::assert_consumption_owed(&fixture);
             assert_eq!(
                 fixture.oracle_methods().await,
                 ["getLatestLedger", "getLedgers"]
             );
             assert_eq!(fixture.initializer_calls(), 1);
+
+            // Inside the consent's execution window, once both endpoints
+            // report the transaction included, `tx status` ends the operation
+            // and records the owed consumption once; a second call writes
+            // nothing.
+            *evidence.lock().unwrap() = Some(json!({
+                "status": "SUCCESS",
+                "ledger": 1005,
+                "createdAt": (built_at_ms / 1000 + 5).to_string(),
+                "txHash": data["tx_hash"],
+                "envelopeXdr": sent[0],
+                "resultXdr": stellar_xdr::TransactionResult {
+                    fee_charged: 100,
+                    result: stellar_xdr::TransactionResultResult::TxSuccess(
+                        stellar_xdr::VecM::default(),
+                    ),
+                    ext: stellar_xdr::TransactionResultExt::V0,
+                }
+                .to_xdr_base64(stellar_xdr::Limits::none())
+                .unwrap(),
+                "latestLedger": 1006,
+                "oldestLedger": 1,
+            }));
+            let nonce = fixture.pending_entries()[0].approval_nonce.clone();
+            let execution_end =
+                stellar_agent_network::policy_state::approvals::ApprovalStatus::new(
+                    &stellar_agent_network::policy_state::PersistedWindowStore::for_profile(
+                        fixture.name,
+                    ),
+                    &fixture.profile(),
+                )
+                .find_by_nonce(&nonce)
+                .unwrap()
+                .unwrap()
+                .record
+                .consent
+                .unwrap()
+                .execution_expires_at_ms;
+            let status_at = execution_end - 100_000;
+            clock.set(status_at);
+            let system_secs = now() / 1000;
+            for endpoint in &endpoints {
+                endpoint.close_health_ahead(status_at / 1000 + 1 - system_secs);
+            }
+            let status = || async {
+                crate::common::render::take_rendered_for_test();
+                crate::commands::tx::status::run(&crate::commands::tx::status::StatusArgs {
+                    tx_hash: Some(data["tx_hash"].as_str().unwrap().to_owned()),
+                    business_id: None,
+                    profile: Some(fixture.name.to_owned()),
+                    output: stellar_agent_core::envelope::OutputFormat::Json,
+                    retry_recovery: false,
+                })
+                .await
+            };
+            assert_eq!(status().await, 0, "{:?}", crate::test_rpc::last_rendered());
+            assert_eq!(
+                fixture.window_body()["operations"]["records"][0]["state"],
+                "succeeded",
+                "the evidence ends the operation"
+            );
+            let entries = fixture.pending_entries();
+            assert_eq!(entries.len(), 1, "{entries:?}");
+            assert_eq!(entries[0].kind_name, "Consumed", "{entries:?}");
+            let state = || {
+                (
+                    std::fs::read(fixture.approval_store_path()).unwrap(),
+                    std::fs::read(fixture.window_path()).unwrap(),
+                )
+            };
+            let before = state();
+            assert_eq!(status().await, 0, "{:?}", crate::test_rpc::last_rendered());
+            assert!(state() == before, "a second status call writes nothing");
         }
 
         /// Operational check: a primary whose latest ledger closed beyond the
@@ -7513,12 +7615,13 @@ pub(crate) mod tests {
         }
 
         /// Operational check: the build checks the primary's identity, then its
-        /// readiness, then reads the account, and the write checks readiness
-        /// only once; the summary names the latest ledger and the close-time
-        /// lag after the fee lines.
+        /// readiness, then reads the account; the write checks readiness once
+        /// more, for the rebuild after the confirmation. The confirmation shows
+        /// the stored intent with its fee bound, which names no ledger: the
+        /// rebuild reads the endpoint again.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
-        async fn the_summary_names_the_ledger_of_a_current_endpoint() {
+        async fn the_build_and_the_rebuild_check_a_current_endpoint() {
             let fixture = Spec::new("mainnet-pay-summary-ledger").build().await;
 
             let run = run(&fixture, &memo_args(&fixture)).await;
@@ -7537,36 +7640,22 @@ pub(crate) mod tests {
             for read in ["getHealth", "getLedgers"] {
                 assert_eq!(
                     methods.iter().filter(|method| *method == read).count(),
-                    1,
-                    "the write checks the endpoint once: {methods:?}"
+                    2,
+                    "the build and the rebuild check the endpoint: {methods:?}"
                 );
             }
             let summaries = fixture.summaries();
             assert_eq!(summaries.len(), 1, "{summaries:?}");
             let lines: Vec<&str> = summaries[0].lines().collect();
-            let at = lines
-                .iter()
-                .position(|line| line.starts_with("Ledger "))
-                .unwrap_or_else(|| panic!("the summary names the ledger: {lines:?}"));
+            assert!(lines.contains(&"Fee at most: 500 stroops"), "{lines:?}");
             assert!(
-                lines[at - 1].starts_with("Fee cap: "),
-                "the ledger line follows the fee lines: {lines:?}"
+                !lines.iter().any(|line| line.starts_with("Ledger ")),
+                "the intent names no transient ledger: {lines:?}"
             );
             assert_eq!(
-                lines[at + 1],
-                crate::common::mainnet_confirm::CONSENT_LINE,
+                lines.last(),
+                Some(&crate::common::mainnet_confirm::CONSENT_LINE),
                 "{lines:?}"
-            );
-            let lag: u64 = lines[at]
-                .strip_prefix("Ledger 2000, closed ")
-                .and_then(|rest| rest.strip_suffix(" s ago"))
-                .unwrap_or_else(|| panic!("unexpected ledger line: {}", lines[at]))
-                .parse()
-                .unwrap();
-            assert!(
-                lag <= stellar_agent_network::operational::MAX_LEDGER_CLOSE_LAG.as_secs(),
-                "{}",
-                lines[at]
             );
         }
 
@@ -7712,7 +7801,7 @@ pub(crate) mod tests {
             assert!(!fixture.oracle_methods().await.is_empty());
             assert!(fixture.open_authorizations(now()).is_empty());
             assert!(invalidations_on_this_thread().is_empty());
-            assert_eq!(fixture.pending_entries()[0].kind_name, "Consumed");
+            crate::common::mainnet_authority_tests::assert_consumption_owed(&fixture);
         }
 
         /// An enabled profile whose oracle was removed after enablement
@@ -8224,20 +8313,18 @@ pub(crate) mod tests {
         }
 
         /// Pending store scope: the confirmation closes its store, so the
-        /// recorder tombstones the entry in the same run and nothing remains
-        /// owed.
+        /// recorder's send outcome reports no failed consumption write; the
+        /// canonical entry's tombstone stays owed until the operation ends.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
-        async fn the_entry_is_tombstoned_in_the_same_run() {
+        async fn the_entry_outlives_the_send_without_a_store_failure() {
             let fixture = Spec::new("mainnet-pay-store-scope").build().await;
             let (capture, _guard) = WarningCapture::capture(None);
 
             let run = run(&fixture, &memo_args(&fixture)).await;
 
             assert_eq!(run.code, 0, "{}", run.envelope);
-            let entries = fixture.pending_entries();
-            assert_eq!(entries.len(), 1);
-            assert_eq!(entries[0].kind_name, "Consumed");
+            crate::common::mainnet_authority_tests::assert_consumption_owed(&fixture);
             assert!(
                 !capture.seen().iter().any(|event| event
                     .get("message")
@@ -8325,11 +8412,13 @@ pub(crate) mod tests {
             assert_eq!(fixture.sent_envelopes().await.len(), 2);
         }
 
-        /// A confirmation beyond the envelope deadline refuses before signing.
+        /// A confirmation beyond the prepared envelope's deadline covers the
+        /// stored intent: the verb signs an envelope rebuilt with a deadline
+        /// from the confirmation time, once, and logs no refusal.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial(mainnet_clock)]
         #[serial_test::serial]
-        async fn a_confirmation_slower_than_the_deadline_refuses_before_signing() {
+        async fn a_confirmation_slower_than_the_deadline_signs_a_rebuilt_envelope() {
             let mut fixture = Spec::new("mainnet-pay-slow-confirm").build().await;
             let clock = Rc::new(stellar_agent_network::mainnet::clock::set_now_ms_for_test(
                 now() + CLOCK_LEAD_MS,
@@ -8353,18 +8442,15 @@ pub(crate) mod tests {
             let (capture, _guard) = WarningCapture::capture(None);
             let run = run(&fixture, &ledger_args(&fixture)).await;
 
+            let confirmed_at_ms = mainnet_now();
             drop(clock);
-            assert_withheld_before_the_mint(
-                &fixture,
-                &run,
-                "network.mainnet_authorization_refused",
-            )
-            .await;
-            assert_eq!(
-                refusal_warnings(&capture, "resolve_tx_sign"),
-                vec!["\"deadline_elapsed\"".to_owned()]
-            );
-            assert!(!calls.lock().unwrap().contains(&"sign_tx_payload"));
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            assert!(refusal_warnings(&capture, "resolve_canonical_tx_sign").is_empty());
+            let sent = fixture.sent_envelopes().await;
+            assert_eq!(sent.len(), 1, "signed once");
+            crate::common::mainnet_write_fixture::assert_deadline_bound(&sent[0], confirmed_at_ms);
+            assert!(calls.lock().unwrap().contains(&"sign_tx_payload"));
+            assert!(invalidations_on_this_thread().is_empty());
         }
 
         /// Fee cap: the signed cap below the profile's governs.
@@ -8547,10 +8633,14 @@ pub(crate) mod tests {
                 .collect();
             assert_eq!(all.len(), 1, "{all:?}");
             assert_eq!(
-                refusal_warnings(&capture, "resolve_tx_sign"),
+                refusal_warnings(&capture, "resolve_canonical_tx_sign"),
                 vec!["\"endpoint_not_mainnet\"".to_owned()]
             );
         }
+
+        /// The account read of the resolver: the preparation reads the
+        /// source and the destination, and the rebuild the source once more.
+        const RESOLVER_ACCOUNT_READ: usize = 3;
 
         /// Resolver policy denial: the resolver's own source read crosses the
         /// reserve, so it denies with the criterion's code and the withheld
@@ -8561,7 +8651,7 @@ pub(crate) mod tests {
             let fixture = Spec::new("mainnet-pay-resolver-deny")
                 .rules(vec![pay_rule("require_approval", &minimum_reserve(0))])
                 .primary(accounts().with_script(|method, index, _| {
-                    (method == "getLedgerEntries" && index == 2)
+                    (method == "getLedgerEntries" && index == RESOLVER_ACCOUNT_READ)
                         .then(|| agent_entries(RESERVE + AMOUNT))
                 }))
                 .build()
@@ -8591,7 +8681,7 @@ pub(crate) mod tests {
             let fixture = Spec::new("mainnet-pay-resolver-deny-allow")
                 .rules(vec![pay_rule("allow", &minimum_reserve(0))])
                 .primary(accounts().with_script(|method, index, _| {
-                    (method == "getLedgerEntries" && index == 2)
+                    (method == "getLedgerEntries" && index == RESOLVER_ACCOUNT_READ)
                         .then(|| agent_entries(RESERVE + AMOUNT))
                 }))
                 .build()
@@ -8615,7 +8705,7 @@ pub(crate) mod tests {
             assert!(records(&fixture).is_empty());
             assert!(invalidations_on_this_thread().is_empty());
             assert_eq!(
-                refusal_warnings(&capture, "resolve_tx_sign"),
+                refusal_warnings(&capture, "resolve_canonical_tx_sign"),
                 vec!["\"fresh_decision_requires_approval\"".to_owned()]
             );
         }

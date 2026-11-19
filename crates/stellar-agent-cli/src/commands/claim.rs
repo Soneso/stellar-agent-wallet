@@ -170,8 +170,8 @@ use crate::commands::policy_engine::{
     load_mainnet_policy_engine, mainnet_floor_source, with_total_fee,
 };
 use crate::common::business_entry::{
-    BoundEnvelope, ClassicStart, bind_envelope, classic_start, entry_business_id,
-    mainnet_business_id, signing_envelope, write_replay,
+    Bound, ClassicStart, Staging, bind_signing, classic_start, entry_business_id,
+    mainnet_business_id, write_replay,
 };
 use crate::common::mainnet_write::{
     MainnetWriteRequest, authorize_and_submit, mainnet_context, mainnet_profiles_dir,
@@ -1118,6 +1118,32 @@ async fn witness_built_claim(
         tool,
     )
     .await
+}
+
+/// The intent payload of the claim `built` stages for `claimant`: its
+/// balance id, and the asset and amount of the balance record the build
+/// read.
+///
+/// # Errors
+///
+/// `internal.unexpected_state` for a record whose asset has no canonical
+/// form.
+fn claim_payload(
+    built: &BuiltClaimEnvelope,
+    claimant: &str,
+) -> Result<stellar_agent_core::approval::IntentPayload, WalletError> {
+    let asset = stellar_agent_network::mainnet::canonical::exact_asset(&built.record.asset)
+        .ok_or_else(|| {
+            WalletError::Internal(stellar_agent_core::error::InternalError::UnexpectedState {
+                detail: "the claimable balance's asset has no canonical form".to_owned(),
+            })
+        })?;
+    Ok(stellar_agent_core::approval::IntentPayload::Claim {
+        balance_id: built.balance_id_hex72.clone(),
+        claimant: claimant.to_owned(),
+        asset,
+        amount_stroops: built.record.amount,
+    })
 }
 
 /// The observations a built claim's witness compares: the source, the
@@ -2104,7 +2130,7 @@ where
     };
     let operation = match classic_start(
         &context,
-        &policy,
+        &policy.verified,
         business_id,
         &args.source,
         fee_choice,
@@ -2126,22 +2152,8 @@ where
     let preview = built.preview.clone();
     let failed = |envelope: Envelope<()>| ClaimOutcome::failed_after_preview(preview, envelope);
 
-    let handle = match bind_envelope(
-        &context,
-        operation,
-        OperationTool::CliClaim,
-        OperationKind::Claim,
-        &built.envelope_xdr,
-    ) {
-        Ok(BoundEnvelope::Sign(handle)) => handle,
-        Ok(BoundEnvelope::Replay(view)) => return ClaimOutcome::replayed(view),
-        Err(e) => return failed(Envelope::<()>::err(&e)),
-    };
-    let (unsigned_xdr, fee_per_op_stroops) = match signing_envelope(&handle) {
-        Ok(signing) => signing,
-        Err(e) => return failed(Envelope::<()>::err(&e)),
-    };
-    let total_fee = match envelope_total_fee(unsigned_xdr) {
+    let candidate = operation.candidate(&built.envelope_xdr);
+    let total_fee = match envelope_total_fee(&candidate) {
         Ok(fee) => fee,
         Err(e) => return failed(Envelope::<()>::err(&e)),
     };
@@ -2177,10 +2189,28 @@ where
             ));
         }
     };
+    let signing = match claim_payload(&built, &args.source).and_then(|payload| {
+        bind_signing(
+            &context,
+            operation,
+            Staging {
+                policy: &policy.verified,
+                tool: OperationTool::CliClaim,
+                kind: OperationKind::Claim,
+                built: &built.envelope_xdr,
+                payload,
+                verdict: evaluation.verdict,
+            },
+        )
+    }) {
+        Ok(Bound::Sign(signing)) => signing,
+        Ok(Bound::Replay(view)) => return ClaimOutcome::replayed(view),
+        Err(e) => return failed(Envelope::<()>::err(&e)),
+    };
 
     let body = &policy.body;
     if let Err(e) = check_classic_fee_cap_signed(
-        fee_per_op_stroops,
+        signing.fee_per_op_stroops(),
         classic_fee_source(built.fee_choice, FeeSource::CommandDefault),
         profile,
         Some(body.classic_max_fee_per_op_stroops),
@@ -2207,8 +2237,8 @@ where
         profile,
         &net_context,
         stellar_agent_core::cross_check::CrossCheckValue::Unvalued,
-        inputs,
-        unsigned_xdr,
+        inputs.clone(),
+        signing.checked(),
         &thresholds,
         "stellar_claim",
     )
@@ -2224,7 +2254,7 @@ where
         verb: "claim",
         tool: "stellar_claim",
         consumer: MainnetConsumer::CliClaim,
-        unsigned_xdr,
+        unsigned_xdr: signing.stored(),
         client: &client,
         probe_deadline: stellar_agent_network::PRE_SEND_BUDGET,
         submit_timeout: submit_timeout(args.timeout_seconds, profile),
@@ -2236,19 +2266,20 @@ where
         effective_cap,
         witness: cross_check.witness(),
         ledger: built.operational.clone(),
-        operation: Some(&handle),
+        operation: Some(signing.handle()),
+        rebuild: signing.rebuild(built.fee_choice, DEFAULT_FEE_STROOPS, inputs, &thresholds),
     })
     .await
     {
         Ok(submitted) => ClaimOutcome::succeeded(
             Some(built.preview),
             ClaimResult {
+                cross_check: Some(submitted.cross_check(&cross_check).view()),
                 envelope_xdr: submitted.signed_xdr,
                 tx_hash: Some(submitted.result.tx_hash.clone()),
                 ledger: Some(submitted.result.ledger),
                 stage: "build+sign+submit".to_owned(),
                 balance_id_hex72: Some(built.balance_id_hex72),
-                cross_check: Some(cross_check.view()),
                 business_id: None,
             },
         ),
@@ -3483,7 +3514,7 @@ pub(crate) mod tests {
     /// Returns the ledger key and the entry XDR of an unconditional native
     /// claimable balance of `amount` stroops with id
     /// `CLAIM_RPC_BALANCE_HEX64`, whose one claimant is `claimant`.
-    fn claimable_entry_with(claimant: &str, amount: i64) -> (String, String) {
+    pub(crate) fn claimable_entry_with(claimant: &str, amount: i64) -> (String, String) {
         use stellar_xdr::{
             ClaimPredicate, ClaimableBalanceEntry, ClaimableBalanceEntryExt, Claimant, ClaimantV0,
             LedgerEntryData, LedgerKey, LedgerKeyClaimableBalance,
@@ -5167,19 +5198,18 @@ pub(crate) mod tests {
             assert!(!fixture.oracle_methods().await.is_empty());
             assert!(fixture.open_authorizations(now()).is_empty());
             assert!(invalidations_on_this_thread().is_empty());
-            let entries = fixture.pending_entries();
-            assert_eq!(entries.len(), 1);
-            assert_eq!(entries[0].kind_name, "Consumed");
+            crate::common::mainnet_authority_tests::assert_consumption_owed(&fixture);
         }
 
-        /// Elapsed bound: a confirmation one second past the envelope's
-        /// on-chain deadline refuses at the resolver with `deadline_elapsed`,
-        /// before any signer is resolved: the Ledger never signs and nothing
-        /// is sent.
+        /// Elapsed bound: a confirmation one second past the prepared
+        /// envelope's on-chain deadline covers the stored intent, so the
+        /// verb rebuilds the envelope with a deadline from the confirmation
+        /// time and the Ledger signs it once; no refusal is logged and
+        /// nothing is invalidated.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial(mainnet_clock)]
         #[serial_test::serial]
-        async fn mainnet_time_bounds_claim_elapsed_refuses_before_signing() {
+        async fn mainnet_time_bounds_claim_elapsed_rebuilds_after_consent() {
             let mut fixture = spec("mainnet-claim-elapsed").build().await;
             let clock = Rc::new(stellar_agent_network::mainnet::clock::set_now_ms_for_test(
                 now() + CLOCK_LEAD_MS,
@@ -5189,32 +5219,20 @@ pub(crate) mod tests {
             let mut args = mainnet_args(&fixture);
             args.sign_with_ledger = true;
             let resolutions = signer_resolutions_on_this_thread();
-            let kinds = submission_kinds_on_this_thread().len();
             let (capture, _guard) = WarningCapture::capture(None);
 
             let run = run(&fixture, &args).await;
 
+            let confirmed_at_ms = stellar_agent_network::mainnet::clock::now_ms().unwrap();
             drop(clock);
-            assert_eq!(run.code, 1, "{}", run.envelope);
-            assert_eq!(
-                run.code(),
-                "network.mainnet_authorization_refused",
-                "{}",
-                run.envelope
-            );
-            assert_eq!(
-                refusal_warnings(&capture, "resolve_tx_sign"),
-                vec!["\"deadline_elapsed\"".to_owned()]
-            );
-            assert!(records(&fixture).is_empty(), "no authorization record");
-            let entries = fixture.pending_entries();
-            assert_eq!(entries.len(), 1, "{entries:?}");
-            assert_eq!(entries[0].kind_name, "ClaimSimulated");
-            assert!(fixture.sent_envelopes().await.is_empty(), "nothing is sent");
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            assert!(refusal_warnings(&capture, "resolve_canonical_tx_sign").is_empty());
+            let sent = fixture.sent_envelopes().await;
+            assert_eq!(sent.len(), 1, "signed once");
+            crate::common::mainnet_write_fixture::assert_deadline_bound(&sent[0], confirmed_at_ms);
             assert!(invalidations_on_this_thread().is_empty());
-            assert!(!calls.lock().unwrap().contains(&"sign_tx_payload"));
-            assert_eq!(signer_resolutions_on_this_thread(), resolutions);
-            assert_eq!(submission_kinds_on_this_thread().len(), kinds);
+            assert!(calls.lock().unwrap().contains(&"sign_tx_payload"));
+            assert_eq!(signer_resolutions_on_this_thread(), resolutions + 1);
         }
 
         /// Engine kind: a Noop profile refuses at the engine check.
@@ -5324,13 +5342,13 @@ pub(crate) mod tests {
             assert!(fixture.sent_envelopes().await.is_empty());
         }
 
-        /// Claim confirmation: the prompt shows the asset and the amount as
-        /// not known before the claim; the entry the confirmation writes
-        /// carries the decoded envelope and no value, and the authorization
-        /// is minted for the claim from it before the device opens.
+        /// Claim confirmation: the prompt shows the stored intent, with the
+        /// amount of the balance the preparation read and the fee bound; the
+        /// entry the confirmation writes carries the decoded envelope, and
+        /// the authorization is minted for the claim before the device opens.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
-        async fn the_claim_confirmation_shows_the_value_as_unknown() {
+        async fn the_claim_confirmation_shows_the_stored_value() {
             let fixture = spec("mainnet-claim-confirmation").build().await;
             let observed = Rc::new(std::cell::RefCell::new(Vec::new()));
             let seen = Rc::clone(&observed);
@@ -5383,28 +5401,17 @@ pub(crate) mod tests {
             let prompt = &summaries[0];
             assert!(prompt.contains(balance_id_strkey.as_str()), "{prompt}");
             assert!(prompt.contains(&fixture.agent.g), "{prompt}");
-            assert!(prompt.contains("Fee: 100 stroops"), "{prompt}");
-            assert_eq!(
-                prompt
-                    .matches("not known to the wallet before the claim")
-                    .count(),
-                2,
+            assert!(prompt.contains("Amount: 100000000 stroops"), "{prompt}");
+            assert!(prompt.contains("Fee at most: 500 stroops"), "{prompt}");
+            assert!(
+                !prompt.contains("not known to the wallet before the claim"),
                 "{prompt}"
             );
             assert_eq!(
                 *calls.lock().unwrap(),
                 ["construct", "public_key", "sign_tx_payload"]
             );
-            let after = fixture.pending_entries();
-            assert_eq!(after.len(), 1);
-            let stellar_agent_core::approval::view::ApprovalSummaryView::Consumed {
-                original_kind_name,
-                ..
-            } = &after[0].summary
-            else {
-                panic!("{:?}", after[0].summary);
-            };
-            assert_eq!(original_kind_name, "ClaimSimulated");
+            crate::common::mainnet_authority_tests::assert_consumption_owed(&fixture);
         }
 
         /// Pre-flight before the witness: without the audit chain key the

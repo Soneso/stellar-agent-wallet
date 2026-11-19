@@ -799,14 +799,27 @@ projects it onto the receipt. A `pending` or `ambiguous` receipt becomes
 decision identifier as `settlement_decision_id`. A missing receipt is restored
 in that form. The chain outcome stays unknown.
 
-Classic mainnet envelopes carry a deadline 120 seconds after they are built,
-covered by the operator's consent. Deadline expiry ends future execution;
-accounting continues through each affected spending window. Testnet envelopes
-can carry no bound. A confirmation after the deadline refuses with
+Classic mainnet envelopes carry a deadline 120 seconds after they are built.
+The operator's consent covers the stored intent, not one envelope. After the
+confirmation the CLI verbs `pay`, `claim`, `trustline` and sponsored
+`accounts create` rebuild the envelope from that intent with the account's
+current sequence, the fee the `--fee` choice gives now, a new deadline, and a
+fresh oracle check, so a slow confirmation does not stale the transaction. The
+new deadline lies before the end of the approval's execution window or of the
+policy decision's authority.
+Deadline expiry ends future execution; accounting continues through each
+affected spending window. Testnet envelopes can carry no bound. A transaction
+whose deadline passed before signing refuses with
 `network.mainnet_authorization_refused` (`deadline_elapsed`); run the command
 again for a fresh envelope. A send that starts within 30 seconds of the
 deadline refuses with `network.mainnet_authorization_refused`
-(`deadline_within_margin`).
+(`deadline_within_margin`). A retry in the last 30 seconds of an approval's
+execution window gets no usable fresh envelope, so it refuses
+`deadline_within_margin` too; once the window ends the business id replays as
+`expired`, and the operator requests a new approval by running the command
+under a new `--business-id`. A rebuilt transaction that no longer matches the
+stored intent, such as a claimable balance whose amount changed, refuses with
+`simulation.divergence` before any signature.
 
 A reported failure or missing transaction does not release possible spending. Bounded uncertainty counts through the later of the signed deadline and the first local success observation, plus each affected spending window.
 

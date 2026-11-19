@@ -561,6 +561,12 @@ pub struct CanonicalRebuildRequest<'a> {
     pub thresholds: &'a stellar_agent_core::cross_check::ThresholdSet<'a>,
     /// The policy tool the oracle check is logged under.
     pub tool: &'static str,
+    /// The end of the authority the signature proceeds under, in Unix
+    /// milliseconds: an approval's execution end, or a policy decision's
+    /// governing end. The authority holds strictly before it, and a ledger
+    /// whose close time equals an envelope's deadline still includes it, so
+    /// the rebuilt deadline lies strictly before this end.
+    pub authority_end_ms: u64,
 }
 
 /// An envelope rebuilt from a canonical intent, with the reads behind it.
@@ -583,8 +589,10 @@ pub struct CanonicalRebuild {
 /// The reads run in order: the readiness check, the source account, the fee
 /// statistics when the choice is a percentile, then the oracle check bound
 /// to the rebuilt envelope. The envelope takes the account's next sequence,
-/// the chosen fee, and a deadline [`MAINNET_CLASSIC_DEADLINE_SECONDS`] after
-/// the mainnet clock. Nothing is signed or stored.
+/// the chosen fee, and a deadline at the earlier of
+/// [`MAINNET_CLASSIC_DEADLINE_SECONDS`] after the mainnet clock and the last
+/// whole second before the request's `authority_end_ms`, so the transaction
+/// cannot land once its authority has ended. Nothing is signed or stored.
 ///
 /// [`MAINNET_CLASSIC_DEADLINE_SECONDS`]: crate::mainnet::resolve::MAINNET_CLASSIC_DEADLINE_SECONDS
 ///
@@ -633,7 +641,8 @@ pub async fn rebuild_canonical(
     }
     require_sequence_successor(account.sequence_number)?;
     let max_time_s = (crate::mainnet::clock::now_ms()? / 1000)
-        .saturating_add(crate::mainnet::resolve::MAINNET_CLASSIC_DEADLINE_SECONDS);
+        .saturating_add(crate::mainnet::resolve::MAINNET_CLASSIC_DEADLINE_SECONDS)
+        .min(request.authority_end_ms.saturating_sub(1) / 1000);
     let envelope = intent_envelope(
         intent,
         request.network.network_passphrase(),
@@ -2742,7 +2751,7 @@ pub(crate) mod tests {
             subentry_count: 0,
             flags: None,
         };
-        let rebuild = |fee_choice| {
+        let rebuild_until = |fee_choice, authority_end_ms| {
             rebuild_canonical(CanonicalRebuildRequest {
                 profile: &f.profile,
                 network: &network,
@@ -2761,8 +2770,10 @@ pub(crate) mod tests {
                 .into(),
                 thresholds: &thresholds,
                 tool: "stellar_pay",
+                authority_end_ms,
             })
         };
+        let rebuild = |fee_choice| rebuild_until(fee_choice, u64::MAX);
         let subject = |rebuilt: &CanonicalRebuild| match &rebuilt.cross_check {
             CrossCheckOutcome::Passed(witness) => witness.subject().unwrap(),
             other => panic!("a bound witness, got {other:?}"),
@@ -2800,6 +2811,29 @@ pub(crate) mod tests {
             (2, 100, now_ms / 1000 + 120)
         );
         assert_eq!(subject(&first), tx_hash(&first.unsigned_envelope_b64));
+
+        // The deadline is the earlier of 120 seconds after the rebuild and
+        // the last whole second before the authority's end: one second before
+        // an end of whole seconds, the floor of a fractional end.
+        let whole_s = now_ms / 1000 + 60;
+        for (end_ms, expected_s) in [
+            (now_ms + 600_000, now_ms / 1000 + 120),
+            (whole_s * 1000, whole_s - 1),
+            (whole_s * 1000 + 500, whole_s),
+        ] {
+            serve_chain(&f, &primary, &oracle, 1, "healthy").await;
+            let bounded = rebuild_until(ClassicFeeChoice::ProfileDefault, end_ms)
+                .await
+                .unwrap();
+            assert_eq!(bounded.max_time_s, expected_s, "authority end {end_ms}");
+            assert_eq!(
+                match_envelope(&bounded.unsigned_envelope_b64, &check)
+                    .unwrap()
+                    .max_time_s,
+                expected_s,
+                "the envelope carries the bounded deadline"
+            );
+        }
 
         serve_chain(&f, &primary, &oracle, 5, "healthy").await;
         let second = rebuild(ClassicFeeChoice::ProfileDefault).await.unwrap();

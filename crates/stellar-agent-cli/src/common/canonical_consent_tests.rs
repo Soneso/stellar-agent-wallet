@@ -17,6 +17,19 @@ pub(crate) fn staged(
     memo: MemoFact,
     limit: i64,
 ) -> (ClassicIntent, MainnetWriteSummary, OperationHandle) {
+    staged_as(fixture, context, kind, memo, limit, "canonical-consent", 37)
+}
+
+/// [`staged`] under `business_id`, paying `amount` for a payment.
+fn staged_as(
+    fixture: &MainnetConsentFixture,
+    context: &MainnetWriteContext,
+    kind: usize,
+    memo: MemoFact,
+    limit: i64,
+    business_id: &str,
+    amount: i64,
+) -> (ClassicIntent, MainnetWriteSummary, OperationHandle) {
     let source = context.profile().mcp_signer_default.account.clone();
     let destination = stellar_strkey::ed25519::PublicKey([6; 32])
         .to_string()
@@ -30,7 +43,7 @@ pub(crate) fn staged(
             IntentPayload::Pay {
                 destination,
                 asset: issued,
-                amount_stroops: 37,
+                amount_stroops: amount,
             },
             MainnetConsumer::CliPay,
             OperationTool::CliPay,
@@ -95,7 +108,7 @@ pub(crate) fn staged(
     }
     .open(
         &mut OperationRecorder::new(&store, context.profile(), &mut NoRows, "canonical-open"),
-        BusinessId::parse("canonical-consent").unwrap(),
+        BusinessId::parse(business_id).unwrap(),
         tool,
         operation,
         &envelope,
@@ -322,6 +335,53 @@ async fn canonical_recovery_keeps_signed_clocks() {
     }
 }
 
+/// Under integrated delivery, an intent entry that names the operation's
+/// nonce, kind and signed clocks but carries another envelope as its
+/// challenge refuses with `approval.attestation_invalid` before any
+/// ceremony, and no consent commits.
+#[tokio::test]
+#[serial_test::serial]
+async fn integrated_intent_entry_of_another_envelope_refuses() {
+    let (fixture, context, _) = confirmation_fixture("canonical-integrated-challenge");
+    let (intent, summary, handle) = staged(&fixture, &context, 0, MemoFact::None, 0);
+    let parked = park_staged(&fixture, &context, &intent, &summary, &handle);
+    let other = intent_envelope(
+        &intent,
+        context.profile().chain_id.network_passphrase(),
+        90,
+        100,
+        clock_now().unwrap() / 1000 + 600,
+    )
+    .unwrap();
+    let mut swapped = MainnetWriteSummary::from_envelope(&other, MainnetConsumer::CliPay, 500)
+        .unwrap()
+        .pending(parked.process_uid.clone(), 120_000)
+        .unwrap();
+    stellar_agent_network::operation_entry::stage_pending(&mut swapped, Some(&intent), 120_000)
+        .unwrap();
+    swapped.approval_nonce = parked.approval_nonce.clone();
+    swapped.created_at_unix_ms = parked.created_at_unix_ms;
+    swapped.expires_at_unix_ms = parked.expires_at_unix_ms;
+    {
+        let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+        store.remove(&parked.approval_nonce).unwrap();
+        store
+            .insert(swapped.clone(), swapped.created_at_unix_ms)
+            .unwrap();
+    }
+    let _enabled = stellar_agent_network::policy_state::approvals::ConsentEvidenceEnforcementGuard::new(
+        context.profile_name(),
+        intent.approved_kind(),
+    );
+    let _driver = driver::install(driver::fixture_credential());
+    let refused = confirm_staged(&fixture, &context, &summary, &handle)
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), "approval.attestation_invalid", "{refused:?}");
+    assert!(driver::ceremonies().is_empty(), "no presence");
+    assert!(durable_record(&context, &handle).unwrap().consent.is_none());
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn canonical_queued_consent_retains_the_exact_reference() {
@@ -497,6 +557,7 @@ async fn canonical_consent_summary_and_completion() {
         let entry = park_staged(&fixture, &context, &intent, &summary, &handle);
         let _driver = driver::install(driver::fixture_credential());
         crate::common::render::take_rendered_for_test();
+        clear_shown_summaries();
         let code = crate::commands::approve::run::run(crate::commands::approve::run::RunArgs {
             id: Some(entry.approval_nonce.clone()),
             profile: Some(fixture.name().into()),
@@ -506,6 +567,25 @@ async fn canonical_consent_summary_and_completion() {
         .await;
         let output = crate::common::render::take_rendered_for_test();
         assert_eq!(code, 0, "approve canonical stored subject: {output:?}");
+        let rendered = shown_summaries().pop().expect("approve shows the intent");
+        let lasting = match kind {
+            0 => "Amount: 37 stroops",
+            1 => "Starting balance: 53 stroops",
+            2 => "Limit: 0 stroops (removes the trustline)",
+            _ => "Amount: 71 stroops",
+        };
+        for expected in ["Fee at most: 500 stroops", "Memo: id 17", lasting] {
+            assert!(
+                rendered.contains(expected),
+                "approve summary contains {expected}: {rendered}"
+            );
+        }
+        for ephemeral in ["Sequence", "Fee: 100"] {
+            assert!(
+                !rendered.contains(ephemeral),
+                "approve summary omits {ephemeral}: {rendered}"
+            );
+        }
         let consent = durable_record(&context, &handle).unwrap().consent;
         assert!(consent.is_some(), "approve success follows durable consent");
         assert_eq!(
@@ -517,6 +597,47 @@ async fn canonical_consent_summary_and_completion() {
         );
         assert_eq!(inbox(&fixture)[0].attestation_version, 6);
     }
+    // The entry of another operation presented under this operation's
+    // durable link proves nothing for it.
+    let (fixture, context, _) = confirmation_fixture("canonical-approve-swapped");
+    let (intent, summary, handle) = staged(&fixture, &context, 0, MemoFact::None, 0);
+    let entry = park_staged(&fixture, &context, &intent, &summary, &handle);
+    let (other_intent, other_summary, other_handle) =
+        staged_as(&fixture, &context, 0, MemoFact::None, 0, "canonical-other", 41);
+    let other = park_staged(
+        &fixture,
+        &context,
+        &other_intent,
+        &other_summary,
+        &other_handle,
+    );
+    {
+        let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+        store.remove(&entry.approval_nonce).unwrap();
+        let mut swapped = other.clone();
+        swapped.approval_nonce = entry.approval_nonce.clone();
+        store
+            .insert(swapped.clone(), swapped.created_at_unix_ms)
+            .unwrap();
+    }
+    let _driver = driver::install(driver::fixture_credential());
+    crate::common::render::take_rendered_for_test();
+    let code = crate::commands::approve::run::run(crate::commands::approve::run::RunArgs {
+        id: Some(entry.approval_nonce.clone()),
+        profile: Some(fixture.name().into()),
+        yes: false,
+        open_by_operator: false,
+    })
+    .await;
+    let output = crate::common::render::take_rendered_for_test();
+    assert_eq!(code, 1, "{output:?}");
+    assert_eq!(
+        output.last().unwrap()["error"]["code"],
+        "approval.wrong_kind",
+        "a swapped durable link refuses"
+    );
+    assert!(driver::ceremonies().is_empty(), "no presence for a swap");
+    assert!(durable_record(&context, &handle).unwrap().consent.is_none());
 }
 
 #[tokio::test]

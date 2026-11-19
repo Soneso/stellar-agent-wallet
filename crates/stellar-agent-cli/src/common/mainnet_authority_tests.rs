@@ -395,6 +395,9 @@ fn approved_kind(verb: Verb) -> stellar_agent_core::approval::witness::ApprovedK
     }
 }
 
+#[cfg(test)]
+mod canonical_activation;
+
 /// The delivered-consent boundary, which holds the audit writer from a second
 /// registry name; the source scans read this module as test code.
 #[cfg(test)]
@@ -653,6 +656,19 @@ pub(crate) fn assert_provenance(fixture: &MainnetFixture, approval: bool, index:
     );
 }
 
+/// Asserts that the one inbox approval stays attested and unconsumed after a
+/// canonical send: its tombstone waits until the operation ends or its
+/// execution window passes, so a successor attempt keeps the consent.
+pub(crate) fn assert_consumption_owed(fixture: &MainnetFixture) {
+    let entries = fixture.pending_entries();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert!(entries[0].attested, "{entries:?}");
+    assert!(
+        entries[0].kind_name.ends_with("Simulated"),
+        "the approval is not tombstoned at the send: {entries:?}"
+    );
+}
+
 /// Asserts signature, authority, consent, and audit properties after submission.
 pub(crate) async fn assert_authorized(fixture: &MainnetFixture, approval: bool, index: u32) {
     let sent = fixture.sent_envelopes().await;
@@ -673,9 +689,7 @@ pub(crate) async fn assert_authorized(fixture: &MainnetFixture, approval: bool, 
     if approval {
         assert_eq!(fixture.summaries().len(), 1);
         assert_eq!(fixture.audit_rows("approval_attested").len(), 1);
-        let entries = fixture.pending_entries();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].kind_name, "Consumed");
+        assert_consumption_owed(fixture);
     } else {
         fixture.assert_no_consent_ceremony();
         assert!(fixture.pending_entries().is_empty());

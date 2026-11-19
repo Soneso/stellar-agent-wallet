@@ -141,8 +141,8 @@ use stellar_agent_stablecoin::{
 };
 
 use crate::common::business_entry::{
-    BoundEnvelope, ClassicStart, bind_envelope, classic_start, entry_business_id,
-    mainnet_business_id, signing_envelope, write_replay,
+    Bound, ClassicStart, Staging, bind_signing, classic_start, entry_business_id,
+    mainnet_business_id, write_replay,
 };
 use crate::common::mainnet_write::{
     MainnetWriteRequest, authorize_and_submit, mainnet_context, mainnet_profiles_dir,
@@ -791,6 +791,16 @@ struct BuiltTrustline {
     fee_per_op: u32,
 }
 
+/// The fee per operation a profile-default fee choice gives: the profile's
+/// configured fee, else 100 stroops, as the MCP helper
+/// `resolve_classic_fee_per_op_stroops` gives.
+fn default_fee_per_op(profile: &Profile) -> u32 {
+    const DEFAULT_CLASSIC_FEE_STROOPS: u32 = 100;
+    profile
+        .classic_fee_per_op_stroops
+        .unwrap_or(DEFAULT_CLASSIC_FEE_STROOPS)
+}
+
 /// Resolves the fee and builds the unsigned `ChangeTrust` envelope of `from`
 /// for `resolved`, at the source's current sequence.
 ///
@@ -808,17 +818,12 @@ async fn build_change_trust(
 ) -> Result<BuiltTrustline, Envelope<()>> {
     let fee_choice = parse_classic_fee_choice(args.classic_base.as_deref())
         .map_err(|e| Envelope::<()>::err_raw("trustline.invalid_fee", e.code().to_string()))?;
-    // Unwrap Option<u32> with a safe default (100 stroops = testnet safe floor).
-    // The MCP path uses the common helper `resolve_classic_fee_per_op_stroops`;
-    // the CLI path is equivalent: fallback to 100 when the profile has no explicit
-    // fee configured.
-    const DEFAULT_CLASSIC_FEE_STROOPS: u32 = 100;
-    let default_fee_per_op = profile
-        .classic_fee_per_op_stroops
-        .unwrap_or(DEFAULT_CLASSIC_FEE_STROOPS);
-    let fee_selection = resolve_classic_fee_selection(rpc_client, default_fee_per_op, fee_choice)
-        .await
-        .map_err(|e| Envelope::<()>::err_raw("trustline.fee_resolution_failed", e.to_string()))?;
+    let fee_selection =
+        resolve_classic_fee_selection(rpc_client, default_fee_per_op(profile), fee_choice)
+            .await
+            .map_err(|e| {
+                Envelope::<()>::err_raw("trustline.fee_resolution_failed", e.to_string())
+            })?;
     let fee_per_op = fee_selection.per_op_stroops;
 
     let asset = Asset::from_code_and_issuer(&resolved.code, &resolved.issuer)
@@ -1394,20 +1399,19 @@ where
         Ok(id) => id,
         Err(e) => return write_envelope(out, &Envelope::<()>::err(&e), 1),
     };
+    let payload = stellar_agent_core::approval::IntentPayload::Trustline {
+        issuer: asset.issuer.clone(),
+        code: asset.code.clone(),
+        limit_stroops: args.limit_stroops.unwrap_or(i64::MAX),
+    };
     let operation = match classic_start(
         &context,
-        &policy,
+        &policy.verified,
         business_id,
         &args.from,
         fee_choice,
         &stellar_xdr::Memo::None,
-        stellar_agent_network::operation_entry::IdentityFacts::Intent(
-            stellar_agent_core::approval::IntentPayload::Trustline {
-                issuer: asset.issuer.clone(),
-                code: asset.code.clone(),
-                limit_stroops: args.limit_stroops.unwrap_or(i64::MAX),
-            },
-        ),
+        stellar_agent_network::operation_entry::IdentityFacts::Intent(payload.clone()),
     ) {
         Ok(ClassicStart::Proceed(operation)) => operation,
         Ok(ClassicStart::Replay(view)) => {
@@ -1429,26 +1433,8 @@ where
         Ok(built) => built,
         Err(envelope) => return write_envelope(out, &envelope, 1),
     };
-    // The record binds the envelope the run signs: a waiting record's
-    // stored envelope, or the one just built.
-    let handle = match bind_envelope(
-        &context,
-        operation,
-        OperationTool::CliTrustline,
-        OperationKind::Trustline,
-        &built.envelope_xdr,
-    ) {
-        Ok(BoundEnvelope::Sign(handle)) => handle,
-        Ok(BoundEnvelope::Replay(view)) => {
-            return write_replay(out, stellar_agent_core::envelope::OutputFormat::Json, &view);
-        }
-        Err(e) => return write_envelope(out, &Envelope::<()>::err(&e), 1),
-    };
-    let (unsigned_xdr, fee_per_op_stroops) = match signing_envelope(&handle) {
-        Ok(signing) => signing,
-        Err(e) => return write_envelope(out, &Envelope::<()>::err(&e), 1),
-    };
-    let total_fee = match envelope_total_fee(unsigned_xdr) {
+    let candidate = operation.candidate(&built.envelope_xdr);
+    let total_fee = match envelope_total_fee(&candidate) {
         Ok(fee) => fee,
         Err(e) => return write_envelope(out, &Envelope::<()>::err(&e), 1),
     };
@@ -1488,10 +1474,28 @@ where
             );
         }
     };
+    let signing = match bind_signing(
+        &context,
+        operation,
+        Staging {
+            policy: &policy.verified,
+            tool: OperationTool::CliTrustline,
+            kind: OperationKind::Trustline,
+            built: &built.envelope_xdr,
+            payload,
+            verdict: evaluation.verdict,
+        },
+    ) {
+        Ok(Bound::Sign(signing)) => signing,
+        Ok(Bound::Replay(view)) => {
+            return write_replay(out, stellar_agent_core::envelope::OutputFormat::Json, &view);
+        }
+        Err(e) => return write_envelope(out, &Envelope::<()>::err(&e), 1),
+    };
 
     let body = &policy.body;
     if let Err(e) = check_classic_fee_cap_signed(
-        fee_per_op_stroops,
+        signing.fee_per_op_stroops(),
         classic_fee_source(built.fee_choice, FeeSource::ProfileDefault),
         profile,
         Some(body.classic_max_fee_per_op_stroops),
@@ -1525,15 +1529,16 @@ where
     let outcome = async {
         let source = AccountObservation::from_view(&source_account_view)
             .map_err(|error| Envelope::<()>::err(&error))?;
+        let inputs = TrustlineWitnessInputs {
+            source,
+            issuer: IssuerObservation::from_view(&asset.issuer, issuer_account_view.as_ref()),
+        };
         let cross_check = obtain_classic_witness_bound(
             profile,
             &net_context,
             CrossCheckValue::Unvalued,
-            TrustlineWitnessInputs {
-                source,
-                issuer: IssuerObservation::from_view(&asset.issuer, issuer_account_view.as_ref()),
-            },
-            unsigned_xdr,
+            inputs.clone(),
+            signing.checked(),
             &thresholds,
             "stellar_trustline",
         )
@@ -1545,7 +1550,7 @@ where
             verb: "trustline",
             tool: "stellar_trustline",
             consumer: MainnetConsumer::CliTrustline,
-            unsigned_xdr,
+            unsigned_xdr: signing.stored(),
             client: &client,
             probe_deadline: stellar_agent_network::PRE_SEND_BUDGET,
             submit_timeout: submit_timeout(args.timeout_seconds, profile),
@@ -1557,9 +1562,16 @@ where
             effective_cap,
             witness: cross_check.witness(),
             ledger: operational,
-            operation: Some(&handle),
+            operation: Some(signing.handle()),
+            rebuild: signing.rebuild(
+                built.fee_choice,
+                default_fee_per_op(profile),
+                inputs,
+                &thresholds,
+            ),
         })
         .await?;
+        let cross_check = submitted.cross_check(&cross_check).view();
         let SubmissionResult {
             tx_hash, ledger, ..
         } = submitted.result;
@@ -1572,7 +1584,7 @@ where
             is_pinned: asset.is_pinned,
             tx_hash,
             ledger,
-            cross_check: Some(cross_check.view()),
+            cross_check: Some(cross_check),
             business_id: None,
         })
     }
@@ -3066,9 +3078,7 @@ pub(crate) mod tests {
         use stellar_agent_test_support::WarningCapture;
         use stellar_agent_test_support::signed_envelope::get_network_result;
 
-        use crate::common::mainnet_write::{
-            invalidations_on_this_thread, submission_kinds_on_this_thread,
-        };
+        use crate::common::mainnet_write::invalidations_on_this_thread;
         use crate::common::mainnet_write_fixture::{
             AGENT_SEED, CLOCK_LEAD_MS, DESTINATION, ISSUER, MainnetFixture, Spec, TRUSTLINE_ASSET,
             balance_floor, minimum_reserve, refusal_warnings, trustline_rule,
@@ -3299,19 +3309,18 @@ pub(crate) mod tests {
             assert!(!fixture.oracle_methods().await.is_empty());
             assert!(fixture.open_authorizations(now()).is_empty());
             assert!(invalidations_on_this_thread().is_empty());
-            let entries = fixture.pending_entries();
-            assert_eq!(entries.len(), 1);
-            assert_eq!(entries[0].kind_name, "Consumed");
+            crate::common::mainnet_authority_tests::assert_consumption_owed(&fixture);
         }
 
-        /// Elapsed bound: a confirmation one second past the envelope's
-        /// on-chain deadline refuses at the resolver with `deadline_elapsed`,
-        /// before any signer is resolved: the keyring never signs and nothing
-        /// is sent.
+        /// Elapsed bound: a confirmation one second past the prepared
+        /// envelope's on-chain deadline covers the stored intent, so the
+        /// verb rebuilds the envelope with a deadline from the confirmation
+        /// time and signs it once; no refusal is logged and nothing is
+        /// invalidated.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial(mainnet_clock)]
         #[serial_test::serial]
-        async fn mainnet_time_bounds_trustline_elapsed_refuses_before_signing() {
+        async fn mainnet_time_bounds_trustline_elapsed_rebuilds_after_consent() {
             let mut fixture = spec("mainnet-trustline-elapsed").build().await;
             let clock = Rc::new(stellar_agent_network::mainnet::clock::set_now_ms_for_test(
                 now() + CLOCK_LEAD_MS,
@@ -3319,31 +3328,19 @@ pub(crate) mod tests {
             fixture.present_past_the_deadline(Rc::clone(&clock));
             let args = mainnet_args(&fixture);
             let resolutions = signer_resolutions_on_this_thread();
-            let kinds = submission_kinds_on_this_thread().len();
             let (capture, _guard) = WarningCapture::capture(None);
 
             let run = run(&fixture, &args).await;
 
+            let confirmed_at_ms = stellar_agent_network::mainnet::clock::now_ms().unwrap();
             drop(clock);
-            assert_eq!(run.code, 1, "{}", run.envelope);
-            assert_eq!(
-                run.code(),
-                "network.mainnet_authorization_refused",
-                "{}",
-                run.envelope
-            );
-            assert_eq!(
-                refusal_warnings(&capture, "resolve_tx_sign"),
-                vec!["\"deadline_elapsed\"".to_owned()]
-            );
-            assert!(records(&fixture).is_empty(), "no authorization record");
-            let entries = fixture.pending_entries();
-            assert_eq!(entries.len(), 1, "{entries:?}");
-            assert_eq!(entries[0].kind_name, "TrustlineSimulated");
-            assert!(fixture.sent_envelopes().await.is_empty(), "nothing is sent");
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            assert!(refusal_warnings(&capture, "resolve_canonical_tx_sign").is_empty());
+            let sent = fixture.sent_envelopes().await;
+            assert_eq!(sent.len(), 1, "signed once");
+            crate::common::mainnet_write_fixture::assert_deadline_bound(&sent[0], confirmed_at_ms);
             assert!(invalidations_on_this_thread().is_empty());
-            assert_eq!(signer_resolutions_on_this_thread(), resolutions);
-            assert_eq!(submission_kinds_on_this_thread().len(), kinds);
+            assert_eq!(signer_resolutions_on_this_thread(), resolutions + 1);
         }
 
         /// Engine kind: a Noop profile refuses at the engine check.

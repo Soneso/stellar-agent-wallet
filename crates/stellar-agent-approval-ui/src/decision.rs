@@ -474,7 +474,10 @@ pub(crate) fn verified_consent(
 }
 
 /// Completes the durable consent of the attested value entry `nonce` before
-/// its attestation is shown. It verifies the stored proof under `admission`.
+/// its attestation is shown. It releases `store` for the context's intent
+/// lookup, which opens the inbox itself, and reopens the inbox after it. It
+/// verifies the stored proof under `admission`, as a consent to the looked-up
+/// intent when there is one.
 /// For a published kind it then runs [`ConsentRecording::precheck_completion`],
 /// which for a consent not yet committed proves the scope ready and
 /// reacquires the record's reservation, and verifies the entry's publication
@@ -622,6 +625,7 @@ impl DecisionContext {
             .as_ref()
             .map_or(Ok(None), |lookup| lookup.lookup(nonce, current))
     }
+
     /// Installs authenticated durable approval access for inbox revocation.
     #[must_use]
     pub fn with_revocation_access(mut self, access: Arc<dyn RevocationAccess>) -> Self {
