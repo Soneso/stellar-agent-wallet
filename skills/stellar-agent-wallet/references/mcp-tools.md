@@ -145,12 +145,14 @@ operator runs `stellar-agent approve --id <approval_nonce> --profile <name>` as
 the same local user as the server. The commit request then carries that nonce
 and the `approval_attestation` the approval returned.
 
-On mainnet, `stellar_create_account_commit`, `stellar_trustline_commit` and
-`stellar_claim_commit` rebuild the envelope from the intent their preparation
-stored under the business id. They need no `nonce`, `expires_at_unix_ms` or
-`envelope_xdr`, so a commit after a server restart still proceeds. Their other
-arguments must match the preparation's, or the commit refuses with
-`operation.business_id_conflict`.
+On mainnet, `stellar_pay_commit`, `stellar_create_account_commit`,
+`stellar_trustline_commit` and `stellar_claim_commit` rebuild the envelope
+from the intent their preparation stored under the business id, at the fee
+per operation of the prepared envelope. They need no `nonce`,
+`expires_at_unix_ms` or `envelope_xdr`, so a commit after a server restart
+still proceeds. Their other arguments must match the preparation's, or the
+commit refuses with `operation.business_id_conflict`. A payment through a
+toolset keeps the three fields and the nonce check.
 
 ## The result envelope
 
@@ -263,8 +265,10 @@ Each commit evaluates both names before attestation validation. A proof
 supplied under Allow is verified and spent like a required one.
 
 Classic mainnet previews carry an on-chain deadline 120 seconds after they are
-built, bound into consent and the protocol nonce. Commits copy this deadline
-into the rebuild. A commit whose envelope carries no valid deadline refuses
+built, or for `stellar_pay` the last whole second before its decision's end
+when that comes first, bound into consent and the protocol nonce. A commit of
+an exact-envelope record and every toolset payment commit copy this deadline
+into the rebuild; a direct commit of a stored intent sets a fresh one. A commit whose envelope carries no valid deadline refuses
 with `simulation.deadline_invalid`; simulate again for a fresh envelope.
 
 | Classic commit code | Meaning |
@@ -507,9 +511,9 @@ the binding triple and the optional approval pair:
 
 | Field | Type | Required | Notes |
 | --- | --- | --- | --- |
-| `nonce` | string | yes | Base64-url-no-pad nonce from simulate; HMAC-verified against `envelope_xdr`, `expires_at_unix_ms`, and the chain. |
-| `expires_at_unix_ms` | integer (u64) | yes | Unix milliseconds at which the nonce expires. |
-| `envelope_xdr` | string | yes | Base64 envelope from simulate; byte-compared against a fresh rebuild. |
+| `nonce` | string | except on a mainnet commit of an intent stored under `business_id` | Base64-url-no-pad nonce from simulate; HMAC-verified against `envelope_xdr`, `expires_at_unix_ms`, and the chain. |
+| `expires_at_unix_ms` | integer (u64) | except on a mainnet commit of an intent stored under `business_id` | Unix milliseconds at which the nonce expires. |
+| `envelope_xdr` | string | except on a mainnet commit of an intent stored under `business_id` | Base64 envelope from simulate; byte-compared against a fresh rebuild. |
 | `approval_nonce` | string | when approval required | Wallet-issued approval nonce from the simulate-step `approval` block. |
 | `approval_attestation` | string | when approval required | The attestation `approve` returned, verified alongside `approval_nonce`. Testnet compares the HMAC-SHA256 tag in constant time. Mainnet verifies it through the approval witness, also when the rule allows. |
 | `business_id` | string | on mainnet | The preparation's business id; another id returns `operation.business_id_mismatch`. |

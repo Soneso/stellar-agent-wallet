@@ -11,8 +11,11 @@
 //! part, so a commit after a server restart proceeds.
 
 use rmcp::model::{CallToolResult, Content};
-use serde_json::json;
+use serde_json::{Value, json};
 use stellar_agent_core::approval::ClassicIntent;
+use stellar_agent_core::audit_log::ValueLegRecord;
+use stellar_agent_core::policy::v1::AccountIdentityView;
+use stellar_agent_core::profile::receipt::DestinationFields;
 use stellar_agent_network::cross_check::{AccountObservation, ClassicInputs};
 use stellar_agent_network::fees::ClassicFeeChoice;
 use stellar_agent_network::mainnet::MainnetConsumer;
@@ -47,6 +50,14 @@ pub(crate) struct CanonicalCommit<'a> {
     /// The oracle observations of the operation; the rebuild replaces the
     /// source observation with its own read.
     pub(crate) witness_inputs: ClassicInputs,
+    /// The account the policy's identity criteria read: a payment's
+    /// destination base account; `None` for the other tools and for a
+    /// destination that does not exist.
+    pub(crate) identity_view: Option<&'a dyn AccountIdentityView>,
+    /// Whether the commit is a payment, whose audit legs record the SHA-256
+    /// of the complete destination and whose result names the destination of
+    /// the sent envelope.
+    pub(crate) payment: bool,
 }
 
 /// The source observation a commit hands to the rebuild, which replaces it
@@ -108,11 +119,13 @@ impl WalletServer {
     /// current caps refuses as on the envelope route. The
     /// policy gate evaluates the rebuilt envelope's arguments with the source
     /// read before the rebuild, which requests a trustline intent's trustline
-    /// as the envelope route does, and the stricter of the commit's and the
-    /// preparation's decisions governs. A proof must be the consent to the
-    /// stored intent. The signed deadline is the earlier of 120 seconds after
-    /// the rebuild and the last whole second strictly before the authority's
-    /// end. The authorization is minted inside the attempt's begin.
+    /// as the envelope route does, and a payment's destination view; the
+    /// stricter of the commit's and the preparation's decisions governs. A
+    /// proof must be the consent to the stored intent. The signed deadline is
+    /// the earlier of 120 seconds after the rebuild and the last whole second
+    /// strictly before the authority's end, which for a successor is also
+    /// bounded by the record's execution end. The authorization is minted
+    /// inside the attempt's begin.
     ///
     /// # Errors
     ///
@@ -221,8 +234,15 @@ impl WalletServer {
         };
         let adapter = crate::policy_adapter::AccountViewAdapter::new(&source_view);
         let view = FloorSource::view_or(floor.as_ref(), &adapter);
+        let identity_view = commit.identity_view;
         let outcome = match self
-            .dispatch_gate_with_views(commit.commit_tool, &args, commit.chain_id, Some(view), None)
+            .dispatch_gate_with_views(
+                commit.commit_tool,
+                &args,
+                commit.chain_id,
+                Some(view),
+                identity_view,
+            )
             .await
         {
             Ok(outcome) => outcome,
@@ -235,7 +255,7 @@ impl WalletServer {
                 &args,
                 commit.chain_id,
                 Some(view),
-                None,
+                identity_view,
             )
             .await
         {
@@ -296,6 +316,22 @@ impl WalletServer {
             DispatchOutcome::Allow(allowed) => allowed.value_effects.clone(),
             DispatchOutcome::RequireApproval(approval) => approval.value_effects.clone(),
         };
+        let legs = effects
+            .as_ref()
+            .map_or(&[][..], |effects| effects.legs())
+            .iter()
+            .map(|leg| {
+                if commit.payment && leg.destination.is_some() {
+                    ValueLegRecord::from_payment_leg(leg)
+                } else {
+                    Ok(leg.into())
+                }
+            })
+            .collect::<Result<Vec<_>, _>>();
+        let legs = match legs {
+            Ok(legs) => legs,
+            Err(error) => return Ok(ledger_err_result(&error)),
+        };
         let (audit_writer, readiness) = match self.write_audit() {
             Ok(write) => write,
             Err(error) => return Ok(ledger_err_result(&error)),
@@ -318,10 +354,7 @@ impl WalletServer {
                 profile_name: self.profile_name_for_approval(),
                 tool: commit.commit_tool,
                 chain_id: commit.chain_id.to_owned(),
-                legs: effects
-                    .as_ref()
-                    .map(|effects| effects.legs().iter().map(Into::into).collect())
-                    .unwrap_or_default(),
+                legs,
                 engine: self.policy_engine.as_ref(),
                 registry: &self.tool_registry,
                 value_class: effects.map_or(
@@ -352,6 +385,16 @@ impl WalletServer {
             "ledger": result.ledger,
             "cross_check": rebuilt.cross_check.view(),
         });
+        if commit.payment
+            && let (Some(view), Ok(Value::Object(fields))) = (
+                view.as_object_mut(),
+                serde_json::to_value(DestinationFields(
+                    stellar_agent_network::operation_entry::envelope_result_destinations(envelope),
+                )),
+            )
+        {
+            view.extend(fields);
+        }
         crate::tools::business_entry::echo_business_id(&mut view, Some(&target.business_id));
         let json = stellar_agent_core::envelope::Envelope::ok(view)
             .to_json_pretty()

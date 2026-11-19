@@ -849,6 +849,7 @@ impl WalletServer {
                     &profile_name,
                     request,
                     crate::tools::pay::PaymentQueue::Toolset(None),
+                    stellar_agent_core::approval::subject::SubjectKind::EnvelopeText,
                 )
                 .map_err(|error| {
                     match crate::tools::common::payment_recovery_wire_error(&error, &profile_name) {

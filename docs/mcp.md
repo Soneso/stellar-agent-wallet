@@ -379,18 +379,20 @@ subsecond remainder remains usable, and an expired interval refuses before
 issuing a protocol nonce. Mainnet signing authority also ends at the earlier
 of the captured decision end and the operator witness expiry.
 
-On mainnet, `stellar_create_account`, `stellar_trustline` and `stellar_claim`
-store the lasting intent under the business id. Their commits rebuild the
-envelope from that intent with a fresh sequence and deadline, so `nonce`,
-`expires_at_unix_ms` and `envelope_xdr` are optional there and a commit
-after a server restart still proceeds. The rebuild pays the fee per
+On mainnet, `stellar_pay`, `stellar_create_account`, `stellar_trustline` and
+`stellar_claim` store the lasting intent under the business id. Their commits
+rebuild the envelope from that intent with a fresh sequence and deadline, so
+`nonce`, `expires_at_unix_ms` and `envelope_xdr` are optional there and a
+commit after a server restart still proceeds. The rebuild pays the fee per
 operation of the envelope the preparation returned; a fee above the current
 caps refuses as it would on the presented envelope. The commit's other
 arguments must name the stored intent, or it refuses with
-`operation.business_id_conflict`, also after the operation ran.
-`stellar_pay_commit`, a commit of an operation recorded with its exact
-envelope, and every commit off mainnet require all three fields; an omitted
-one answers the tool's fixed argument refusal.
+`operation.business_id_conflict`, also after the operation ran. For a payment
+these are the source, the destination as supplied (a G account, or an M
+address with its ID), the asset, the amount and the memo. A payment through a
+toolset, a commit of an operation recorded with its exact envelope, and every
+commit off mainnet require all three fields; an omitted one answers the
+tool's fixed argument refusal.
 
 A retried mainnet preparation, and a commit of an operation recorded with its
 exact envelope, use the retained envelope, including the original sequence.
@@ -401,7 +403,8 @@ The preparation may issue a new protocol nonce for committing that envelope.
 A preparation that finds the approval producer lock held refuses with
 `approval.writer_locked`; retry with the same `business_id`.
 When the operation's linked approval entry is gone, the preparation refuses
-with `approval.not_found`; prepare the operation again.
+with `approval.not_found` and the business id ends; prepare the operation
+again under a new `business_id`.
 Direct preparation needs a signed, verified policy to queue a new payment
 approval. Without one, a policy-required toolset approval queues an entry with no
 recovery binding.
@@ -494,18 +497,21 @@ Each commit evaluates both names before attestation validation. A proof
 supplied under Allow is verified and spent like a required one.
 
 Classic mainnet previews carry an on-chain deadline 120 seconds after they are
-built. A commit of an operation recorded with its exact envelope, and every
-`stellar_pay_commit`, copies this deadline into the rebuild; the deadline is
-bound into consent and the protocol nonce. A mainnet
-`stellar_create_account_commit`, `stellar_trustline_commit` or
-`stellar_claim_commit` of a stored intent sets a new deadline at the earlier
-of 120 seconds after the commit and the last whole second strictly before
-the end of its authority: an approval's execution end, or a policy
-decision's governing end. The authority holds strictly before its end, and a
-ledger that closes at the deadline still includes the transaction. A
-successor attempt's deadline also stays before the execution end the first
-attempt set, and the signing refuses a deadline that does not lie before the
-end.
+built; a `stellar_pay` preview carries the earlier of that deadline and the
+last whole second before the end of its preparation's decision. A commit of an operation recorded with its exact envelope, and every
+toolset commit of `stellar_pay_commit`, copies this deadline into the
+rebuild; the deadline is bound into consent and the protocol nonce. A
+mainnet direct commit of a stored intent, which `stellar_pay`,
+`stellar_create_account`, `stellar_trustline` and `stellar_claim` store,
+sets a new deadline at the earlier of 120 seconds after the commit and the
+last whole second strictly before the end of its authority: an approval's
+execution end, or a policy decision's governing end. The authority holds
+strictly before its end, and a ledger that closes at the deadline still
+includes the transaction. A successor attempt's deadline also stays before
+the execution end the first attempt set, and the signing refuses a deadline
+that does not lie before the end. An approved commit signs until just before
+the consent's execution end, the consent time plus the rule's lifetime, which
+can lie after the approval's `expires_at_unix_ms`.
 A commit whose envelope carries no valid deadline refuses
 with `simulation.deadline_invalid`; simulate again for a fresh envelope.
 A commit within 30 seconds of the deadline refuses with the same code, so

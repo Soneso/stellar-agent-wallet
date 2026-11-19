@@ -375,9 +375,9 @@ fn commit_args(args: &StellarPayArgs, data: &serde_json::Value) -> StellarPayCom
         memo_id: None,
         memo_hash_hex: None,
         memo_return_hex: None,
-        nonce: data["nonce"].as_str().unwrap().to_owned(),
-        expires_at_unix_ms: data["expires_at_unix_ms"].as_u64().unwrap(),
-        envelope_xdr: data["envelope_xdr"].as_str().unwrap().to_owned(),
+        nonce: Some(data["nonce"].as_str().unwrap().to_owned()),
+        expires_at_unix_ms: Some(data["expires_at_unix_ms"].as_u64().unwrap()),
+        envelope_xdr: Some(data["envelope_xdr"].as_str().unwrap().to_owned()),
         approval_nonce: None,
         approval_attestation: None,
         business_id: None,
@@ -481,13 +481,16 @@ async fn mcp_muxed_payment_pipeline() {
         );
         // A tampered envelope or nonce refuses before signing.
         let mut tampered = commit_args(&args, &data);
-        tampered.envelope_xdr = with_body(&tampered.envelope_xdr, |body| {
-            if let OperationBody::Payment(payment) = body {
-                payment.destination = muxed(key, 18);
-            }
-        });
+        tampered.envelope_xdr = Some(with_body(
+            tampered.envelope_xdr.as_deref().unwrap(),
+            |body| {
+                if let OperationBody::Payment(payment) = body {
+                    payment.destination = muxed(key, 18);
+                }
+            },
+        ));
         let mut bad_nonce = commit_args(&args, &data);
-        bad_nonce.nonce = "A".repeat(bad_nonce.nonce.len());
+        bad_nonce.nonce = Some("A".repeat(bad_nonce.nonce.as_deref().unwrap().len()));
         for refused in [tampered, bad_nonce] {
             let outcome = server.call_stellar_pay_commit(refused).await;
             let rejected = match outcome {
@@ -1297,7 +1300,7 @@ async fn muxed_destination_safety_parity() {
         let args = pay_args(&destination);
         let data = prepare(&server, &args).await;
         let mut expired = commit_args(&args, &data);
-        expired.expires_at_unix_ms = 1;
+        expired.expires_at_unix_ms = Some(1);
         seen.push(code_of(server.call_stellar_pay_commit(expired).await));
 
         // An unsupported operation at commit: an account merge to the same
@@ -1305,9 +1308,9 @@ async fn muxed_destination_safety_parity() {
         let mut merge = commit_args(&args, &data);
         let merged =
             stellar_agent_core::payment_accounts::PaymentAccount::parse(&destination).unwrap();
-        merge.envelope_xdr = with_body(&merge.envelope_xdr, |body| {
+        merge.envelope_xdr = Some(with_body(merge.envelope_xdr.as_deref().unwrap(), |body| {
             *body = OperationBody::AccountMerge(merged.to_muxed_account());
-        });
+        }));
         seen.push(code_of(server.call_stellar_pay_commit(merge).await));
 
         assert!(sent_payments(&rpc).await.is_empty(), "{destination}");
@@ -1723,14 +1726,14 @@ async fn pay_commit_success_carries_the_complete_destination() {
             let data = prepare(&server, &args).await;
 
             let mut diverged = commit_args(&args, &data);
-            diverged.envelope_xdr = with_second_payment(
-                &diverged.envelope_xdr,
+            diverged.envelope_xdr = Some(with_second_payment(
+                diverged.envelope_xdr.as_deref().unwrap(),
                 MuxedAccount::Ed25519(Uint256(
                     stellar_strkey::ed25519::PublicKey::from_string(OTHER_G)
                         .unwrap()
                         .0,
                 )),
-            );
+            ));
             let refused = server.call_stellar_pay_commit(diverged).await.unwrap();
             assert_eq!(
                 json_of(&refused)["error"]["code"],

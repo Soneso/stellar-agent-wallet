@@ -335,6 +335,46 @@ async fn canonical_recovery_keeps_signed_clocks() {
     }
 }
 
+/// A crash after a canonical record opens and before its inbox entry's first
+/// write leaves the record without an entry. The retry, a minute later,
+/// queues a new entry over the decision's whole lifetime, and its consent to
+/// the stored intent admits the operation, for each of the four verbs.
+#[tokio::test]
+#[serial_test::serial]
+async fn canonical_retry_after_a_lost_first_entry_admits_its_consent() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+    for kind in 0..4 {
+        let (fixture, context, _) = confirmation_fixture(&format!("canonical-lost-entry-{kind}"));
+        let time = Arc::new(AtomicU64::new(clock_now().unwrap()));
+        let read = time.clone();
+        let _clock = stellar_agent_core::timefmt::test_clock::install(Arc::new(
+            stellar_agent_core::timefmt::MockClock::new(move || Ok(read.load(Ordering::SeqCst))),
+        ));
+        let (intent, summary, handle) = staged(&fixture, &context, kind, MemoFact::None, 0);
+        assert!(inbox(&fixture).is_empty(), "the crash wrote no entry");
+        assert!(durable_record(&context, &handle).is_none());
+        time.fetch_add(60_000, Ordering::SeqCst);
+        let retried_at = time.load(Ordering::SeqCst);
+        let _driver = driver::install(driver::fixture_credential());
+        let witness = confirm_staged(&fixture, &context, &summary, &handle)
+            .await
+            .expect("the retry's consent admits the canonical record");
+        assert_eq!(witness.kind(), intent.approved_kind());
+        let record = durable_record(&context, &handle).unwrap();
+        assert_eq!(record.subject, *intent.digest().as_bytes());
+        assert_eq!(
+            (record.created_at_ms, record.rule_ttl_ms),
+            (retried_at, 120_000),
+            "the retry's entry keeps the decision's whole lifetime"
+        );
+        assert!(record.consent.is_some());
+        assert_eq!(inbox(&fixture).len(), 1);
+    }
+}
+
 /// Under integrated delivery, an intent entry that names the operation's
 /// nonce, kind and signed clocks but carries another envelope as its
 /// challenge refuses with `approval.attestation_invalid` before any

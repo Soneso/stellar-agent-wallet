@@ -6,6 +6,7 @@
 )]
 
 use super::*;
+use crate::approval::subject::SubjectKind;
 use crate::approval::{AttestedApprover, ConsumedOutcome, mainnet_fixtures::MainnetConsentFixture};
 use crate::policy::ApprovalRequest;
 
@@ -43,6 +44,7 @@ fn queue(
         now + 1_001,
         now,
         &ApprovalRequest::new("review".to_owned(), 600),
+        SubjectKind::EnvelopeText,
     )
 }
 
@@ -125,6 +127,7 @@ fn payment_recovery_preserves_consent_and_each_key_component() {
             END,
             START,
             &ApprovalRequest::new("review".to_owned(), 600),
+            SubjectKind::EnvelopeText,
         )
         .unwrap();
     assert_ne!(
@@ -327,6 +330,7 @@ fn payment_recovery_attestation_checks_recorded_expiry() {
             now + 60_000,
             now,
             &ApprovalRequest::new("review".to_owned(), 60),
+            SubjectKind::EnvelopeText,
         )
         .unwrap();
     let identity = ApproverIdentity::OsUid("1000".to_owned());
@@ -586,6 +590,7 @@ fn queue_with(
         expires,
         now,
         &ApprovalRequest::new("review".to_owned(), 600),
+        SubjectKind::EnvelopeText,
     )
 }
 
@@ -836,6 +841,7 @@ fn payment_recovery_survives_unrelated_inbox_writers() {
             now + 60_000,
             now,
             &ApprovalRequest::new("review".to_owned(), 60),
+            SubjectKind::EnvelopeText,
         )
         .unwrap();
     let binding = serde_json::to_value(&store.payment_recovery).unwrap();

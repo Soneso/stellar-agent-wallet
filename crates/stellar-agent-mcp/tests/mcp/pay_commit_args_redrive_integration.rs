@@ -239,9 +239,9 @@ async fn pay_commit_with_create_account_xdr_returns_simulation_divergence() {
         memo_id: None,
         memo_hash_hex: None,
         memo_return_hex: None,
-        nonce: "dGVzdA".to_owned(),
-        expires_at_unix_ms: u64::MAX,
-        envelope_xdr,
+        nonce: Some("dGVzdA".to_owned()),
+        expires_at_unix_ms: Some(u64::MAX),
+        envelope_xdr: Some(envelope_xdr),
         approval_nonce: None,
         approval_attestation: None,
         business_id: None,
@@ -303,9 +303,9 @@ async fn pay_commit_policy_engine_sees_xdr_destination_not_caller_destination() 
         memo_id: None,
         memo_hash_hex: None,
         memo_return_hex: None,
-        nonce: "dGVzdA".to_owned(), // invalid stub → nonce.expired after policy gate
-        expires_at_unix_ms: u64::MAX,
-        envelope_xdr,
+        nonce: Some("dGVzdA".to_owned()), // invalid stub → nonce.expired after policy gate
+        expires_at_unix_ms: Some(u64::MAX),
+        envelope_xdr: Some(envelope_xdr),
         approval_nonce: None,
         approval_attestation: None,
         business_id: None,
@@ -378,9 +378,9 @@ async fn pay_commit_hash_memo_xdr_reaches_nonce_check() {
         memo_return_hex: None,
         // An invalid-format nonce: decode succeeds, policy allows (testnet
         // NoopPolicyEngine), then nonce-parse fails here.
-        nonce: "dGVzdA".to_owned(),
-        expires_at_unix_ms: u64::MAX,
-        envelope_xdr,
+        nonce: Some("dGVzdA".to_owned()),
+        expires_at_unix_ms: Some(u64::MAX),
+        envelope_xdr: Some(envelope_xdr),
         approval_nonce: None,
         approval_attestation: None,
         business_id: None,

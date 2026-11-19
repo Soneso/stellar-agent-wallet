@@ -102,6 +102,11 @@ impl ClassicOperation {
     pub(crate) fn stored_envelope(&self) -> Option<&str> {
         self.resume.as_ref().and_then(OperationHandle::envelope_xdr)
     }
+
+    /// Whether the record this preparation opens holds a canonical intent.
+    pub(crate) fn stages_canonical(&self) -> bool {
+        matches!(self.preparation, Some(Preparation::Canonical { .. }))
+    }
 }
 
 /// The successful answer to a call under a retained business id.
@@ -426,8 +431,10 @@ impl WalletServer {
     /// subject and signed clocks. The entry must be unique and live, and
     /// any recovery binding must be active; an observed expiry persists first.
     ///
-    /// The subject of `handle`'s retained envelope must equal the entry's
-    /// and the record's subject.
+    /// The subject of `handle`'s retained envelope must equal the entry's.
+    /// An envelope slot's record binds that subject as envelope text. A
+    /// canonical slot's entry and record bind the intent digest, and the
+    /// record's subject is the slot's intent digest, as consent requires.
     fn linked_payment(
         &self,
         path: &std::path::Path,
@@ -503,12 +510,27 @@ impl WalletServer {
                 self.context.chain_id.caip2_str(),
             ),
         )?;
-        let retained = handle.unsigned_envelope_sha256();
+        let (retained, subject_kind, record_subject) =
+            if handle.intent().kind() == stellar_agent_network::policy_state::SlotKind::Canonical {
+                (
+                    handle
+                        .envelope_xdr()
+                        .map(stellar_agent_core::approval::subject::approval_subject_classic),
+                    stellar_agent_core::approval::subject::SubjectKind::IntentDigest,
+                    handle.intent().intent_digest(),
+                )
+            } else {
+                (
+                    handle.unsigned_envelope_sha256(),
+                    stellar_agent_core::approval::subject::SubjectKind::EnvelopeText,
+                    subject,
+                )
+            };
         if record.kind != ApprovedKind::Payment
-            || record.subject_kind != entry.subject_kind
-            || record.subject != subject
+            || entry.subject_kind != subject_kind
+            || record.subject_kind != subject_kind
+            || record.subject != record_subject
             || retained != Some(subject)
-            || retained != Some(record.subject)
             || (record.created_at_ms, record.waiting_expires_at_ms)
                 != (entry.created_at_unix_ms, entry.expires_at_unix_ms)
         {
@@ -922,10 +944,60 @@ impl WalletServer {
         self.operation_step(step).map_err(|error| refusal(&error))
     }
 
-    /// Looks up `business_id` before a classic preparation does any work.
+    /// Looks up `business_id` before a toolset preparation does any work,
+    /// with the canonical lookup of [`Self::canonical_prepare_entry`]: a
+    /// canonical record of the same intent and an envelope record of the same
+    /// identity resume or replay, so either route continues the record the
+    /// first preparation opened. A new id opens an envelope record of the
+    /// request's [`operation_entry::operation_identity`], whose commit
+    /// verifies the toolset's protocol nonce.
     ///
-    /// The identity is the [`operation_entry::operation_identity`] of
-    /// `facts` under the verified mainnet policy.
+    /// # Errors
+    ///
+    /// The errors of [`Self::canonical_prepare_entry`].
+    pub(crate) fn toolset_prepare_entry(
+        &self,
+        business_id: BusinessId,
+        consumer: MainnetConsumer,
+        source: &str,
+        fee_choice: ClassicFeeChoice,
+        memo: &stellar_xdr::Memo,
+        facts: IdentityFacts,
+    ) -> Result<ClassicOperation, CallToolResult> {
+        let mut operation = self.canonical_prepare_entry(
+            business_id,
+            consumer,
+            source,
+            fee_choice,
+            memo,
+            facts.clone(),
+        )?;
+        if operation.resume.is_none() {
+            let guard = self.mainnet_write_admission(consumer)?;
+            let identity = operation_entry::operation_identity(
+                IntentBaseFacts::new(
+                    self.security_profile(),
+                    source,
+                    guard.policy,
+                    fee_choice,
+                    operation_entry::memo_fact(memo),
+                ),
+                facts,
+            )
+            .map_err(|error| refusal(&error))?;
+            operation.preparation = Some(Preparation::Envelope(identity));
+            operation.canonical = None;
+        }
+        Ok(operation)
+    }
+
+    /// Looks up `business_id` before a classic preparation of a lasting
+    /// canonical intent does any work, with the canonical lookup of the
+    /// request's `facts` under the verified mainnet policy.
+    ///
+    /// A record of the same intent resumes or replays. An envelope record of
+    /// the same identity keeps its stored envelope. The returned preparation
+    /// opens a canonical record only after [`Self::stage_canonical`].
     ///
     /// # Errors
     ///
@@ -935,41 +1007,6 @@ impl WalletServer {
     /// - `operation.business_id_conflict` for an id bound to another intent;
     /// - the admission refusal of a server without mainnet authority;
     /// - the store's refusals.
-    pub(crate) fn classic_prepare_entry(
-        &self,
-        business_id: BusinessId,
-        consumer: MainnetConsumer,
-        source: &str,
-        fee_choice: ClassicFeeChoice,
-        memo: &stellar_xdr::Memo,
-        facts: IdentityFacts,
-    ) -> Result<ClassicOperation, CallToolResult> {
-        let guard = self.mainnet_write_admission(consumer)?;
-        let identity = operation_entry::operation_identity(
-            IntentBaseFacts::new(
-                self.security_profile(),
-                source,
-                guard.policy,
-                fee_choice,
-                operation_entry::memo_fact(memo),
-            ),
-            facts,
-        )
-        .map_err(|error| refusal(&error))?;
-        self.prepare_entry(business_id, Preparation::Envelope(identity))
-    }
-
-    /// Looks up `business_id` before a classic preparation of a lasting
-    /// canonical intent does any work, as [`Self::classic_prepare_entry`]
-    /// does, with the canonical lookup of the request's `facts`.
-    ///
-    /// A record of the same intent resumes or replays. An envelope record of
-    /// the same identity keeps its stored envelope. The returned preparation
-    /// opens a canonical record only after [`Self::stage_canonical`].
-    ///
-    /// # Errors
-    ///
-    /// The errors of [`Self::classic_prepare_entry`].
     pub(crate) fn canonical_prepare_entry(
         &self,
         business_id: BusinessId,
@@ -1044,16 +1081,6 @@ impl WalletServer {
             .then(|| outcome.governing_ttl_ms()),
         });
         Ok(())
-    }
-
-    fn prepare_entry(
-        &self,
-        business_id: BusinessId,
-        preparation: Preparation,
-    ) -> Result<ClassicOperation, CallToolResult> {
-        let entry =
-            self.with_operation_recorder(|recorder| preparation.lookup(recorder, &business_id))?;
-        Self::entered(business_id, Some(preparation), None, entry)
     }
 
     /// The preparation `entry` continues under `business_id`; a retained
@@ -1308,6 +1335,55 @@ impl WalletServer {
         }
     }
 
+    /// The business id of a record holding a canonical intent, read without
+    /// a lock; `None` for a malformed id, an id without a record, an
+    /// envelope record and a window the read cannot read, so an envelope
+    /// record is never looked up under the recorder.
+    pub(crate) fn canonical_slot_id(&self, business_id: Option<&str>) -> Option<BusinessId> {
+        use stellar_agent_network::policy_state::{OperationStatus, SlotKind};
+        let id = business_id.and_then(|raw| BusinessId::parse(raw).ok())?;
+        OperationStatus::new(&self.window_store, self.security_profile())
+            .view(&id)
+            .is_ok_and(|view| view.is_some_and(|view| view.slot_kind == SlotKind::Canonical))
+            .then_some(id)
+    }
+
+    /// Admits a commit of the unsigned `envelope_xdr` for the canonical
+    /// record under `business_id` only when that record binds the envelope,
+    /// read without a lock. A preparation of the record binds the envelope it
+    /// built for the stored intent, so an envelope that only other records
+    /// bind, or none, belongs to another intent.
+    ///
+    /// # Errors
+    ///
+    /// `operation.business_id_conflict` for an envelope the record does not
+    /// bind, and for a window the read cannot read.
+    pub(crate) fn canonical_envelope(
+        &self,
+        business_id: &BusinessId,
+        envelope_xdr: &str,
+    ) -> Result<(), CallToolResult> {
+        use stellar_agent_network::policy_state::{OperationStatus, WindowStoreError};
+        let bound = OperationStatus::new(&self.window_store, self.security_profile())
+            .commit_binding(
+                business_id,
+                &operation_entry::unsigned_envelope_sha256(envelope_xdr),
+            )
+            .is_ok_and(|binding| {
+                binding
+                    .owners
+                    .iter()
+                    .any(|owner| &owner.business_id == business_id)
+            });
+        if bound {
+            Ok(())
+        } else {
+            Err(refusal(&operation_entry::operation_refusal(
+                WindowStoreError::BusinessIdConflict,
+            )))
+        }
+    }
+
     /// The canonical operation a mainnet commit under `business_id`
     /// continues, looked up under the recorder, with its stored intent
     /// validated under `policy`, the commit's verified mainnet policy.
@@ -1331,7 +1407,18 @@ impl WalletServer {
         source: &str,
         matches: impl FnOnce(&stellar_agent_core::approval::ClassicIntent) -> bool,
     ) -> Result<crate::tools::canonical_commit::CanonicalTarget, CallToolResult> {
-        use stellar_agent_network::policy_state::{LookupOutcome, WindowStoreError};
+        use stellar_agent_network::policy_state::{
+            LookupOutcome, OperationStatus, WindowStoreError,
+        };
+        // A tombstone keeps no intent and never resumes, so it answers from
+        // one read of the window without a recorder write.
+        let tombstone = OperationStatus::new(&self.window_store, self.security_profile())
+            .view(&business_id)
+            .map_err(|error| refusal(&operation_entry::operation_refusal(error)))?
+            .filter(|view| view.compacted);
+        if let Some(view) = tombstone {
+            return Err(replay_result(&view));
+        }
         let (found, retained) = self.with_operation_recorder(|recorder| {
             let found = recorder
                 .lookup(&business_id)
@@ -1644,6 +1731,47 @@ mod tests {
     mod canonical_consent_tests {
         include!("canonical_consent_tests.rs");
     }
+
+    #[cfg(feature = "mainnet-write")]
+    impl WalletServer {
+        /// Looks up `business_id` with the envelope lookup of the request's
+        /// operation identity under the verified mainnet policy.
+        pub(crate) fn classic_prepare_entry(
+            &self,
+            business_id: BusinessId,
+            consumer: MainnetConsumer,
+            source: &str,
+            fee_choice: ClassicFeeChoice,
+            memo: &stellar_xdr::Memo,
+            facts: IdentityFacts,
+        ) -> Result<ClassicOperation, CallToolResult> {
+            let guard = self.mainnet_write_admission(consumer)?;
+            let identity = operation_entry::operation_identity(
+                IntentBaseFacts::new(
+                    self.security_profile(),
+                    source,
+                    guard.policy,
+                    fee_choice,
+                    operation_entry::memo_fact(memo),
+                ),
+                facts,
+            )
+            .map_err(|error| refusal(&error))?;
+            self.prepare_entry(business_id, Preparation::Envelope(identity))
+        }
+
+        /// Looks up `business_id` with `preparation`'s own lookup.
+        pub(crate) fn prepare_entry(
+            &self,
+            business_id: BusinessId,
+            preparation: Preparation,
+        ) -> Result<ClassicOperation, CallToolResult> {
+            let entry = self
+                .with_operation_recorder(|recorder| preparation.lookup(recorder, &business_id))?;
+            Self::entered(business_id, Some(preparation), None, entry)
+        }
+    }
+
     use stellar_agent_core::profile::receipt::{OperationDestination, PaymentDestinations};
     use stellar_agent_network::policy_state::{
         OperationId, OperationResult, OperationState, OperationView, SlotKind,

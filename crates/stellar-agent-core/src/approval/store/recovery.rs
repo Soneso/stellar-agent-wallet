@@ -254,7 +254,9 @@ impl PendingApprovalStore {
     }
 
     /// Reuses the original payment consent or inserts its payload and recovery binding atomically.
-    /// The store lock covers lookup, nonce allocation, and persistence.
+    /// The store lock covers lookup, nonce allocation, and persistence. A new
+    /// payload records `subject_kind`, the subject its consent binds; a
+    /// reused one keeps its own.
     ///
     /// # Errors
     /// Returns a terminal binding's status, inconsistent facts, an elapsed interval,
@@ -272,6 +274,7 @@ impl PendingApprovalStore {
         expires: u64,
         now: u64,
         request: &crate::policy::ApprovalRequest,
+        subject_kind: super::super::subject::SubjectKind,
     ) -> Result<PendingApproval, ApprovalError> {
         let key = RecoveryKey::new(&context, envelope);
         // A binding whose retention has ended is absent; the insertion below
@@ -297,7 +300,7 @@ impl PendingApprovalStore {
                 .cloned()
                 .ok_or(ApprovalError::RecoveryInconsistent);
         }
-        let entry = PendingApproval::new_payment_pending_until(
+        let mut entry = PendingApproval::new_payment_pending_until(
             envelope.to_owned(),
             uid,
             created,
@@ -305,6 +308,7 @@ impl PendingApprovalStore {
             now,
             request.reason.clone(),
         )?;
+        entry.subject_kind = subject_kind;
         self.insert_bound(key, context, entry, (created, expires), now)
     }
 
