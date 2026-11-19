@@ -1131,6 +1131,28 @@ impl Run {
     fn simulations(&self) -> usize {
         self.control.count("simulateTransaction")
     }
+
+    /// Starts a new server on the current files and keyring, routed to the
+    /// run's own primary and oracle servers and to its SEP-10 double, in
+    /// place of the running one, as `ClassicRun::restart` does.
+    ///
+    /// # Errors
+    ///
+    /// The startup refusal of the new server; the running one stays.
+    pub(super) fn restart(&mut self) -> Result<(), stellar_agent_core::policy::BuildRegistryError> {
+        let mut server = WalletServer::new_with_selection_and_routes_for_test(
+            (*self.f.server.profile).clone(),
+            stellar_agent_core::profile::name::ProfileNameSource::Flag,
+            &stellar_agent_core::profile::schema::default_profile_dir().unwrap(),
+            &[
+                ("rpc.example.invalid", self._primary.uri().as_str()),
+                ("oracle.example.invalid", self._oracle.uri().as_str()),
+            ],
+        )?;
+        self.double.install(&mut server);
+        self.f.server = server;
+        Ok(())
+    }
 }
 
 /// Asserts the accepted payment of `run`: the response fields, the verified

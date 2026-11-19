@@ -8,8 +8,11 @@
 //! the child the dev-dependency features of both.
 //!
 //! The canonical file sits in the run's target and profile directory, which
-//! [`bin_dir_of`] derives from the test executable's path. Its `--version`
-//! marker must match this test build's `mainnet-write` state. The alias is a complete copy below
+//! [`bin_dir_of`] derives from the test executable's path. Before any test
+//! spawns it, its bytes must carry the storage isolation literal, and on Unix
+//! it must refuse `profile list` from an unmarked home (see
+//! [`require_sandboxed_data_root`]). Its `--version` marker must match this
+//! test build's `mainnet-write` state. The alias is a complete copy below
 //! `<bin dir>/../tmp/server-alias-<len>-<mtime_ns>/`. It is published without
 //! overwriting an existing file, so concurrent test processes share one
 //! alias, and an existing alias is used only when its bytes equal the
@@ -115,6 +118,7 @@ fn resolve(dir: &Path) -> Result<PathBuf, String> {
     if !stellar_agent_test_support::sandbox::isolated_executable(&bytes) {
         return Err("child lacks storage isolation; run cargo test -p stellar-agent-cli -p stellar-agent-mcp --no-run".to_owned());
     }
+    require_sandboxed_data_root(&canonical)?;
     verify_marker(&canonical, cfg!(feature = "mainnet-write"))?;
     let alias = alias_path(&canonical)?;
     publish(&canonical, &alias)?;
@@ -135,6 +139,58 @@ fn locate_in(dir: &Path) -> Result<PathBuf, String> {
             path.display()
         ))
     }
+}
+
+/// The refusal an isolated build gives for a data root outside a marked
+/// sandbox.
+const UNMARKED_ROOT_REFUSAL: &str = "could not determine OS-conventional state directory";
+
+/// Requires that `canonical` refuses a data root outside a marked sandbox.
+///
+/// The check runs `profile list`, which reads only the profile directory
+/// and touches no keyring, with an empty environment: `HOME` and
+/// `XDG_DATA_HOME` name a fresh empty directory and `STELLAR_AGENT_HOME` is
+/// unset. A build with the test helpers refuses, because its data root
+/// needs a marked sandbox. A plain build answers from the empty directory,
+/// so the child would use storage outside the test sandbox. Windows derives
+/// the data root from no environment variable, so the check runs on Unix
+/// only.
+///
+/// # Errors
+///
+/// Returns the reason when the run fails or the build answers.
+fn require_sandboxed_data_root(canonical: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let root = canonical
+            .parent()
+            .ok_or_else(|| format!("{} has no directory", canonical.display()))?
+            .join("..")
+            .join("tmp");
+        std::fs::create_dir_all(&root).map_err(|err| format!("{}: {err}", root.display()))?;
+        let home = tempfile::Builder::new()
+            .prefix("unmarked-home-")
+            .tempdir_in(&root)
+            .map_err(|err| format!("{}: {err}", root.display()))?;
+        let output = Command::new(canonical)
+            .env_clear()
+            .env("HOME", home.path())
+            .env("XDG_DATA_HOME", home.path())
+            .current_dir(home.path())
+            .args(["profile", "list"])
+            .output()
+            .map_err(|err| format!("{} profile list: {err}", canonical.display()))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if output.status.success() || !stdout.contains(UNMARKED_ROOT_REFUSAL) {
+            return Err(format!(
+                "child ignores the test sandbox: {} answered profile list from an unmarked home ({}: {}); run cargo test -p stellar-agent-cli -p stellar-agent-mcp --no-run with this run's feature flags",
+                canonical.display(),
+                output.status,
+                stdout.trim_end()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Requires a successful `--version` whose second line is the marker for
@@ -357,15 +413,19 @@ mod tests {
         assert_eq!(locate_in(&fixture.path().join("bin")).unwrap(), canonical);
     }
 
-    /// A script that prints a version and the marker for `state`.
+    /// A script that prints a version and the marker for `state`, and
+    /// refuses `profile list` outside a marked sandbox as an isolated build
+    /// does.
     #[cfg(unix)]
     fn version_script(fixture: &Path, state: &str, status: i32) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
         let marker = format!("{}{}{state}", "STELLAR_AGENT_BUILD_", "MAINNET_WRITE=");
         let path = canonical_in(
             fixture,
-            format!("#!/bin/sh\n# STELLAR_AGENT_TEST_STORAGE_ISOLATED\nprintf 'stellar-agent 0.0.0\\n{marker}\\n'\nexit {status}\n")
-                .as_bytes(),
+            format!(
+                "#!/bin/sh\n# STELLAR_AGENT_TEST_STORAGE_ISOLATED\nif [ \"$1\" = profile ]; then printf '{UNMARKED_ROOT_REFUSAL}\\n'; exit 1; fi\nprintf 'stellar-agent 0.0.0\\n{marker}\\n'\nexit {status}\n"
+            )
+            .as_bytes(),
         );
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         wait_until_executable(&path);
@@ -419,6 +479,81 @@ mod tests {
             !canonical.with_extension("executed").exists(),
             "rejected bytes never execute"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_refuses_a_child_that_answers_from_an_unmarked_home() {
+        let fixture = fixture();
+        let canonical = version_script(fixture.path(), build_state(), 0);
+        let source = std::fs::read_to_string(&canonical).unwrap();
+        std::fs::write(
+            &canonical,
+            source
+                .replace(
+                    &format!("printf '{UNMARKED_ROOT_REFUSAL}\\n'; exit 1"),
+                    "printf '{\"ok\":true,\"data\":[]}\\n'; exit 0",
+                )
+                .replace(
+                    "printf 'stellar-agent",
+                    "printf executed > \"$0.executed\"\nprintf 'stellar-agent",
+                ),
+        )
+        .unwrap();
+        wait_until_executable(&canonical);
+        // The wait itself runs `--version`; only the resolver's runs count.
+        let _ = std::fs::remove_file(canonical.with_extension("executed"));
+        let alias = alias_path(&canonical).unwrap();
+        let reason = resolve(&fixture.path().join("bin")).unwrap_err();
+        assert!(
+            reason.contains("child ignores the test sandbox"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("cargo test -p stellar-agent-cli -p stellar-agent-mcp --no-run"),
+            "{reason}"
+        );
+        assert!(
+            !canonical.with_extension("executed").exists(),
+            "the refusal comes before the marker run"
+        );
+        assert!(
+            alias.symlink_metadata().is_err(),
+            "a refused build publishes no alias"
+        );
+    }
+
+    /// A plain build of the CLI, named by `STELLAR_AGENT_TEST_PLAIN_BINARY`
+    /// and built into its own target directory, is refused before any
+    /// spawn: its bytes lack the isolation literal. The run check alone
+    /// also refuses it, because it answers `profile list` from an unmarked
+    /// home.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "needs a plain build named by STELLAR_AGENT_TEST_PLAIN_BINARY"]
+    fn resolve_refuses_a_plain_build_before_any_spawn() {
+        let plain = PathBuf::from(
+            std::env::var_os("STELLAR_AGENT_TEST_PLAIN_BINARY")
+                .expect("STELLAR_AGENT_TEST_PLAIN_BINARY names a plain build"),
+        );
+        assert_eq!(
+            plain.file_name().unwrap().to_string_lossy(),
+            canonical_name()
+        );
+        let alias = alias_path(&plain).unwrap();
+        let reason = resolve(plain.parent().unwrap()).unwrap_err();
+        assert!(reason.contains("child lacks storage isolation"), "{reason}");
+        assert!(reason.contains("--no-run"), "{reason}");
+        assert!(
+            alias.symlink_metadata().is_err(),
+            "a refused build publishes no alias"
+        );
+        let reason = require_sandboxed_data_root(&plain).unwrap_err();
+        assert!(
+            reason.contains("child ignores the test sandbox"),
+            "{reason}"
+        );
+        assert!(reason.contains("--no-run"), "{reason}");
     }
 
     #[cfg(unix)]

@@ -72,7 +72,7 @@ fn owner() -> Keypair {
 
 /// The ledger key and entry of an unconditional 10 XLM native claimable
 /// balance with id [`BALANCE_ID_HEX64`] whose one claimant is `claimant`.
-fn claimable_entry(claimant: &str) -> (String, String) {
+pub(super) fn claimable_entry(claimant: &str) -> (String, String) {
     let balance_id = ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([0xab; 32]));
     let key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
         balance_id: balance_id.clone(),

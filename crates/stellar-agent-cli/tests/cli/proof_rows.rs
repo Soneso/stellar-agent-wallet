@@ -470,3 +470,138 @@ fn cli_proof_rows_match_the_mainnet_write_callers() {
          {without_caller:?}"
     );
 }
+
+/// The owner key the approval homes sign their policy with.
+const OWNER_SEED: [u8; 32] = [0x47; 32];
+
+/// The policy tool `row`'s verb evaluates.
+pub(super) fn row_tool(row: &CliProofRow) -> &'static str {
+    match row.verb {
+        "pay" => "stellar_pay",
+        "claim" => "stellar_claim",
+        "trustline" => "stellar_trustline",
+        "accounts create" => "stellar_create_account",
+        other => panic!("no tool for {other}"),
+    }
+}
+
+/// The ledger key and entry of the unconditional native claimable balance
+/// whose id the claim argv names, claimable by `claimant`.
+fn claimable_balance(claimant: &str) -> (String, String) {
+    use stellar_xdr::{
+        AccountId, Asset, ClaimPredicate, ClaimableBalanceEntry, ClaimableBalanceEntryExt,
+        ClaimableBalanceId, Claimant, ClaimantV0, Hash, LedgerEntryData, LedgerKey,
+        LedgerKeyClaimableBalance, Limits, PublicKey, Uint256, WriteXdr as _,
+    };
+    let balance_id = ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([0x01; 32]));
+    let key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
+        balance_id: balance_id.clone(),
+    })
+    .to_xdr_base64(Limits::none())
+    .unwrap();
+    let destination = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+        stellar_strkey::ed25519::PublicKey::from_string(claimant)
+            .unwrap()
+            .0,
+    )));
+    let entry = LedgerEntryData::ClaimableBalance(ClaimableBalanceEntry {
+        balance_id,
+        claimants: vec![Claimant::ClaimantTypeV0(ClaimantV0 {
+            destination,
+            predicate: ClaimPredicate::Unconditional,
+        })]
+        .try_into()
+        .unwrap(),
+        asset: Asset::Native,
+        amount: 100_000_000,
+        ext: ClaimableBalanceEntryExt::V0,
+    })
+    .to_xdr_base64(Limits::none())
+    .unwrap();
+    (key, entry)
+}
+
+/// A fresh home whose testnet profile [`PROFILE`] reads through its own
+/// ledger and signs a policy that gives every row's tool `decision`.
+///
+/// No agent signer is enrolled, and every signer-source flag of the argvs
+/// names a variable no child has, so a run that reaches its signing key
+/// fails there.
+async fn approval_home(
+    decision: &str,
+) -> (
+    crate::v1_ceremony::IsolatedHome,
+    crate::classic_ledger::ClassicLedger,
+    wiremock::MockServer,
+) {
+    use crate::v1_ceremony::{IsolatedHome, Keypair, policy_document, policy_rule};
+    let ledger =
+        crate::classic_ledger::ClassicLedger::new(&[ACCOUNT_G], &[claimable_balance(ACCOUNT_G)]);
+    let rpc = ledger.serve().await;
+    let home = IsolatedHome::new();
+    let owner = Keypair::from_seed(OWNER_SEED);
+    home.init_profile(PROFILE, &["--rpc-url", &rpc.uri()]);
+    home.rotate_audit_key(PROFILE);
+    home.rotate_nonce_key(PROFILE);
+    home.enroll_owner_key(PROFILE, &owner);
+    home.rotate_attestation_key(PROFILE);
+    let fields = if decision == "require_approval" {
+        "ttl_secs = 600\nreason = \"operator review\"\n"
+    } else {
+        ""
+    };
+    let rules: Vec<String> = CLI_PROOF_ROWS
+        .iter()
+        .map(|row| {
+            format!(
+                "{}{fields}",
+                policy_rule(row_tool(row), "stellar:testnet", "[]", decision)
+            )
+        })
+        .collect();
+    home.write_policy(PROFILE, &policy_document(PROFILE, &rules));
+    home.sign_policy(PROFILE, &owner);
+    (home, ledger, rpc)
+}
+
+/// Under a policy that requires approval, every CLI row refuses its run
+/// with `policy.approval_required` and sends nothing. The run cannot
+/// present an attestation, and the refusal precedes any key access: no
+/// signing key is available, and the same argv under an allowing policy
+/// fails at its signer instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_cli_row_refuses_a_required_approval_before_key_access() {
+    let (home, ledger, _rpc) = approval_home("require_approval").await;
+    let (allowed, allowed_ledger, _allowed_rpc) = approval_home("allow").await;
+    let mut failures = Vec::new();
+    for row in CLI_PROOF_ROWS {
+        let mut argv = invocation(row);
+        // The creation names an amount the policy can size.
+        if let Some(at) = argv.iter().position(|arg| arg == "--starting-balance") {
+            argv[at + 1] = "1 XLM".to_owned();
+        }
+        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let run = home.run(&args, &[]);
+        if run.code != 1 || run.error_code() != "policy.approval_required" {
+            failures.push(format!(
+                "{} required: exit {} {} stderr={}",
+                row.id, run.code, run.envelope, run.stderr
+            ));
+        }
+        // Without the requirement the same run reaches its signer.
+        let signer_code = match row.verb {
+            "trustline" => "auth.enrolled_identity_unusable",
+            _ => "validation.secret_env_not_set",
+        };
+        let control = allowed.run(&args, &[]);
+        if control.code != 1 || control.error_code() != signer_code {
+            failures.push(format!(
+                "{} allowed: exit {} {} stderr={}",
+                row.id, control.code, control.envelope, control.stderr
+            ));
+        }
+    }
+    assert_eq!(ledger.sends(), 0, "nothing is sent under the requirement");
+    assert_eq!(allowed_ledger.sends(), 0, "no control run signs");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

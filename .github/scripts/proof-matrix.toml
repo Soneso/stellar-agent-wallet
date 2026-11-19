@@ -237,7 +237,14 @@ applies = ["commit", "single", "verb"]
 id = "approval.single_use"
 family = "approval"
 statement = "a consumed approval refuses a second commit"
-applies = ["commit", "single", "verb"]
+applies = ["commit", "single"]
+
+[[claim]]
+id = "approval.single_use_mainnet"
+family = "approval"
+statement = "a committed approval authorizes only its own operation: the same business id replays the stored operation without a second send, and a new business id opens a new approval"
+applies = ["verb"]
+builds = "feature-on"
 
 [[claim]]
 id = "approval.mainnet_presence"
@@ -256,8 +263,15 @@ builds = "feature-on"
 [[claim]]
 id = "approval.durable"
 family = "approval"
+statement = "an approval keeps its state and its stored lifetime window across a restart"
+applies = ["commit", "single"]
+
+[[claim]]
+id = "approval.durable_mainnet"
+family = "approval"
 statement = "an approval keeps its state and its waiting and execution windows across a restart"
 applies = ["commit", "single", "verb"]
+builds = "feature-on"
 
 [[claim]]
 id = "approval.binds_intent"
@@ -291,6 +305,13 @@ statement = "the minimum reserve criterion refuses a call that would leave the s
 applies = ["commit", "single", "verb"]
 
 [[claim]]
+id = "sizing.reserve_refuses_mainnet"
+family = "sizing"
+statement = "the minimum reserve criterion refuses a call that would leave the source balance below its reserve plus the margin, before signing"
+applies = ["single", "verb"]
+builds = "feature-on"
+
+[[claim]]
 id = "sizing.accounting_inputs"
 family = "sizing"
 statement = "the unlisted counter, the budget epoch and the balance floor size the call from persisted accounting"
@@ -299,7 +320,7 @@ applies = ["commit", "single", "verb"]
 [[claim]]
 id = "sizing.hold_follows_evidence"
 family = "sizing"
-statement = "the hold of a sent call is released only on evidence of non-inclusion or a confirmed outcome"
+statement = "a sent call's hold is never released without evidence: a reported success turns it into an exposure, and a failed or not-found answer keeps it"
 applies = ["commit", "verb"]
 
 [[claim]]
@@ -307,6 +328,13 @@ id = "audit.writer_before_signer"
 family = "audit"
 statement = "the audit writer is acquired before the signing key loads"
 applies = ["commit", "single", "verb"]
+
+[[claim]]
+id = "audit.writer_before_signer_mainnet"
+family = "audit"
+statement = "the audit writer is acquired before the signing key loads"
+applies = ["commit", "single", "verb"]
+builds = "feature-on"
 
 [[claim]]
 id = "audit.outcome_row"
@@ -319,6 +347,13 @@ id = "audit.outbox_at_shutdown"
 family = "audit"
 statement = "queued approval audit rows drain or persist at shutdown"
 applies = ["commit", "single", "verb"]
+
+[[claim]]
+id = "audit.outbox_at_shutdown_mainnet"
+family = "audit"
+statement = "queued approval audit rows drain or persist at shutdown"
+applies = ["verb"]
+builds = "feature-on"
 
 [[claim]]
 id = "halt.refuses_first"
@@ -351,12 +386,20 @@ id = "status.operation_view"
 family = "status"
 statement = "the operation status reports state, attempts, recovery and the next safe step"
 applies = ["commit", "single", "verb"]
+builds = "feature-on"
 
 [[claim]]
 id = "status.approval_view"
 family = "status"
 statement = "the approval status reports state and validity and consumes nothing"
 applies = ["commit", "single", "verb"]
+
+[[claim]]
+id = "status.approval_view_mainnet"
+family = "status"
+statement = "the approval status reports state and validity and consumes nothing"
+applies = ["verb"]
+builds = "feature-on"
 
 [[claim]]
 id = "status.retry_returns_stored"
@@ -374,8 +417,9 @@ applies = ["commit", "single", "verb"]
 [[claim]]
 id = "revocation.refuses_commit"
 family = "revocation"
-statement = "a revoked approval refuses the commit and leaves an audit row"
+statement = "a revoked approval refuses the commit, and its revocation leaves an audit row"
 applies = ["commit", "single", "verb"]
+builds = "feature-on"
 
 [[claim]]
 id = "remote.refused_without_signed_origin"
@@ -412,12 +456,39 @@ change = "operation-state notifications on MCP"
 key = "row-test"
 change = "the behavior exists; a test for this row follows"
 
-# Cells: approval.required_blocks_commit.
+[[delivery]]
+key = "x402-testnet-no-payer-view"
+change = "on testnet and in a build without mainnet writes, the x402 tools pass no account view, so a minimum_reserve rule refuses with policy.engine_required before sizing; on mainnet the payer read sizes the call, and the claim's mainnet-write scope names its tests"
+
+[[delivery]]
+key = "cli-trustline-mainnet-reserve"
+change = "the CLI trustline verb's refusal below the reserve of the trustline it opens has a test in the mainnet-write build only, which the claim's mainnet-write scope names; a test that runs in both builds follows"
+
+[[delivery]]
+key = "cli-mainnet-approval"
+change = "a CLI value verb holds an approval only in a build with mainnet writes, so no test runs these rows in both builds; the claim's mainnet-write scope names their feature-on test"
+
+# Cells: approval.required_blocks_commit. Per route, a commit without a
+# valid attestation answers: a classic MCP commit refuses
+# policy.approval_required for every invalid proof, including none; an x402
+# payment without a proof answers ok with the approval it queues and no
+# payment signature, and refuses policy.approval_required for every other
+# invalid proof.
 
 [[cell]]
 claim = "approval.required_blocks_commit"
-rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
-pending = "row-test"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment"]
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "approval_cap_integration::every_commit_row_refuses_without_a_valid_attestation_before_key_access" },
+]
+
+[[cell]]
+claim = "approval.required_blocks_commit"
+rows = ["cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+tests = [
+  { package = "stellar-agent-cli", target = "test:cli", name = "proof_rows::every_cli_row_refuses_a_required_approval_before_key_access" },
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "common::mainnet_authority_tests::every_value_verb_refuses_without_a_valid_attestation_before_the_signer", builds = "feature-on" },
+]
 
 # Cells: approval.single_use.
 
@@ -431,8 +502,17 @@ tests = [
 
 [[cell]]
 claim = "approval.single_use"
-rows = ["mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
-pending = "row-test"
+rows = ["mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment"]
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "approval_cap_integration::every_commit_row_refuses_a_second_commit_under_a_consumed_approval" },
+]
+
+[[cell]]
+claim = "approval.single_use_mainnet"
+rows = ["cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+tests = [
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "common::mainnet_authority_tests::every_value_verb_commits_under_its_approval_once", builds = "feature-on" },
+]
 
 # Cells: approval.mainnet_presence.
 
@@ -447,7 +527,9 @@ tests = [
 [[cell]]
 claim = "approval.mainnet_presence"
 rows = ["cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
-pending = "row-test"
+tests = [
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "common::mainnet_authority_tests::every_value_verb_needs_presence_verified_against_the_signed_policy", builds = "feature-on" },
+]
 
 # Cells: the approval claims a later change delivers.
 
@@ -478,8 +560,24 @@ tests = [
 
 [[cell]]
 claim = "approval.durable"
-rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
-pending = "row-test"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment"]
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "approval_cap_integration::every_commit_row_keeps_its_approval_state_and_window_across_restart" },
+]
+
+[[cell]]
+claim = "approval.durable_mainnet"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::mainnet_presence_tests::durable_approval_keeps_state_and_windows_across_restart_for_every_kind", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "approval.durable_mainnet"
+rows = ["cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+tests = [
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "common::mainnet_authority_tests::every_value_verb_keeps_its_approval_across_a_restart", builds = "feature-on" },
+]
 
 [[cell]]
 claim = "approval.binds_intent"
@@ -647,8 +745,15 @@ tests = [
 
 [[cell]]
 claim = "sizing.caps_refuse"
-rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
-pending = "row-test"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "cli.pay", "cli.accounts_create"]
+tests = [
+  { package = "stellar-agent-cli", target = "test:cli", name = "proof_row_claims::every_debit_row_refuses_a_call_over_its_cap_before_signing" },
+]
+
+[[cell]]
+claim = "sizing.caps_refuse"
+rows = ["mcp.claim_commit", "mcp.trustline_commit", "cli.claim", "cli.trustline"]
+not_applicable = "a claim credits the source account and a trustline change moves no value, so these calls have no debit amount for a cap to size"
 
 # Cells: sizing.reserve_refuses.
 
@@ -691,8 +796,73 @@ tests = [
 
 [[cell]]
 claim = "sizing.reserve_refuses"
-rows = ["mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.trustline", "cli.accounts_create"]
-pending = "row-test"
+rows = ["cli.accounts_create"]
+tests = [
+  { package = "stellar-agent-cli", target = "test:cli", name = "proof_row_claims::the_create_account_row_refuses_below_reserve_and_admits_the_boundary" },
+]
+
+[[cell]]
+claim = "sizing.reserve_refuses"
+rows = ["mcp.x402_create_payment", "mcp.x402_authenticated_payment"]
+pending = "x402-testnet-no-payer-view"
+
+# The trustline counts the base reserve of the trustline it opens.
+[[cell]]
+claim = "sizing.reserve_refuses"
+rows = ["mcp.trustline_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "trustline_integration::trustline_commit_counts_the_opened_reserve" },
+]
+
+[[cell]]
+claim = "sizing.reserve_refuses"
+rows = ["cli.trustline"]
+pending = "cli-trustline-mainnet-reserve"
+
+# Cells: sizing.reserve_refuses_mainnet. On mainnet the x402 tools read the
+# payer for the reserve, and each CLI verb's refusal has a mainnet test.
+
+[[cell]]
+claim = "sizing.reserve_refuses_mainnet"
+rows = ["mcp.x402_create_payment"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::x402_create_payment::tests::mainnet_partial_approval_and_minimum_reserve_persist_nothing", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "sizing.reserve_refuses_mainnet"
+rows = ["mcp.x402_authenticated_payment"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::x402_authenticated_mainnet_tests::call_one_reads_the_payer_under_a_minimum_reserve_rule", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "sizing.reserve_refuses_mainnet"
+rows = ["cli.pay"]
+tests = [
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "commands::pay::tests::mainnet_full::the_fee_counts_toward_the_reserve_on_mainnet", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "sizing.reserve_refuses_mainnet"
+rows = ["cli.claim"]
+tests = [
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "commands::claim::tests::mainnet_full::the_fee_counts_toward_the_reserve_on_mainnet", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "sizing.reserve_refuses_mainnet"
+rows = ["cli.accounts_create"]
+tests = [
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "commands::accounts::create::tests::mainnet_full::the_fee_counts_toward_the_reserve_on_mainnet", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "sizing.reserve_refuses_mainnet"
+rows = ["cli.trustline"]
+tests = [
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "commands::trustline::tests::mainnet_full::the_opened_trustline_counts_toward_the_reserve_on_mainnet", builds = "feature-on" },
+]
 
 # Classified hold composition has API and atomic-mint proofs in
 # policy_state::ledger::tests::composed, and the restricted resolver has
@@ -714,7 +884,9 @@ pending = "accounting-counters"
 [[cell]]
 claim = "sizing.hold_follows_evidence"
 rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
-pending = "row-test"
+tests = [
+  { package = "stellar-agent-cli", target = "test:cli", name = "proof_row_claims::every_commit_row_settles_its_hold_only_on_outcome_evidence" },
+]
 
 # Cells: audit.writer_before_signer.
 
@@ -729,19 +901,77 @@ tests = [
 [[cell]]
 claim = "audit.writer_before_signer"
 rows = ["cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+tests = [
+  { package = "stellar-agent-cli", target = "test:cli", name = "proof_row_claims::every_cli_value_verb_acquires_the_audit_writer_before_the_signing_key" },
+]
+
+# Cells: audit.writer_before_signer_mainnet.
+
+[[cell]]
+claim = "audit.writer_before_signer_mainnet"
+rows = ["cli.pay"]
+tests = [
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "commands::pay::tests::mainnet_full::the_writer_preflight_refuses_a_held_audit_writer_before_the_summary", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "audit.writer_before_signer_mainnet"
+rows = ["cli.claim"]
+tests = [
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "commands::claim::tests::mainnet_full::the_audit_preflight_refuses_a_held_writer_before_the_signer", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "audit.writer_before_signer_mainnet"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.trustline", "cli.accounts_create"]
 pending = "row-test"
 
 # Cells: audit.outcome_row and audit.outbox_at_shutdown.
+#
+# The two audit.outcome_row cells prove the outcomes their tests reach. A
+# classic call writes one value_action_pending row and no other value row
+# when the endpoint applies it, times it out, reports it FAILED or refuses
+# its send, on testnet and, for an applied call, on mainnet. An x402 call
+# writes one x402_payment_authorized row when paid, or one
+# x402_authorization_withheld row when withheld. No row test reaches a
+# transport failure after the send or the not-sent exit, which writes the
+# closing value_action_failed row.
 
 [[cell]]
 claim = "audit.outcome_row"
-rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
-pending = "row-test"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment"]
+tests = [
+  { package = "stellar-agent-cli", target = "test:cli", name = "proof_row_claims::every_terminal_outcome_writes_one_audit_row" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::proof_row_status_tests::every_mcp_row_writes_one_value_row_on_mainnet", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "audit.outcome_row"
+rows = ["cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+tests = [
+  { package = "stellar-agent-cli", target = "test:cli", name = "proof_row_claims::every_terminal_outcome_writes_one_audit_row" },
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "common::proof_row_status_tests::every_cli_row_writes_one_value_row_on_mainnet", builds = "feature-on" },
+]
 
 [[cell]]
 claim = "audit.outbox_at_shutdown"
-rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
-pending = "row-test"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment"]
+tests = [
+  { package = "stellar-agent-cli", target = "test:cli", name = "proof_row_claims::every_mcp_row_queues_its_approval_row_until_the_server_exit_drain" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::proof_row_status_tests::every_mcp_row_drains_or_keeps_its_queued_approval_row_at_shutdown", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "audit.outbox_at_shutdown"
+rows = ["cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+pending = "cli-mainnet-approval"
+
+[[cell]]
+claim = "audit.outbox_at_shutdown_mainnet"
+rows = ["cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+tests = [
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "common::proof_row_status_tests::every_cli_row_keeps_its_queued_consent_row_until_the_holder_drains", builds = "feature-on" },
+]
 
 # Cells: halt.refuses_first.
 
@@ -841,11 +1071,26 @@ tests = [
 
 [[cell]]
 claim = "feature.on_build_needs_signed_policy"
-rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.claim", "cli.trustline", "cli.accounts_create"]
-pending = "row-test"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::mainnet_presence_tests::missing_signed_policy_or_enablement_refuses_every_kind", builds = "feature-on" },
+]
 
-# Cells: status.transaction_reconciles. The status tests seed the receipt
-# and the native hold of a sent payment.
+[[cell]]
+claim = "feature.on_build_needs_signed_policy"
+rows = ["cli.claim", "cli.trustline", "cli.accounts_create"]
+tests = [
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "common::mainnet_authority_tests::every_value_verb_refuses_without_the_signed_policy_or_enablement", builds = "feature-on" },
+]
+
+# Cells: status.transaction_reconciles. The pay cells' status tests seed the
+# receipt and the native hold of a sent payment. The cell of the other rows
+# names proof_row_claims::every_sent_row_reconciles_its_receipt_and_hold. For
+# each row it shows that the status, through the row's own surface, reports
+# that row's sent receipt beside its hold and records a reported success
+# while keeping the hold. The release half seeds the same expired native
+# hold for every row and selects only the status surface, so it shows the
+# release on each surface, not the release of a row's own send.
 
 [[cell]]
 claim = "status.transaction_reconciles"
@@ -867,19 +1112,50 @@ tests = [
 [[cell]]
 claim = "status.transaction_reconciles"
 rows = ["mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "cli.claim", "cli.trustline", "cli.accounts_create"]
-pending = "row-test"
+tests = [
+  { package = "stellar-agent-cli", target = "test:cli", name = "proof_row_claims::every_sent_row_reconciles_its_receipt_and_hold" },
+]
 
 # Cells: status.operation_view and status.approval_view.
 
 [[cell]]
 claim = "status.operation_view"
-rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
-pending = "row-test"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::proof_row_status_tests::every_classic_mcp_row_reports_its_operation_and_next_step", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "status.operation_view"
+rows = ["mcp.x402_create_payment", "mcp.x402_authenticated_payment"]
+not_applicable = "an x402 authorization is returned to the host, which delivers it; the payee settles it. Status reports its state and attempt; the wallet keeps no recovery path or next step for it"
+
+[[cell]]
+claim = "status.operation_view"
+rows = ["cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+tests = [
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "common::proof_row_status_tests::every_cli_row_reports_its_operation_and_next_step", builds = "feature-on" },
+]
 
 [[cell]]
 claim = "status.approval_view"
-rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
-pending = "row-test"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment"]
+tests = [
+  { package = "stellar-agent-cli", target = "test:cli", name = "proof_row_claims::every_mcp_row_reports_its_inbox_approval_without_consuming_it" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::proof_row_status_tests::every_mcp_row_reports_its_approval_without_consuming_it", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "status.approval_view"
+rows = ["cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+pending = "cli-mainnet-approval"
+
+[[cell]]
+claim = "status.approval_view_mainnet"
+rows = ["cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+tests = [
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "common::proof_row_status_tests::every_cli_row_reports_its_approval_without_consuming_it", builds = "feature-on" },
+]
 
 # Cells: status.retry_returns_stored. Each test retries every kind its
 # surface admits under a retained business id.
@@ -928,11 +1204,21 @@ not_applicable = "the CLI reports state through its status verb"
 
 [[cell]]
 claim = "revocation.refuses_commit"
-rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
-pending = "row-test"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment"]
+tests = [
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "common::mainnet_authority_tests::every_mcp_commit_refuses_a_revoked_approval", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "revocation.refuses_commit"
+rows = ["cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+tests = [
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "common::mainnet_authority_tests::every_value_verb_refuses_a_revoked_approval", builds = "feature-on" },
+]
 
 # Cells: remote approval. Without a signed approval origin, the listener
-# refuses mainnet before binding. Signed-origin value flows need separate proofs.
+# refuses mainnet before binding. The two signed-origin cells name their
+# proofs: each commits on a consent from the signed-origin listener.
 
 [[cell]]
 claim = "remote.refused_without_signed_origin"
@@ -943,8 +1229,18 @@ tests = [
 
 [[cell]]
 claim = "remote.consent_at_signed_origin"
-rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
-pending = "row-test"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::mainnet_presence_tests::signed_origin_consent_commits_every_kind", builds = "feature-on" },
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "common::mainnet_authority_tests::every_mcp_row_commits_on_consent_at_the_signed_origin", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "remote.consent_at_signed_origin"
+rows = ["cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+tests = [
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "common::mainnet_authority_tests::every_value_verb_commits_on_consent_at_the_signed_origin", builds = "feature-on" },
+]
 
 # Verified toolset payment adapters.
 
@@ -1017,6 +1313,11 @@ rows = ["mcp.toolset_pay_commit"]
 pending = "row-test"
 
 [[cell]]
+claim = "approval.durable_mainnet"
+rows = ["mcp.toolset_pay_commit"]
+pending = "row-test"
+
+[[cell]]
 claim = "approval.binds_intent"
 rows = ["mcp.toolset_pay_commit"]
 pending = "row-test"
@@ -1068,6 +1369,11 @@ pending = "row-test"
 
 [[cell]]
 claim = "audit.writer_before_signer"
+rows = ["mcp.toolset_pay_commit"]
+pending = "row-test"
+
+[[cell]]
+claim = "audit.writer_before_signer_mainnet"
 rows = ["mcp.toolset_pay_commit"]
 pending = "row-test"
 

@@ -4618,3 +4618,461 @@ mod durable_gate {
         );
     }
 }
+
+/// A startup authority of a mainnet write that a test removes.
+#[derive(Clone, Copy, Debug)]
+enum Missing {
+    /// The owner-signed policy file.
+    SignedPolicy,
+    /// The enablement entry of the keyring.
+    Enablement,
+}
+
+const MISSING: [Missing; 2] = [Missing::SignedPolicy, Missing::Enablement];
+
+impl Missing {
+    /// Removes the authority of `f` and returns what puts it back.
+    fn remove(self, f: &Fixture) -> Box<dyn FnOnce()> {
+        let policy = policy_file();
+        let policy_bytes = std::fs::read(&policy).unwrap();
+        let enablement = stellar_agent_core::profile::schema::mainnet_enablement_entry_ref(
+            &f.server.profile.policy_window_state_key_id,
+        );
+        let entry = keyring_core::Entry::new(&enablement.service, &enablement.account).unwrap();
+        let enablement_value = entry.get_password().unwrap();
+        match self {
+            Self::SignedPolicy => std::fs::remove_file(&policy).unwrap(),
+            Self::Enablement => entry.delete_credential().unwrap(),
+        }
+        Box::new(move || match self {
+            Self::SignedPolicy => std::fs::write(&policy, policy_bytes).unwrap(),
+            Self::Enablement => keyring_core::Entry::new(&enablement.service, &enablement.account)
+                .unwrap()
+                .set_password(&enablement_value)
+                .unwrap(),
+        })
+    }
+}
+
+/// Asserts the mainnet refusal of a write whose startup authority is
+/// missing.
+fn assert_mainnet_forbidden(context: &str, result: &serde_json::Value) {
+    assert_eq!(result["ok"], false, "{context}: {result}");
+    assert_eq!(
+        result["error"]["code"], "network.mainnet_write_forbidden",
+        "{context}: {result}"
+    );
+}
+
+/// A mainnet-write build refuses each MCP commit row on mainnet when the
+/// owner-signed policy file or the keyring enablement is missing: the running
+/// server refuses the call before any seed read, signing or payment request,
+/// and a restart refuses to start. With the authority back, the same call
+/// commits.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn missing_signed_policy_or_enablement_refuses_every_kind() {
+    for tool in Tool::ALL {
+        for missing in MISSING {
+            let context = format!("{tool:?} without {missing:?}");
+            let mut run = ClassicRun::new(tool).await;
+            let restore = missing.remove(&run.f);
+            let result = run.commit().await;
+            assert_mainnet_forbidden(&context, &result);
+            assert_classic_unsigned(&context, &run, &run.entry);
+            assert_eq!(
+                run.control.methods().len() + run.oracle_control.methods().len(),
+                0,
+                "{context}: no request"
+            );
+            assert!(run.restart().is_err(), "{context}: the start refuses");
+            restore();
+            let result = run.commit().await;
+            assert_classic_accepted(&format!("{context} restored"), &run, &result);
+        }
+    }
+
+    for missing in MISSING {
+        let context = format!("x402 without {missing:?}");
+        let mut run = X402Run::new().await;
+        let restore = missing.remove(&run.f);
+        let result = run.pay().await;
+        assert_mainnet_forbidden(&context, &result);
+        assert_x402_refused_before_intent(&run, &result, "network.mainnet_write_forbidden", 0);
+        assert!(run.control.methods().is_empty(), "{context}: no request");
+        assert!(run.restart().is_err(), "{context}: the start refuses");
+        restore();
+        let result = run.pay().await;
+        assert_eq!(result["ok"], true, "{context} restored: {result}");
+        assert!(result["data"]["paymentSignature"].is_string(), "{context}");
+    }
+
+    for missing in MISSING {
+        let context = format!("authenticated x402 without {missing:?}");
+        let mut run = AuthenticatedRun::new().await;
+        let approval = run.prepare().await;
+        let restore = missing.remove(&run.f);
+        let result = run.pay(HOME, &approval).await;
+        assert_mainnet_forbidden(&context, &result);
+        assert!(
+            result["data"].get("paymentSignature").is_none(),
+            "{context}"
+        );
+        assert!(signings().is_empty(), "{context}: nothing signed");
+        assert_eq!(run.double.posts().await, 0, "{context}: no SEP-10 post");
+        assert!(authorizations(&run.f).is_empty(), "{context}");
+        assert_eq!(
+            run.f.seed_reads.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "{context}"
+        );
+        assert!(run.control.methods().is_empty(), "{context}: no request");
+        assert!(run.restart().is_err(), "{context}: the start refuses");
+        restore();
+        let result = run.pay(HOME, &approval).await;
+        assert_eq!(result["ok"], true, "{context} restored: {result}");
+        assert_eq!(signings().len(), 1, "{context} restored");
+    }
+}
+
+/// The durable record of the approval `nonce` on the running server of `f`.
+fn durable_record(f: &Fixture, nonce: &str) -> stellar_agent_network::policy_state::WireApproval {
+    stellar_agent_network::policy_state::ApprovalStatus::new(
+        &f.server.window_store,
+        f.server.security_profile(),
+    )
+    .find_by_nonce(nonce)
+    .unwrap()
+    .expect("the approval has its durable record")
+    .record
+}
+
+/// The waiting and execution windows of `record`.
+fn windows(record: &stellar_agent_network::policy_state::WireApproval) -> (u64, u64, u64) {
+    let consent = record
+        .consent
+        .as_ref()
+        .expect("the record holds its consent");
+    (
+        record.waiting_expires_at_ms,
+        consent.consent_at_ms,
+        consent.execution_expires_at_ms,
+    )
+}
+
+/// On every MCP commit row, a mainnet approval keeps its durable record
+/// across a restart. The consented record keeps its state, its waiting window
+/// and its execution window, and the restarted server commits under it. The
+/// consumed record keeps its state and both windows across another restart,
+/// and the restarted server refuses a second commit under it.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn durable_approval_keeps_state_and_windows_across_restart_for_every_kind() {
+    use stellar_agent_network::policy_state::ApprovalState;
+    for tool in Tool::ALL {
+        let context = format!("{tool:?}");
+        let mut run = ClassicRun::new(tool).await;
+        let nonce = run.entry.approval_nonce.clone();
+        let consented = durable_record(&run.f, &nonce);
+        assert_eq!(consented.state, ApprovalState::Pending, "{context}");
+        run.restart().unwrap();
+        assert_eq!(
+            durable_record(&run.f, &nonce),
+            consented,
+            "{context}: consented"
+        );
+        let result = run.commit().await;
+        assert_classic_accepted(&context, &run, &result);
+        let consumed = durable_record(&run.f, &nonce);
+        assert_eq!(consumed.state, ApprovalState::Consumed, "{context}");
+        assert_eq!(windows(&consumed), windows(&consented), "{context}");
+        run.restart().unwrap();
+        assert_eq!(
+            durable_record(&run.f, &nonce),
+            consumed,
+            "{context}: consumed"
+        );
+        let xdr = run.args["envelope_xdr"].as_str().unwrap().to_owned();
+        let blob = run.args["approval_attestation"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut again = run.commit_args_for(&xdr, &nonce, &blob);
+        again["business_id"] = serde_json::json!(run.bind_new_business_id());
+        let result = refused_commit(&run, again).await;
+        assert_eq!(
+            result["error"]["code"], "policy.approval_consumed",
+            "{context} after restart: {result}"
+        );
+    }
+
+    let mut run = X402Run::new().await;
+    let consented = durable_record(&run.f, &run.nonce);
+    assert_eq!(consented.state, ApprovalState::Pending, "x402");
+    run.restart().unwrap();
+    assert_eq!(
+        durable_record(&run.f, &run.nonce),
+        consented,
+        "x402: consented"
+    );
+    let result = run.pay().await;
+    assert_eq!(result["ok"], true, "x402: {result}");
+    let consumed = durable_record(&run.f, &run.nonce);
+    assert_eq!(consumed.state, ApprovalState::Consumed, "x402");
+    assert_eq!(windows(&consumed), windows(&consented), "x402");
+    run.restart().unwrap();
+    assert_eq!(
+        durable_record(&run.f, &run.nonce),
+        consumed,
+        "x402: consumed"
+    );
+    // The completed payment released the record's consent payload, so the
+    // replayed proof is answered as a proof without an approval.
+    let result = run.pay().await;
+    assert_eq!(
+        result["error"]["code"], "policy.approval_required",
+        "x402 after restart: {result}"
+    );
+
+    let mut run = AuthenticatedRun::new().await;
+    let approval = run.prepare().await;
+    let consented = durable_record(&run.f, &approval.0);
+    assert_eq!(
+        consented.state,
+        ApprovalState::Pending,
+        "authenticated x402"
+    );
+    run.restart().unwrap();
+    assert_eq!(
+        durable_record(&run.f, &approval.0),
+        consented,
+        "authenticated x402: consented"
+    );
+    let result = run.pay(HOME, &approval).await;
+    assert_eq!(result["ok"], true, "authenticated x402: {result}");
+    let consumed = durable_record(&run.f, &approval.0);
+    assert_eq!(
+        consumed.state,
+        ApprovalState::Consumed,
+        "authenticated x402"
+    );
+    assert_eq!(
+        windows(&consumed),
+        windows(&consented),
+        "authenticated x402"
+    );
+    run.restart().unwrap();
+    assert_eq!(
+        durable_record(&run.f, &approval.0),
+        consumed,
+        "authenticated x402: consumed"
+    );
+    // As for the plain payment, the completed payment released the consent
+    // payload, so the replayed proof is answered as a proof without an
+    // approval.
+    let result = run.pay(HOME, &approval).await;
+    assert_eq!(
+        result["error"]["code"], "policy.approval_required",
+        "authenticated x402 after restart: {result}"
+    );
+    assert_eq!(signings().len(), 1, "authenticated x402: one signing");
+}
+
+/// The policy `raw` re-signed at sequence 8 with the signed approval origin
+/// and its certificate pin.
+fn signed_origin_policy(raw: &str) -> String {
+    use stellar_agent_core::approval::mainnet_fixtures::{SIGNED_CERT_SPKI_SHA256, SIGNED_ORIGIN};
+    raw.replace("sequence = 7", "sequence = 8").replace(
+        "[mainnet]",
+        &format!(
+            "[mainnet]\napproval_origin = \"{SIGNED_ORIGIN}\"\napproval_cert_spki_sha256 = \"{}\"",
+            stellar_agent_core::hex::encode(&SIGNED_CERT_SPKI_SHA256)
+        ),
+    )
+}
+
+/// Records the consent of `entry` given at the signed HTTPS origin, as the
+/// remote listener records it, completes its durable record, and returns its
+/// attestation.
+///
+/// The challenge is issued for the listener identity captured from the
+/// current signed policy, the fixture credential asserts over it at that
+/// origin, and the consent persists on the remote surface.
+fn signed_origin_consent(f: &Fixture, entry: &PendingApproval) -> String {
+    use stellar_agent_core::approval::{
+        ConsentAudit, ConsentAuthorization, ListenerIdentity, MainnetApprovalAuthority,
+        PresenceListener, Surface, attest_and_persist, issue_mainnet_intent_presence,
+        mainnet_fixtures::MainnetConsentFixture, verify_mainnet_presence,
+    };
+    let server = &f.server;
+    let profile = server.security_profile();
+    let policy = MainnetApprovalAuthority::for_profile(PROFILE)
+        .unwrap()
+        .load_current()
+        .unwrap()
+        .into_policy();
+    let identity = ListenerIdentity::capture(&policy).unwrap();
+    let intent = stellar_agent_network::operation_entry::consent_intent(
+        &server.window_store,
+        profile,
+        entry,
+        &policy,
+    )
+    .unwrap();
+    let pending = issue_mainnet_intent_presence(
+        entry,
+        &binding(),
+        &policy,
+        PresenceListener::SignedOrigin(&identity),
+        intent.as_ref(),
+        now_ms(),
+        std::time::Instant::now(),
+    )
+    .unwrap();
+    let assertion = MainnetConsentFixture::sign_issued(&fixture_authenticator(), &pending);
+    let presence = verify_mainnet_presence(
+        pending,
+        MainnetConsentFixture::input(&assertion),
+        now_ms(),
+        std::time::Instant::now(),
+    )
+    .unwrap();
+    let readiness =
+        stellar_agent_network::mainnet::audit_readiness::audit_readiness(profile, PROFILE).unwrap();
+    let mut store = PendingApprovalStore::open(store_path(f)).unwrap();
+    attest_and_persist(
+        &mut store,
+        entry,
+        &attestation_key(f),
+        &binding(),
+        Surface::ServeRemote,
+        ConsentAudit::Writer(&mut readiness.writer().lock().unwrap()),
+        ConsentAuthorization::Mainnet {
+            presence,
+            policy: &policy,
+        },
+        |_, _| Err("no grant".to_owned()),
+    )
+    .unwrap();
+    drop(store);
+    let admission = MainnetApprovalAuthority::for_profile(PROFILE)
+        .unwrap()
+        .admit()
+        .unwrap();
+    let store = PendingApprovalStore::open(store_path(f)).unwrap();
+    let completion = stellar_agent_network::operation_entry::consent_completion(
+        &store,
+        &server.window_store,
+        profile,
+        PROFILE,
+        &entry.approval_nonce,
+        &policy,
+        stellar_agent_network::policy_state::ConsentRow::Written,
+        &admission,
+    )
+    .unwrap();
+    let blob = store
+        .get(&entry.approval_nonce)
+        .unwrap()
+        .attestation_blob_b64
+        .clone()
+        .unwrap();
+    drop(store);
+    drop(admission);
+    stellar_agent_network::operation_entry::commit_consent(
+        &server.window_store,
+        profile,
+        &completion,
+    )
+    .unwrap();
+    blob
+}
+
+/// Asserts that `f` holds one consent row from the remote surface, for
+/// `nonce`.
+fn assert_signed_origin_row(context: &str, f: &Fixture, nonce: &str) {
+    let rows: Vec<_> = rows_of(f, "approval_attested")
+        .into_iter()
+        .filter(|row| row["origin"] == "serve-remote")
+        .collect();
+    assert_eq!(rows.len(), 1, "{context}: {rows:?}");
+    assert!(
+        nonce.starts_with(rows[0]["nonce_prefix"].as_str().unwrap()),
+        "{context}: {rows:?}"
+    );
+}
+
+/// On every MCP commit row, a mainnet approval given at the signed HTTPS
+/// origin commits. The server restarts on a policy that pins the signed
+/// origin, the row's preparation stores its approval, the fixture
+/// credential consents at that origin on the remote surface, and the commit
+/// with that attestation signs and spends the approval.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn signed_origin_consent_commits_every_kind() {
+    for tool in Tool::ALL {
+        let context = format!("{tool:?}");
+        let mut run = ClassicRun::new(tool).await;
+        Fixture::write_policy(&signed_origin_policy(&run.f.raw));
+        run.restart().unwrap();
+        let mut args = tool.prepare_args(&run.f);
+        let prepared = wire(&tool.prepare(&run.f.server, &args).await);
+        assert_eq!(prepared["ok"], true, "{context}: {prepared}");
+        let data = &prepared["data"];
+        let nonce = data["approval"]["approval_nonce"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let entry = stored_approval(&run.f, &nonce).unwrap();
+        let blob = signed_origin_consent(&run.f, &entry);
+        assert_signed_origin_row(&context, &run.f, &nonce);
+        for field in ["envelope_xdr", "nonce", "expires_at_unix_ms"] {
+            args[field] = data[field].clone();
+        }
+        args["approval_nonce"] = serde_json::json!(nonce);
+        args["approval_attestation"] = serde_json::json!(blob);
+        let result = run.commit_with(args).await;
+        assert_classic_accepted_for(&context, &run, &result, &nonce);
+    }
+
+    let mut run = X402Run::new().await;
+    Fixture::write_policy(&signed_origin_policy(&run.f.raw));
+    run.restart().unwrap();
+    let prepared = run.pay_with(x402_args(&run.f, None)).await;
+    assert_eq!(prepared["ok"], true, "x402: {prepared}");
+    let nonce = prepared["data"]["approval"]["approval_nonce"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let blob = signed_origin_consent(&run.f, &stored_approval(&run.f, &nonce).unwrap());
+    assert_signed_origin_row("x402", &run.f, &nonce);
+    let result = run.pay_with(x402_args(&run.f, Some((&nonce, &blob)))).await;
+    assert_eq!(result["ok"], true, "x402: {result}");
+    assert!(result["data"]["paymentSignature"].is_string(), "x402");
+    assert!(
+        is_consumed(&stored_approval(&run.f, &nonce).unwrap()),
+        "x402"
+    );
+
+    let mut run = AuthenticatedRun::new().await;
+    Fixture::write_policy(&signed_origin_policy(&run.f.raw));
+    run.restart().unwrap();
+    let prepared = run.call(run.args(HOME, None)).await;
+    assert_eq!(prepared["ok"], true, "authenticated x402: {prepared}");
+    let nonce = prepared["data"]["approval"]["approval_nonce"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let blob = signed_origin_consent(&run.f, &stored_approval(&run.f, &nonce).unwrap());
+    assert_signed_origin_row("authenticated x402", &run.f, &nonce);
+    let result = run.pay(HOME, &(nonce.clone(), blob)).await;
+    assert_eq!(result["ok"], true, "authenticated x402: {result}");
+    assert_eq!(signings().len(), 1, "authenticated x402");
+    assert!(
+        is_consumed(&stored_approval(&run.f, &nonce).unwrap()),
+        "authenticated x402"
+    );
+}

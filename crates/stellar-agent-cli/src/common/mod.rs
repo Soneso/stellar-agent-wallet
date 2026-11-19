@@ -60,6 +60,8 @@ pub mod network;
 mod operation_replay_tests;
 pub(crate) mod private_open;
 pub mod profile_access;
+#[cfg(all(test, feature = "mainnet-write"))]
+mod proof_row_status_tests;
 #[cfg(test)]
 pub(crate) mod refusal_fixture;
 #[cfg(test)]

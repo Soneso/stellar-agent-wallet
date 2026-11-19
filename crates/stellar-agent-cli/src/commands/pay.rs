@@ -7570,14 +7570,22 @@ pub(crate) mod tests {
             );
         }
 
-        /// Guard of the build's audit-writer preflight, which acquires the
-        /// writer after the policy evaluation and before the witness: a
-        /// writer another handle holds on the profile's log refuses with the
-        /// writer's code before the summary is shown and before an entry is
-        /// parked.
+        /// Guard of both writer acquisitions of a mainnet payment before its
+        /// summary. A writer another handle holds on the profile's log
+        /// refuses with the writer's code, before the summary is shown,
+        /// before an entry is parked, before any signer resolution and before
+        /// any send.
+        ///
+        /// Held from the start, the writer refuses the business id lookup in
+        /// `classic_start`. Taken after that lookup, on a rerun that resumes
+        /// a waiting operation and so binds its stored envelope without the
+        /// writer, it refuses the build's audit-writer preflight, which
+        /// acquires the writer after the policy evaluation and before the
+        /// witness.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
         async fn the_writer_preflight_refuses_a_held_audit_writer_before_the_summary() {
+            the_preflight_refuses_a_writer_taken_after_the_lookup().await;
             let fixture = Spec::new("mainnet-pay-held-writer").build().await;
             let profile = fixture.profile();
             // The enrollment ceremony left this process's registry holding the
@@ -7590,16 +7598,101 @@ pub(crate) mod tests {
                 crate::common::profile_access::ProfileOrigin::Persisted,
             )
             .unwrap_or_else(|e| panic!("the test holds the keyed writer: {e}"));
+            let resolutions = signer_resolutions_on_this_thread();
 
             let run = run(&fixture, &memo_args(&fixture)).await;
 
             assert_refused_before_confirmation(&fixture, &run, "audit.chain_key_unavailable").await;
+            assert_eq!(
+                signer_resolutions_on_this_thread(),
+                resolutions,
+                "no signer resolution"
+            );
+            assert!(fixture.sent_envelopes().await.is_empty(), "nothing is sent");
             assert!(
                 run.message().contains("audit.writer_locked"),
                 "{}",
                 run.envelope
             );
             fixture.assert_no_consent_ceremony();
+        }
+
+        /// The second case of
+        /// [`the_writer_preflight_refuses_a_held_audit_writer_before_the_summary`].
+        ///
+        /// A first run under a business id cancels its ceremony and leaves
+        /// the operation waiting. The rerun under the same id resumes it, so
+        /// its writer acquisitions before the summary are the lookup in
+        /// `classic_start` and the preflight. Another handle takes the
+        /// writer at the rerun's first account read, which follows the
+        /// lookup. The rerun refuses with the writer's code, shows no
+        /// summary, runs no ceremony, leaves the waiting entry as it was,
+        /// resolves no signer and sends nothing.
+        async fn the_preflight_refuses_a_writer_taken_after_the_lookup() {
+            use stellar_agent_core::error::{ApprovalFailure, WalletError};
+            let late = crate::common::mainnet_write_fixture::LateWriter::default();
+            let agent =
+                stellar_agent_test_support::signed_envelope::account_id_for_seed(AGENT_SEED);
+            let mut fixture = Spec::new("mainnet-pay-late-writer")
+                .primary(late.on(
+                    ClassicRpc::mainnet(&[&agent, DESTINATION, ISSUER]),
+                    "getLedgerEntries",
+                ))
+                .build()
+                .await;
+            let mut args = memo_args(&fixture);
+            args.business_id = Some("late-writer".to_owned());
+            fixture.present_with(|_: &driver::Ceremony| {
+                Err(WalletError::Approval(ApprovalFailure::PresenceCanceled))
+            });
+            let first = run(&fixture, &args).await;
+            assert_eq!(first.code, 1, "canceled: {}", first.envelope);
+            let entries = fixture.pending_entries();
+            assert_eq!(entries.len(), 1, "{entries:?}");
+            let (summaries, ceremonies) = (fixture.summaries().len(), fixture.ceremonies().len());
+            stellar_agent_core::audit_log::AuditWriterRegistry::remove_for_test(fixture.name);
+            late.arm(&fixture);
+            let resolutions = signer_resolutions_on_this_thread();
+
+            let run = run(&fixture, &args).await;
+
+            assert_eq!(late.held(), Ok(true), "the late handle holds the writer");
+            assert_eq!(run.code, 1, "late writer: {}", run.envelope);
+            assert_eq!(
+                run.code(),
+                "audit.chain_key_unavailable",
+                "late writer: {}",
+                run.envelope
+            );
+            assert!(
+                run.message().contains("audit.writer_locked"),
+                "late writer: {}",
+                run.envelope
+            );
+            assert_eq!(
+                fixture.summaries().len(),
+                summaries,
+                "late writer: no summary is shown"
+            );
+            assert_eq!(
+                fixture.ceremonies().len(),
+                ceremonies,
+                "late writer: no ceremony runs"
+            );
+            assert_eq!(
+                fixture.pending_entries(),
+                entries,
+                "late writer: the waiting entry stays as it was"
+            );
+            assert_eq!(
+                signer_resolutions_on_this_thread(),
+                resolutions,
+                "late writer: no signer resolution"
+            );
+            assert!(
+                fixture.sent_envelopes().await.is_empty(),
+                "late writer: nothing is sent"
+            );
         }
 
         /// Accept: a memo-less payment reaches the oracle through the route

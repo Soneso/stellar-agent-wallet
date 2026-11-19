@@ -108,6 +108,10 @@ mod operation_replay_tests;
 #[cfg(all(test, feature = "mainnet-write"))]
 mod toolsets_mainnet_tests;
 
+// The status views and the audit outbox of every mainnet value kind.
+#[cfg(all(test, feature = "mainnet-write"))]
+mod proof_row_status_tests;
+
 #[cfg(test)]
 pub(crate) mod identity_fixture;
 
