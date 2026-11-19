@@ -241,13 +241,13 @@ pub use ledger::{
 };
 pub use notices::{CommittedBatch, CommittedTransition, WatchClass, WatchedOperation};
 pub use operations::{
-    AdmissibleFloors, AgreedOutcome, AttemptAuthorization, AttemptEnvelope, AttemptRequest,
-    AttemptStarted, BoundedText, BusinessId, CapacityDetail, ClearForm, CommitBinding, CommitId,
-    CommitTarget, CommittedDecision, ConsumptionExposure, Disposition, EndpointCoverage,
-    EvidenceAnswer, EvidenceAuditFacts, EvidenceClassification, EvidenceEndpoint, EvidenceInput,
-    EvidenceRowInput, EvidenceSequenceClass, EvidenceVerdict, ExposureIdentity, IntentSlot,
-    LookupOutcome, NotIncludedProof, ObligationKind, OpenOutcome, OpenRequest, OperationAudit,
-    OperationAuthority, OperationHandle, OperationId, OperationKind, OperationLink,
+    AdmissibleFloors, AgreedOutcome, ApprovalLineage, AttemptAuthorization, AttemptEnvelope,
+    AttemptRequest, AttemptStarted, BoundedText, BusinessId, CapacityDetail, ClearForm,
+    CommitBinding, CommitId, CommitTarget, CommittedDecision, ConsumptionExposure, Disposition,
+    EndpointCoverage, EvidenceAnswer, EvidenceAuditFacts, EvidenceClassification, EvidenceEndpoint,
+    EvidenceInput, EvidenceRowInput, EvidenceSequenceClass, EvidenceVerdict, ExposureIdentity,
+    IntentSlot, LookupOutcome, NotIncludedProof, ObligationKind, OpenOutcome, OpenRequest,
+    OperationAudit, OperationAuthority, OperationHandle, OperationId, OperationKind, OperationLink,
     OperationProjection, OperationRecorder, OperationResult, OperationState, OperationStatus,
     OperationTool, OperationView, RecoveryUpdate, ReleaseObligation, SequenceReleaseInput,
     SlotKind, StatusSelectors, StatusTarget, TransitionEvidence, WindowObservation, X402Intent,

@@ -184,6 +184,11 @@ pub enum MainnetPrecondition {
     IntentRecordMismatch,
     /// The canonical slot or the candidate envelope differs from the intent.
     IntentMismatch,
+    /// A field of the candidate envelope, the ledger state the resolver
+    /// rereads for it, or the intent digest the mint carries differs from the
+    /// operation's stored canonical intent. The reread state is a claim's
+    /// claimable balance: its asset or amount differs, or the entry is gone.
+    IntentDivergence,
     /// The predecessor differs from the operation's latest attempt.
     PredecessorMismatch,
     /// The final envelope digest differs.
@@ -354,6 +359,7 @@ impl MainnetPrecondition {
             Self::PreimageAddress => "preimage_address",
             Self::IntentRecordMismatch => "intent_record_mismatch",
             Self::IntentMismatch => "intent_mismatch",
+            Self::IntentDivergence => "intent_divergence",
             Self::PredecessorMismatch => "predecessor_mismatch",
             Self::FinalEnvelope => "final_envelope",
             Self::RootInvocation => "root_invocation",
@@ -547,7 +553,9 @@ impl From<MainnetAuthorizationError> for WalletError {
     /// `policy.accounting_invalid` for an unlisted or native accounting
     /// refusal, the closed `validation.contract_*` or
     /// `validation.asset_contract_not_deployed` code for a contract transfer,
-    /// and `network.mainnet_authorization_refused` for every refused
+    /// `simulation.divergence` for
+    /// [`MainnetPrecondition::IntentDivergence`], and
+    /// `network.mainnet_authorization_refused` for every other refused
     /// precondition. The precondition does not cross into the error: the
     /// caller logs it.
     fn from(error: MainnetAuthorizationError) -> Self {
@@ -555,6 +563,9 @@ impl From<MainnetAuthorizationError> for WalletError {
             MainnetAuthorizationError::PolicyDenied(reason) => WalletError::PolicyDenied { reason },
             MainnetAuthorizationError::FeatureDisabled => {
                 WalletError::Network(NetworkError::MainnetWriteForbidden)
+            }
+            MainnetAuthorizationError::Refused(MainnetPrecondition::IntentDivergence) => {
+                WalletError::Network(NetworkError::IntentDivergence)
             }
             MainnetAuthorizationError::Refused(_) => {
                 WalletError::Network(NetworkError::MainnetAuthorizationRefused)
@@ -567,8 +578,8 @@ impl From<MainnetAuthorizationError> for WalletError {
 }
 
 /// The failure of an authorized signing or submit path: a broken
-/// precondition, which the path logs before it reports the generic refusal,
-/// or an error of the path itself, which passes through unchanged.
+/// precondition, which the path logs before it reports its agent-facing
+/// error, or an error of the path itself, which passes through unchanged.
 #[derive(Debug)]
 pub(crate) enum AuthorizedPathError {
     /// A precondition does not hold.
@@ -579,7 +590,8 @@ pub(crate) enum AuthorizedPathError {
 
 impl AuthorizedPathError {
     /// The agent-facing error. A refusal is logged under `path` with its
-    /// precondition's label and becomes `network.mainnet_authorization_refused`.
+    /// precondition's label and converts as
+    /// [`From<MainnetAuthorizationError>`] converts it.
     pub(crate) fn report(self, path: &'static str) -> WalletError {
         match self {
             Self::Refused(precondition) => {
@@ -588,7 +600,7 @@ impl AuthorizedPathError {
                     precondition = precondition.label(),
                     "mainnet authorization refused"
                 );
-                WalletError::Network(NetworkError::MainnetAuthorizationRefused)
+                MainnetAuthorizationError::Refused(precondition).into()
             }
             Self::Wallet(error) => error,
         }
@@ -785,6 +797,7 @@ mod tests {
             P::PreimageAddress,
             P::IntentRecordMismatch,
             P::IntentMismatch,
+            P::IntentDivergence,
             P::PredecessorMismatch,
             P::FinalEnvelope,
             P::RootInvocation,
@@ -905,6 +918,7 @@ mod tests {
                 | P::PreimageAddress
                 | P::IntentRecordMismatch
                 | P::IntentMismatch
+                | P::IntentDivergence
                 | P::PredecessorMismatch
                 | P::FinalEnvelope
                 | P::RootInvocation
@@ -946,11 +960,12 @@ mod tests {
         all.to_vec()
     }
 
-    /// Every refused precondition maps to the one agent-facing code, whose
-    /// text names no precondition; a disabled build maps to the write
-    /// refusal.
+    /// Every refused precondition but a canonical intent divergence maps to
+    /// the one agent-facing code; the divergence maps to
+    /// `simulation.divergence`. No text names its precondition; a disabled
+    /// build maps to the write refusal.
     #[test]
-    fn every_refusal_maps_to_the_one_generic_code() {
+    fn every_refusal_but_the_divergence_maps_to_the_one_generic_code() {
         let all = every_precondition();
         let expected = [
             "name_source_not_flag",
@@ -1034,6 +1049,7 @@ mod tests {
             "preimage_address",
             "intent_record_mismatch",
             "intent_mismatch",
+            "intent_divergence",
             "predecessor_mismatch",
             "final_envelope",
             "root_invocation",
@@ -1078,7 +1094,12 @@ mod tests {
         assert_eq!(labels.len(), all.len(), "labels are distinct");
         for precondition in all {
             let error = WalletError::from(MainnetAuthorizationError::Refused(precondition));
-            assert_eq!(error.code(), "network.mainnet_authorization_refused");
+            let expected = if precondition == MainnetPrecondition::IntentDivergence {
+                "simulation.divergence"
+            } else {
+                "network.mainnet_authorization_refused"
+            };
+            assert_eq!(error.code(), expected, "{precondition}");
             let text = error.to_string();
             assert!(!text.contains(precondition.label()), "{text}");
             assert!(

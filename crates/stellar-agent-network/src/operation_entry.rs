@@ -1003,6 +1003,89 @@ pub fn begin_classic_attempt_committed(
     unsigned_envelope_b64: &str,
     committed: &mut CommittedBatch,
 ) -> Result<OperationAttempt, WalletError> {
+    let started = begin_envelope_attempt(
+        store,
+        profile,
+        writer,
+        request_id,
+        handle,
+        unsigned_envelope_b64,
+        AttemptAuthorization::Linked,
+        committed,
+    )?;
+    Ok(OperationAttempt {
+        operation_id: handle.id(),
+        attempt_index: started.attempt_index,
+    })
+}
+
+/// Opens the next attempt of `handle`'s canonical operation for the unsigned
+/// envelope `unsigned_envelope_b64` and mints `pending`'s authorization in
+/// the same commit, so the mint, the approval's consumption and the
+/// `Sending` attempt are durable together or not at all.
+///
+/// The attempt's send-by is the one [`begin_classic_attempt`] records. The
+/// writer lock is taken before the window lock.
+///
+/// # Errors
+///
+/// The refusals of [`begin_classic_attempt`] and of the mint, which write
+/// nothing. A begin that commits without returning its minted record refuses
+/// `submission.record_unavailable` after that commit; the `Sending` attempt
+/// and its unclaimed authorization stay until the sweep adopts the
+/// authorization at its expiry. A begin that mints always returns its record.
+pub fn begin_canonical_attempt(
+    writer: &AuditWriterHandle,
+    request_id: &str,
+    handle: &OperationHandle,
+    unsigned_envelope_b64: &str,
+    pending: crate::mainnet::resolve::PendingTxSign<'_>,
+) -> Result<
+    (
+        OperationAttempt,
+        crate::mainnet::authorization::MainnetTxSignAuthorization,
+    ),
+    WalletError,
+> {
+    let (store, context) = pending.target();
+    let started = begin_envelope_attempt(
+        store,
+        context.profile(),
+        writer,
+        request_id,
+        handle,
+        unsigned_envelope_b64,
+        AttemptAuthorization::Mint(Box::new(pending.request().clone())),
+        &mut CommittedBatch::default(),
+    )?;
+    let minted = started.minted.ok_or_else(|| {
+        WalletError::Submission(SubmissionError::RecordUnavailable {
+            detail: "the attempt's begin returned no minted record".to_owned(),
+        })
+    })?;
+    Ok((
+        OperationAttempt {
+            operation_id: handle.id(),
+            attempt_index: started.attempt_index,
+        },
+        pending.finish(minted),
+    ))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the attempt's store, writer, envelope and authorization commit together"
+)]
+fn begin_envelope_attempt(
+    store: &PersistedWindowStore,
+    profile: &Profile,
+    writer: &AuditWriterHandle,
+    request_id: &str,
+    handle: &OperationHandle,
+    unsigned_envelope_b64: &str,
+    authorization: AttemptAuthorization,
+    committed: &mut CommittedBatch,
+) -> Result<crate::policy_state::AttemptStarted, WalletError> {
     let send_by_ms = attempt_send_by_ms(envelope_max_time(unsigned_envelope_b64)?);
     let mut guard = writer.lock().map_err(|_| {
         WalletError::Submission(SubmissionError::RecordUnavailable {
@@ -1018,16 +1101,12 @@ pub fn begin_classic_attempt_committed(
                 xdr: unsigned_envelope_b64.to_owned(),
                 unsigned_envelope_sha256: unsigned_envelope_sha256(unsigned_envelope_b64),
             }),
-            authorization: AttemptAuthorization::Linked,
+            authorization,
             send_by_ms,
         },
     );
     committed.append(recorder.take_committed());
-    let started = started.map_err(operation_refusal)?;
-    Ok(OperationAttempt {
-        operation_id: handle.id(),
-        attempt_index: started.attempt_index,
-    })
+    started.map_err(operation_refusal)
 }
 
 /// What a caller should do next about a retained operation. It is `none` once
@@ -1128,6 +1207,12 @@ pub fn lookup_classic(
     if found.binding() != (SlotKind::Envelope, *intent_digest) {
         return Err(operation_refusal(WindowStoreError::BusinessIdConflict));
     }
+    classic_dispatch(found)
+}
+
+/// How a request proceeds on the envelope record `found`: it signs the
+/// stored envelope, or answers with the replay.
+fn classic_dispatch(found: LookupOutcome) -> Result<ClassicEntry, WalletError> {
     Ok(match found {
         LookupOutcome::Replay(view) => ClassicEntry::Replay(view),
         LookupOutcome::Resumable(handle) => ClassicEntry::Resume(resumable(handle)?),

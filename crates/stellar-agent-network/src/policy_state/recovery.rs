@@ -2798,20 +2798,24 @@ async fn recover_reported(
     Ok(report)
 }
 
-/// Runs `claim` under the window lock with the committed sequence releases.
-/// The `_writer` borrow proves the caller holds the audit writer guard, so
-/// the order stays writer, window, then the receipt lock `claim` takes.
+/// Runs `claim` under the window lock with the committed sequence releases
+/// and the approval carriers of `operation`, the operation the claim
+/// continues. The `_writer` borrow proves the caller holds the audit writer
+/// guard, so the order stays writer, window, then the receipt lock `claim`
+/// takes.
 pub(crate) fn with_sequence_releases<T>(
     store: &PersistedWindowStore,
     profile: &Profile,
     _writer: &AuditWriter,
+    operation: Option<super::OperationId>,
     claim: impl FnOnce(&dyn SequenceReleases) -> T,
 ) -> Result<T, WindowStoreError> {
     store.ensure_parent_dir()?;
     let _window =
         WindowStoreLock::acquire_for_with_retry(store.path(), &profile.policy_window_state_key_id)?;
-    let status = OperationStatus::new(store, profile);
-    Ok(claim(&status))
+    Ok(claim(&super::ApprovalLineage::new(
+        store, profile, operation,
+    )))
 }
 
 /// Independent submission provenance and the primary accounting observation.
@@ -2932,6 +2936,236 @@ pub fn claim_fixture_authorization(
             },
         )
         .map(|_| ())
+}
+
+/// Leaves a canonical operation under `business_id` whose one attempt ended
+/// in a checked, projected non-inclusion, and a sent receipt of that attempt
+/// holding `nonce`, so the attempt carries the nonce to a successor of the
+/// same operation. The attempt runs under a policy authority of the pinned
+/// policy; no durable approval record names `nonce`. Returns the operation.
+///
+/// It serves receipt checks only. It builds a state production never
+/// writes: a receipt that holds an approval nonce under a policy authority
+/// with no durable approval record, so no admission past the receipt check
+/// can run on it.
+///
+/// # Errors
+/// Returns the store's refusal of any step, and a receipt-store failure or a
+/// receipt claim that records no new receipt as [`WindowStoreError::Invalid`].
+#[cfg(all(feature = "mainnet-write", feature = "test-helpers"))]
+#[doc(hidden)]
+pub fn canonical_retry_fixture(
+    store: &PersistedWindowStore,
+    profile: &Profile,
+    receipts: &stellar_agent_core::profile::receipt::ReceiptStore,
+    business_id: &str,
+    nonce: &str,
+) -> Result<super::OperationHandle, WindowStoreError> {
+    use super::{
+        AttemptAuthorization, AttemptEnvelope, AttemptRequest, BusinessId, ClaimExpect,
+        DomainBinding, EndpointCoverage, IntentSlot, MintAuthority, MintRequest, OpenOutcome,
+        OpenRequest, OperationAudit, OperationKind, OperationLink, OperationState, OperationTool,
+        TransitionEvidence,
+    };
+    use stellar_agent_core::policy::pin::{self, PinScope, PinState};
+    struct Discard;
+    impl OperationAudit for Discard {
+        fn append(
+            &mut self,
+            _entry: stellar_agent_core::audit_log::AuditEntry,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    let invalid = |detail: String| WindowStoreError::Invalid { detail };
+    let pinned = {
+        let lock = WindowStoreLock::acquire_for(store.path(), &profile.policy_window_state_key_id)?;
+        match pin::read(&lock, &PinScope::for_profile(store.path(), profile)) {
+            Ok(PinState::Present(pin)) => pin,
+            other => {
+                return Err(invalid(format!(
+                    "the fixture needs a policy pin: {other:?}"
+                )));
+            }
+        }
+    };
+    let digest = [0x6c; 32];
+    let signed = [0x6d; 32];
+    let tx_hash = [0x6e; 32];
+    let sequence = 7_i64;
+    let now = crate::mainnet::clock::now_ms().map_err(|error| invalid(error.to_string()))?;
+    let mut audit = Discard;
+    let mut recorder = OperationRecorder::new(store, profile, &mut audit, "retry-fixture");
+    let OpenOutcome::New(handle) = recorder.open(&OpenRequest {
+        business_id: BusinessId::parse(business_id).map_err(|error| invalid(error.to_string()))?,
+        tool: OperationTool::CliPay,
+        kind: OperationKind::Pay,
+        intent: IntentSlot::Canonical {
+            intent_digest: digest,
+            intent: serde_json::json!({ "fixture": "retry" }),
+        },
+        envelope_xdr: None,
+        prepared_decision: None,
+        rule_ttl_ms: None,
+    })?
+    else {
+        return Err(invalid("the fixture business id is taken".to_owned()));
+    };
+    let link = OperationLink {
+        operation_id: handle.id(),
+        attempt_index: 1,
+    };
+    let authority = MintAuthority::Policy(super::PolicyAuthorityBinding {
+        policy_digest: pinned.digest(),
+        policy_sequence: pinned.sequence(),
+        rule_index: 0,
+        evaluated_at_ms: now,
+        governing_until_ms: now + 600_000,
+        scope: stellar_agent_core::mainnet::decision::AuthorityScope::Classic,
+    });
+    let mint = MintRequest {
+        chain: profile.chain_id,
+        binding: DomainBinding::Transaction {
+            unsigned_envelope_sha256: [0x6f; 32],
+            tx_hash,
+            source: "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN".to_owned(),
+            sequence,
+        },
+        consumer: crate::mainnet::MainnetConsumer::CliPay,
+        policy_sequence: pinned.sequence(),
+        policy_digest: pinned.digest(),
+        authority: authority.clone(),
+        chain_deadline_ms: None,
+        restriction_end_ms: None,
+        authorization_ttl_ms: 60_000,
+        bindings: crate::mainnet::digest::BindingFacts {
+            endpoint: None,
+            signer: [1; 32],
+            policy: [2; 32],
+            enablement: [3; 32],
+            witness: None,
+            reservation: None,
+            authority: [4; 32],
+            audit: [5; 32],
+            restriction: None,
+        },
+        holds: vec![],
+        parent: None,
+        operation: Some(link),
+        intent_digest: Some(digest),
+        predecessor: None,
+        approval_operation: None,
+        native_reservation: None,
+        floor: None,
+    };
+    let started = recorder.begin_attempt(
+        &handle,
+        &AttemptRequest {
+            envelope: Some(AttemptEnvelope {
+                xdr: "AAAARETRYFIXTURE".to_owned(),
+                unsigned_envelope_sha256: [0x6f; 32],
+            }),
+            authorization: AttemptAuthorization::Mint(Box::new(mint.clone())),
+            send_by_ms: u64::MAX,
+        },
+    )?;
+    let minted = started
+        .minted
+        .ok_or_else(|| invalid("the fixture begin minted nothing".to_owned()))?;
+    store.claim_authorization(
+        profile,
+        minted.id,
+        &ClaimExpect {
+            operation: Some(link),
+            intent_digest: mint.intent_digest,
+            predecessor: None,
+            domain: mint.binding.domain(),
+            consumer: mint.consumer,
+            bindings_digest: minted.bindings_digest,
+            policy_sequence: mint.policy_sequence,
+            policy_digest: mint.policy_digest,
+            authority,
+        },
+    )?;
+    recorder.expose(
+        handle.id(),
+        1,
+        &ExposureIdentity::Classic {
+            envelope_sha256: signed,
+            tx_hash,
+            sequence,
+            max_time: 0,
+            receipt: stellar_agent_core::hex::encode(&signed),
+        },
+        Some(10),
+    )?;
+    recorder.transition(
+        handle.id(),
+        Some(1),
+        OperationState::SentOutcomeUnknown,
+        &TransitionEvidence::default(),
+    )?;
+    recorder.record_evidence(
+        handle.id(),
+        1,
+        &EvidenceInput {
+            sequence_released: Some(SequenceReleaseInput {
+                primary_ledger: 300,
+                witness_ledger: 300,
+                min_close_time_ms: now,
+            }),
+            ..EvidenceInput::default()
+        },
+    )?;
+    let attempt = OperationStatus::new(store, profile)
+        .outcome_snapshot(Some(&tx_hash))?
+        .pop()
+        .ok_or_else(|| invalid("the fixture attempt is not decidable".to_owned()))?;
+    let coverage = |last_ledger| EndpointCoverage {
+        first_ledger: 10,
+        last_ledger,
+        latest_ledger: last_ledger,
+        oldest_ledger: 1,
+    };
+    let decision = CheckedRecoveryDecision::new(
+        &attempt,
+        [0xd1; 32],
+        (130, 131),
+        DecidedTransition::NotIncluded(NotIncludedProof::AccountSequence {
+            primary: coverage(140),
+            witness: coverage(141),
+        }),
+        attempt.recovery.clone(),
+    )
+    .ok_or_else(|| invalid("the fixture decision is refused".to_owned()))?;
+    let commit = recorder.commit_decision(&decision)?;
+    recorder.acknowledge_projection(handle.id(), 1, commit)?;
+    let receipt_error =
+        |error: stellar_agent_core::profile::receipt::ReceiptStoreError| invalid(error.to_string());
+    let envelope_hash = stellar_agent_core::hex::encode(&signed);
+    let claimed = receipts
+        .begin_submission_with_approval(
+            &envelope_hash,
+            &stellar_agent_core::hex::encode(&tx_hash),
+            "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+            sequence,
+            0,
+            1,
+            Some(nonce),
+        )
+        .map_err(receipt_error)?;
+    if !matches!(
+        claimed,
+        stellar_agent_core::profile::receipt::BeginSubmissionOutcome::Recorded
+    ) {
+        return Err(invalid(
+            "the fixture receipt claim recorded no new receipt".to_owned(),
+        ));
+    }
+    receipts
+        .mark_submitted(&envelope_hash)
+        .map_err(receipt_error)?;
+    Ok(handle)
 }
 
 #[cfg(test)]
@@ -5559,7 +5793,7 @@ mod tests {
                     scope.spawn(move || {
                         barrier.wait();
                         let writer = fx.writer.lock().unwrap();
-                        with_sequence_releases(&fx.window, &fx.profile, &writer, |releases| {
+                        with_sequence_releases(&fx.window, &fx.profile, &writer, None, |releases| {
                             assert!(
                                 WindowStoreLock::acquire_for(
                                     fx.window.path(),
@@ -8374,6 +8608,35 @@ mod tests {
                 .unwrap()
                 .unacknowledged
                 .is_empty()
+        );
+    }
+
+    /// The retry fixture refuses a receipt claim that records no new
+    /// receipt: a second call on a fresh window store meets, in the shared
+    /// receipt store, the receipt of the first call's attempt.
+    #[cfg(all(feature = "mainnet-write", feature = "test-helpers"))]
+    #[test]
+    #[serial_test::serial(mainnet_clock)]
+    #[serial_test::serial]
+    fn retry_fixture_refuses_a_claim_that_records_no_receipt() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let dir = tempfile::TempDir::new().unwrap();
+        let receipts =
+            stellar_agent_core::profile::receipt::ReceiptStore::open_at(dir.path(), "retry")
+                .unwrap();
+        let fx = Fx::new();
+        canonical_retry_fixture(&fx.store, &fx.profile, &receipts, "retry-1", "nonce-1").unwrap();
+        drop(fx);
+        let fx = Fx::new();
+        let error =
+            canonical_retry_fixture(&fx.store, &fx.profile, &receipts, "retry-2", "nonce-2")
+                .unwrap_err();
+        assert!(
+            matches!(&error, WindowStoreError::Invalid { detail }
+                if detail.contains("recorded no new receipt")),
+            "{error:?}"
         );
     }
 }

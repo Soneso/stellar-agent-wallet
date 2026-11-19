@@ -263,11 +263,11 @@ pub(crate) mod tests {
     use crate::policy_state::operations::ReceiptProjectionIdentity;
     use crate::policy_state::operations::tests::{
         CONSUMED_LEDGER, Checked, FAILED_CODE, Fx, PROJECTED_LEDGER, accounting_state,
-        checked_transition, commit_approved, commit_checked, commit_on, consumed_ledger,
-        consumed_zero_entry, decided_attempt, envelope_id, expire_reservation, exposure_facts,
-        exposure_keys, failed_result_xdr, forget_failure_code, historical_without,
-        invalidated_sending, retained_result, successor_attempt, successor_refusal, unknown_named,
-        zero_entry_committed,
+        checked_transition, commit_approved, commit_approved_in, commit_checked, commit_on,
+        consumed_ledger, consumed_zero_entry, decided_attempt, envelope_id, expire_reservation,
+        exposure_facts, exposure_keys, failed_result_xdr, forget_failure_code, historical_without,
+        invalidated_sending, linkable, retained_result, successor_attempt, successor_refusal,
+        unknown_named, zero_entry_committed,
     };
     use crate::policy_state::{
         CommitId, RECONCILE_BUDGET, RecoveryError, store::arm_accounting_fault,
@@ -1513,8 +1513,10 @@ pub(crate) mod tests {
         assert_eq!(rig.audit_bytes(), audit);
     }
 
-    /// Approval consumption survives restart and repeated repair with its
-    /// nonce exclusion and linkage; a new receipt starts unconsumed.
+    /// Approval consumption of an envelope record's checked non-inclusion
+    /// survives restart and repeated repair with its nonce exclusion and
+    /// linkage, also with the window that keeps a canonical record's
+    /// consent; a new receipt starts unconsumed.
     #[test]
     #[serial]
     fn recovery_projection_preserves_approval_consumption() {
@@ -1528,7 +1530,8 @@ pub(crate) mod tests {
         );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut rig = Rig::with_approvals();
-        let (_, commit, nonce) = commit_approved(&mut rig.fx, 1, Checked::NotIncluded);
+        let (_, commit, nonce) =
+            commit_approved_in(&mut rig.fx, 1, linkable(1), Checked::NotIncluded);
         rig.seed_pending_approval(&nonce);
         rig.repair(None).unwrap();
         let receipt = rig.receipt(1).unwrap();
@@ -1546,6 +1549,7 @@ pub(crate) mod tests {
             &envelope_id(1),
             &rig.home.path().join("approvals"),
             "ops",
+            Some((&rig.fx.store, &rig.fx.profile)),
         )
         .unwrap();
         assert!(rig.receipt(1).unwrap().approval_consumed);
@@ -1582,6 +1586,360 @@ pub(crate) mod tests {
         let fresh = rig.receipt(2).unwrap();
         assert_eq!(fresh.approval_nonce.as_deref(), Some(other.as_str()));
         assert!(!fresh.approval_consumed, "a new receipt starts unconsumed");
+    }
+
+    /// A receipt whose attempt ended in a checked non-inclusion of the
+    /// claim's canonical operation carries the approval nonce to the
+    /// successor's claim under the window lock, after a restart too; a claim
+    /// of another operation and a claim without an operation still refuse
+    /// `DuplicateApproval`. The successor's own receipt, whose attempt
+    /// succeeded or stays of unknown outcome, carries nothing, so a further
+    /// claim refuses on it. The holder lookup `find_approval_holder`, which
+    /// the CLI and MCP gates call, applies the same check to every holder.
+    #[test]
+    #[serial]
+    fn successor_passes_the_claim_and_the_holder_lookup() {
+        use crate::policy_state::operations::tests::approved_successor;
+        use crate::policy_state::{ApprovalLineage, recovery::with_sequence_releases};
+        use stellar_agent_core::profile::receipt::PaymentDestinations;
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        for second in [Some(Checked::Succeeded), None] {
+            let mut rig = Rig::with_approvals();
+            let (handle, _, nonce) = commit_approved(&mut rig.fx, 1, Checked::NotIncluded);
+            let (other, _, _) = commit_approved(&mut rig.fx, 3, Checked::NotIncluded);
+            rig.repair(None).unwrap();
+            rig.reopen();
+            assert_eq!(
+                rig.receipt(1).unwrap().approval_nonce.as_deref(),
+                Some(nonce.as_str())
+            );
+            let claim = |rig: &Rig, n: u8, operation| {
+                let writer = rig.writer.lock().unwrap();
+                with_sequence_releases(
+                    &rig.fx.store,
+                    &rig.fx.profile,
+                    &writer,
+                    operation,
+                    |lineage| {
+                        rig.receipts.begin_submission_to(
+                            &envelope_id(n),
+                            &tx_hex(n),
+                            SOURCE,
+                            200 + i64::from(n),
+                            0,
+                            1,
+                            Some(&nonce),
+                            Some(lineage),
+                            &PaymentDestinations::None,
+                        )
+                    },
+                )
+                .unwrap()
+                .unwrap()
+            };
+            let holder = |rig: &Rig, operation| {
+                rig.receipts
+                    .find_approval_holder(
+                        &nonce,
+                        &ApprovalLineage::new(&rig.fx.store, &rig.fx.profile, operation),
+                    )
+                    .unwrap()
+                    .map(|receipt| receipt.envelope_hash)
+            };
+            assert_eq!(holder(&rig, Some(handle.id())), None);
+            for refused in [Some(other.id()), None] {
+                assert_eq!(holder(&rig, refused), Some(envelope_id(1)));
+                assert!(matches!(
+                    claim(&rig, 2, refused),
+                    BeginSubmissionOutcome::DuplicateApproval(existing) if existing.envelope_hash == envelope_id(1)
+                ));
+            }
+            assert!(matches!(
+                claim(&rig, 2, Some(handle.id())),
+                BeginSubmissionOutcome::Recorded
+            ));
+            // The second receipt's own attempt: a checked success, or an
+            // outcome still unknown.
+            approved_successor(&mut rig.fx, &handle, &nonce, 1, 2, second);
+            assert_eq!(
+                holder(&rig, Some(handle.id())),
+                Some(envelope_id(2)),
+                "{second:?}"
+            );
+            assert!(
+                matches!(
+                    claim(&rig, 4, Some(handle.id())),
+                    BeginSubmissionOutcome::DuplicateApproval(existing) if existing.envelope_hash == envelope_id(2)
+                ),
+                "{second:?}"
+            );
+            assert!(rig.receipt(4).is_none());
+        }
+    }
+
+    /// A canonical operation's checked non-inclusion keeps its approval for
+    /// a successor: status repair leaves the inbox entry pending and the
+    /// receipt's tombstone owed. After the successor's checked success under
+    /// the same nonce, one repair writes the tombstone and acknowledges both
+    /// receipts, also after a crash that left the tombstone unacknowledged;
+    /// a repeated repair writes nothing.
+    #[test]
+    #[serial]
+    fn status_repair_keeps_retry_consent() {
+        use crate::policy_state::operations::tests::approved_successor;
+        use stellar_agent_core::approval::{ApprovalKind, ConsumedOutcome, PendingApprovalStore};
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        for crash in [false, true] {
+            let mut rig = Rig::with_approvals();
+            let (handle, _, nonce) = commit_approved(&mut rig.fx, 1, Checked::NotIncluded);
+            rig.seed_pending_approval(&nonce);
+            rig.repair(None).unwrap();
+            let approvals = rig.home.path().join("approvals");
+            let repair = |rig: &Rig, n: u8| {
+                crate::submission_record::repair_approval_consumption(
+                    &rig.receipts,
+                    &envelope_id(n),
+                    &approvals,
+                    "ops",
+                    Some((&rig.fx.store, &rig.fx.profile)),
+                )
+            };
+            repair(&rig, 1).unwrap();
+            assert!(
+                !rig.receipt(1).unwrap().approval_consumed,
+                "the tombstone stays owed"
+            );
+            assert!(
+                matches!(
+                    rig.approval_kind(&nonce),
+                    Some(ApprovalKind::PaymentSimulated { .. })
+                ),
+                "the consent stays for the successor"
+            );
+
+            approved_successor(&mut rig.fx, &handle, &nonce, 1, 2, Some(Checked::Succeeded));
+            rig.repair(None).unwrap();
+            let second = rig.receipt(2).unwrap();
+            assert_eq!(second.approval_nonce.as_deref(), Some(nonce.as_str()));
+            assert!(!second.approval_consumed);
+            // A repair of the first receipt wrote the tombstone and stopped
+            // before any acknowledgement.
+            if crash {
+                PendingApprovalStore::open(rig.approvals_path())
+                    .unwrap()
+                    .record_sent_consumption(&nonce, &tx_hex(1), ConsumedOutcome::Unknown)
+                    .unwrap();
+            }
+            repair(&rig, 2).unwrap();
+            for n in [1, 2] {
+                assert!(
+                    rig.receipt(n).unwrap().approval_consumed,
+                    "receipt {n} acknowledged (crash {crash})"
+                );
+            }
+            rig.assert_approval_consumed(&nonce, if crash { 1 } else { 2 });
+            let receipts = rig.receipt_bytes();
+            let inbox = fs::read(rig.approvals_path()).unwrap();
+            for n in [1, 2] {
+                repair(&rig, n).unwrap();
+            }
+            assert_eq!(rig.receipt_bytes(), receipts);
+            assert_eq!(fs::read(rig.approvals_path()).unwrap(), inbox);
+        }
+
+        // Past its execution expiry, a non-inclusion that stays the
+        // operation's last attempt releases the hold: the next repair writes
+        // the tombstone.
+        let mut rig = Rig::with_approvals();
+        let (_, _, nonce) = commit_approved(&mut rig.fx, 1, Checked::NotIncluded);
+        rig.seed_pending_approval(&nonce);
+        rig.repair(None).unwrap();
+        let end = OperationStatus::new(&rig.fx.store, &rig.fx.profile)
+            .view(&crate::policy_state::BusinessId::parse("order-1").unwrap())
+            .unwrap()
+            .unwrap()
+            .execution_expires_at_ms
+            .unwrap();
+        let repair = |rig: &Rig| {
+            crate::submission_record::repair_approval_consumption(
+                &rig.receipts,
+                &envelope_id(1),
+                &rig.home.path().join("approvals"),
+                "ops",
+                Some((&rig.fx.store, &rig.fx.profile)),
+            )
+        };
+        rig.fx.clock.set(end - 1);
+        repair(&rig).unwrap();
+        assert!(
+            !rig.receipt(1).unwrap().approval_consumed,
+            "inside the window"
+        );
+        rig.fx.clock.set(end);
+        repair(&rig).unwrap();
+        assert!(
+            rig.receipt(1).unwrap().approval_consumed,
+            "at the execution expiry"
+        );
+        rig.assert_approval_consumed(&nonce, 1);
+    }
+
+    /// The send outcome keeps a canonical attempt's approval for a successor:
+    /// after a sent outcome the receipt's tombstone stays owed and the inbox
+    /// entry stays pending. An envelope record's receipt is consumed at once.
+    #[tokio::test]
+    #[serial]
+    async fn send_outcome_keeps_retry_consent() {
+        use crate::submission_record::{ApprovalTombstone, WalletSubmissionRecorder};
+        use crate::{SubmissionIntent, SubmissionOutcome, SubmissionRecorder as _};
+        use stellar_agent_core::approval::ApprovalKind;
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        for canonical in [true, false] {
+            let mut rig = Rig::with_approvals();
+            let (_, _, nonce) = if canonical {
+                commit_approved(&mut rig.fx, 1, Checked::NotIncluded)
+            } else {
+                commit_approved_in(&mut rig.fx, 1, linkable(1), Checked::NotIncluded)
+            };
+            rig.seed_pending_approval(&nonce);
+            rig.repair(None).unwrap();
+            let receipt = rig.receipt(1).unwrap();
+            assert!(receipt.submitted && !receipt.approval_consumed);
+            let recorder = WalletSubmissionRecorder::new(
+                &rig.fx.profile,
+                "ops",
+                "stellar_pay_commit",
+                Some("stellar:mainnet".into()),
+                stellar_agent_core::audit_log::PolicyDecision::RequireApproval,
+                vec![],
+                vec![],
+                rig.receipts.clone(),
+                rig.fx.store.clone(),
+                None,
+                None,
+                "request",
+                T0,
+            )
+            .with_approval(Some(ApprovalTombstone {
+                store_dir: rig.home.path().join("approvals"),
+                profile_name: "ops".into(),
+                approval_nonce: nonce.clone(),
+            }));
+            let intent = SubmissionIntent {
+                chain_scope: crate::policy_state::ChainScope::for_chain(
+                    stellar_agent_core::profile::caip2::Caip2::Mainnet,
+                ),
+                envelope_hash: envelope_id(1),
+                tx_hash: tx_hex(1),
+                source: SOURCE.to_owned(),
+                sequence: 101,
+                max_time: T0 / 1_000 + 60,
+                submission_ledger: 1,
+                submission_anchor: None,
+                send_by_ms: None,
+                destinations: Default::default(),
+            };
+            recorder
+                .outcome(
+                    &intent,
+                    &SubmissionOutcome::Rejected {
+                        code: "transaction.failed".into(),
+                        error: "refused".into(),
+                    },
+                )
+                .await;
+            let consumed = rig.receipt(1).unwrap().approval_consumed;
+            if canonical {
+                assert!(!consumed, "the canonical tombstone stays owed");
+                assert!(
+                    matches!(
+                        rig.approval_kind(&nonce),
+                        Some(ApprovalKind::PaymentSimulated { .. })
+                    ),
+                    "the consent stays for the successor"
+                );
+            } else {
+                assert!(consumed, "the envelope record's approval is consumed");
+                rig.assert_approval_consumed(&nonce, 1);
+            }
+        }
+    }
+
+    /// The recorder's receipt claim continues the attempt's own operation: a
+    /// successor's send records its receipt beside the predecessor's checked
+    /// non-inclusion, while the same send recorded for another operation
+    /// refuses `submission.tx_already_submitted` and records nothing.
+    #[tokio::test]
+    #[serial]
+    async fn the_recorder_claims_for_its_own_operation() {
+        use crate::submission_record::{
+            ApprovalTombstone, OperationAttempt, WalletSubmissionRecorder,
+        };
+        use crate::{SubmissionIntent, SubmissionRecorder as _};
+        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        for own in [false, true] {
+            let mut rig = Rig::with_approvals();
+            let (handle, _, nonce) = commit_approved(&mut rig.fx, 1, Checked::NotIncluded);
+            let (other, _, _) = commit_approved(&mut rig.fx, 3, Checked::NotIncluded);
+            rig.repair(None).unwrap();
+            let operation = if own { handle.id() } else { other.id() };
+            let recorder = WalletSubmissionRecorder::new(
+                &rig.fx.profile,
+                "ops",
+                "stellar_pay_commit",
+                Some("stellar:mainnet".into()),
+                stellar_agent_core::audit_log::PolicyDecision::RequireApproval,
+                vec![],
+                vec![],
+                rig.receipts.clone(),
+                rig.fx.store.clone(),
+                Some(Arc::clone(&rig.writer)),
+                None,
+                "request",
+                T0,
+            )
+            .with_approval(Some(ApprovalTombstone {
+                store_dir: rig.home.path().join("approvals"),
+                profile_name: "ops".into(),
+                approval_nonce: nonce.clone(),
+            }))
+            .with_operation(Some(OperationAttempt {
+                operation_id: operation,
+                attempt_index: 2,
+            }));
+            let intent = SubmissionIntent {
+                chain_scope: crate::policy_state::ChainScope::for_chain(
+                    stellar_agent_core::profile::caip2::Caip2::Mainnet,
+                ),
+                envelope_hash: envelope_id(2),
+                tx_hash: tx_hex(2),
+                source: SOURCE.to_owned(),
+                sequence: 102,
+                max_time: T0 / 1_000 + 60,
+                submission_ledger: 1,
+                submission_anchor: None,
+                send_by_ms: None,
+                destinations: Default::default(),
+            };
+            let claimed = recorder.pre_send(&intent).await;
+            if own {
+                claimed.unwrap();
+                assert_eq!(
+                    rig.receipt(2).unwrap().approval_nonce.as_deref(),
+                    Some(nonce.as_str())
+                );
+            } else {
+                assert_eq!(
+                    claimed.unwrap_err().code(),
+                    "submission.tx_already_submitted"
+                );
+                assert!(rig.receipt(2).is_none());
+            }
+        }
     }
 
     /// The complete M address of `id` on a fixed key.
@@ -2471,8 +2829,10 @@ pub(crate) mod tests {
     }
 
     /// Status after an approval receipt's removal restores its nonce, and
-    /// the same call consumes it and marks the restored receipt. After a
-    /// reopen the nonce stays excluded with no second consumption.
+    /// for an envelope record's checked non-inclusion the same call consumes
+    /// it and marks the restored receipt. After a reopen the nonce stays
+    /// excluded with no second consumption. A canonical non-inclusion's
+    /// status keeps its nonce for a successor.
     #[tokio::test]
     #[serial]
     async fn recovery_status_rereads_projected_approval_nonce() {
@@ -2486,7 +2846,8 @@ pub(crate) mod tests {
         );
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
         let mut rig = Rig::with_approvals();
-        let (_, commit, nonce) = commit_approved(&mut rig.fx, 1, Checked::NotIncluded);
+        let (_, commit, nonce) =
+            commit_approved_in(&mut rig.fx, 1, linkable(1), Checked::NotIncluded);
         rig.seed_pending_approval(&nonce);
         rig.repair(None).unwrap();
         rig.edit_receipts(|map| {
@@ -2528,6 +2889,19 @@ pub(crate) mod tests {
                 )
                 .unwrap(),
             BeginSubmissionOutcome::DuplicateApproval(_)
+        ));
+
+        let (_, _, kept) = commit_approved(&mut rig.fx, 2, Checked::NotIncluded);
+        rig.seed_pending_approval(&kept);
+        rig.repair(None).unwrap();
+        rig.status(2, &client).await.unwrap();
+        assert!(
+            !rig.receipt(2).unwrap().approval_consumed,
+            "a canonical non-inclusion keeps its tombstone owed"
+        );
+        assert!(matches!(
+            rig.approval_kind(&kept),
+            Some(stellar_agent_core::approval::ApprovalKind::PaymentSimulated { .. })
         ));
     }
 

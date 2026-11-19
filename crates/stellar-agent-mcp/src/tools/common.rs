@@ -3340,10 +3340,19 @@ pub(crate) async fn verify_attestation_subject_gate(
         })?;
 
     // A receipt that holds the nonce proves the approval was spent, also while
-    // its tombstone is owed. It is read before the mutable approval store, so a
-    // locked store or an expired entry cannot hide the spend.
+    // its tombstone is owed, unless its attempt ended in a checked
+    // non-inclusion of the admitted operation and that operation is
+    // canonical. A checked non-inclusion of an admitted envelope operation
+    // still proves the spend. It is read before the mutable
+    // approval store, so a locked store or an expired entry cannot hide the
+    // spend.
+    let lineage = stellar_agent_network::policy_state::ApprovalLineage::new(
+        &server.window_store,
+        server.security_profile(),
+        operation,
+    );
     let receipt_hold = stellar_agent_core::profile::receipt::ReceiptStore::open(&profile_name)
-        .and_then(|receipts| receipts.find_by_approval_nonce(approval_nonce_str));
+        .and_then(|receipts| receipts.find_approval_holder(approval_nonce_str, &lineage));
     if matches!(&receipt_hold, Ok(Some(_))) {
         return Err(approval_consumed_error());
     }
