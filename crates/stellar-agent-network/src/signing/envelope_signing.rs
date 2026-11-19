@@ -1001,13 +1001,17 @@ mod tests {
         const OTHER_SEED: [u8; 32] = [0x3b; 32];
 
         /// An unsigned mainnet envelope and an audit writer the authorization's
-        /// proof holds. The unkeyed log holds no consent evidence, so the
-        /// fixture profile opts out of every kind's enforcement.
+        /// proof holds. Its Approval headers carry the store access their
+        /// expiry check reads under the enforcement.
         struct Case {
             _dir: TempDir,
             writer: AuditWriterHandle,
             unsigned: SignedTestEnvelope,
-            _unenforced: Vec<crate::policy_state::approvals::ConsentEvidenceDisableGuard>,
+            /// The store access of the first header built; a later header's
+            /// guard drops at once and restores this store.
+            store: std::cell::RefCell<
+                Option<stellar_agent_test_support::keyring_mock::DefaultStoreGuard>,
+            >,
         }
 
         impl Case {
@@ -1020,10 +1024,7 @@ mod tests {
                     _dir: dir,
                     writer,
                     unsigned: fixtures::unsigned_envelope(),
-                    _unenforced:
-                        crate::policy_state::approvals::ConsentEvidenceDisableGuard::every_kind(
-                            "fixture",
-                        ),
+                    store: std::cell::RefCell::new(None),
                 }
             }
 
@@ -1056,7 +1057,7 @@ mod tests {
                     anchor_covers_tip: true,
                     entry_tags_in_force: true,
                 };
-                let mut header = fixtures::header(
+                let (mut header, access) = fixtures::approval_header(
                     fixtures::claim_target(self._dir.path(), "fixture"),
                     "fixture",
                     None,
@@ -1064,6 +1065,7 @@ mod tests {
                     facts,
                     NOW,
                 );
+                let _ = self.store.borrow_mut().get_or_insert(access);
                 let mut binding =
                     fixtures::tx_binding(envelope.envelope_xdr(), envelope.tx_hash_hex());
                 edit(&mut header, &mut binding);

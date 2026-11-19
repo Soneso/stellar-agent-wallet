@@ -1671,6 +1671,7 @@ mod producers {
         // durable verifier refuses the replayed proof as outside its execution
         // window; the inbox tombstone does not answer a mainnet proof.
         let minted = authorizations(&run.f).len();
+        let sent = run.control.sent();
         let replay = call_muxed(run, false, run.args(HOME, Some((&approval.0, &approval.1)))).await;
         assert_eq!(
             replay["error"]["code"], "policy.approval_required",
@@ -1681,6 +1682,7 @@ mod producers {
             minted,
             "the replay mints nothing"
         );
+        assert_eq!(run.control.sent(), sent, "the replay sends nothing");
     }
 
     /// Tears both evidence slots of `server`'s audit log and returns their

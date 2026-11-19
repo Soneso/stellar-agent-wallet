@@ -277,12 +277,15 @@ mod authorized {
     const EXPIRATION_LEDGER: u32 = 1_000;
     const OTHER_SEED: [u8; 32] = [0x3b; 32];
 
-    /// A fixture profile whose unkeyed log holds no consent evidence; it
-    /// opts out of every kind's enforcement, so no evidence floor is read.
+    /// A fixture profile with an unkeyed log, whose Approval headers carry
+    /// the store access their expiry check reads under the enforcement.
     struct Case {
         _dir: TempDir,
         writer: AuditWriterHandle,
-        _unenforced: Vec<crate::policy_state::approvals::ConsentEvidenceDisableGuard>,
+        /// The store access of the first header built; a later header's
+        /// guard drops at once and restores this store.
+        store:
+            std::cell::RefCell<Option<stellar_agent_test_support::keyring_mock::DefaultStoreGuard>>,
     }
 
     impl Case {
@@ -294,24 +297,28 @@ mod authorized {
             Self {
                 _dir: dir,
                 writer,
-                _unenforced:
-                    crate::policy_state::approvals::ConsentEvidenceDisableGuard::every_kind(
-                        "fixture",
-                    ),
+                store: std::cell::RefCell::new(None),
             }
+        }
+
+        /// Keeps the first header's store access for the life of the case.
+        fn keep(&self, access: stellar_agent_test_support::keyring_mock::DefaultStoreGuard) {
+            let _ = self.store.borrow_mut().get_or_insert(access);
         }
 
         /// A Soroban intent authorization over the `transfer` invocation
         /// under [`NONCE`] and [`EXPIRATION_LEDGER`], valid at [`NOW`].
         fn soroban(&self) -> MainnetSorobanIntentAuthorization {
-            fixtures::soroban_authorization(
+            let (authorization, access) = fixtures::soroban_approval(
                 fixtures::claim_target(self._dir.path(), "fixture"),
                 &self.writer,
                 &invocation("transfer"),
                 NONCE,
                 EXPIRATION_LEDGER,
                 NOW,
-            )
+            );
+            self.keep(access);
+            authorization
         }
 
         fn minted_soroban(&self) -> MainnetSorobanIntentAuthorization {
@@ -336,7 +343,7 @@ mod authorized {
                 anchor_covers_tip: true,
                 entry_tags_in_force: true,
             };
-            let mut header = fixtures::header(
+            let (mut header, access) = fixtures::approval_header(
                 fixtures::claim_target(self._dir.path(), "fixture"),
                 "fixture",
                 None,
@@ -344,6 +351,7 @@ mod authorized {
                 facts,
                 NOW,
             );
+            self.keep(access);
             let mut binding = fixtures::tx_binding(envelope.envelope_xdr(), envelope.tx_hash_hex());
             edit(&mut header, &mut binding);
             fixtures::tx_authorization(header, binding)
