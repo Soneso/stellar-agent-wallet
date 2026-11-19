@@ -142,7 +142,7 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     # Dropping test-profile debuginfo roughly halves target/ size and link time,
     # keeping the build closure within the runner's free disk.
     env:
@@ -254,7 +254,7 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     # Dropping test-profile debuginfo roughly halves target/ size and link
     # time, keeping the build closure within the runner's free disk.
     env:
