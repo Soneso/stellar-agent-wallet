@@ -379,7 +379,21 @@ subsecond remainder remains usable, and an expired interval refuses before
 issuing a protocol nonce. Mainnet signing authority also ends at the earlier
 of the captured decision end and the operator witness expiry.
 
-A mainnet retry uses its retained envelope, including the original sequence.
+On mainnet, `stellar_create_account`, `stellar_trustline` and `stellar_claim`
+store the lasting intent under the business id. Their commits rebuild the
+envelope from that intent with a fresh sequence and deadline, so `nonce`,
+`expires_at_unix_ms` and `envelope_xdr` are optional there and a commit
+after a server restart still proceeds. The rebuild pays the fee per
+operation of the envelope the preparation returned; a fee above the current
+caps refuses as it would on the presented envelope. The commit's other
+arguments must name the stored intent, or it refuses with
+`operation.business_id_conflict`, also after the operation ran.
+`stellar_pay_commit`, a commit of an operation recorded with its exact
+envelope, and every commit off mainnet require all three fields; an omitted
+one answers the tool's fixed argument refusal.
+
+A retried mainnet preparation, and a commit of an operation recorded with its
+exact envelope, use the retained envelope, including the original sequence.
 Repeated preparation of the same envelope under the same verified policy,
 profile, chain, and retained operation returns the original approval nonce and
 interval. An attestation already recorded on that approval stays unchanged.
@@ -480,15 +494,26 @@ Each commit evaluates both names before attestation validation. A proof
 supplied under Allow is verified and spent like a required one.
 
 Classic mainnet previews carry an on-chain deadline 120 seconds after they are
-built, bound into consent and the protocol nonce. Commits copy this deadline
-into the rebuild. A commit whose envelope carries no valid deadline refuses
+built. A commit of an operation recorded with its exact envelope, and every
+`stellar_pay_commit`, copies this deadline into the rebuild; the deadline is
+bound into consent and the protocol nonce. A mainnet
+`stellar_create_account_commit`, `stellar_trustline_commit` or
+`stellar_claim_commit` of a stored intent sets a new deadline at the earlier
+of 120 seconds after the commit and the last whole second strictly before
+the end of its authority: an approval's execution end, or a policy
+decision's governing end. The authority holds strictly before its end, and a
+ledger that closes at the deadline still includes the transaction. A
+successor attempt's deadline also stays before the execution end the first
+attempt set, and the signing refuses a deadline that does not lie before the
+end.
+A commit whose envelope carries no valid deadline refuses
 with `simulation.deadline_invalid`; simulate again for a fresh envelope.
 A commit within 30 seconds of the deadline refuses with the same code, so
 commit within 90 seconds of the preview.
 
 | Classic commit code | Meaning |
 |---|---|
-| `simulation.divergence` | The rebuilt envelope differs from the presented bytes. |
+| `simulation.divergence` | The rebuilt envelope differs from the presented bytes, or, for a stored intent, the ledger no longer matches it (a claimable balance that changed). |
 | `simulation.deadline_invalid` | The mainnet envelope has no valid on-chain deadline. Simulate again for a fresh envelope. |
 
 Feature-on startup loads the mainnet write context for a verified enabled
@@ -619,7 +644,9 @@ minimum separately requires the signed field. The resolver independently
 checks effective fees and thresholds when authorizing the action. The commit tools
 `stellar_pay_commit`, `stellar_create_account_commit`,
 `stellar_trustline_commit`, and `stellar_claim_commit` check the fee of the
-presented envelope the same way, before anything is signed or sent. A fee
+presented envelope the same way, before anything is signed or sent; a
+mainnet commit of a stored intent checks the fee of the envelope its
+preparation returned. A fee
 above the cap returns `fees.percentile_exceeds_cap`. The message names where
 the fee came from: an auto-selected fee and its percentile, an explicit
 `classic_base`, the profile's `classic_fee_per_op_stroops`, or the envelope.
@@ -876,9 +903,9 @@ envelope.
 | `stellar_pay` | Simulate a payment: build the Payment envelope, run the SEP-29 memo-required check, mint a single-use nonce. | No signing; no submission. Not annotated read-only (mints the single-use nonce the commit step consumes). |
 | `stellar_pay_commit` | Verify the nonce, re-check the envelope, sign from the keyring, submit. | Signs and submits. Two-phase verb; approval spine. |
 | `stellar_create_account` | Simulate account creation: build the CreateAccount envelope, mint a single-use nonce. | No signing; no submission. Not annotated read-only (mints the single-use nonce the commit step consumes). |
-| `stellar_create_account_commit` | Verify the nonce, re-check the envelope, sign, submit. | Signs and submits. Two-phase verb; approval spine. |
+| `stellar_create_account_commit` | Verify the nonce, re-check the envelope, sign, submit. A mainnet commit of an intent stored under `business_id` rebuilds the envelope from that intent without the nonce. | Signs and submits. Two-phase verb; approval spine. |
 | `stellar_claim` | Simulate claiming a claimable balance by ID: fetch the entry, run the claimant / predicate / trustline guards, render the typed preview, mint a single-use nonce. | No signing; no submission. Not annotated read-only (mints the single-use nonce the commit step consumes). |
-| `stellar_claim_commit` | Recheck record, witness, sign, submit. | Signs and submits. Two-phase verb; approval spine. |
+| `stellar_claim_commit` | Recheck record, witness, sign, submit. A mainnet commit of an intent stored under `business_id` rebuilds the envelope from that intent without the nonce. | Signs and submits. Two-phase verb; approval spine. |
 | `stellar_balances` | Fetch native XLM balance and optional trustline balances for an account. | Read-only. |
 | `stellar_friendbot` | Fund a testnet account via Friendbot. | Mutating, testnet-only; gated. |
 | `stellar_transaction_status` | Reconcile one submitted transaction against the chain and update the wallet's record of it, by its receipt or, when the receipt is missing, by its reservation. The way out of `submission.tx_timeout`. A reported failure or missing transaction does not release possible spending. Reports `record.release_code` for an accounting disposition such as `submission.accounting_expired`, `record.settlement_evidence: "unavailable"` with an optional `record.settlement_decision_id`, and `reservation` for a hold that remains. On a mainnet profile the primary's `FAILED` and `NOT_FOUND` decide nothing alone; the oracle is asked as well. | Reads the chain and writes the wallet's record; moves no value and never sends. Not annotated read-only. |
@@ -981,7 +1008,7 @@ Without an id the result is unchanged.
 | Tool | Purpose | Gating |
 | --- | --- | --- |
 | `stellar_trustline` | Simulate a trustline change: build the ChangeTrust envelope, run the issuer clawback-flag gate, mint a single-use nonce. | No signing; no submission. Not annotated read-only (mints the single-use nonce the commit step consumes). |
-| `stellar_trustline_commit` | Recheck issuer, witness, sign, submit. | Signs and submits. Two-phase verb; approval spine. |
+| `stellar_trustline_commit` | Recheck issuer, witness, sign, submit. A mainnet commit of an intent stored under `business_id` rebuilds the envelope from that intent without the nonce. | Signs and submits. Two-phase verb; approval spine. |
 
 Both trustline tools take `business_id` as described under
 [Business ids](#business-ids).

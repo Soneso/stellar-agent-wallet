@@ -1966,6 +1966,7 @@ impl WalletServer {
                         &args.envelope_xdr,
                     ),
                 ),
+                None,
                 &super::common::SuppliedProof {
                     nonce: args.approval_nonce.clone(),
                     attestation: args.approval_attestation.clone(),

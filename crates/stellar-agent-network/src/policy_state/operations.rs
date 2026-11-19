@@ -4640,10 +4640,11 @@ impl<'a> OperationRecorder<'a> {
     }
 
     /// The authenticated full slot, including terminal records before compaction.
-    pub(crate) fn retained_intent(
-        &self,
-        id: OperationId,
-    ) -> Result<Option<IntentSlot>, WindowStoreError> {
+    ///
+    /// # Errors
+    ///
+    /// The store's read refusals.
+    pub fn retained_intent(&self, id: OperationId) -> Result<Option<IntentSlot>, WindowStoreError> {
         Ok(OperationStatus::new(self.store, self.profile)
             .read()?
             .and_then(|wire| {
@@ -5711,12 +5712,14 @@ impl<'a> OperationStatus<'a> {
         Ok(None)
     }
 
-    /// The retained slot and latest attempt, for resolver inspection.
+    /// The retained slot, the latest attempt's authorization and the
+    /// record's execution end once an authority stands, for resolver
+    /// inspection.
     #[cfg(feature = "mainnet-write")]
     pub(crate) fn intent_for_resolution(
         &self,
         id: OperationId,
-    ) -> Result<(IntentSlot, Option<AuthorizationId>), WindowStoreError> {
+    ) -> Result<(IntentSlot, Option<AuthorizationId>, Option<u64>), WindowStoreError> {
         let wire = self
             .read()?
             .ok_or_else(|| invalid("the operation is absent"))?;
@@ -5729,6 +5732,7 @@ impl<'a> OperationStatus<'a> {
             record
                 .current_attempt()
                 .map(|attempt| attempt.authorization_id),
+            record.execution_expires_at_ms,
         ))
     }
 

@@ -652,6 +652,7 @@ impl WalletServer {
                 self,
                 &dispatch_outcome,
                 GatedApprovalKind::X402.expectation(subject),
+                None,
                 args.approval_nonce.as_deref(),
                 args.approval_attestation.as_deref(),
                 None,
@@ -1195,6 +1196,7 @@ impl WalletServer {
                 &digest,
                 &args.home_domain,
             )),
+            None,
             &SuppliedProof {
                 nonce: args.approval_nonce.clone(),
                 attestation: args.approval_attestation.clone(),

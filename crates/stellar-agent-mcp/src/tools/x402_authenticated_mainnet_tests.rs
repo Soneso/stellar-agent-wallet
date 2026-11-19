@@ -2045,6 +2045,7 @@ impl Boundary {
                     &digest, HOME,
                 ),
             ),
+            None,
             Some(&entry.approval_nonce),
             Some(&blob),
             Some(link.operation_id),

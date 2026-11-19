@@ -609,7 +609,7 @@ pub(crate) async fn authorize_and_submit(
         _ => None,
     };
     let rebuilt = match &canonical {
-        Some((_, intent, inputs)) => Some(
+        Some((handle, intent, inputs)) => Some(
             rebuild_canonical(CanonicalRebuildRequest {
                 profile,
                 network: &context.network_context(),
@@ -622,6 +622,8 @@ pub(crate) async fn authorize_and_submit(
                 witness_inputs: inputs.witness_inputs.clone(),
                 thresholds: inputs.thresholds,
                 tool,
+                // A successor also stays inside the record's execution window,
+                // which the first attempt's authority set.
                 authority_end_ms: match &authority {
                     stellar_agent_network::mainnet::authority::MainnetAuthority::Approval(
                         approval,
@@ -629,7 +631,8 @@ pub(crate) async fn authorize_and_submit(
                     stellar_agent_network::mainnet::authority::MainnetAuthority::Policy(policy) => {
                         policy.governing_until_ms()
                     }
-                },
+                }
+                .min(handle.execution_expires_at_ms().unwrap_or(u64::MAX)),
             })
             .await
             .map_err(|e| refused(PipelineStep::Resolver, &e, "", verb, None))?,

@@ -205,11 +205,15 @@ pub struct StellarTrustlineCommitArgs {
     /// Base64-url-no-pad nonce returned by the simulate step.
     ///
     /// HMAC-verified against `envelope_xdr`, `expires_at_unix_ms`, and the
-    /// registered commit tool name before signing.
-    pub nonce: String,
+    /// registered commit tool name before signing. A mainnet commit of an
+    /// intent stored under `business_id` needs none of the three fields; every
+    /// other commit requires them.
+    #[serde(default)]
+    pub nonce: Option<String>,
 
     /// Unix timestamp (milliseconds) at which the nonce expires.
-    pub expires_at_unix_ms: u64,
+    #[serde(default)]
+    pub expires_at_unix_ms: Option<u64>,
 
     /// Base64 XDR envelope returned by the simulate step.
     ///
@@ -217,7 +221,8 @@ pub struct StellarTrustlineCommitArgs {
     /// re-derived from this envelope at commit time via `decode_authoritative_args`
     /// (the caller-supplied values are not trusted); a decode failure returns
     /// `simulation.divergence`.
-    pub envelope_xdr: String,
+    #[serde(default)]
+    pub envelope_xdr: Option<String>,
 
     /// Wallet-issued approval nonce from the simulate-step `approval` block.
     ///
@@ -398,6 +403,122 @@ impl WalletServer {
         .map_err(|error| error.to_string())?;
 
         Ok(entry)
+    }
+
+    /// Reads the issuer of `code` and runs the clawback gate a commit
+    /// repeats, and returns the issuer's account, `None` for an issuer the
+    /// ledger does not hold.
+    ///
+    /// # Errors
+    ///
+    /// The call's whole answer: the account read's refusal,
+    /// `trustline.gate_refused`, `trustline.clawback_opt_in_required`, or a
+    /// clock failure.
+    async fn commit_clawback_gate(
+        &self,
+        client: &stellar_agent_network::StellarRpcClient,
+        code: &str,
+        issuer: &str,
+    ) -> Result<Option<AccountView>, Result<CallToolResult, rmcp::ErrorData>> {
+        let issuer_view = match fetch_account(client, issuer, &[]).await {
+            Ok(view) => Some(view),
+            Err(stellar_agent_core::WalletError::Network(
+                stellar_agent_core::error::NetworkError::AccountNotFound { .. },
+            )) => None,
+            Err(err) => return Err(Ok(ledger_err_result(&err))),
+        };
+        let now_ms = now_unix_ms().map_err(|e| {
+            Err(rmcp::ErrorData::internal_error(
+                format!("clock_error: {e}"),
+                None,
+            ))
+        })?;
+        match stellar_agent_stablecoin::flags::clawback_gate(
+            issuer_view
+                .as_ref()
+                .and_then(|view| view.account_flags.as_ref()),
+            self.verified_clawback_opt_in(code, issuer, now_ms),
+        ) {
+            stellar_agent_stablecoin::flags::GateDecision::Proceed => Ok(issuer_view),
+            stellar_agent_stablecoin::flags::GateDecision::Refuse { reason } => Err(Ok(
+                crate::tools::common::business_error_result("trustline.gate_refused", reason),
+            )),
+            stellar_agent_stablecoin::flags::GateDecision::RefuseWithWarning { .. } => {
+                Err(Ok(crate::tools::common::business_error_result(
+                    "trustline.clawback_opt_in_required",
+                    "no verified clawback opt-in covers this trustline (missing, expired or \
+                     not verifiable), or the issuer enabled clawback after prepare. \
+                     Nothing was signed. Re-invoke stellar_trustline to obtain a new \
+                     opt-in request.",
+                )))
+            }
+        }
+    }
+
+    /// The commit of the canonical trustline change under `business_id`: the
+    /// account and the endpoint are checked as on the envelope route, the
+    /// record is looked up, the issuer is read and the clawback gate runs
+    /// again, then the envelope is rebuilt from the stored intent and signed.
+    async fn trustline_canonical(
+        &self,
+        guard: &crate::server::MainnetWriteGuard<'_>,
+        args: &StellarTrustlineCommitArgs,
+        business_id: stellar_agent_network::policy_state::BusinessId,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if let Err(err) = stellar_strkey::ed25519::PublicKey::from_string(&args.from) {
+            return Err(rmcp::ErrorData::invalid_params(
+                format!("invalid from (expected G-strkey): {err}"),
+                None,
+            ));
+        }
+        // A record of another tool under the id holds another intent kind and
+        // refuses as a conflict, waiting or retained.
+        let entry = self.canonical_entry(guard, business_id, &args.from, |intent| {
+            matches!(
+                intent.payload(),
+                stellar_agent_core::approval::IntentPayload::Trustline { .. }
+            ) && intent.base().source() == args.from
+        });
+        let (client, target) = match entry.await {
+            Ok(entry) => entry,
+            Err(answer) => return answer,
+        };
+        let stellar_agent_core::approval::IntentPayload::Trustline { issuer, code, .. } =
+            target.intent.payload()
+        else {
+            return Err(rmcp::ErrorData::internal_error(
+                "the matched intent is a trustline",
+                None,
+            ));
+        };
+        let issuer_view = match self.commit_clawback_gate(&client, code, issuer).await {
+            Ok(view) => view,
+            Err(answer) => return answer,
+        };
+        let witness_inputs = stellar_agent_network::cross_check::TrustlineWitnessInputs {
+            source: crate::tools::canonical_commit::placeholder_source(&target.intent),
+            issuer: stellar_agent_network::cross_check::IssuerObservation::from_view(
+                issuer,
+                issuer_view.as_ref(),
+            ),
+        };
+        self.canonical_commit(
+            guard,
+            &client,
+            &target,
+            crate::tools::canonical_commit::CanonicalCommit {
+                consumer: stellar_agent_network::mainnet::MainnetConsumer::McpTrustline,
+                prepare_tool: "stellar_trustline",
+                commit_tool: "stellar_trustline_commit",
+                chain_id: &args.chain_id,
+                proof: crate::tools::common::SuppliedProof {
+                    nonce: args.approval_nonce.clone(),
+                    attestation: args.approval_attestation.clone(),
+                },
+                witness_inputs: witness_inputs.into(),
+            },
+        )
+        .await
     }
 
     /// Persists a [`PendingApproval`] entry for a trustline change.
@@ -590,7 +711,7 @@ impl WalletServer {
         // A retained operation answers here with its stored state, once
         // the endpoint is known to serve the profile's network and before
         // any account read.
-        let operation = match business_id
+        let mut operation = match business_id
             .clone()
             .filter(|_| self.context.chain_id.is_mainnet())
         {
@@ -603,7 +724,7 @@ impl WalletServer {
                             None,
                         )
                     })?;
-                match self.classic_prepare_entry(
+                match self.canonical_prepare_entry(
                     id,
                     stellar_agent_network::mainnet::MainnetConsumer::McpTrustline,
                     &args.from,
@@ -964,6 +1085,34 @@ impl WalletServer {
             }
         };
 
+        // The governing decision of this preparation and its commit is the
+        // one the record keeps, so it is evaluated before the record opens.
+        let dispatch_outcome = match self
+            .paired_commit_outcome(
+                dispatch_outcome,
+                &envelope_xdr,
+                "stellar_trustline_commit",
+                &args.chain_id,
+                Some(source_view),
+                None,
+            )
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => return error.into_result(),
+        };
+        if let Err(result) = self.stage_canonical(
+            operation.as_mut(),
+            stellar_agent_core::approval::IntentPayload::Trustline {
+                issuer: resolved.issuer.clone(),
+                code: resolved.code.clone(),
+                limit_stroops: limit_stroops.unwrap_or(i64::MAX),
+            },
+            &dispatch_outcome,
+        ) {
+            return Ok(result);
+        }
+
         let prepared = match self.prepared_envelope(
             operation.as_ref(),
             stellar_agent_network::policy_state::OperationTool::StellarTrustline,
@@ -1019,21 +1168,6 @@ impl WalletServer {
         );
 
         // Persist pending approval if policy requires it.
-        let dispatch_outcome = match self
-            .paired_commit_outcome(
-                dispatch_outcome,
-                &envelope_xdr,
-                "stellar_trustline_commit",
-                &args.chain_id,
-                Some(source_view),
-                None,
-            )
-            .await
-        {
-            Ok(outcome) => outcome,
-            Err(error) => return error.into_result(),
-        };
-
         let approval_block =
             if let DispatchOutcome::RequireApproval(ref approval) = dispatch_outcome {
                 let profile_name = self.profile_name_for_approval();
@@ -1130,6 +1264,13 @@ impl WalletServer {
     /// `(nonce, expires_at_unix_ms, envelope_xdr)` triple returned by
     /// `stellar_trustline`, plus the original arguments.
     ///
+    /// A mainnet commit under a `business_id` whose record holds a stored
+    /// intent takes none of the three: after the issuer re-read and the
+    /// clawback re-check it rebuilds the envelope from that intent with a fresh
+    /// sequence and deadline at the fee per operation of the prepared
+    /// envelope, takes its authority from the stored record, and verifies no
+    /// nonce. Invariants 1, 4 and 5 below hold for every other commit.
+    ///
     /// # Security invariants (policy-evaluation order)
     ///
     /// 1. **Re-derive authoritative args:** `decode_authoritative_args` decodes
@@ -1159,12 +1300,15 @@ impl WalletServer {
     #[tool(
         name = "stellar_trustline_commit",
         description = "Sign and submit a ChangeTrust transaction (commit step). \
-                       Requires the nonce, expires_at_unix_ms, and envelope_xdr returned \
-                       by stellar_trustline. Also pass approval_nonce and \
-                       approval_attestation when the simulate step returned an approval \
-                       block. Pass business_id on mainnet. Re-builds the envelope, re-reads the issuer \
-                       and re-runs the clawback gate, obtains the cross-check witness, \
-                       verifies the nonce, signs via keyring, and submits. \
+                       Takes the nonce, expires_at_unix_ms, and envelope_xdr returned \
+                       by stellar_trustline. A mainnet commit of an intent stored under \
+                       business_id needs none of the three and rebuilds the envelope from \
+                       that intent at the fee per operation of the prepared envelope; every \
+                       other commit requires them and verifies the nonce. Also pass \
+                       approval_nonce and approval_attestation when the simulate step \
+                       returned an approval block. Pass business_id on mainnet. Re-builds \
+                       the envelope, re-reads the issuer and re-runs the clawback gate, \
+                       obtains the cross-check witness, signs via keyring, and submits. \
                        On mainnet, a matching balance_floor rule adds an endpoint readiness \
                        check and an operating account read. \
                        Returns {tx_hash, ledger, cross_check}. \
@@ -1192,10 +1336,33 @@ impl WalletServer {
         } else {
             None
         };
+        use crate::tools::business_entry::{CommitRoute, EnvelopeFields};
+        let fields = EnvelopeFields {
+            envelope_xdr: args.envelope_xdr.as_deref(),
+            nonce: args.nonce.as_deref(),
+            expires_at_unix_ms: args.expires_at_unix_ms,
+        };
+        let (envelope_xdr, nonce_b64, expires_at_unix_ms) = match self.commit_route(
+            "stellar_trustline_commit",
+            mainnet.as_ref(),
+            &args.chain_id,
+            args.business_id.as_deref(),
+            fields,
+        ) {
+            CommitRoute::Canonical(guard, business_id) => {
+                return self.trustline_canonical(guard, &args, business_id).await;
+            }
+            CommitRoute::Answer(result) => return Ok(result),
+            CommitRoute::Envelope {
+                envelope_xdr,
+                nonce,
+                expires_at_unix_ms,
+            } => (envelope_xdr, nonce, expires_at_unix_ms),
+        };
 
         // ── Re-derive authoritative args from HMAC-bound envelope_xdr ─────────
         let mut authoritative_args =
-            match decode_authoritative_args(&args.envelope_xdr, "stellar_trustline_commit") {
+            match decode_authoritative_args(envelope_xdr, "stellar_trustline_commit") {
                 Ok(a) => a,
                 Err(e) => {
                     tracing::debug!(
@@ -1317,7 +1484,7 @@ impl WalletServer {
             mainnet.as_ref().map(|guard| guard.policy),
             stellar_agent_network::policy_state::OperationKind::Trustline,
             business_id.as_ref(),
-            &args.envelope_xdr,
+            envelope_xdr,
         ) {
             Ok(operation) => operation,
             Err(result) => return Ok(result),
@@ -1403,10 +1570,9 @@ impl WalletServer {
                 self,
                 &dispatch_outcome,
                 super::common::GatedApprovalKind::Trustline.expectation(
-                    stellar_agent_core::approval::subject::approval_subject_classic(
-                        &args.envelope_xdr,
-                    ),
+                    stellar_agent_core::approval::subject::approval_subject_classic(envelope_xdr),
                 ),
+                None,
                 &super::common::SuppliedProof {
                     nonce: args.approval_nonce.clone(),
                     attestation: args.approval_attestation.clone(),
@@ -1427,7 +1593,7 @@ impl WalletServer {
                 self,
                 &dispatch_outcome,
                 super::common::GatedApprovalKind::Trustline,
-                &args.envelope_xdr,
+                envelope_xdr,
                 args.approval_nonce.as_deref(),
                 args.approval_attestation.as_deref(),
                 "stellar_trustline_commit",
@@ -1452,7 +1618,7 @@ impl WalletServer {
         }
 
         // ── Decode nonce ──────────────────────────────────────────────────────
-        let nonce = match stellar_agent_nonce::Nonce::from_base64(&args.nonce) {
+        let nonce = match stellar_agent_nonce::Nonce::from_base64(nonce_b64) {
             Ok(n) => n,
             Err(_) => return Ok(commit_path_error_result("nonce parse failed")),
         };
@@ -1464,7 +1630,7 @@ impl WalletServer {
         };
 
         let presented_deadline = if self.context.chain_id.is_mainnet() {
-            match crate::tools::common::presented_classic_deadline(&args.envelope_xdr) {
+            match crate::tools::common::presented_classic_deadline(envelope_xdr) {
                 Ok(max_time) => Some(max_time),
                 Err(result) => return Ok(result),
             }
@@ -1488,7 +1654,7 @@ impl WalletServer {
             Err(err) => return Ok(commit_path_error_result(err)),
         };
 
-        if rebuilt_envelope_xdr != args.envelope_xdr {
+        if rebuilt_envelope_xdr != envelope_xdr {
             return Ok(crate::tools::common::business_error_result(
                 "simulation.divergence",
                 "re-built envelope does not match presented envelope_xdr; \
@@ -1496,39 +1662,13 @@ impl WalletServer {
             ));
         }
 
-        let issuer_account_view = match fetch_account(&client, &auth_asset_issuer, &[]).await {
-            Ok(view) => Some(view),
-            Err(stellar_agent_core::WalletError::Network(
-                stellar_agent_core::error::NetworkError::AccountNotFound { .. },
-            )) => None,
-            Err(err) => return Ok(ledger_err_result(&err)),
+        let issuer_account_view = match self
+            .commit_clawback_gate(&client, &auth_asset_code, &auth_asset_issuer)
+            .await
+        {
+            Ok(view) => view,
+            Err(answer) => return answer,
         };
-        let now_ms = now_unix_ms()
-            .map_err(|e| rmcp::ErrorData::internal_error(format!("clock_error: {e}"), None))?;
-        let opt_in = self.verified_clawback_opt_in(&auth_asset_code, &auth_asset_issuer, now_ms);
-        match stellar_agent_stablecoin::flags::clawback_gate(
-            issuer_account_view
-                .as_ref()
-                .and_then(|view| view.account_flags.as_ref()),
-            opt_in,
-        ) {
-            stellar_agent_stablecoin::flags::GateDecision::Proceed => {}
-            stellar_agent_stablecoin::flags::GateDecision::Refuse { reason } => {
-                return Ok(crate::tools::common::business_error_result(
-                    "trustline.gate_refused",
-                    reason,
-                ));
-            }
-            stellar_agent_stablecoin::flags::GateDecision::RefuseWithWarning { .. } => {
-                return Ok(crate::tools::common::business_error_result(
-                    "trustline.clawback_opt_in_required",
-                    "no verified clawback opt-in covers this trustline (missing, expired or \
-                     not verifiable), or the issuer enabled clawback after prepare. \
-                     Nothing was signed. Re-invoke stellar_trustline to obtain a new \
-                     opt-in request.",
-                ));
-            }
-        }
         let source = match stellar_agent_network::cross_check::AccountObservation::from_view(
             &source_account_view,
         ) {
@@ -1545,7 +1685,7 @@ impl WalletServer {
                         issuer_account_view.as_ref(),
                     ),
                 },
-                &args.envelope_xdr,
+                envelope_xdr,
                 "stellar_trustline_commit",
             )
             .await
@@ -1582,8 +1722,8 @@ impl WalletServer {
             &self.nonce_mint,
             &self.replay_window,
             &nonce,
-            &args.envelope_xdr,
-            args.expires_at_unix_ms,
+            envelope_xdr,
+            expires_at_unix_ms,
             &args.chain_id,
             "stellar_trustline_commit",
             now_ms,
@@ -1600,7 +1740,7 @@ impl WalletServer {
             mainnet.as_ref().map(|guard| guard.policy),
             stellar_agent_network::policy_state::OperationKind::Trustline,
             business_id.as_ref(),
-            &args.envelope_xdr,
+            envelope_xdr,
         ) {
             Ok(operation) => operation,
             Err(result) => return Ok(result),
@@ -1629,7 +1769,7 @@ impl WalletServer {
             audit_readiness,
             stellar_agent_network::mainnet::MainnetConsumer::McpTrustline,
             &client,
-            &args.envelope_xdr,
+            envelope_xdr,
             &args.from,
             crate::tools::submission_record::CommitRecord {
                 policy_decision: dispatch_outcome.audit_decision(),

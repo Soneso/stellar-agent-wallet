@@ -208,9 +208,9 @@ async fn create_account_commit_with_payment_xdr_returns_simulation_divergence() 
         source: SOURCE_G.to_owned(),
         destination: G_REAL_DEST.to_owned(),
         starting_balance: serde_json::from_str(r#""1 XLM""#).unwrap(),
-        nonce: "dGVzdA".to_owned(),
-        expires_at_unix_ms: u64::MAX,
-        envelope_xdr,
+        nonce: Some("dGVzdA".to_owned()),
+        expires_at_unix_ms: Some(u64::MAX),
+        envelope_xdr: Some(envelope_xdr),
         approval_nonce: None,
         approval_attestation: None,
         business_id: None,
@@ -258,9 +258,9 @@ async fn create_account_commit_policy_engine_sees_xdr_destination_not_caller_des
         source: SOURCE_G.to_owned(),
         destination: G_ATTACKER.to_owned(), // attacker-controlled field
         starting_balance: serde_json::from_str(r#""1 XLM""#).unwrap(),
-        nonce: "dGVzdA".to_owned(), // invalid stub → nonce.expired after policy gate
-        expires_at_unix_ms: u64::MAX,
-        envelope_xdr,
+        nonce: Some("dGVzdA".to_owned()), // invalid stub → nonce.expired after policy gate
+        expires_at_unix_ms: Some(u64::MAX),
+        envelope_xdr: Some(envelope_xdr),
         approval_nonce: None,
         approval_attestation: None,
         business_id: None,
@@ -318,9 +318,9 @@ async fn create_account_commit_policy_engine_sees_xdr_balance_not_caller_balance
         source: SOURCE_G.to_owned(),
         destination: G_REAL_DEST.to_owned(),
         starting_balance: serde_json::from_str(r#""999 XLM""#).unwrap(), // attacker-inflated
-        nonce: "dGVzdA".to_owned(), // invalid stub → nonce.expired after policy gate
-        expires_at_unix_ms: u64::MAX,
-        envelope_xdr,
+        nonce: Some("dGVzdA".to_owned()), // invalid stub → nonce.expired after policy gate
+        expires_at_unix_ms: Some(u64::MAX),
+        envelope_xdr: Some(envelope_xdr),
         approval_nonce: None,
         approval_attestation: None,
         business_id: None,

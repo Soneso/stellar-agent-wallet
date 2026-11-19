@@ -271,9 +271,9 @@ async fn t1_classic_trustline_add_two_phase_happy_path_under_minimum_reserve_rul
         .call_stellar_trustline_commit(StellarTrustlineCommitArgs {
             chain_id: TESTNET_CHAIN_ID.to_owned(),
             from: source_g.clone(),
-            nonce,
-            expires_at_unix_ms,
-            envelope_xdr,
+            nonce: Some(nonce),
+            expires_at_unix_ms: Some(expires_at_unix_ms),
+            envelope_xdr: Some(envelope_xdr),
             approval_nonce: None,
             approval_attestation: None,
             business_id: None,

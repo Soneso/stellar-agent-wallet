@@ -145,6 +145,13 @@ operator runs `stellar-agent approve --id <approval_nonce> --profile <name>` as
 the same local user as the server. The commit request then carries that nonce
 and the `approval_attestation` the approval returned.
 
+On mainnet, `stellar_create_account_commit`, `stellar_trustline_commit` and
+`stellar_claim_commit` rebuild the envelope from the intent their preparation
+stored under the business id. They need no `nonce`, `expires_at_unix_ms` or
+`envelope_xdr`, so a commit after a server restart still proceeds. Their other
+arguments must match the preparation's, or the commit refuses with
+`operation.business_id_conflict`.
+
 ## The result envelope
 
 Every tool returns the same JSON envelope, with five success-path exceptions:

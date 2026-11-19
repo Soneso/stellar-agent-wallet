@@ -182,6 +182,7 @@ async fn approval_clock_bounds_refuse_without_consumption() {
                 &server,
                 &outcome,
                 GatedApprovalKind::X402.expectation(proof.expected_subject),
+                None,
                 Some(&nonce),
                 Some(&proof.attestation),
                 None,

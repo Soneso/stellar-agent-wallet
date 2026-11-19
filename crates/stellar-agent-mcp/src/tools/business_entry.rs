@@ -36,8 +36,48 @@ use crate::server::WalletServer;
 #[derive(Debug)]
 pub(crate) struct ClassicOperation {
     business_id: BusinessId,
-    preparation: Preparation,
+    /// The binding the record opens with. A canonical preparation learns its
+    /// payload and decision only after the account reads and the policy
+    /// gate, so [`WalletServer::stage_canonical`] sets it before the open.
+    preparation: Option<Preparation>,
+    /// The base facts a canonical lookup took, which the staged intent
+    /// keeps.
+    canonical: Option<CanonicalBase>,
     resume: Option<OperationHandle>,
+}
+
+/// The source, fee choice and memo of a canonical preparation, with the
+/// digest and signed fee cap of the policy its admission verified.
+#[derive(Debug)]
+struct CanonicalBase {
+    source: String,
+    fee_choice: ClassicFeeChoice,
+    memo: stellar_agent_core::approval::MemoFact,
+    policy_digest: [u8; 32],
+    signed_fee_cap: Option<u32>,
+}
+
+/// The envelope, protocol nonce and nonce expiry a classic commit presents,
+/// each `None` when the call omits it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EnvelopeFields<'a> {
+    pub(crate) envelope_xdr: Option<&'a str>,
+    pub(crate) nonce: Option<&'a str>,
+    pub(crate) expires_at_unix_ms: Option<u64>,
+}
+
+/// How a classic commit proceeds; see [`WalletServer::commit_route`].
+pub(crate) enum CommitRoute<'a, 'g> {
+    /// The id names a canonical record on mainnet.
+    Canonical(&'a crate::server::MainnetWriteGuard<'g>, BusinessId),
+    /// The envelope route, with the fields the call presents.
+    Envelope {
+        envelope_xdr: &'a str,
+        nonce: &'a str,
+        expires_at_unix_ms: u64,
+    },
+    /// The call's whole answer.
+    Answer(CallToolResult),
 }
 
 /// The envelope a classic preparation returns under its business id.
@@ -919,6 +959,93 @@ impl WalletServer {
         self.prepare_entry(business_id, Preparation::Envelope(identity))
     }
 
+    /// Looks up `business_id` before a classic preparation of a lasting
+    /// canonical intent does any work, as [`Self::classic_prepare_entry`]
+    /// does, with the canonical lookup of the request's `facts`.
+    ///
+    /// A record of the same intent resumes or replays. An envelope record of
+    /// the same identity keeps its stored envelope. The returned preparation
+    /// opens a canonical record only after [`Self::stage_canonical`].
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::classic_prepare_entry`].
+    pub(crate) fn canonical_prepare_entry(
+        &self,
+        business_id: BusinessId,
+        consumer: MainnetConsumer,
+        source: &str,
+        fee_choice: ClassicFeeChoice,
+        memo: &stellar_xdr::Memo,
+        facts: IdentityFacts,
+    ) -> Result<ClassicOperation, CallToolResult> {
+        let guard = self.mainnet_write_admission(consumer)?;
+        let memo = operation_entry::memo_fact(memo);
+        let base = IntentBaseFacts::new(
+            self.security_profile(),
+            source,
+            guard.policy,
+            fee_choice,
+            memo.clone(),
+        );
+        let canonical = CanonicalBase {
+            source: source.to_owned(),
+            fee_choice,
+            memo,
+            policy_digest: base.policy_digest,
+            signed_fee_cap: base.signed_fee_cap,
+        };
+        let entry = self.with_operation_recorder(|recorder| {
+            operation_entry::lookup_canonical(recorder, &business_id, base, facts)
+        })?;
+        Self::entered(business_id, None, Some(canonical), entry)
+    }
+
+    /// Completes the canonical binding of `operation` with the full lasting
+    /// `payload` and the preparation's governing `outcome`, whose decision the
+    /// record keeps. A required approval gives the record the outcome's
+    /// lifetime as its waiting interval. A call without an operation, an
+    /// envelope preparation, and a binding already staged stay as they are.
+    ///
+    /// # Errors
+    ///
+    /// The intent constructor's refusals, as a tool result.
+    pub(crate) fn stage_canonical(
+        &self,
+        operation: Option<&mut ClassicOperation>,
+        payload: stellar_agent_core::approval::IntentPayload,
+        outcome: &crate::tools::common::DispatchOutcome,
+    ) -> Result<(), CallToolResult> {
+        let Some(operation) = operation else {
+            return Ok(());
+        };
+        let Some(canonical) = operation.canonical.take() else {
+            return Ok(());
+        };
+        let profile = self.security_profile();
+        let base = IntentBaseFacts {
+            chain_id: profile.chain_id.caip2_str(),
+            source: &canonical.source,
+            policy_digest: canonical.policy_digest,
+            signed_fee_cap: canonical.signed_fee_cap,
+            profile_fee_cap: profile.classic_max_fee_per_op_stroops,
+            fee_choice: canonical.fee_choice,
+            memo: canonical.memo,
+        };
+        let intent =
+            operation_entry::classic_intent(base, payload).map_err(|error| refusal(&error))?;
+        operation.preparation = Some(Preparation::Canonical {
+            intent: Box::new(intent),
+            decision: outcome.audit_decision(),
+            rule_ttl_ms: matches!(
+                outcome,
+                crate::tools::common::DispatchOutcome::RequireApproval(_)
+            )
+            .then(|| outcome.governing_ttl_ms()),
+        });
+        Ok(())
+    }
+
     fn prepare_entry(
         &self,
         business_id: BusinessId,
@@ -926,6 +1053,17 @@ impl WalletServer {
     ) -> Result<ClassicOperation, CallToolResult> {
         let entry =
             self.with_operation_recorder(|recorder| preparation.lookup(recorder, &business_id))?;
+        Self::entered(business_id, Some(preparation), None, entry)
+    }
+
+    /// The preparation `entry` continues under `business_id`; a retained
+    /// operation answers with its replay.
+    fn entered(
+        business_id: BusinessId,
+        preparation: Option<Preparation>,
+        canonical: Option<CanonicalBase>,
+        entry: ClassicEntry,
+    ) -> Result<ClassicOperation, CallToolResult> {
         let resume = match entry {
             ClassicEntry::Build => None,
             ClassicEntry::Resume(handle) => Some(handle),
@@ -934,6 +1072,7 @@ impl WalletServer {
         Ok(ClassicOperation {
             business_id,
             preparation,
+            canonical,
             resume,
         })
     }
@@ -951,7 +1090,8 @@ impl WalletServer {
     ///
     /// The call's whole answer as a tool result: the replay of a retained
     /// operation, `operation.business_id_conflict`, `operation.capacity`,
-    /// and the store's refusals.
+    /// the store's refusals, and an internal error for a canonical
+    /// preparation that [`Self::stage_canonical`] has not staged.
     pub(crate) fn prepared_envelope(
         &self,
         operation: Option<&ClassicOperation>,
@@ -967,6 +1107,15 @@ impl WalletServer {
                 operation_id: None,
                 handle: None,
             });
+        };
+        // An operation without its binding opens no record, so no envelope
+        // returns for it.
+        let Some(preparation) = operation.preparation.as_ref() else {
+            return Err(refusal(&WalletError::Internal(
+                InternalError::UnexpectedState {
+                    detail: "a canonical preparation opens only once staged".to_owned(),
+                },
+            )));
         };
         let stored = |xdr: &str, handle: &OperationHandle| {
             operation_entry::envelope_facts(xdr)
@@ -985,7 +1134,7 @@ impl WalletServer {
             return stored(&candidate, handle);
         }
         let entry = self.with_operation_recorder(|recorder| {
-            operation.preparation.open(
+            preparation.open(
                 recorder,
                 operation.business_id.clone(),
                 tool,
@@ -1098,6 +1247,135 @@ impl WalletServer {
             CommitEntry::Proceed(handle) => Ok(Some(handle)),
             CommitEntry::Replay(view) => Err(replay_result(&view)),
         }
+    }
+
+    /// The route of a classic commit of `tool`, decided before its other
+    /// checks.
+    ///
+    /// Under the mainnet `guard`, an id whose record holds a canonical intent
+    /// takes the canonical route; the read takes no lock and writes nothing.
+    /// Every other commit presenting `fields` takes the envelope route with
+    /// them, unchanged. A commit that omits one of them answers with the fixed
+    /// argument refusal of `tool`, except that on mainnet it first resolves
+    /// its business id: a missing or malformed id and an id without a record
+    /// refuse with their own codes, and a window that cannot be read with the
+    /// refusal the envelope route's policy gate gives for it.
+    pub(crate) fn commit_route<'a, 'g>(
+        &self,
+        tool: &str,
+        guard: Option<&'a crate::server::MainnetWriteGuard<'g>>,
+        chain_id: &str,
+        business_id: Option<&str>,
+        fields: EnvelopeFields<'a>,
+    ) -> CommitRoute<'a, 'g> {
+        use stellar_agent_network::policy_state::{OperationStatus, SlotKind, WindowStoreError};
+        let status = OperationStatus::new(&self.window_store, self.security_profile());
+        if let Some(guard) = guard
+            && let Some(id) = business_id.and_then(|raw| BusinessId::parse(raw).ok())
+            && status
+                .view(&id)
+                .is_ok_and(|view| view.is_some_and(|view| view.slot_kind == SlotKind::Canonical))
+        {
+            return CommitRoute::Canonical(guard, id);
+        }
+        if let EnvelopeFields {
+            envelope_xdr: Some(envelope_xdr),
+            nonce: Some(nonce),
+            expires_at_unix_ms: Some(expires_at_unix_ms),
+        } = fields
+        {
+            return CommitRoute::Envelope {
+                envelope_xdr,
+                nonce,
+                expires_at_unix_ms,
+            };
+        }
+        let omitted = || CommitRoute::Answer(crate::server::argument_refusal(tool));
+        if guard.is_none() {
+            return omitted();
+        }
+        let id = match self.entry_business_id(chain_id, business_id) {
+            Ok(Some(id)) => id,
+            Ok(None) => return omitted(),
+            Err(result) => return CommitRoute::Answer(result),
+        };
+        match status.view(&id) {
+            Ok(Some(_)) => omitted(),
+            Ok(None) => CommitRoute::Answer(refusal(&operation_entry::operation_refusal(
+                WindowStoreError::BusinessIdMismatch,
+            ))),
+            Err(error) => CommitRoute::Answer(crate::tools::common::window_refresh_refusal(&error)),
+        }
+    }
+
+    /// The canonical operation a mainnet commit under `business_id`
+    /// continues, looked up under the recorder, with its stored intent
+    /// validated under `policy`, the commit's verified mainnet policy.
+    ///
+    /// `matches` compares the commit's lasting arguments, of the account
+    /// `source`, with the stored intent. A record that does no further work
+    /// answers with its stored state when its retained intent matches; a
+    /// compacted record keeps no intent and answers as it is.
+    ///
+    /// # Errors
+    ///
+    /// The call's whole answer as a tool result: the replay of a retained
+    /// operation; `operation.business_id_mismatch` for an id whose record is
+    /// gone; `operation.business_id_conflict` for lasting arguments other than
+    /// the stored intent's or a stored intent that does not validate; and the
+    /// store's refusals.
+    pub(crate) fn canonical_commit_target(
+        &self,
+        policy: &VerifiedPolicy,
+        business_id: BusinessId,
+        source: &str,
+        matches: impl FnOnce(&stellar_agent_core::approval::ClassicIntent) -> bool,
+    ) -> Result<crate::tools::canonical_commit::CanonicalTarget, CallToolResult> {
+        use stellar_agent_network::policy_state::{LookupOutcome, WindowStoreError};
+        let (found, retained) = self.with_operation_recorder(|recorder| {
+            let found = recorder
+                .lookup(&business_id)
+                .map_err(operation_entry::operation_refusal)?;
+            let retained = match &found {
+                Some(LookupOutcome::Replay(view)) => recorder
+                    .retained_intent(view.operation_id)
+                    .map_err(operation_entry::operation_refusal)?,
+                _ => None,
+            };
+            Ok((found, retained))
+        })?;
+        let refused = |error| refusal(&operation_entry::operation_refusal(error));
+        let handle = match found {
+            None => return Err(refused(WindowStoreError::BusinessIdMismatch)),
+            Some(LookupOutcome::Replay(view)) => {
+                // A compacted record keeps no intent and answers as it is.
+                let other = retained.is_some_and(|slot| {
+                    !operation_entry::canonical_slot_intent(
+                        &slot,
+                        &operation_entry::CanonicalUse {
+                            chain_id: self.security_profile().chain_id.caip2_str(),
+                            source,
+                            policy_digest: policy.digest(),
+                        },
+                    )
+                    .is_ok_and(|intent| matches(&intent))
+                });
+                if other {
+                    return Err(refused(WindowStoreError::BusinessIdConflict));
+                }
+                return Err(replay_result(&view));
+            }
+            Some(LookupOutcome::Resumable(handle)) => handle,
+        };
+        let intent = operation_entry::preparation_intent(&handle, self.security_profile(), policy)
+            .map_err(|error| refusal(&error))?
+            .filter(|intent| matches(intent))
+            .ok_or_else(|| refused(WindowStoreError::BusinessIdConflict))?;
+        Ok(crate::tools::canonical_commit::CanonicalTarget {
+            business_id,
+            handle,
+            intent,
+        })
     }
 
     /// Opens the x402 record of a payment under its business id, with the
@@ -1394,6 +1672,58 @@ mod tests {
         assert!(
             producer_lock(&path).is_ok(),
             "a released producer lock can be acquired"
+        );
+    }
+
+    /// A canonical preparation that reaches its open without the staged
+    /// binding refuses with an internal error; no envelope returns and no
+    /// record opens under its business id.
+    #[cfg(feature = "mainnet-write")]
+    #[test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    fn an_unstaged_canonical_preparation_fails_closed() {
+        use crate::tools::common::tests::mainnet::{Fixture, wire};
+        use stellar_agent_core::approval::IntentPayload;
+        let f = Fixture::new(|raw| raw);
+        let server = &f.server;
+        let id = BusinessId::parse("canonical-unstaged").unwrap();
+        let operation = server
+            .canonical_prepare_entry(
+                id.clone(),
+                MainnetConsumer::McpCreateAccount,
+                f.envelope.source(),
+                ClassicFeeChoice::Explicit(500),
+                &stellar_xdr::Memo::None,
+                IdentityFacts::Intent(IntentPayload::CreateAccount {
+                    destination: f.envelope.destination().into(),
+                    starting_balance_stroops: 17,
+                }),
+            )
+            .unwrap();
+        let refused = server
+            .prepared_envelope(
+                Some(&operation),
+                OperationTool::StellarCreateAccount,
+                OperationKind::CreateAccount,
+                "candidate".to_owned(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            wire(&refused)["error"]["code"],
+            "internal.unexpected_state",
+            "{}",
+            wire(&refused)
+        );
+        assert!(
+            stellar_agent_network::policy_state::OperationStatus::new(
+                &server.window_store,
+                server.security_profile(),
+            )
+            .view(&id)
+            .unwrap()
+            .is_none(),
+            "no record opens"
         );
     }
 

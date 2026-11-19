@@ -367,8 +367,9 @@ pub(crate) fn cleanup_authorization(
 /// Signs and submits the approved bytes under the same client and consumer.
 ///
 /// Under a mainnet guard with an operation record, the record's next attempt is
-/// committed as `Sending` after the mint and before the signature. Every
-/// refusal before any send ends it as `NotSent`.
+/// committed as `Sending` after the mint and before the signature; a canonical
+/// record's attempt commits in the same write as its mint. Every refusal
+/// before any send ends it as `NotSent`.
 #[allow(
     clippy::too_many_arguments,
     reason = "one call owns the signing and submission lifecycle"
@@ -437,52 +438,78 @@ pub(crate) async fn sign_and_submit_classic(
             prepare_authorized_recorder(record, server.window_store.clone(), authority)
                 .map_err(render)?;
         prepared.restricted = restricted;
-        let authorization = stellar_agent_network::mainnet::resolve::resolve_tx_sign(
-            stellar_agent_network::mainnet::resolve::TxSignRequest {
-                context: guard.context,
-                consumer,
-                unsigned_envelope_xdr: envelope,
-                client,
-                probe_deadline: stellar_agent_network::PRE_SEND_BUDGET,
-                witness,
-                signer: &signer,
-                policy: guard.policy,
-                enablement: guard.enablement,
-                authority,
-                audit,
-                store: &prepared.window,
-                operation: operation.map(stellar_agent_network::operation_entry::next_attempt_link),
-                restriction,
-                sac_payment_context: None,
-            },
-        )
-        .await
-        .map_err(|error| render(error.into()))?;
-        let id = authorization.id();
-        // The attempt is committed before the signature exists: a crash from
-        // here on leaves a `Sending` record that recovery reads.
-        let attempt = match operation {
-            Some(handle) => match stellar_agent_network::operation_entry::begin_classic_attempt(
-                &store,
-                profile,
-                &writer,
-                &request_id,
-                handle,
-                envelope,
-            ) {
-                Ok(attempt) => Some(attempt),
-                Err(error) => {
-                    cleanup_authorization(
-                        &store,
-                        guard.context,
-                        id,
-                        stellar_agent_network::mainnet::resolve::InvalidationStage::SignRefused,
-                    );
-                    return Err(render(error));
-                }
-            },
-            None => None,
+        let request = stellar_agent_network::mainnet::resolve::TxSignRequest {
+            context: guard.context,
+            consumer,
+            unsigned_envelope_xdr: envelope,
+            client,
+            probe_deadline: stellar_agent_network::PRE_SEND_BUDGET,
+            witness,
+            signer: &signer,
+            policy: guard.policy,
+            enablement: guard.enablement,
+            authority,
+            audit,
+            store: &prepared.window,
+            operation: operation.map(stellar_agent_network::operation_entry::next_attempt_link),
+            restriction,
+            sac_payment_context: None,
         };
+        // A canonical operation's authorization is minted inside its attempt's
+        // begin, so no mint, approval consumption or attempt commits alone; a
+        // refusal there leaves nothing to clean up.
+        let canonical = operation.filter(|handle| {
+            handle.intent().kind() == stellar_agent_network::policy_state::SlotKind::Canonical
+        });
+        let (authorization, attempt) = if let Some(handle) = canonical {
+            let pending =
+                stellar_agent_network::mainnet::resolve::resolve_canonical_tx_sign(request)
+                    .await
+                    .map_err(|error| render(error.into()))?;
+            let (attempt, authorization) =
+                stellar_agent_network::operation_entry::begin_canonical_attempt(
+                    &writer,
+                    &request_id,
+                    handle,
+                    envelope,
+                    pending,
+                )
+                .map_err(render)?;
+            (authorization, Some(attempt))
+        } else {
+            let authorization = stellar_agent_network::mainnet::resolve::resolve_tx_sign(request)
+                .await
+                .map_err(|error| render(error.into()))?;
+            let id = authorization.id();
+            // The attempt is committed before the signature exists: a crash from
+            // here on leaves a `Sending` record that recovery reads.
+            let attempt = match operation {
+                Some(handle) => {
+                    match stellar_agent_network::operation_entry::begin_classic_attempt(
+                        &store,
+                        profile,
+                        &writer,
+                        &request_id,
+                        handle,
+                        envelope,
+                    ) {
+                        Ok(attempt) => Some(attempt),
+                        Err(error) => {
+                            cleanup_authorization(
+                            &store,
+                            guard.context,
+                            id,
+                            stellar_agent_network::mainnet::resolve::InvalidationStage::SignRefused,
+                        );
+                            return Err(render(error));
+                        }
+                    }
+                }
+                None => None,
+            };
+            (authorization, attempt)
+        };
+        let id = authorization.id();
         let end_unsent = |code: &str| {
             if let Some(attempt) = attempt {
                 end_unsent_attempt(&store, profile, &writer, &request_id, attempt, code);

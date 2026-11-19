@@ -1038,10 +1038,17 @@ async fn commit_with_another_business_id_refuses_with_mismatch() {
             args["business_id"] = json!(named);
             let result = run.commit_with(args).await;
             assert_eq!(result["ok"], false, "{tool:?} {named}: {result}");
-            assert_eq!(
-                result["error"]["code"], "operation.business_id_mismatch",
-                "{tool:?} {named}: {result}"
-            );
+            // The other operation of a canonical tool stores its own intent.
+            // The commit's arguments name another one, or, for a trustline
+            // commit, which names only the account, the run's approval names
+            // another operation.
+            let code = match tool {
+                _ if named != other => "operation.business_id_mismatch",
+                Tool::Pay => "operation.business_id_mismatch",
+                Tool::Trustline => "policy.approval_required",
+                Tool::CreateAccount | Tool::Claim => "operation.business_id_conflict",
+            };
+            assert_eq!(result["error"]["code"], code, "{tool:?} {named}: {result}");
             assert_eq!(run.control.count("sendTransaction"), 0, "{tool:?}");
             assert_eq!(Effects::of(&run.f), before, "{tool:?} {named}");
         }
@@ -1094,17 +1101,18 @@ async fn assert_foreign_envelope_conflicts(run: &ClassicRun, context: &str) {
     );
 }
 
-/// A commit under the business id of a retained record whose envelope is not
-/// the commit's refuses with `operation.business_id_conflict`, also when no
-/// record binds the commit's own envelope. It replays nothing, and the
-/// refusal comes before the approval is verified or its nonce consumed.
+/// A commit under the business id of a retained envelope record whose
+/// envelope is not the commit's refuses with `operation.business_id_conflict`,
+/// also when no record binds the commit's own envelope. It replays nothing, and
+/// the refusal comes before the approval is verified or its nonce consumed.
 #[tokio::test]
 #[serial_test::serial(keyring)]
 #[serial_test::serial]
 async fn a_commit_of_an_envelope_a_retained_record_does_not_bind_conflicts() {
     for tool in Tool::ALL {
         let id = fresh_business_id();
-        let run = classic_run(tool, &id).await;
+        let run = classic_run(tool, &id).await.envelope_route();
+        let id = run.args["business_id"].as_str().unwrap().to_owned();
         let committed = run.commit().await;
         assert_eq!(committed["ok"], true, "{tool:?}: {committed}");
         assert_eq!(record(&run.f, &id)["state"], "sent_outcome_unknown");
@@ -1112,8 +1120,8 @@ async fn a_commit_of_an_envelope_a_retained_record_does_not_bind_conflicts() {
     }
 }
 
-/// A commit under the business id of a waiting record whose envelope is not
-/// the commit's refuses with `operation.business_id_conflict`, also when no
+/// A commit under the business id of a waiting envelope record whose envelope
+/// is not the commit's refuses with `operation.business_id_conflict`, also when no
 /// record binds the commit's own envelope. The refusal comes before the
 /// approval is verified, the envelope rebuilt or its nonce consumed. The
 /// record's own commit then proceeds.
@@ -1123,7 +1131,8 @@ async fn a_commit_of_an_envelope_a_retained_record_does_not_bind_conflicts() {
 async fn a_commit_of_an_envelope_a_waiting_record_does_not_bind_conflicts() {
     for tool in Tool::ALL {
         let id = fresh_business_id();
-        let run = classic_run(tool, &id).await;
+        let run = classic_run(tool, &id).await.envelope_route();
+        let id = run.args["business_id"].as_str().unwrap().to_owned();
         assert_foreign_envelope_conflicts(&run, &format!("{tool:?}")).await;
         let committed = run.commit().await;
         assert_eq!(committed["ok"], true, "{tool:?}: {committed}");
@@ -1131,10 +1140,12 @@ async fn a_commit_of_an_envelope_a_waiting_record_does_not_bind_conflicts() {
     }
 }
 
-/// A classic run under `business_id` whose commit ended `not_sent` before any
-/// send, with the store's clock held past the terminal retention so the record
-/// reads as a tombstone. The preparation names `fee` when one is given. The
-/// guard holds the clock.
+/// A classic run prepared under `business_id` whose envelope-route commit
+/// ended `not_sent` before any send, with the store's clock held past the
+/// terminal retention so the record reads as a tombstone. The preparation
+/// names `fee` when one is given. The guard holds the clock. A canonical tool's
+/// run commits under the envelope record [`ClassicRun::envelope_route_of`]
+/// opens, whose business id the run's arguments carry.
 async fn compacted_run(
     tool: Tool,
     business_id: &str,
@@ -1156,7 +1167,17 @@ async fn compacted_run(
             }
         },
     )
-    .await;
+    .await
+    // The tombstone's commit refuses an envelope another live record binds,
+    // so the envelope record binds an envelope of its own: the prepared one
+    // with an earlier deadline, which the operation identity leaves out.
+    .envelope_route_of(|tx| {
+        if let stellar_xdr::Preconditions::Time(bounds) = &mut tx.cond {
+            bounds.max_time.0 -= 1;
+        }
+    });
+    let business_id = run.args["business_id"].as_str().unwrap().to_owned();
+    let business_id = business_id.as_str();
     let key = &run.f.server.security_profile().mcp_signer_default;
     let seed = keyring_core::Entry::new(&key.service, &key.account).unwrap();
     let stored = seed.get_password().unwrap();
@@ -1228,6 +1249,7 @@ async fn a_commit_under_a_tombstone_of_another_slot_kind_conflicts() {
     for tool in Tool::ALL {
         let id = fresh_business_id();
         let (run, _clock) = compacted_run(tool, &id, None).await;
+        let id = run.args["business_id"].as_str().unwrap().to_owned();
         let mut audit = NoRows;
         let stored = OperationRecorder::new(
             &run.f.server.window_store,
@@ -1261,6 +1283,7 @@ async fn a_commit_retried_under_its_tombstone_replays() {
     for tool in Tool::ALL {
         let id = fresh_business_id();
         let (run, _clock) = compacted_run(tool, &id, None).await;
+        let id = run.args["business_id"].as_str().unwrap().to_owned();
         let before = Effects::of(&run.f);
         let result = run.commit().await;
         assert_eq!(result["ok"], true, "{tool:?}: {result}");
@@ -1354,11 +1377,11 @@ async fn commit_identities_follow_the_tool_kind() {
                 kind,
                 envelope,
             );
+            // The identities are the request's operation identity, which an
+            // envelope record binds; a canonical record binds its intent
+            // digest instead.
             if Some(kind) == view.kind {
-                assert!(
-                    identities.contains(&view.intent_digest),
-                    "{tool:?} {kind:?}"
-                );
+                assert!(identities.contains(&run.identity), "{tool:?} {kind:?}");
             } else {
                 assert!(identities.is_empty(), "{tool:?} {kind:?}: {identities:?}");
             }

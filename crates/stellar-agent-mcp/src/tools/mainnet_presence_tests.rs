@@ -393,10 +393,6 @@ mod producers {
                     kind(tool),
                     "the record keeps the approval kind"
                 );
-                assert_eq!(
-                    record.subject,
-                    mainnet_consent_subject(&run.entry, &binding()).unwrap()
-                );
                 assert_eq!(record.created_at_ms, run.entry.created_at_unix_ms);
                 assert_eq!(record.waiting_expires_at_ms, run.entry.expires_at_unix_ms);
                 assert_eq!(
@@ -418,13 +414,33 @@ mod producers {
                 assert_eq!(record.operation_id, operation.operation_id);
                 assert_eq!(record.intent_digest, operation.intent_digest);
                 assert_eq!(operation.state, OperationState::AwaitingApproval);
-                let end =
-                    operation_entry::envelope_max_time(run.args["envelope_xdr"].as_str().unwrap())
-                        .unwrap()
-                        * 1000;
+                // The preparation stores the canonical intent: the record
+                // binds its digest and waits for the governing lifetime, with
+                // no envelope end.
+                assert_eq!(
+                    operation.slot_kind,
+                    stellar_agent_network::policy_state::SlotKind::Canonical,
+                    "{tool:?}"
+                );
+                assert_eq!(record.subject, operation.intent_digest, "{tool:?}");
+                assert_eq!(
+                    record.subject_kind,
+                    stellar_agent_core::approval::subject::SubjectKind::IntentDigest,
+                    "{tool:?}"
+                );
+                // The record opens before its approval, both for the
+                // governing lifetime.
+                let waiting = operation.waiting_expires_at_ms.unwrap();
+                assert!(
+                    waiting
+                        >= operation.created_at_ms.unwrap() + u64::try_from(ttl).unwrap() * 1000
+                        && waiting <= record.waiting_expires_at_ms,
+                    "{tool:?}: {waiting} {operation:?} {record:?}"
+                );
                 assert_eq!(
                     operation.waiting_expires_at_ms,
-                    Some(end.min(record.waiting_expires_at_ms))
+                    Some(record.waiting_expires_at_ms),
+                    "{tool:?}: the operation and its approval wait until one deadline"
                 );
                 let window = ledger(&run.f).unwrap();
                 let operations = window["operations"]["records"].as_array().unwrap();
@@ -1114,7 +1130,14 @@ mod producers {
                     );
                 } else {
                     let dropped = case == "dropped";
-                    run.delivery_fixture(dropped, dropped);
+                    // The consent matches the record the tool prepared: an
+                    // envelope approval for a payment, an intent-digest
+                    // approval for the three canonical tools.
+                    if tool == Tool::Pay {
+                        run.delivery_fixture(dropped, dropped);
+                    } else {
+                        run.canonical_delivery_fixture(dropped, dropped);
+                    }
                     let result = run.commit().await;
                     if dropped {
                         assert_eq!(
@@ -2671,8 +2694,9 @@ fn edit_stored(f: &Fixture, nonce: &str, edit: impl FnOnce(&mut toml_edit::Table
 }
 
 /// Replaces the assertion of the consented entry `nonce` with a `forged` one
-/// over the same challenge and origin, and recomputes its version 5 HMAC with
-/// the attestation key; returns that blob.
+/// over the same challenge and origin, and recomputes its version 5 HMAC, or
+/// its version 6 HMAC over the record's intent digest, with the attestation
+/// key; returns that blob.
 fn forge(f: &Fixture, nonce: &str, forged: Forged) -> String {
     edit_stored(f, nonce, |entry| {
         let assertion = &mut entry["mainnet_presence"]["assertion"];
@@ -2693,19 +2717,39 @@ fn forge(f: &Fixture, nonce: &str, forged: Forged) -> String {
     });
     let store = PendingApprovalStore::open(store_path(f)).unwrap();
     let stored = store.get(nonce).unwrap();
-    let Some(AttestationScope::V5(lifetime, approver, receipt)) = stored.attestation_scope() else {
-        panic!("{forged:?}: the rewritten record keeps a version 5 scope")
-    };
-    let blob = URL_SAFE_NO_PAD.encode(compute_attestation_v5(
-        &attestation_key(f),
-        &binding(),
-        nonce,
-        &mainnet_consent_subject(stored, &binding()).unwrap(),
-        &stored.process_uid,
-        &lifetime,
-        approver,
-        receipt,
-    ));
+    let blob = URL_SAFE_NO_PAD.encode(match stored.attestation_scope() {
+        Some(AttestationScope::V5(lifetime, approver, receipt)) => compute_attestation_v5(
+            &attestation_key(f),
+            &binding(),
+            nonce,
+            &mainnet_consent_subject(stored, &binding()).unwrap(),
+            &stored.process_uid,
+            &lifetime,
+            approver,
+            receipt,
+        ),
+        Some(AttestationScope::V6(lifetime, approver, receipt)) => {
+            stellar_agent_core::approval::attestation::compute_attestation_v6(
+                &attestation_key(f),
+                &binding(),
+                nonce,
+                &stellar_agent_network::policy_state::ApprovalStatus::new(
+                    &f.server.window_store,
+                    f.server.security_profile(),
+                )
+                .find_by_nonce(nonce)
+                .unwrap()
+                .unwrap()
+                .record
+                .subject,
+                &stored.process_uid,
+                &lifetime,
+                approver,
+                receipt,
+            )
+        }
+        _ => panic!("{forged:?}: the rewritten record keeps a mainnet scope"),
+    });
     drop(store);
     edit_stored(f, nonce, |entry| {
         entry["attestation_blob_b64"] = toml_edit::value(blob.clone());
@@ -2824,17 +2868,34 @@ fn assert_classic_accepted(context: &str, run: &ClassicRun, result: &serde_json:
 }
 
 /// Asserts the accepted classic commit of the approval `approval_nonce`:
-/// one submission, and that approval spent.
+/// one submission, and that approval's durable record spent. An envelope
+/// approval's inbox entry is tombstoned at the send; a canonical one's stays
+/// owed until the status repair after the operation's outcome.
 fn assert_classic_accepted_for(
     context: &str,
     run: &ClassicRun,
     result: &serde_json::Value,
     approval_nonce: &str,
 ) {
+    use stellar_agent_core::approval::subject::SubjectKind;
     assert_eq!(result["ok"], true, "{context}: {result}");
     assert_eq!(run.control.count("sendTransaction"), 1, "{context}");
-    assert!(
+    let record = stellar_agent_network::policy_state::ApprovalStatus::new(
+        &run.f.server.window_store,
+        run.f.server.security_profile(),
+    )
+    .find_by_nonce(approval_nonce)
+    .unwrap()
+    .unwrap()
+    .record;
+    assert_eq!(
+        record.state,
+        stellar_agent_network::policy_state::ApprovalState::Consumed,
+        "{context}"
+    );
+    assert_eq!(
         is_consumed(&stored_approval(&run.f, approval_nonce).unwrap()),
+        record.subject_kind == SubjectKind::EnvelopeText,
         "{context}"
     );
 }
@@ -4061,6 +4122,7 @@ mod durable_gate {
             &run.f.server,
             outcome,
             GatedApprovalKind::Payment.expectation(approval_subject_classic(xdr)),
+            None,
             &proof,
             operation,
             "stellar_pay_commit",
@@ -4515,6 +4577,7 @@ mod durable_gate {
                 nonce,
                 &presented,
                 &expected,
+                None,
                 server.current_mainnet_policy().unwrap(),
                 Some(run.operation_id()),
             )
@@ -4586,6 +4649,7 @@ mod durable_gate {
                 server,
                 &outcome,
                 GatedApprovalKind::Payment.expectation(approval_subject_classic(xdr)),
+                None,
                 Some(nonce),
                 Some(&blob),
                 operation,

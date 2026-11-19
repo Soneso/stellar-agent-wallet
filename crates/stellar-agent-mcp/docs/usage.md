@@ -139,16 +139,16 @@ percentile, an explicit `classic_base`, or the profile's
 
 ## stellar_create_account_commit
 
-Commit step: verifies the nonce, re-builds the envelope for divergence check, signs via the profile keyring, and submits the transaction. Configured mainnet writes require a feature-enabled build and per-action authorization. Before the nonce is burned, the tool establishes which network the RPC endpoint actually serves and refuses a mismatch, so a wrongly-configured endpoint does not consume the nonce. The submit layer then verifies every signature on the envelope against the network the endpoint reported.
+Commit step: verifies the nonce, re-builds the envelope for divergence check, signs via the profile keyring, and submits the transaction. A mainnet commit of an intent stored under `business_id` needs no `nonce`, `expires_at_unix_ms` or `envelope_xdr`: it rebuilds the envelope from that intent with a fresh sequence and deadline at the fee per operation of the prepared envelope, and verifies no nonce. Configured mainnet writes require a feature-enabled build and per-action authorization. Before the nonce is burned, the tool establishes which network the RPC endpoint actually serves and refuses a mismatch, so a wrongly-configured endpoint does not consume the nonce. The submit layer then verifies every signature on the envelope against the network the endpoint reported.
 
 **Arguments:**
 - `chain_id` (string, required): CAIP-2 chain identifier.
 - `source` (string, required): G-strkey of the funding account.
 - `destination` (string, required): G-strkey of the new account.
 - `starting_balance` (string, required): Amount with unit suffix (same as simulate).
-- `nonce` (string, required): Base64 nonce from the simulate step.
-- `expires_at_unix_ms` (number, required): Expiry from the simulate step.
-- `envelope_xdr` (string, required): Base64 envelope from the simulate step.
+- `nonce` (string): Base64 nonce from the simulate step. Required except on a mainnet commit of an intent stored under `business_id`.
+- `expires_at_unix_ms` (number): Expiry from the simulate step. Required as `nonce` is.
+- `envelope_xdr` (string): Base64 envelope from the simulate step. Required as `nonce` is.
 - `approval_nonce` (string, optional): Approval nonce from the simulate step's `approval` block. Required, with `approval_attestation`, when the simulate step reported that approval is required.
 - `approval_attestation` (string, optional): URL-safe base64 attestation that `stellar-agent approve` writes after the operator confirms.
 
@@ -289,15 +289,15 @@ Simulate step: fetches the claimable-balance entry, renders a typed preview, enf
 
 ## stellar_claim_commit
 
-Commit step for `stellar_claim`: verifies the nonce, re-builds the `ClaimClaimableBalance` envelope for the divergence check, signs via the profile keyring, and submits. Configured mainnet writes require a feature-enabled build and per-action authorization. Carries the same pre-send endpoint-identity probe, signature-binding check and submission record as the other commit tools.
+Commit step for `stellar_claim`: verifies the nonce, re-builds the `ClaimClaimableBalance` envelope for the divergence check, signs via the profile keyring, and submits. A mainnet commit of an intent stored under `business_id` needs no `nonce`, `expires_at_unix_ms` or `envelope_xdr`: it rebuilds the envelope from that intent with a fresh sequence and deadline at the fee per operation of the prepared envelope, and verifies no nonce. Configured mainnet writes require a feature-enabled build and per-action authorization. Carries the same pre-send endpoint-identity probe, signature-binding check and submission record as the other commit tools.
 
 **Arguments:**
 - `chain_id` (string, required): CAIP-2 chain identifier.
 - `balance_id` (string, required): Claimable-balance id (same as simulate).
 - `source_account` (string, optional): G-strkey of the claiming account (same as simulate).
-- `nonce` (string, required): Base64 nonce from the simulate step.
-- `expires_at_unix_ms` (number, required): Expiry from the simulate step.
-- `envelope_xdr` (string, required): Base64 envelope from the simulate step.
+- `nonce` (string): Base64 nonce from the simulate step. Required except on a mainnet commit of an intent stored under `business_id`.
+- `expires_at_unix_ms` (number): Expiry from the simulate step. Required as `nonce` is.
+- `envelope_xdr` (string): Base64 envelope from the simulate step. Required as `nonce` is.
 - `approval_nonce` (string, optional): Approval nonce from the simulate step's `approval` block. Required, with `approval_attestation`, when the simulate step reported that approval is required.
 - `approval_attestation` (string, optional): URL-safe base64 attestation that `stellar-agent approve` writes after the operator confirms.
 
@@ -348,14 +348,14 @@ Simulate step: resolves the asset, fetches the issuer's live flags, runs the cla
 
 ## stellar_trustline_commit
 
-Commit step for `stellar_trustline`: verifies the nonce, re-builds the `ChangeTrust` envelope for the divergence check, signs via the profile keyring, and submits. Configured mainnet writes require a feature-enabled build and per-action authorization. Carries the same pre-send endpoint-identity probe, signature-binding check and submission record as the other commit tools.
+Commit step for `stellar_trustline`: verifies the nonce, re-builds the `ChangeTrust` envelope for the divergence check, signs via the profile keyring, and submits. A mainnet commit of an intent stored under `business_id` needs no `nonce`, `expires_at_unix_ms` or `envelope_xdr`: it rebuilds the envelope from that intent with a fresh sequence and deadline at the fee per operation of the prepared envelope, and verifies no nonce. Configured mainnet writes require a feature-enabled build and per-action authorization. Carries the same pre-send endpoint-identity probe, signature-binding check and submission record as the other commit tools.
 
 **Arguments:**
 - `chain_id` (string, required): CAIP-2 chain identifier (same as simulate).
 - `from` (string, required): G-strkey of the trustline account (same as simulate).
-- `nonce` (string, required): Base64 nonce from the simulate step.
-- `expires_at_unix_ms` (number, required): Expiry from the simulate step.
-- `envelope_xdr` (string, required): Base64 envelope from the simulate step. The commit derives the asset, issuer, and limit from it.
+- `nonce` (string): Base64 nonce from the simulate step. Required except on a mainnet commit of an intent stored under `business_id`.
+- `expires_at_unix_ms` (number): Expiry from the simulate step. Required as `nonce` is.
+- `envelope_xdr` (string): Base64 envelope from the simulate step. Required as `nonce` is. The commit derives the asset, issuer, and limit from it.
 - `approval_nonce` (string, optional): Approval nonce from the simulate step's `approval` block. Required, with `approval_attestation`, when the simulate step reported that approval is required.
 - `approval_attestation` (string, optional): URL-safe base64 attestation that `stellar-agent approve` writes after the operator confirms.
 

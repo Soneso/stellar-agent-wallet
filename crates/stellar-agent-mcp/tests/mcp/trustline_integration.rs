@@ -280,9 +280,9 @@ async fn trustline_commit_full_round_trip_succeeds_with_string_encoded_limit() {
     let commit_args = StellarTrustlineCommitArgs {
         chain_id: simulate_args.chain_id.clone(),
         from: simulate_args.from.clone(),
-        nonce,
-        expires_at_unix_ms,
-        envelope_xdr,
+        nonce: Some(nonce),
+        expires_at_unix_ms: Some(expires_at_unix_ms),
+        envelope_xdr: Some(envelope_xdr),
         approval_nonce: None,
         approval_attestation: None,
         business_id: None,
@@ -569,9 +569,9 @@ async fn commit_rejects_invalid_from_strkey_before_any_rpc_call() {
     let commit_args = StellarTrustlineCommitArgs {
         chain_id: "stellar:testnet".to_owned(),
         from: "not-a-valid-g-strkey".to_owned(),
-        nonce,
-        expires_at_unix_ms,
-        envelope_xdr,
+        nonce: Some(nonce),
+        expires_at_unix_ms: Some(expires_at_unix_ms),
+        envelope_xdr: Some(envelope_xdr),
         approval_nonce: None,
         approval_attestation: None,
         business_id: None,
@@ -685,9 +685,9 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
     let commit_args = StellarTrustlineCommitArgs {
         chain_id: "stellar:testnet".to_owned(),
         from: source_g,
-        nonce,
-        expires_at_unix_ms,
-        envelope_xdr,
+        nonce: Some(nonce),
+        expires_at_unix_ms: Some(expires_at_unix_ms),
+        envelope_xdr: Some(envelope_xdr),
         approval_nonce: None,
         approval_attestation: None,
         business_id: None,
@@ -787,12 +787,14 @@ async fn prepare_and_commit_send_the_primary_credential() {
     let commit_args = StellarTrustlineCommitArgs {
         chain_id: "stellar:testnet".to_owned(),
         from: source_g,
-        nonce: sim_data["nonce"].as_str().expect("nonce").to_owned(),
-        expires_at_unix_ms: sim_data["expires_at_unix_ms"].as_u64().expect("expiry"),
-        envelope_xdr: sim_data["envelope_xdr"]
-            .as_str()
-            .expect("envelope")
-            .to_owned(),
+        nonce: Some(sim_data["nonce"].as_str().expect("nonce").to_owned()),
+        expires_at_unix_ms: Some(sim_data["expires_at_unix_ms"].as_u64().expect("expiry")),
+        envelope_xdr: Some(
+            sim_data["envelope_xdr"]
+                .as_str()
+                .expect("envelope")
+                .to_owned(),
+        ),
         approval_nonce: None,
         approval_attestation: None,
         business_id: None,
@@ -992,9 +994,9 @@ async fn trustline_commit_counts_the_opened_reserve() {
     let commit_args = |data: &serde_json::Value, from: &str| StellarTrustlineCommitArgs {
         chain_id: "stellar:testnet".to_owned(),
         from: from.to_owned(),
-        nonce: data["nonce"].as_str().unwrap().to_owned(),
-        expires_at_unix_ms: data["expires_at_unix_ms"].as_u64().unwrap(),
-        envelope_xdr: data["envelope_xdr"].as_str().unwrap().to_owned(),
+        nonce: Some(data["nonce"].as_str().unwrap().to_owned()),
+        expires_at_unix_ms: Some(data["expires_at_unix_ms"].as_u64().unwrap()),
+        envelope_xdr: Some(data["envelope_xdr"].as_str().unwrap().to_owned()),
         approval_nonce: None,
         approval_attestation: None,
         business_id: None,
@@ -1135,9 +1137,9 @@ async fn remove_held_trustline(seed: [u8; 32], spelling: &str) {
         .call_stellar_trustline_commit(StellarTrustlineCommitArgs {
             chain_id: "stellar:testnet".to_owned(),
             from: source.clone(),
-            nonce: data["nonce"].as_str().unwrap().to_owned(),
-            expires_at_unix_ms: data["expires_at_unix_ms"].as_u64().unwrap(),
-            envelope_xdr: data["envelope_xdr"].as_str().unwrap().to_owned(),
+            nonce: Some(data["nonce"].as_str().unwrap().to_owned()),
+            expires_at_unix_ms: Some(data["expires_at_unix_ms"].as_u64().unwrap()),
+            envelope_xdr: Some(data["envelope_xdr"].as_str().unwrap().to_owned()),
             approval_nonce: None,
             approval_attestation: None,
             business_id: None,
@@ -1262,9 +1264,9 @@ async fn trustline_commit_fee_above_cap_refuses() {
         .call_stellar_trustline_commit(StellarTrustlineCommitArgs {
             chain_id: "stellar:testnet".to_owned(),
             from: source_g,
-            nonce: data["nonce"].as_str().unwrap().to_owned(),
-            expires_at_unix_ms: data["expires_at_unix_ms"].as_u64().unwrap(),
-            envelope_xdr: data["envelope_xdr"].as_str().unwrap().to_owned(),
+            nonce: Some(data["nonce"].as_str().unwrap().to_owned()),
+            expires_at_unix_ms: Some(data["expires_at_unix_ms"].as_u64().unwrap()),
+            envelope_xdr: Some(data["envelope_xdr"].as_str().unwrap().to_owned()),
             approval_nonce: None,
             approval_attestation: None,
             business_id: None,
@@ -1588,9 +1590,9 @@ async fn witness_trustline_case(case: TrustlineCase, expected: &str) {
     let commit = StellarTrustlineCommitArgs {
         chain_id: "stellar:testnet".to_owned(),
         from: source,
-        nonce: data["nonce"].as_str().unwrap().to_owned(),
-        expires_at_unix_ms: data["expires_at_unix_ms"].as_u64().unwrap(),
-        envelope_xdr: data["envelope_xdr"].as_str().unwrap().to_owned(),
+        nonce: Some(data["nonce"].as_str().unwrap().to_owned()),
+        expires_at_unix_ms: Some(data["expires_at_unix_ms"].as_u64().unwrap()),
+        envelope_xdr: Some(data["envelope_xdr"].as_str().unwrap().to_owned()),
         approval_nonce: None,
         approval_attestation: None,
         business_id: None,
