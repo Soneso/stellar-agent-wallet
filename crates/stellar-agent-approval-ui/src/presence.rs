@@ -370,6 +370,9 @@ impl<G: ConsentSessionGate> PresenceState<G> {
             Mode::OneShot { intent, .. } => intent.as_deref().cloned(),
         };
         let store = self.open_store()?;
+        // The installed inbox lookup already refuses an intent of another
+        // chain or policy; the chain and policy clause holds the same for a
+        // one-shot intent, which no lookup checked.
         if let Some(entry) = store.get(nonce)
             && ((entry.subject_kind
                 == stellar_agent_core::approval::subject::SubjectKind::IntentDigest)
@@ -1062,7 +1065,8 @@ pub(crate) fn detail<G: ConsentSessionGate>(
 }
 
 /// The detail page of `nonce`, showing `intent` in place of the envelope
-/// summary when one is given.
+/// summary when one is given. An absent `intent` falls back to the
+/// authenticated stored intent the snapshot reads.
 ///
 /// The island carries the consent view digest of the entry with that
 /// intent, [`mainnet_intent_consent_view_digest`], so the page stands for

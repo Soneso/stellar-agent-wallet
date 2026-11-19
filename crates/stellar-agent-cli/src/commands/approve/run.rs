@@ -440,7 +440,7 @@ struct MainnetApproved {
 /// The summary is rendered and the entry checked as on testnet, the kind
 /// must have a mainnet consent path, and the pending store is released
 /// before the presence wait. After it the store is reopened, the current
-/// policy is read again without advancing its pin, and the version 5 consent
+/// policy is read under the held admission, and the version 5 or 6 consent
 /// is recorded; the attester rechecks the entry, the policy and the
 /// ceremony's deadlines under the store lock.
 /// A linked value approval releases the inbox and commits durable consent
@@ -482,7 +482,10 @@ async fn approve_mainnet(
     let intent =
         crate::common::mainnet_presence::stored_intent(entry, &context.profile_name, &current)?;
     if let Some(intent) = intent.as_ref() {
-        let _ = crate::common::intent_summary::write(intent, &mut std::io::stderr());
+        let mut rendered = Vec::new();
+        if crate::common::intent_summary::write(intent, &mut rendered).is_ok() {
+            let _ = crate::common::mainnet_confirm::show_summary(&rendered);
+        }
     } else {
         render_summary(entry, context);
     }
@@ -718,12 +721,10 @@ fn recover_durable_consent(
     let Some(entry) = store.get(nonce).cloned() else {
         return Ok(store);
     };
-    if !profile.chain_id.is_mainnet() {
-        return Ok(store);
-    }
     let window = PersistedWindowStore::for_profile(&context.profile_name);
     // Keep legacy non-value, unattested and already-completed entries outside
-    // the ceremony. An envelope value entry needs its record even unattested.
+    // the ceremony. An envelope value entry needs its record even unattested;
+    // off mainnet no entry has a record.
     if entry.subject_kind == stellar_agent_core::approval::subject::SubjectKind::EnvelopeText {
         let durable = durable_approval(&window, profile, context, &entry, None)?;
         if entry.attestation_blob_b64.is_none()

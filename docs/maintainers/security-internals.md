@@ -2175,9 +2175,11 @@ build reads are execution facts. The lookup runs after the argument and
 endpoint refusals and before any build, and in the CLI before the
 confirmation ceremony. A claim looks its id up before the balance read and
 the predicate check. A retained record answers with its stored state and a
-waiting record yields its stored envelope. An unknown id opens an `Envelope`
-slot over the unsigned envelope just built, with the intent digest beside its
-hash.
+waiting envelope record yields its stored envelope. An unknown id of an MCP
+tool opens an `Envelope` slot over the unsigned envelope just built, with the
+intent digest beside its hash. An unknown id of a CLI verb opens a `Canonical`
+slot with the full intent, the policy decision and the unsigned envelope just
+built; a claim's intent takes the asset and amount of the balance it read.
 
 A classic commit reads its record before it verifies the approval, rebuilds
 the envelope or consumes the nonce. One window read yields the record under
@@ -2463,7 +2465,15 @@ That precondition renders `simulation.divergence` from the resolver error and fr
 Under a canonical preparation, `lookup_canonical` answers an envelope record of the same identity as `lookup_classic` does, with its stored envelope or its replay.
 The record stays an envelope record, so a rebuilt envelope with a fresh sequence refuses at its attempt with `operation.business_id_conflict`.
 The x402 parent retains its separate meaning. Malformed canonical content refuses resolution while lifecycle operations remain available.
-Current commands create envelope slots; canonical slot creation is not exposed by the command or tool surfaces.
+The CLI verbs `pay`, `claim`, `trustline` and sponsored `accounts create` create canonical slots; the MCP tools create envelope slots.
+A CLI run of a canonical record shows the stored intent at the confirmation, whose challenge is the stored envelope.
+Before the ceremony, the confirmation requires the durable record's subject to equal the stored intent digest and the entry's challenge subject to equal the stored envelope's subject.
+After the confirmation it rebuilds the envelope with `rebuild_canonical`: the readiness check, the source account's current sequence, the fee the caller's choice gives now, a fresh deadline, and the oracle check bound to the rebuilt envelope.
+The deadline is the earlier of 120 seconds after the rebuild and the last whole second before the end of the authority: an approval's execution end, or a policy decision's governing end. The authority holds strictly before its end, and a ledger whose close time equals the deadline still includes the transaction, so the deadline lies strictly before the end.
+It then resolves through `resolve_canonical_tx_sign` and begins through `begin_canonical_attempt`, so a refused begin leaves no authorization to invalidate.
+A run of an envelope record signs its stored envelope through `resolve_tx_sign` and the linked begin, and is never rebuilt.
+A CLI divergence renders `simulation.divergence` with the sentence that the signature was withheld and nothing was sent.
+A published consent of a canonical record completes as a consent to the stored intent, on `approve --id` and at the confirmation.
 
 The shared staging helpers can open canonical records with the full intent digest
 and the prepare audit decision. A retained claim retry uses its stored asset and

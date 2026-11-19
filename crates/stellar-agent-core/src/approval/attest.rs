@@ -1239,11 +1239,12 @@ pub fn attest_mainnet_confirmation(
 /// # Errors
 /// Returns the refusals of [`attest_mainnet_confirmation`].
 /// Direct rows also refuse if their tip anchor cannot be made current.
+#[cfg(test)]
 #[allow(
     clippy::too_many_arguments,
     reason = "the store, entry, key, binding, sink, tool, policy and proof are each explicit"
 )]
-pub fn attest_mainnet_confirmation_with_row(
+pub(crate) fn attest_mainnet_confirmation_with_row(
     store: &mut PendingApprovalStore,
     entry: &PendingApproval,
     key_bytes: &[u8],
@@ -1262,7 +1263,8 @@ pub fn attest_mainnet_confirmation_with_row(
 /// The caller acquires admission before opening the pending store.
 ///
 /// # Errors
-/// Returns the refusals of [`attest_mainnet_confirmation_with_row`].
+/// Returns the refusals of [`attest_mainnet_confirmation`]. Direct rows also
+/// refuse if their tip anchor cannot be made current.
 #[allow(
     clippy::too_many_arguments,
     reason = "the attester inputs and held admission are explicit"
