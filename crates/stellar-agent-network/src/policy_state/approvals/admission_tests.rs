@@ -971,6 +971,9 @@ fn publication_protocol_documents_commit_points() {
         "An integrated request is presented only after its committed pending record holds a reservation.",
         "Admission requires a readiness proof of the whole owner scope from stored state, then explicit owner initialization, then the reservation.",
         "It refuses with `live grant without delivery facts` while the verified window holds a live consent of an enforced kind without delivery facts.",
+        "Readiness refuses with `owner scope shared or unreadable` when a sibling profile names an audit scope coordinate, or a profile file or the profiles directory cannot be read.",
+        "Such a grant ends at its execution expiry against the greater of wall time and the evidence floor, or at the end of its operation.",
+        "Readiness takes no window lock and writes nothing to the window, so a concurrent older binary on the same store can still record such a grant.",
         "Any other pin keeps refusing admission with `unresolved migration pin`, and no command clears it, so a migrated scope with an unmatched pin stays blocked.",
         "A grant held only in the inbox, without a window record, is outside the proof and refuses at use for an enforced kind.",
         "Integrated consent succeeds only after the window commit holds the receipt, the authenticated sink, and the exact queued reference.",
@@ -983,6 +986,7 @@ fn publication_protocol_documents_commit_points() {
         "When enabled, the challenge precheck reacquires the record's reservation before either challenge form is issued.",
         "Every inbox response that shows a value attestation verifies the handoff under policy admission and shows it only after the window commit.",
         "When enabled, an MCP producer opens or selects the committed record and reserves before it stores the inbox entry or returns an approval block.",
+        "The x402 payment capability is enabled, so both x402 tools reserve, publish, and consume through the integrated route.",
         "A retry reacquires the committed record's slot before it returns the linked approval block, so a full scope still answers the retry.",
         "A crash between the reservation and the inbox insert leaves a reserved record without an entry, and a retry refuses with `approval.not_found`.",
     ] {
@@ -991,12 +995,16 @@ fn publication_protocol_documents_commit_points() {
     }
     for rule in [
         "reserve before ceremony",
-        "All four production kind capabilities are disabled",
+        "All four production kind capabilities are enabled",
         "stellar-agent-consent-publication:v1",
     ] {
         assert!(recovery.contains(rule), "{rule}");
     }
     assert!(internals.contains("in the replacement that stores the blob and receipt"));
+    assert!(
+        internals
+            .contains("capabilities are enabled: payment, claim, trustline, and x402 payment.")
+    );
     assert!(internals.contains("takes the sink only from a verified"));
     assert!(internals.contains("reserves before its challenge and again before its row"));
     assert!(

@@ -517,6 +517,105 @@ mod delivered {
     }
 }
 
+/// The CLI producer and consumer rows of the activation matrix: each listed
+/// kind's value verb runs under the compiled kind list, with the fixture's
+/// opt-outs dropped and no enforcement guard. The confirmation publishes
+/// direct delivery and the command signs and sends once. When the evidence
+/// image becomes unusable before the consumer's check, the command refuses
+/// with the check's refusal before the signer and sends nothing. Payment
+/// runs both of its verbs. X402 payment has no CLI value verb; the MCP
+/// matrix runs both x402 tools.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn activation_matrix_consumer_rows() {
+    use crate::common::unenforced_fixture::listed_kinds;
+    use stellar_agent_core::approval::witness::ApprovedKind;
+    use stellar_agent_network::policy_state::approvals::delivery_enforced;
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+    for kind in listed_kinds() {
+        let rows: &[(Verb, [&str; 2])] = match kind {
+            ApprovedKind::Payment => &[
+                (Verb::Pay, ["matrix-pay-ok", "matrix-pay-unusable"]),
+                (Verb::Create, ["matrix-create-ok", "matrix-create-unusable"]),
+            ],
+            ApprovedKind::Claim => &[(Verb::Claim, ["matrix-claim-ok", "matrix-claim-unusable"])],
+            ApprovedKind::Trustline => &[(
+                Verb::Trustline,
+                ["matrix-trust-ok", "matrix-trust-unusable"],
+            )],
+            ApprovedKind::X402Payment => &[],
+            other => panic!("no value verb row for {other:?}"),
+        };
+        for (unusable, name, verb) in rows.iter().flat_map(|&(verb, names)| {
+            [false, true]
+                .into_iter()
+                .zip(names)
+                .map(move |(unusable, name)| (unusable, name, verb))
+        }) {
+            let mut fixture = verb.spec(name).build().await;
+            fixture.enforce_listed();
+            assert!(
+                delivery_enforced(fixture.name, kind),
+                "{kind:?} {name}: the compiled kind list enforces"
+            );
+            let _hook = unusable.then(|| {
+                crate::common::mainnet_write::consent_test::on_witness(
+                    fixture.name,
+                    |profile, _| {
+                        for suffix in [".outbox.evidence.0", ".outbox.evidence.1"] {
+                            let mut path = profile.audit_log_path.as_os_str().to_os_string();
+                            path.push(suffix);
+                            std::fs::write(std::path::PathBuf::from(path), b"invalid image")
+                                .unwrap();
+                        }
+                    },
+                )
+            });
+            let before = signer_resolutions_on_this_thread();
+            let (code, envelope) = verb.run(&fixture).await;
+            if unusable {
+                assert_eq!(code, 1, "{kind:?} {name}: {envelope}");
+                assert_eq!(
+                    envelope["error"]["code"], "audit.outbox_evidence_unusable",
+                    "{kind:?} {name}: the consumer's delivery check refuses: {envelope}"
+                );
+                assert_eq!(
+                    signer_resolutions_on_this_thread(),
+                    before,
+                    "{kind:?} {name}: delivery precedes the signer"
+                );
+                assert!(
+                    fixture.sent_envelopes().await.is_empty(),
+                    "{kind:?} {name}: nothing is sent"
+                );
+            } else {
+                assert_eq!(code, 0, "{kind:?} {name}: {envelope}");
+                assert_eq!(
+                    fixture.sent_envelopes().await.len(),
+                    1,
+                    "{kind:?} {name}: one send"
+                );
+                let window =
+                    stellar_agent_network::policy_state::PersistedWindowStore::for_profile(name);
+                let record = stellar_agent_network::policy_state::ApprovalStatus::new(
+                    &window,
+                    &fixture.profile(),
+                )
+                .find_by_nonce(&fixture.ceremonies()[0].nonce)
+                .unwrap()
+                .unwrap()
+                .record;
+                assert_eq!(
+                    record.consent.unwrap().delivery,
+                    Some(stellar_agent_network::policy_state::approvals::ConsentDeliveryV1::direct_anchored(record.id)),
+                    "{kind:?} {name}: the confirmation publishes direct delivery"
+                );
+            }
+        }
+    }
+}
+
 /// Asserts the governing policy facts on the pending value row.
 pub(crate) fn assert_provenance(fixture: &MainnetFixture, approval: bool, index: u32) {
     let raw = std::fs::read_to_string(fixture.policy_path()).unwrap();
@@ -861,25 +960,25 @@ mod publication {
         let names = [
             [
                 "publication-pay-full",
-                "publication-pay-inventory",
+                "publication-pay-unready",
                 "publication-pay-enabled",
                 "publication-pay-disabled",
             ],
             [
                 "publication-claim-full",
-                "publication-claim-inventory",
+                "publication-claim-unready",
                 "publication-claim-enabled",
                 "publication-claim-disabled",
             ],
             [
                 "publication-create-full",
-                "publication-create-inventory",
+                "publication-create-unready",
                 "publication-create-enabled",
                 "publication-create-disabled",
             ],
             [
                 "publication-trust-full",
-                "publication-trust-inventory",
+                "publication-trust-unready",
                 "publication-trust-enabled",
                 "publication-trust-disabled",
             ],

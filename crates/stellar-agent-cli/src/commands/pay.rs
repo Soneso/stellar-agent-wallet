@@ -8188,6 +8188,50 @@ pub(crate) mod tests {
             assert!(submitted.is_empty(), "{submitted:?}");
         }
 
+        /// `approval_above` on mainnet: under an allow rule with a 1 XLM
+        /// threshold, a 1 XLM payment sends without a confirmation, and a
+        /// 1.5 XLM payment escalates to one confirmation, records a
+        /// require-approval pending row, and sends.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn approval_above_escalates_to_the_confirmation() {
+            let fixture = Spec::new("mainnet-pay-approval-above")
+                .rules(vec![pay_rule(
+                    "allow",
+                    "{ kind = \"approval_above\", asset = \"native\", max_stroops = 10000000 },\n",
+                )])
+                .build()
+                .await;
+
+            let at_threshold = run(&fixture, &memo_args(&fixture)).await;
+            assert_eq!(at_threshold.code, 0, "{}", at_threshold.envelope);
+            assert!(fixture.ceremonies().is_empty(), "no confirmation at 1 XLM");
+            let allowed = fixture.audit_rows("value_action_pending");
+            assert_eq!(allowed.len(), 1, "one pending row at 1 XLM: {allowed:?}");
+            assert!(
+                allowed.iter().all(|row| row["policy_decision"] == "allow"),
+                "{allowed:?}"
+            );
+
+            let mut above = memo_args(&fixture);
+            above.amount = "1.5 XLM".to_owned();
+            let escalated = run(&fixture, &above).await;
+            assert_eq!(escalated.code, 0, "{}", escalated.envelope);
+            assert_eq!(
+                fixture.ceremonies().len(),
+                1,
+                "one confirmation above 1 XLM"
+            );
+            let pending = fixture.audit_rows("value_action_pending");
+            assert_eq!(pending.len(), allowed.len() + 1, "{pending:?}");
+            assert_eq!(
+                pending[allowed.len()]["policy_decision"],
+                "require_approval"
+            );
+            assert_eq!(fixture.audit_rows("approval_attested").len(), 1);
+            assert_eq!(fixture.sent_envelopes().await.len(), 2);
+        }
+
         /// A confirmation beyond the envelope deadline refuses before signing.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial(mainnet_clock)]

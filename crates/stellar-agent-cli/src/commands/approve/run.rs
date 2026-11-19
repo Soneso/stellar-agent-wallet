@@ -1740,12 +1740,17 @@ mod tests {
             }
         }
 
-        fn fixture(name: &str) -> MainnetConsentFixture {
+        /// A consent fixture with an audit chain key, opted out of every
+        /// kind's enforcement.
+        fn fixture(
+            name: &str,
+        ) -> crate::common::unenforced_fixture::Unenforced<MainnetConsentFixture> {
             let fixture = MainnetConsentFixture::new(name);
             let key = &fixture.profile().audit_log_hash_chain_key_id;
             stellar_agent_network::keyring::rotate_keyring_secret_32(&key.service, &key.account)
                 .unwrap();
-            fixture
+            let name = fixture.name().to_owned();
+            crate::common::unenforced_fixture::Unenforced::new(fixture, &name)
         }
 
         fn record(fixture: &MainnetConsentFixture, nonce: &str) -> WireApproval {
@@ -3057,6 +3062,12 @@ mod tests {
         let fixture = stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture::new(
             "browser-refusal",
         );
+        // The uninitialized log serves the browser refusal, not a published
+        // consent.
+        let _unpublished =
+            stellar_agent_network::policy_state::approvals::ConsentEvidenceDisableGuard::every_kind(
+                fixture.name(),
+            );
         let entry = fixture.payment(DEFAULT_TTL_MS);
         park(&fixture, &entry);
         let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();

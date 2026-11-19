@@ -181,8 +181,10 @@ fn readiness_enumerates_the_scope() {
 /// operation, or its execution expiry at the greater of wall time and the
 /// evidence floor ends it. A reversed clock keeps it live. The record keeps
 /// its view and revocation. A live Claim consent without delivery facts
-/// leaves the scope ready while only Payment enforces. A window that fails
-/// authentication refuses.
+/// leaves the scope ready while a test opt-out leaves Claim unenforced, and
+/// refuses once Claim enforces. On the compiled kind list, a live Claim
+/// consent without delivery facts refuses admission of a Payment request in
+/// its scope and writes nothing. A window that fails authentication refuses.
 #[test]
 #[serial]
 fn migration_readiness_preserves_all_live_grants() {
@@ -292,6 +294,7 @@ fn migration_readiness_preserves_all_live_grants() {
         let legacy = fx.view().record;
         assert_eq!(legacy.kind, ApprovedKind::Claim);
         assert_eq!(legacy.consent.unwrap().delivery, None);
+        let _claim_opt_out = ConsentEvidenceDisableGuard::new(&name, ApprovedKind::Claim);
         let (window, evidence) = (fx.bytes(), outbox.evidence().unwrap());
         for _ in 0..2 {
             ready(&fx, &outbox).expect("an unenforced Claim grant leaves the scope ready");
@@ -299,6 +302,33 @@ fn migration_readiness_preserves_all_live_grants() {
         assert_eq!((fx.bytes(), outbox.evidence().unwrap()), (window, evidence));
         let _claim = ConsentEvidenceEnforcementGuard::new(&name, ApprovedKind::Claim);
         assert_unready(ready(&fx, &outbox), "live grant without delivery facts");
+    }
+
+    {
+        let mut fx = Fx::new(300_000);
+        fx.unpublished = None;
+        let name = fx.fixture.name().to_owned();
+        assert!(
+            delivery_enforced(&name, ApprovedKind::Claim)
+                && delivery_enforced(&name, ApprovedKind::Payment),
+            "the compiled kind list decides both kinds"
+        );
+        let (mut writer, outbox) = keyed_evidence(fx.fixture.profile(), &name);
+        fx.open();
+        fx.consent();
+        fx.edit(|wire| wire.approvals.as_mut().unwrap().records[0].kind = ApprovedKind::Claim);
+        let legacy = fx.view().record;
+        assert_eq!(legacy.kind, ApprovedKind::Claim);
+        assert_eq!(legacy.consent.unwrap().delivery, None);
+        assert_eq!(fx.facts.kind, ApprovedKind::Payment, "a payment request");
+        let (window, evidence) = (fx.bytes(), outbox.evidence().unwrap());
+        for _ in 0..2 {
+            assert_unready(
+                admit(&fx, &mut writer, &outbox),
+                "live grant without delivery facts",
+            );
+        }
+        assert_eq!((fx.bytes(), outbox.evidence().unwrap()), (window, evidence));
     }
 
     let fx = Fx::new(300_000);
@@ -367,13 +397,23 @@ fn fill(fx: &Fx, free: usize) {
 /// deadline, occupancy unchanged, and the reservation proceeds; a repeat
 /// returns the same reservation. A pin of another digest, an identity that
 /// holds other evidence, an ended grant, and a grant of a kind that does not
-/// enforce adopt nothing, and the pin keeps refusing admission.
+/// enforce adopt nothing, and the pin keeps refusing admission. Every kind is
+/// listed, so the unenforced grant is a Claim grant under a test opt-out. A
+/// live grant whose conservative deadline overflows refuses with `expiry
+/// overflow` and adopts nothing.
 #[test]
 #[serial]
 fn exact_pin_adoption_at_capacity() {
     let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
-    for case in ["exact", "unmatched", "conflict", "ended", "unenforced"] {
+    for case in [
+        "exact",
+        "unmatched",
+        "conflict",
+        "ended",
+        "unenforced",
+        "overflow",
+    ] {
         let mut fx = Fx::new(300_000);
         let name = fx.fixture.name().to_owned();
         let _enabled = ConsentEvidenceEnforcementGuard::new(&name, ApprovedKind::Payment);
@@ -401,12 +441,31 @@ fn exact_pin_adoption_at_capacity() {
                 .reserve_evidence(fx.id(), deadline + 1, fx.witness.consent_at_ms())
                 .unwrap();
         }
-        if case == "unenforced" {
+        let _claim_opt_out = (case == "unenforced").then(|| {
             fx.edit(|wire| wire.approvals.as_mut().unwrap().records[0].kind = ApprovedKind::Claim);
-        }
+            ConsentEvidenceDisableGuard::new(&name, ApprovedKind::Claim)
+        });
         if case == "ended" {
             let consent = fx.view().record.consent.unwrap();
             fx.clock.set(consent.execution_expires_at_ms);
+        }
+        if case == "overflow" {
+            // Consistent waiting and consent clocks that end at the top of
+            // the clock, so only the conservative deadline overflows.
+            fx.edit(|wire| {
+                let record = &mut wire.approvals.as_mut().unwrap().records[0];
+                record.created_at_ms = u64::MAX - record.rule_ttl_ms;
+                record.waiting_expires_at_ms = u64::MAX;
+                let consent = record.consent.as_mut().unwrap();
+                let at = record.created_at_ms;
+                consent.consent_at_ms = at;
+                consent.execution_expires_at_ms = u64::MAX;
+                let payload = consent.payload.as_mut().unwrap();
+                let mut receipt = serde_json::to_value(&payload.receipt).unwrap();
+                receipt["verified_at_unix_ms"] = serde_json::json!(at);
+                payload.receipt = serde_json::from_value(receipt).unwrap();
+                consent.receipt_sha256 = payload.receipt.digest().unwrap();
+            });
         }
         fill(
             &fx,
@@ -441,10 +500,10 @@ fn exact_pin_adoption_at_capacity() {
             let before = outbox.evidence().unwrap();
             let error = reacquire().expect_err(case);
             assert_eq!(error.code(), "audit.outbox_evidence_unusable", "{case}");
-            let reason = if case == "conflict" {
-                "conflicting reservation"
-            } else {
-                "unresolved migration pin"
+            let reason = match case {
+                "conflict" => "conflicting reservation",
+                "overflow" => "expiry overflow",
+                _ => "unresolved migration pin",
             };
             assert!(error.to_string().contains(reason), "{case}: {error}");
             assert_eq!(outbox.evidence().unwrap(), before, "{case}: the pin stays");

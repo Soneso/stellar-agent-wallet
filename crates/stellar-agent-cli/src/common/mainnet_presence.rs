@@ -910,6 +910,12 @@ mod tests {
         use clap::Parser as _;
 
         let fixture = MainnetConsentFixture::new(name);
+        // The uninitialized log serves the operator-open flag, not a
+        // published consent.
+        let _unpublished =
+            stellar_agent_network::policy_state::approvals::ConsentEvidenceDisableGuard::every_kind(
+                name,
+            );
         let key = &fixture.profile().audit_log_hash_chain_key_id;
         keyring_core::Entry::new(&key.service, &key.account)
             .unwrap()

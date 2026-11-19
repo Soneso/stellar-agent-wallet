@@ -985,9 +985,10 @@ pub(crate) fn evaluate_value_moving_policy(
 /// using the caller-supplied `value_class`. The CLI derives this descriptor
 /// from the same parsed requirements it signs. Returns `Ok(())` on
 /// [`Decision::Allow`]; returns `Err(envelope)` for every other outcome,
-/// mirroring the `evaluate_value_moving_policy` refusal-message shapes
-/// verbatim so a V1-engine deny produces the identical wire code the MCP
-/// twin returns for the same rule.
+/// mirroring the `evaluate_value_moving_policy` deny messages verbatim so a
+/// V1-engine deny produces the identical wire code the MCP twin returns for
+/// the same rule. The approval-required message names only the requirement,
+/// because the MCP server has no approval path for `trade` or `vault`.
 ///
 /// Callers render the envelope with their own `print_error` (JSON vs table)
 /// and exit `1`.
@@ -1041,9 +1042,7 @@ pub(crate) fn evaluate_value_moving_policy_with_value(
             )),
             Decision::RequireApproval(_) => Err(Envelope::<()>::err_raw(
                 "policy.approval_required",
-                format!(
-                    "{verb} operation requires approval; use the MCP server for two-phase approval"
-                ),
+                format!("{verb} operation requires approval"),
             )),
             _ => Err(unexpected_decision()),
         },
@@ -2472,6 +2471,197 @@ decision = "allow"
             "150 XLM over a 100 XLM cap must deny with the same wire code the MCP \
              `stellar_dex_trade` twin returns for the identical rule"
         );
+    }
+
+    // ── Testnet approval refusals ────────────────────────────────────────────
+
+    /// The code and message of a refusal envelope.
+    fn refusal<T: std::fmt::Debug>(result: &Result<T, Envelope<()>>) -> (&str, &str) {
+        let error = result
+            .as_ref()
+            .expect_err("expected a refusal envelope")
+            .error
+            .as_ref()
+            .expect("refusal envelope must carry an error block");
+        (error.code.as_str(), error.message.as_str())
+    }
+
+    /// One rule for `tool` on every chain with `criteria` and `decision`.
+    fn rule_engine(
+        tool: &str,
+        criteria: Vec<Box<dyn stellar_agent_core::policy::v1::criteria::Criterion>>,
+        decision: Decision,
+    ) -> PolicyEngineV1 {
+        let rule = PolicyRule {
+            r#match: RuleMatch {
+                tool: tool.to_owned(),
+                chain: "*".to_owned(),
+            },
+            criteria,
+            decision,
+            allow_opaque_signing: false,
+        };
+        let doc = PolicyDocument {
+            version: 1,
+            scope: ScopeId::AllProfiles,
+            rules: vec![rule],
+            signature: None,
+        };
+        PolicyEngineV1::new(doc, "alice".to_owned())
+    }
+
+    /// An `approval_above` rule over 10 XLM of native for `tool`.
+    fn approval_above_engine(tool: &str) -> PolicyEngineV1 {
+        use stellar_agent_core::policy::v1::criteria::approval_above::ApprovalAboveCriterion;
+        rule_engine(
+            tool,
+            vec![Box::new(ApprovalAboveCriterion::new(
+                "native".to_owned(),
+                100_000_000,
+            ))],
+            Decision::Allow,
+        )
+    }
+
+    /// Testnet `pay` and `accounts create` gates allow at the `approval_above`
+    /// threshold and refuse above it with `policy.approval_required`. The
+    /// message points to the MCP server, which approves both verbs.
+    #[test]
+    #[serial_test::serial]
+    fn testnet_approval_above_refuses_pay_and_create_above_the_threshold() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let profile = parity_profile();
+        for (tool, verb) in [
+            ("stellar_pay", "pay"),
+            ("stellar_create_account", "accounts create"),
+        ] {
+            let args = |amount| {
+                if tool == "stellar_pay" {
+                    pay_policy_args(amount, "native", PARITY_DEST_G)
+                } else {
+                    create_policy_args(amount, PARITY_DEST_G)
+                }
+            };
+            let engine = approval_above_engine(tool);
+            let evaluate = |amount| {
+                evaluate_value_moving_policy(
+                    &engine,
+                    &profile,
+                    tool,
+                    ToolValueKind::MovesValue,
+                    "stellar:testnet",
+                    &args(amount),
+                    verb,
+                    None,
+                    None,
+                )
+            };
+            assert!(
+                evaluate(100_000_000).is_ok(),
+                "{tool}: the threshold amount allows"
+            );
+            assert_eq!(
+                refusal(&evaluate(100_000_001)),
+                (
+                    "policy.approval_required",
+                    format!(
+                        "{verb} operation requires approval; use the MCP server for two-phase \
+                         approval"
+                    )
+                    .as_str()
+                ),
+                "{tool}: one stroop above the threshold requires approval"
+            );
+        }
+    }
+
+    /// Testnet `claim` and `trustline` gates refuse a require-approval rule
+    /// with `policy.approval_required`, pointing to the MCP server.
+    #[test]
+    #[serial_test::serial]
+    fn testnet_require_approval_refuses_claim_and_trustline() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let profile = parity_profile();
+        for (tool, verb, args) in [
+            ("stellar_claim", "claim", claim_policy_args(&"0".repeat(72))),
+            (
+                "stellar_trustline",
+                "trustline",
+                trustline_policy_args(PARITY_DEST_G, "native"),
+            ),
+        ] {
+            let engine = rule_engine(
+                tool,
+                Vec::new(),
+                Decision::RequireApproval(stellar_agent_core::policy::ApprovalRequest::new(
+                    "testnet".to_owned(),
+                    300,
+                )),
+            );
+            let result = evaluate_value_moving_policy(
+                &engine,
+                &profile,
+                tool,
+                ToolValueKind::MovesValue,
+                "stellar:testnet",
+                &args,
+                verb,
+                None,
+                None,
+            );
+            assert_eq!(
+                refusal(&result),
+                (
+                    "policy.approval_required",
+                    format!(
+                        "{verb} operation requires approval; use the MCP server for two-phase \
+                         approval"
+                    )
+                    .as_str()
+                ),
+                "{tool}"
+            );
+        }
+    }
+
+    /// Testnet `trade` and `vault` gates refuse an `approval_above` excess
+    /// with `policy.approval_required` and a message that names only the
+    /// requirement: the MCP server has no approval path for either verb.
+    #[test]
+    #[serial_test::serial]
+    fn testnet_trade_and_vault_approval_names_only_the_requirement() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let profile = parity_profile();
+        for (tool, verb) in [
+            ("stellar_dex_trade", "trade"),
+            ("stellar_defindex_vault_deposit", "vault_deposit"),
+            ("stellar_defindex_vault_withdraw", "vault_withdraw"),
+        ] {
+            let engine = approval_above_engine(tool);
+            let result = evaluate_value_moving_policy_with_value(
+                &engine,
+                &profile,
+                tool,
+                "stellar:testnet",
+                &serde_json::json!({ "from_address": PARITY_DEST_G }),
+                dex_trade_leg(150_000_000),
+                verb,
+            );
+            assert_eq!(
+                refusal(&result),
+                (
+                    "policy.approval_required",
+                    format!("{verb} operation requires approval").as_str()
+                ),
+                "{tool}"
+            );
+        }
     }
 
     // ── trustline_policy_args: field-shape parity with the MCP twin ──────────

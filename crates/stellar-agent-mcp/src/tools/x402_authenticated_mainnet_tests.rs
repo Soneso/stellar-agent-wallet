@@ -954,7 +954,7 @@ fn witness_required_policy(raw: &str) -> String {
 }
 
 /// The ledger records of `domain`.
-fn records(f: &Fixture, domain: &str) -> Vec<serde_json::Value> {
+pub(super) fn records(f: &Fixture, domain: &str) -> Vec<serde_json::Value> {
     authorizations(f)
         .into_iter()
         .filter(|record| record["domain"] == domain)
@@ -1018,6 +1018,9 @@ pub(super) struct Run {
     pub(super) control: Arc<RpcControl>,
     pub(super) oracle_control: Arc<RpcControl>,
     pub(super) double: Sep10Double,
+    /// Opt-outs that keep the legacy-attested run unenforced for every
+    /// kind; a test's later enforcement guard overrides them.
+    _unenforced: Vec<stellar_agent_network::policy_state::approvals::ConsentEvidenceDisableGuard>,
 }
 
 impl Run {
@@ -1036,7 +1039,19 @@ impl Run {
         Self::build(|raw| authenticated_policy(&raw)).await
     }
 
+    /// A run whose rules `policy` edits. The run opts out of consent
+    /// delivery for every kind.
     pub(super) async fn build(policy: impl FnOnce(String) -> String) -> Self {
+        Self::build_scoped(policy, true).await
+    }
+
+    /// A run under the compiled kind capabilities, which installs no
+    /// opt-out.
+    pub(super) async fn production(policy: impl FnOnce(String) -> String) -> Self {
+        Self::build_scoped(policy, false).await
+    }
+
+    async fn build_scoped(policy: impl FnOnce(String) -> String, unenforced: bool) -> Self {
         let primary = wiremock::MockServer::start().await;
         let oracle = wiremock::MockServer::start().await;
         let mut f = routed_fixture_with(policy, |_| {}, &primary, &oracle);
@@ -1046,6 +1061,11 @@ impl Run {
         double.install(&mut f.server);
         let _ = take_authorized_signings_for_test();
         Self {
+            _unenforced: if unenforced {
+                super::common::tests::mainnet::unenforced(&f)
+            } else {
+                Vec::new()
+            },
             f,
             _primary: primary,
             _oracle: oracle,
@@ -1117,7 +1137,11 @@ impl Run {
 /// SEP-10 POST, the signing under exactly the Message record, the three used
 /// records of the chain, the `RequireApproval` audit row, the tombstone over
 /// the final envelope, and a replay refused as consumed.
-async fn assert_accepted(run: &Run, approval: &(String, String), result: &serde_json::Value) {
+pub(super) async fn assert_accepted(
+    run: &Run,
+    approval: &(String, String),
+    result: &serde_json::Value,
+) {
     assert_eq!(result["ok"], true, "{result}");
     let data = &result["data"];
     assert!(data["paymentSignature"].is_string(), "{result}");
@@ -1867,6 +1891,9 @@ struct Boundary {
     requirements: stellar_agent_x402::wire::PaymentRequirements,
     root: stellar_xdr::SorobanAuthorizedInvocation,
     network_id: [u8; 32],
+    /// Opt-outs that keep the legacy-attested boundary unenforced for
+    /// every kind.
+    _unenforced: Vec<stellar_agent_network::policy_state::approvals::ConsentEvidenceDisableGuard>,
 }
 
 impl Boundary {
@@ -1931,6 +1958,7 @@ impl Boundary {
             .await
             .unwrap();
         Self {
+            _unenforced: super::common::tests::mainnet::unenforced(&f),
             f,
             decision: outcome.mainnet_decision().unwrap().clone(),
             double,

@@ -184,8 +184,10 @@ fn approve_binary_case(mainnet: bool, case: ApprovalCase) {
     entry.approval_nonce = format!("-{}", &entry.approval_nonce[1..]);
     if mainnet {
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home);
+        crate::approval_fixture::initialize_consent_scope(&profile, name);
         crate::approval_fixture::open_record(name, &profile, &entry);
     }
+    let log_before = std::fs::read(&profile.audit_log_path).ok();
     let nonce = entry.approval_nonce.clone();
     let mut approvals =
         PendingApprovalStore::open(home.join("approvals").join(format!("{name}.toml"))).unwrap();
@@ -245,7 +247,11 @@ fn approve_binary_case(mainnet: bool, case: ApprovalCase) {
                 .expect("read pending approval");
         let pending = approvals.get(&nonce).expect("entry remains pending");
         assert!(pending.attestation_blob_b64.is_none());
-        assert!(!profile.audit_log_path.exists());
+        assert_eq!(
+            std::fs::read(&profile.audit_log_path).ok(),
+            log_before,
+            "the refusal writes no audit row"
+        );
         if mainnet {
             assert_eq!(
                 std::fs::read(&pending_path).unwrap(),

@@ -2946,6 +2946,9 @@ mod tests {
         nonces: Cell<u32>,
         /// The consent fixture whose profile [`Self::approve`] records under.
         consent: Option<stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture>,
+        /// Keeps the unkeyed fixture's legacy payment consent unenforced, as
+        /// the approvals fixture does; a ledger without approvals needs none.
+        _unpublished: Option<super::super::approvals::ConsentEvidenceDisableGuard>,
     }
 
     /// `request` under the policy `sequence` and `digest`, its policy
@@ -3014,6 +3017,12 @@ mod tests {
             consent: Option<stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture>,
         ) -> Self {
             let store = PersistedWindowStore::at_path(dir.path().join("ledger.window"));
+            let unpublished = consent.as_ref().map(|fixture| {
+                super::super::approvals::ConsentEvidenceDisableGuard::new(
+                    fixture.name(),
+                    stellar_agent_core::approval::witness::ApprovedKind::Payment,
+                )
+            });
             let ledger = Self {
                 _dir: dir,
                 profile,
@@ -3021,6 +3030,7 @@ mod tests {
                 clock: set_now_ms_for_test(T0),
                 nonces: Cell::new(0),
                 consent,
+                _unpublished: unpublished,
             };
             ledger.pin(7, [7; 32]);
             ledger

@@ -9804,7 +9804,7 @@ mod tests {
             "max(wall_time, evidence_floor)",
             "reserve before ceremony",
             "retry the existing grant without another ceremony",
-            "All four production kind capabilities are disabled",
+            "All four production kind capabilities are enabled",
         ] {
             assert!(doc.contains(rule), "protocol rule: {rule}");
         }

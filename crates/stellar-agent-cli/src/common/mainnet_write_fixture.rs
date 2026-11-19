@@ -386,6 +386,9 @@ pub(crate) struct MainnetFixture {
     tty_checks_at_start: u64,
     _routes: TestRoutesGuard,
     _owner: EnvSigner,
+    /// Opt-outs that keep the legacy commands unenforced for every kind; a
+    /// test's later enforcement guard overrides them.
+    _unenforced: Vec<stellar_agent_network::policy_state::approvals::ConsentEvidenceDisableGuard>,
     _keyring: MockKeyringScope,
     _profile_var: ProfileEnvVarGuard,
     _home: StellarAgentHomeGuard,
@@ -400,6 +403,11 @@ fn require_runner(step: &str, code: i32) {
 }
 
 impl MainnetFixture {
+    /// Drops the opt-outs, so the compiled kind capabilities decide.
+    pub(crate) fn enforce_listed(&mut self) {
+        self._unenforced.clear();
+    }
+
     /// Exports only this isolated fixture's credentials for a fresh child process.
     pub(crate) fn save_process_keyring(&self, path: &std::path::Path) {
         stellar_agent_core::approval::fixtures::save_process_keyring(
@@ -558,6 +566,10 @@ impl MainnetFixture {
             tty_checks_at_start: tty_checks_on_this_thread(),
             _routes: routes,
             _owner: owner,
+            _unenforced:
+                stellar_agent_network::policy_state::approvals::ConsentEvidenceDisableGuard::every_kind(
+                    name,
+                ),
             _keyring: keyring,
             _profile_var: profile_var,
             _home: home_guard,

@@ -6628,6 +6628,9 @@ pub(crate) mod tests {
         nonces: Cell<u32>,
         /// The consent fixture whose profile [`Self::approve`] records under.
         consent: Option<stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture>,
+        /// Keeps the unkeyed fixture's legacy payment consent unenforced, as
+        /// the approvals fixture does; a fixture without approvals needs none.
+        _unpublished: Option<super::super::approvals::ConsentEvidenceDisableGuard>,
     }
 
     /// A wall clock fixed at one instant, so a consent ceremony runs on the
@@ -6679,6 +6682,12 @@ pub(crate) mod tests {
             consent: Option<stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture>,
         ) -> Self {
             let store = PersistedWindowStore::at_path(dir.path().join("ops.window"));
+            let unpublished = consent.as_ref().map(|fixture| {
+                super::super::approvals::ConsentEvidenceDisableGuard::new(
+                    fixture.name(),
+                    stellar_agent_core::approval::witness::ApprovedKind::Payment,
+                )
+            });
             let fx = Self {
                 _dir: dir,
                 profile,
@@ -6687,6 +6696,7 @@ pub(crate) mod tests {
                 sink: Sink::default(),
                 nonces: Cell::new(0),
                 consent,
+                _unpublished: unpublished,
             };
             let lock = WindowStoreLock::acquire_for(
                 fx.store.path(),

@@ -1880,7 +1880,13 @@ mod tests {
                 .expect("a Policy header decides at wall time, not at the floor");
             assert_eq!(refused(policy.check_not_expired(1_500)), P::Expired);
             drop(enabled);
+            // An unenforced payment decides at wall time.
+            let unenforced = crate::policy_state::approvals::ConsentEvidenceDisableGuard::new(
+                core.name(),
+                ApprovedKind::Payment,
+            );
             a.check_not_expired(1_000).unwrap();
+            drop(unenforced);
             let enabled = ConsentEvidenceEnforcementGuard::new(core.name(), ApprovedKind::Payment);
             // A nonce without a retained record names no kind, so its check
             // reads no floor.
