@@ -551,3 +551,57 @@ mod intent {
         assert!(durable_record(&context, &handle).unwrap().consent.is_some());
     }
 }
+
+/// A receipt whose attempt ended in a checked non-inclusion of the admitted
+/// canonical operation passes the receipt check, so the check reads the
+/// record next and finds none; the same receipt under another operation
+/// refuses as spent before any record read.
+#[tokio::test]
+#[serial_test::serial]
+async fn committed_check_lineage_receipt_passes_the_receipt_check() {
+    let (fixture, context, envelope) = confirmation_fixture("committed-lineage");
+    let policy = fixture.current_policy();
+    let name = context.profile_name();
+    let nonce = "lineage-nonce";
+    let lineage = stellar_agent_network::policy_state::recovery::canonical_retry_fixture(
+        &PersistedWindowStore::for_profile(name),
+        context.profile(),
+        &ReceiptStore::open(name).unwrap(),
+        "committed-lineage-retry",
+        nonce,
+    )
+    .unwrap();
+    let other = prepared_operation(&context, "committed-lineage-other", &envelope);
+    let presented = [7; 32];
+
+    let error = verify_committed(
+        &context,
+        &policy,
+        nonce,
+        &presented,
+        &check(&lineage, &envelope),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.code(),
+        "approval.not_found",
+        "the admitted operation's receipt passes the receipt check: {error}"
+    );
+
+    let reads = window_calls(name);
+    let error = verify_committed(
+        &context,
+        &policy,
+        nonce,
+        &presented,
+        &check(&other, &envelope),
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), "approval.consumed");
+    assert!(error.to_string().contains(SPENT), "{error}");
+    assert_eq!(
+        window_calls(name),
+        reads,
+        "the receipt refuses before the record read"
+    );
+}

@@ -56,7 +56,7 @@ use stellar_agent_network::policy_state::approvals::{
     consent_evidence_time_floor, delivery_enforced,
 };
 use stellar_agent_network::policy_state::{
-    ApprovalRecorder, ApprovalStatus, ConsentRow, OperationHandle, OperationState,
+    ApprovalLineage, ApprovalRecorder, ApprovalStatus, ConsentRow, OperationHandle, OperationState,
     PendingApprovalFacts, PersistedWindowStore,
 };
 use stellar_agent_network::{
@@ -765,11 +765,6 @@ fn start_durable(
         {
             discard_parked(store_path, &entry);
         }
-        if let Ok(Some(view)) = linked
-            && view.record.nonce != entry.approval_nonce
-        {
-            return linked_durable_start(store_path, &view.record.nonce);
-        }
         return Err(error);
     }
     Ok(DurableStart::Ceremony(Box::new(entry)))
@@ -910,7 +905,10 @@ fn commit_durable(
 ///
 /// In the order the check runs: `submission.record_unavailable` when the
 /// receipt store cannot be read, and `approval.consumed` when a submission
-/// receipt names the nonce, both before any durable read; the store
+/// receipt names the nonce and its attempt is no checked non-inclusion of the
+/// admitted canonical operation, both before any approval record read (a
+/// checked non-inclusion of an admitted envelope operation still refuses as
+/// consumed); the store
 /// refusals of the record's read; `approval.clock_error` when the wall clock
 /// cannot be read; `audit.*` when the evidence floor cannot be read; the
 /// refusals of [`verify_durable_approval`] or
@@ -926,8 +924,10 @@ fn verify_committed(
 ) -> Result<ApprovalWitness, WalletError> {
     let profile = context.profile();
     let name = context.profile_name();
+    let window = PersistedWindowStore::for_profile(name);
+    let lineage = ApprovalLineage::new(&window, profile, Some(check.operation.id()));
     let receipt = ReceiptStore::open(name)
-        .and_then(|receipts| receipts.find_by_approval_nonce(nonce))
+        .and_then(|receipts| receipts.find_approval_holder(nonce, &lineage))
         .map_err(|error| {
             WalletError::Submission(SubmissionError::ReceiptStoreUnreadable {
                 detail: error.to_string(),
@@ -938,7 +938,6 @@ fn verify_committed(
             detail: "this approval was already spent on a submission".to_owned(),
         }));
     }
-    let window = PersistedWindowStore::for_profile(name);
     let facts = ApprovalStatus::new(&window, profile)
         .facts_by_nonce(nonce)
         .map_err(operation_refusal)?;

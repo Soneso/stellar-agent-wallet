@@ -901,18 +901,22 @@ fn intent_restart_seam() {
     fx.clock.set(witness.consent_at_ms());
     let mut without_digest = first.clone();
     without_digest.intent_digest = None;
-    assert!(
-        matches!(
-            store.mint_authorization(fx.fixture.profile(), &without_digest),
-            Err(crate::policy_state::WindowStoreError::AuthorizationRefused {
-                precondition: P::IntentMismatch,
-            })
-        ),
-        "canonical mint without an intent digest refuses IntentMismatch"
-    );
-    store
-        .mint_authorization(fx.fixture.profile(), &first)
-        .unwrap();
+    // Only the attempt's begin mints for a canonical operation: the public
+    // mint refuses with and without the intent digest and writes nothing.
+    for raw in [&without_digest, &first] {
+        let before = std::fs::read(store.path()).unwrap();
+        assert!(
+            matches!(
+                store.mint_authorization(fx.fixture.profile(), raw),
+                Err(crate::policy_state::WindowStoreError::AuthorizationRefused {
+                    precondition: P::IntentMismatch,
+                })
+            ),
+            "a public canonical mint refuses IntentMismatch (digest {:?})",
+            raw.intent_digest.is_some()
+        );
+        assert_eq!(std::fs::read(store.path()).unwrap(), before);
+    }
     fx.clock.set(now);
     let Some(LookupOutcome::Resumable(handle)) = recorder
         .lookup(&BusinessId::parse("durable-intent").unwrap())

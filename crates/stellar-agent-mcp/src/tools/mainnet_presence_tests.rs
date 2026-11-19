@@ -4555,4 +4555,66 @@ mod durable_gate {
             );
         }
     }
+
+    /// A receipt whose attempt ended in a checked non-inclusion of the
+    /// admitted canonical operation passes the receipt check, so the gate
+    /// reads the record next and refuses uniformly without one; the same
+    /// receipt under another operation refuses as consumed before any record
+    /// read.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn mcp_gate_lineage_receipt_passes_the_receipt_check() {
+        use crate::tools::common::verify_attestation_subject_gate;
+        use base64::Engine as _;
+        let run = ClassicRun::new(Tool::Pay).await;
+        let server = &run.f.server;
+        let nonce = "lineage-nonce";
+        let lineage = stellar_agent_network::policy_state::recovery::canonical_retry_fixture(
+            &server.window_store,
+            server.security_profile(),
+            &stellar_agent_core::profile::receipt::ReceiptStore::open(PROFILE).unwrap(),
+            &crate::tools::common::tests::fresh_business_id(),
+            nonce,
+        )
+        .unwrap();
+        let outcome = pay_decision(&run).await;
+        let xdr = run.args["envelope_xdr"].as_str().unwrap();
+        let blob = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7; 32]);
+        let gate = |operation| {
+            verify_attestation_subject_gate(
+                server,
+                &outcome,
+                GatedApprovalKind::Payment.expectation(approval_subject_classic(xdr)),
+                Some(nonce),
+                Some(&blob),
+                operation,
+                "stellar_pay_commit",
+            )
+        };
+
+        let before = facts_reads(&run);
+        let admitted = gate(Some(lineage.id())).await.unwrap_err();
+        assert_eq!(
+            normalized(wire(&admitted)),
+            normalized(wire(&approval_required_indistinguishable(PROFILE))),
+            "the admitted operation's receipt passes the receipt check"
+        );
+        assert!(
+            facts_reads(&run) > before,
+            "past the receipt check the gate reads the record"
+        );
+
+        let reads = facts_reads(&run);
+        let refused = gate(Some(run.operation_id())).await.unwrap_err();
+        assert_eq!(
+            normalized(wire(&refused)),
+            normalized(wire(&approval_consumed_error()))
+        );
+        assert_eq!(
+            facts_reads(&run),
+            reads,
+            "the receipt refuses before the record read"
+        );
+    }
 }

@@ -402,8 +402,12 @@ fn canonical_staging_does_not_promote_legacy() {
     ));
     let canonical = preparation(intent);
     assert!(
-        matches!(canonical.lookup(&mut fx.recorder(), &id), Err(error) if error.code() == "operation.business_id_conflict"),
-        "equal digest cannot promote Envelope"
+        matches!(
+            canonical.lookup(&mut fx.recorder(), &id).unwrap(),
+            ClassicEntry::Resume(handle) if handle.intent().kind() == SlotKind::Envelope
+                && handle.envelope_xdr() == Some(envelope.as_str())
+        ),
+        "an equal digest resumes the envelope record's stored envelope without promoting it"
     );
     assert_eq!(
         canonical
@@ -672,6 +676,7 @@ fn intent_handoff_authenticates_the_link() {
         "handoff refuses the wrong inbox kind"
     );
     let original = fx.wire();
+    let mut codes = Vec::new();
     for case in [
         "link",
         "subject",
@@ -681,6 +686,7 @@ fn intent_handoff_authenticates_the_link() {
         "unknown",
         "envelope",
         "revoked",
+        "clock",
     ] {
         let mut changed = original.clone();
         let operation = &mut changed.operations.as_mut().unwrap().records[0];
@@ -722,13 +728,21 @@ fn intent_handoff_authenticates_the_link() {
                 approval.state = crate::policy_state::ApprovalState::Revoked;
                 approval.revoked_at_ms = Some(T0);
             }
+            // The record's signed clocks move together, so only their
+            // comparison with the inbox entry refuses.
+            "clock" => {
+                approval.created_at_ms += 1;
+                approval.waiting_expires_at_ms += 1;
+            }
             _ => unreachable!(),
         }
         fx.store.seal_unchecked_for_test(&fx.profile, &changed);
-        assert!(
-            intent_for_consent(&fx.store, &fx.profile, &entry, &scope).is_err(),
-            "handoff refuses {case}"
-        );
+        codes.push((
+            case,
+            intent_for_consent(&fx.store, &fx.profile, &entry, &scope)
+                .unwrap_err()
+                .code(),
+        ));
         fx.store.seal_unchecked_for_test(&fx.profile, &original);
         assert_eq!(
             intent_for_consent(&fx.store, &fx.profile, &entry, &scope).unwrap(),
@@ -736,6 +750,22 @@ fn intent_handoff_authenticates_the_link() {
             "fresh authenticated read after {case}"
         );
     }
+    // A broken link or record digest fails the authenticated load; every
+    // other row loads and refuses at the handoff's own comparison.
+    assert_eq!(
+        codes,
+        vec![
+            ("link", "submission.record_unavailable"),
+            ("subject", "approval.wrong_kind"),
+            ("slot-digest", "approval.wrong_kind"),
+            ("record-digest", "submission.record_unavailable"),
+            ("malformed", "approval.wrong_kind"),
+            ("unknown", "approval.wrong_kind"),
+            ("envelope", "approval.wrong_kind"),
+            ("revoked", "approval.revoked"),
+            ("clock", "approval.wrong_kind"),
+        ]
+    );
     for changed in [
         CanonicalUse {
             chain_id: "stellar:testnet",
@@ -766,5 +796,139 @@ fn intent_handoff_authenticates_the_link() {
         intent_for_consent(&fx.store, &fx.profile, &missing, &scope).unwrap(),
         None,
         "legacy absence stays distinct"
+    );
+}
+
+/// Under a canonical preparation, a business id that holds an envelope record
+/// of the same identity resumes that record with its stored envelope, and
+/// replays it once ended; the record stays an envelope record, a rebuilt
+/// envelope with a fresh sequence refuses at its attempt, and another
+/// identity refuses `operation.business_id_conflict`.
+#[test]
+#[serial]
+fn an_envelope_record_keeps_its_envelope_under_a_canonical_preparation() {
+    use crate::operation_entry::operation_identity;
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+    let mut fx = Fx::new();
+    let (tool, kind, payload) = payloads().remove(0);
+    let intent = classic_intent(base(), payload.clone()).unwrap();
+    let envelope = |sequence| {
+        crate::operation_entry::intent_envelope(
+            &intent,
+            "Public Global Stellar Network ; September 2015",
+            sequence,
+            100,
+            T0 / 1000 + 60,
+        )
+        .unwrap()
+    };
+    let stored = envelope(1);
+    let id = BusinessId::parse("legacy").unwrap();
+    let identity = operation_identity(base(), IdentityFacts::Intent(payload.clone())).unwrap();
+    let OpenedEntry::Resume(opened) = Preparation::Envelope(identity)
+        .open(&mut fx.recorder(), id.clone(), tool, kind, &stored)
+        .unwrap()
+    else {
+        panic!("a new envelope record")
+    };
+    let resumed = match lookup_canonical(
+        &mut fx.recorder(),
+        &id,
+        base(),
+        IdentityFacts::Intent(payload.clone()),
+    )
+    .unwrap()
+    {
+        ClassicEntry::Resume(handle) => handle,
+        other => panic!("expected the stored envelope, got {other:?}"),
+    };
+    assert_eq!(resumed.id(), opened.id());
+    assert_eq!(resumed.envelope_xdr(), Some(stored.as_str()));
+    assert_eq!(fx.record(opened.id()).intent.kind(), SlotKind::Envelope);
+
+    let other = IntentPayload::Pay {
+        destination: SOURCE.to_owned(),
+        asset: IntentAsset::Native,
+        amount_stroops: 2,
+    };
+    assert!(matches!(
+        lookup_canonical(&mut fx.recorder(), &id, base(), IdentityFacts::Intent(other)),
+        Err(error) if error.code() == "operation.business_id_conflict"
+    ));
+
+    let fresh = envelope(2);
+    let mint = fx.operation_mint_request(&resumed, tx(2), fx.policy(), vec![]);
+    let refused = fx
+        .recorder()
+        .begin_attempt(
+            &resumed,
+            &AttemptRequest {
+                envelope: Some(AttemptEnvelope {
+                    xdr: fresh.clone(),
+                    unsigned_envelope_sha256: crate::operation_entry::unsigned_envelope_sha256(
+                        &fresh,
+                    ),
+                }),
+                authorization: AttemptAuthorization::Mint(Box::new(mint)),
+                send_by_ms: u64::MAX,
+            },
+        )
+        .unwrap_err();
+    assert_eq!(
+        crate::operation_entry::operation_refusal(refused).code(),
+        "operation.business_id_conflict"
+    );
+    assert_eq!(fx.record(opened.id()).intent.kind(), SlotKind::Envelope);
+
+    fx.recorder()
+        .transition(
+            opened.id(),
+            None,
+            OperationState::Expired,
+            &TransitionEvidence::default(),
+        )
+        .unwrap();
+    assert!(matches!(
+        lookup_canonical(&mut fx.recorder(), &id, base(), IdentityFacts::Intent(payload)).unwrap(),
+        ClassicEntry::Replay(view) if view.slot_kind == SlotKind::Envelope
+    ));
+}
+
+/// A repeated canonical open resumes the stored record only when the stored
+/// slot still parses as the admitted intent: a slot of the same digest whose
+/// intent no longer parses refuses `operation.business_id_conflict`.
+#[test]
+#[serial]
+fn reopened_canonical_slot_is_validated_after_the_open() {
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+    let mut fx = Fx::new();
+    let (tool, kind, payload) = payloads().remove(0);
+    let intent = classic_intent(base(), payload).unwrap();
+    let envelope = crate::operation_entry::intent_envelope(
+        &intent,
+        "Public Global Stellar Network ; September 2015",
+        1,
+        100,
+        T0 / 1000 + 60,
+    )
+    .unwrap();
+    let id = BusinessId::parse("reopened").unwrap();
+    let open = |fx: &mut Fx| {
+        preparation(intent.clone()).open(&mut fx.recorder(), id.clone(), tool, kind, &envelope)
+    };
+    assert!(matches!(open(&mut fx).unwrap(), OpenedEntry::Resume(_)));
+    assert!(matches!(open(&mut fx).unwrap(), OpenedEntry::Resume(_)));
+    let mut changed = fx.wire();
+    if let IntentSlot::Canonical { intent, .. } =
+        &mut changed.operations.as_mut().unwrap().records[0].intent
+    {
+        *intent = serde_json::json!({});
+    }
+    fx.store.seal_unchecked_for_test(&fx.profile, &changed);
+    assert!(
+        matches!(open(&mut fx), Err(error) if error.code() == "operation.business_id_conflict"),
+        "a stored slot that fails validation refuses the resume"
     );
 }

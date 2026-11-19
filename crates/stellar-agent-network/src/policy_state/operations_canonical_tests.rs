@@ -131,7 +131,7 @@ fn canonical_mint_binds_the_previous_attempt() {
         let mut wrong = mint.clone();
         let expected = if case == "digest" {
             wrong.intent_digest = Some([0xff; 32]);
-            MainnetPrecondition::IntentMismatch
+            MainnetPrecondition::IntentDivergence
         } else if case == "predecessor-without-digest" {
             wrong.intent_digest = None;
             MainnetPrecondition::IntentMismatch
@@ -142,32 +142,27 @@ fn canonical_mint_binds_the_previous_attempt() {
         let bytes = file_bytes(&fx);
         for _ in 0..2 {
             assert!(
-                matches!(fx.store.mint_authorization(&fx.profile, &wrong),
+                matches!(fx.begin_mint(&handle, &wrong),
                 Err(WindowStoreError::AuthorizationRefused { precondition }) if precondition == expected),
                 "lineage refusal: {case}"
             );
             assert_eq!(file_bytes(&fx), bytes, "refused lineage writes nothing");
         }
     }
-    let first = fx.store.mint_authorization(&fx.profile, &mint).unwrap();
-    fx.clock.set(fx.now() + TTL_MS + 1);
-    fx.recorder()
-        .lookup(&BusinessId::parse("order-1").unwrap())
-        .unwrap();
-    let again = fx.store.mint_authorization(&fx.profile, &mint).unwrap();
-    assert_ne!(first.id, again.id);
-    assert_eq!(
-        fx.auth(again.id).predecessor,
-        Some(previous),
-        "remint names the prior attempt"
-    );
-    assert_eq!(fx.auth(again.id).intent_digest, mint.intent_digest);
+    // The checked lineage mints only inside the attempt's begin.
+    let bytes = file_bytes(&fx);
+    assert!(matches!(
+        fx.store.mint_authorization(&fx.profile, &mint),
+        Err(WindowStoreError::AuthorizationRefused {
+            precondition: MainnetPrecondition::IntentMismatch
+        })
+    ));
+    assert_eq!(file_bytes(&fx), bytes);
     let started = fx.begin_mint(&handle, &mint).unwrap();
     assert_eq!(started.attempt_index, 2);
-    assert_eq!(
-        fx.auth(started.authorization_id).predecessor,
-        Some(previous)
-    );
+    let minted = fx.auth(started.authorization_id);
+    assert_eq!(minted.predecessor, Some(previous), "the successor names the prior attempt");
+    assert_eq!(minted.intent_digest, mint.intent_digest);
     for (name, slot) in [
         ("first-canonical", canonical(3)),
         ("first-envelope", envelope(3, 3, 0)),
@@ -185,7 +180,7 @@ fn canonical_mint_binds_the_previous_attempt() {
         } else {
             MainnetPrecondition::IntentMismatch
         };
-        assert!(matches!(fx.store.mint_authorization(&fx.profile, &wrong),
+        assert!(matches!(fx.begin_mint(&handle, &wrong),
             Err(WindowStoreError::AuthorizationRefused { precondition }) if precondition == expected));
         fx.recorder()
             .transition(
@@ -195,5 +190,44 @@ fn canonical_mint_binds_the_previous_attempt() {
                 &TransitionEvidence::default(),
             )
             .unwrap();
+    }
+}
+
+/// On the begin path, a mint whose intent digest differs from the stored
+/// canonical intent refuses with `intent_divergence`, which
+/// `operation_refusal` renders as `simulation.divergence`; a predecessor
+/// mismatch keeps `network.mainnet_authorization_refused`. Neither writes.
+#[test]
+#[serial]
+fn canonical_divergence_renders_at_the_begin_exit() {
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+    let mut fx = Fx::new();
+    let handle = projected_not_included(&mut fx, 1);
+    let mint = fx.operation_mint_request(&handle, tx(2), fx.policy(), vec![]);
+    let mut diverged = mint.clone();
+    diverged.intent_digest = Some([0xd1; 32]);
+    let mut stale = mint;
+    stale.predecessor = Some(AuthorizationId::from_bytes([0xd2; 32]));
+    for (request, precondition, code) in [
+        (
+            diverged,
+            MainnetPrecondition::IntentDivergence,
+            "simulation.divergence",
+        ),
+        (
+            stale,
+            MainnetPrecondition::PredecessorMismatch,
+            "network.mainnet_authorization_refused",
+        ),
+    ] {
+        let bytes = file_bytes(&fx);
+        let refused = fx.begin_mint(&handle, &request).unwrap_err();
+        assert!(
+            matches!(&refused, WindowStoreError::AuthorizationRefused { precondition: p } if *p == precondition),
+            "{refused:?}"
+        );
+        assert_eq!(crate::operation_entry::operation_refusal(refused).code(), code);
+        assert_eq!(file_bytes(&fx), bytes);
     }
 }

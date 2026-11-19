@@ -973,6 +973,7 @@ impl<'a> WalletSubmissionRecorder<'a> {
             envelope_hash,
             &approval.store_dir,
             &approval.profile_name,
+            Some((&self.window, self.profile)),
         ) {
             tracing::warn!(
                 profile = %self.profile_name,
@@ -984,22 +985,30 @@ impl<'a> WalletSubmissionRecorder<'a> {
     }
 }
 
-/// Completes a sent receipt's approval tombstone and acknowledges it durably.
+/// Completes a sent receipt's approval tombstone and acknowledges it durably,
+/// with every other sent receipt that holds the same nonce.
 ///
 /// The receipt holds the nonce durably, and every sent outcome consumes it,
-/// a refused send included. A failed approval write or acknowledgement leaves
-/// a retryable consumption repair for the next status call, and the commit
-/// gate continues to refuse reuse.
+/// a refused send included. A receipt of a canonical operation's attempt
+/// keeps the nonce for a successor attempt while `window` names that
+/// operation neither terminal nor past its execution expiry; its tombstone
+/// stays owed and a later call completes it. Every receipt of one nonce
+/// belongs to one operation, so the first tombstone's transaction names one
+/// of them. A failed approval write or acknowledgement leaves a retryable
+/// consumption repair for the next status call, and the commit gate
+/// continues to refuse reuse.
 ///
 /// # Errors
 ///
-/// Returns `submission.record_unavailable` if either store cannot be read or
-/// written, or the approval names a different transaction.
+/// Returns `submission.record_unavailable` if a store cannot be read or
+/// written, or the approval names a transaction no receipt of its nonce
+/// holds.
 pub fn repair_approval_consumption(
     receipts: &ReceiptStore,
     envelope_hash: &str,
     approval_dir: &std::path::Path,
     profile_name: &str,
+    window: Option<(&PersistedWindowStore, &Profile)>,
 ) -> Result<(), WalletError> {
     use stellar_agent_core::approval::{ApprovalKind, ConsumedOutcome};
     let receipt = receipts
@@ -1011,7 +1020,27 @@ pub fn repair_approval_consumption(
     let Some(nonce) = receipt.approval_nonce.as_deref() else {
         return Ok(());
     };
-    if !receipt.submitted || receipt.approval_consumed {
+    if !receipt.submitted {
+        return Ok(());
+    }
+    let holders: Vec<_> = receipts
+        .all()
+        .map_err(|e| receipt_store_refusal(&e))?
+        .into_iter()
+        .filter(|holder| holder.approval_nonce.as_deref() == Some(nonce))
+        .collect();
+    if !holders
+        .iter()
+        .any(|holder| holder.submitted && !holder.approval_consumed)
+    {
+        return Ok(());
+    }
+    if let Some((window, profile)) = window
+        && let Ok(signed) = stellar_agent_core::hex::decode_hex32(envelope_hash)
+        && crate::policy_state::OperationStatus::new(window, profile)
+            .approval_kept_for_retry(&signed)
+            .map_err(|e| record_unavailable(format!("approval hold unreadable: {e}")))?
+    {
         return Ok(());
     }
     let mut store = stellar_agent_core::approval::retry::open_with_retry(
@@ -1023,7 +1052,7 @@ pub fn repair_approval_consumption(
     if let Some(entry) = store.get(nonce)
         && let ApprovalKind::Consumed { tx_hash, .. } = &entry.kind
     {
-        if tx_hash != &receipt.tx_hash {
+        if !holders.iter().any(|holder| &holder.tx_hash == tx_hash) {
             return Err(record_unavailable(
                 "approval consumption names a different transaction",
             ));
@@ -1040,9 +1069,15 @@ pub fn repair_approval_consumption(
                 record_unavailable(format!("approval consumption could not be written: {e}"))
             })?;
     }
-    receipts
-        .mark_approval_consumed(envelope_hash)
-        .map_err(|e| receipt_store_refusal(&e))
+    for holder in holders
+        .iter()
+        .filter(|holder| holder.submitted && !holder.approval_consumed)
+    {
+        receipts
+            .mark_approval_consumed(&holder.envelope_hash)
+            .map_err(|e| receipt_store_refusal(&e))?;
+    }
+    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -1475,6 +1510,7 @@ impl WalletSubmissionRecorder<'_> {
                 &self.window,
                 self.profile,
                 &writer,
+                self.operation.map(|attempt| attempt.operation_id),
                 |releases| claim(Some(releases)),
             )
             .map_err(crate::operation_entry::operation_refusal)?
@@ -2171,7 +2207,7 @@ mod tests {
             assert_eq!(inbox.gc_expired_and_consumed(now).unwrap(), 1);
         }
         for attempt in 0..2 {
-            repair_approval_consumption(&receipts, "envelope", &approvals, "repair").unwrap();
+            repair_approval_consumption(&receipts, "envelope", &approvals, "repair", None).unwrap();
             let inbox = PendingApprovalStore::open(approvals.join("repair.toml")).unwrap();
             assert!(
                 inbox.get(&nonce).is_none(),
@@ -2261,7 +2297,7 @@ mod tests {
         );
         drop(inbox);
 
-        repair_approval_consumption(&receipts, "envelope", &approvals, "repair").unwrap();
+        repair_approval_consumption(&receipts, "envelope", &approvals, "repair", None).unwrap();
         let receipt = receipts.get("envelope").unwrap().unwrap();
         assert!(receipt.approval_consumed);
         let inbox = PendingApprovalStore::open(path).unwrap();

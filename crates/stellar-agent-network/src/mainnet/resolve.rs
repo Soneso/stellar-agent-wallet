@@ -322,8 +322,106 @@ pub async fn resolve_tx_sign(
     #[cfg(feature = "mainnet-write")]
     {
         let mut detail = None;
-        let result = enabled::tx(req, &mut detail).await;
+        let result = match enabled::tx(req, &mut detail).await {
+            Ok(enabled::Resolved::Envelope(pending)) => pending.mint(),
+            // A canonical operation's authorization is minted only inside
+            // its attempt's begin, through `resolve_canonical_tx_sign`.
+            Ok(enabled::Resolved::Canonical(_)) => Err(MainnetAuthorizationError::Refused(
+                MainnetPrecondition::IntentMismatch,
+            )),
+            Err(error) => Err(error),
+        };
         report_detail("resolve_tx_sign", result, detail.as_deref())
+    }
+    #[cfg(not(feature = "mainnet-write"))]
+    {
+        req.context.absurd()
+    }
+}
+
+/// A classic signing of a canonical operation that the resolver checked and
+/// did not mint. [`crate::operation_entry::begin_canonical_attempt`] mints
+/// its authorization inside the operation's next attempt, so the mint, the
+/// approval's consumption and the attempt commit together or not at all.
+pub struct PendingTxSign<'a> {
+    #[cfg(feature = "mainnet-write")]
+    inner: enabled::Pending<'a>,
+    #[cfg(not(feature = "mainnet-write"))]
+    never: (Never, std::marker::PhantomData<&'a ()>),
+}
+
+impl std::fmt::Debug for PendingTxSign<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingTxSign").finish_non_exhaustive()
+    }
+}
+
+impl<'a> PendingTxSign<'a> {
+    /// The checked mint request, linked to the operation's next attempt.
+    pub(crate) fn request(&self) -> &crate::policy_state::MintRequest {
+        #[cfg(feature = "mainnet-write")]
+        {
+            &self.inner.request
+        }
+        #[cfg(not(feature = "mainnet-write"))]
+        {
+            match self.never.0 {}
+        }
+    }
+
+    /// The store and the profile the attempt commits to.
+    pub(crate) fn target(&self) -> (&'a PersistedWindowStore, &'a MainnetWriteContext) {
+        #[cfg(feature = "mainnet-write")]
+        {
+            (self.inner.store, self.inner.context)
+        }
+        #[cfg(not(feature = "mainnet-write"))]
+        {
+            match self.never.0 {}
+        }
+    }
+
+    /// The signing authority over the record the attempt's begin minted.
+    pub(crate) fn finish(
+        self,
+        minted: crate::policy_state::MintedRecord,
+    ) -> MainnetTxSignAuthorization {
+        #[cfg(feature = "mainnet-write")]
+        {
+            self.inner.finish(minted)
+        }
+        #[cfg(not(feature = "mainnet-write"))]
+        {
+            let _minted = minted;
+            match self.never.0 {}
+        }
+    }
+}
+
+/// Resolves one classic signing of a canonical operation without minting.
+///
+/// It runs every check of [`resolve_tx_sign`], including the match of the
+/// envelope against the stored intent and the lineage of the latest
+/// attempt, and returns the checked request.
+///
+/// # Errors
+///
+/// The refusals of [`resolve_tx_sign`]; `intent_mismatch` for a request
+/// without an operation or whose operation holds no canonical intent.
+pub async fn resolve_canonical_tx_sign(
+    req: TxSignRequest<'_>,
+) -> Result<PendingTxSign<'_>, MainnetAuthorizationError> {
+    #[cfg(feature = "mainnet-write")]
+    {
+        let mut detail = None;
+        let result = match enabled::tx(req, &mut detail).await {
+            Ok(enabled::Resolved::Canonical(inner)) => Ok(PendingTxSign { inner }),
+            Ok(enabled::Resolved::Envelope(_)) => Err(MainnetAuthorizationError::Refused(
+                MainnetPrecondition::IntentMismatch,
+            )),
+            Err(error) => Err(error),
+        };
+        report_detail("resolve_canonical_tx_sign", result, detail.as_deref())
     }
     #[cfg(not(feature = "mainnet-write"))]
     {
@@ -1305,7 +1403,7 @@ mod enabled {
         fee_cap: u32,
         now_ms: u64,
     ) -> Result<Option<CanonicalResolution>, MainnetAuthorizationError> {
-        use crate::mainnet::canonical::{CanonicalCheck, match_envelope};
+        use crate::mainnet::canonical::{CanonicalCheck, CanonicalRefusal, match_envelope};
         use crate::operation_entry::{CanonicalUse, canonical_slot_intent};
         use crate::policy_state::{IntentSlot, OperationStatus};
         use stellar_xdr::{LedgerEntryData, LedgerKey, LedgerKeyClaimableBalance};
@@ -1364,7 +1462,12 @@ mod enabled {
                 claim_entry: claim_entry.as_ref(),
             },
         )
-        .map_err(|_| refused(P::IntentMismatch))?;
+        .map_err(|refusal| {
+            refused(match refusal {
+                CanonicalRefusal::Mismatch(_) => P::IntentDivergence,
+                _ => P::IntentMismatch,
+            })
+        })?;
         Ok(Some(CanonicalResolution {
             digest: *matched.digest.as_bytes(),
             predecessor,
@@ -1375,10 +1478,10 @@ mod enabled {
     /// The envelope's shape, its signatures and its on-chain deadline are
     /// checked before the endpoint identity probe, so an envelope refused on
     /// them triggers no request.
-    pub(super) async fn tx(
-        req: TxSignRequest<'_>,
+    pub(super) async fn tx<'a>(
+        req: TxSignRequest<'a>,
         detail: &mut Option<String>,
-    ) -> Result<MainnetTxSignAuthorization, MainnetAuthorizationError> {
+    ) -> Result<Resolved<'a>, MainnetAuthorizationError> {
         let now = now()?;
         let deadline = tokio::time::Instant::now() + req.probe_deadline;
         let body = policy_body(req.context, req.policy, req.enablement)?;
@@ -1610,29 +1713,82 @@ mod enabled {
             &evaluation,
             &request,
         )?;
-        #[cfg(test)]
-        competing_writer::run();
-        let minted = req
-            .store
-            .mint_authorization(req.context.profile(), &request)
-            .map_err(mint::store_error)?;
-        let header = mint::header(
-            req.context,
-            req.store,
-            &request,
-            minted,
-            &endpoint,
-            req.signer,
-            req.enablement,
-            req.witness,
-            req.audit,
-        );
-        Ok(MainnetTxSignAuthorization(TxSignInner {
-            header,
-            binding: request.binding,
-            entries: request.holds,
-            _restriction: req.restriction,
-        }))
+        let pending = Pending {
+            request,
+            endpoint,
+            context: req.context,
+            store: req.store,
+            signer: req.signer,
+            enablement: req.enablement,
+            witness: req.witness,
+            audit: req.audit,
+            restriction: req.restriction,
+        };
+        Ok(if canonical.is_some() {
+            Resolved::Canonical(pending)
+        } else {
+            Resolved::Envelope(pending)
+        })
+    }
+
+    /// A checked classic signing, before its mint.
+    pub(super) enum Resolved<'a> {
+        /// An envelope or unlinked signing, minted by the public mint.
+        Envelope(Pending<'a>),
+        /// A canonical operation's signing, minted inside its attempt.
+        Canonical(Pending<'a>),
+    }
+
+    /// The checked request and the proofs its header binds.
+    pub(super) struct Pending<'a> {
+        pub(super) request: MintRequest,
+        endpoint: EndpointIdentity,
+        pub(super) context: &'a MainnetWriteContext,
+        pub(super) store: &'a PersistedWindowStore,
+        signer: &'a EnrolledSigner,
+        enablement: &'a EnablementRecord,
+        witness: Option<&'a CrossCheckWitness>,
+        audit: AuditReadiness,
+        /// The toolset restriction the signing was resolved under, which the
+        /// authorization owns until submission starts.
+        restriction: Option<crate::mainnet::restriction::ToolsetRestriction>,
+    }
+
+    impl Pending<'_> {
+        /// Mints through the public mint, then assembles the authorization.
+        pub(super) fn mint(self) -> Result<MainnetTxSignAuthorization, MainnetAuthorizationError> {
+            #[cfg(test)]
+            competing_writer::run();
+            let minted = self
+                .store
+                .mint_authorization(self.context.profile(), &self.request)
+                .map_err(mint::store_error)?;
+            Ok(self.finish(minted))
+        }
+
+        /// The authorization over `minted`, a record of this request.
+        pub(super) fn finish(
+            self,
+            minted: crate::policy_state::MintedRecord,
+        ) -> MainnetTxSignAuthorization {
+            let header = mint::header(
+                self.context,
+                self.store,
+                &self.request,
+                minted,
+                &self.endpoint,
+                self.signer,
+                self.enablement,
+                self.witness,
+                self.audit,
+            );
+            MainnetTxSignAuthorization(TxSignInner {
+                header,
+                binding: self.request.binding,
+                entries: self.request.holds,
+                _restriction: self.restriction,
+            })
+        }
     }
     fn network_id(context: &MainnetWriteContext) -> [u8; 32] {
         Sha256::digest(context.network_passphrase().as_bytes()).into()

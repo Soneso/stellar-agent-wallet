@@ -339,6 +339,22 @@ impl CanonicalFx {
         now: u64,
         approval: bool,
     ) -> Result<MainnetTxSignAuthorization, MainnetAuthorizationError> {
+        self.resolve_with(context, envelope, now, approval, |pending| {
+            self.begin(envelope, pending)
+        })
+        .await
+    }
+
+    /// Resolves `envelope` through the canonical route and hands the checked
+    /// signing to `finish`.
+    async fn resolve_with<T>(
+        &self,
+        context: &MainnetWriteContext,
+        envelope: &str,
+        now: u64,
+        approval: bool,
+        finish: impl FnOnce(PendingTxSign<'_>) -> T,
+    ) -> Result<T, MainnetAuthorizationError> {
         self.f.clock.set(now);
         let decision = Self::decision_for(&self.f, 900_000, now);
         let authority =
@@ -371,7 +387,34 @@ impl CanonicalFx {
             .bound_for_crate_tests(stellar_agent_core::hex::decode_hex32(&hash).unwrap())
         });
         req.witness = oracle_witness.as_ref();
-        resolve_tx_sign(req).await
+        Ok(finish(resolve_canonical_tx_sign(req).await?))
+    }
+
+    /// Begins the operation's next attempt under `pending`'s mint.
+    fn begin(&self, envelope: &str, pending: PendingTxSign<'_>) -> MainnetTxSignAuthorization {
+        // Each begin writes under a log of its own, since every test writer
+        // holds a fresh anchor store.
+        static BEGINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = BEGINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let writer = crate::submission_flow::recovery::tests::writer_at(
+            &self.f.dir.path().join(format!("attempt-{n}-audit.jsonl")),
+        );
+        let (attempt, auth) = crate::operation_entry::begin_canonical_attempt(
+            &writer,
+            "attempt",
+            &self.handle,
+            envelope,
+            pending,
+        )
+        .unwrap_or_else(|error| panic!("the canonical attempt's begin refused: {error:?}"));
+        assert_eq!(attempt.attempt_index, self.link.attempt_index);
+        let view = OperationStatus::new(&self.f.window, &self.f.profile)
+            .view(&BusinessId::parse(self.witness.nonce()).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.attempts, self.link.attempt_index);
+        assert_eq!(view.state, crate::policy_state::OperationState::Sending);
+        auth
     }
 
     async fn sign(
@@ -476,10 +519,12 @@ async fn canonical_resolver_rereads_the_claim() {
         if changed == "same" {
             fx.sign(&context, &fx.f.envelope, &result.unwrap()).await;
         } else {
-            let expected = if changed == "transport" {
-                P::EndpointUnavailable
-            } else {
-                P::IntentMismatch
+            // A reread balance that differs from the stored intent is a
+            // field divergence; an unreadable entry is no intent match.
+            let expected = match changed {
+                "transport" => P::EndpointUnavailable,
+                "amount" | "vanished" => P::IntentDivergence,
+                _ => P::IntentMismatch,
             };
             assert!(
                 matches!(
@@ -555,21 +600,6 @@ async fn intent_clock_reaches_real_signing() {
                     auth.expires_at_ms(),
                     (now + 60_000).min(end).min((now / 1000 + 120) * 1000)
                 );
-                let started =
-                    OperationRecorder::new(&fx.f.window, &fx.f.profile, &mut ApprovalRows, "begin")
-                        .begin_attempt(
-                            &fx.handle,
-                            &AttemptRequest {
-                                envelope: Some(AttemptEnvelope {
-                                    xdr: envelope.clone(),
-                                    unsigned_envelope_sha256: approval_subject_classic(&envelope),
-                                }),
-                                authorization: AttemptAuthorization::Linked,
-                                send_by_ms: u64::MAX,
-                            },
-                        )
-                        .unwrap();
-                assert_eq!(started.authorization_id, auth.0.header.id);
                 fx.sign(&context, &envelope, &auth).await;
                 assert!(matches!(
                     auth.check_not_expired(end),
@@ -792,13 +822,9 @@ async fn consented_unminted_intent_survives_waiting_end() {
             let server = fx.f.server().await;
             let context = fx.context(&server);
             let envelope = fx.envelope_at(now, 1);
-            let auth = if case == "restart" {
-                Some(fx.resolve(&context, &envelope, now, true).await.unwrap())
-            } else {
-                None
-            };
-            let authorization = if auth.is_some() {
-                AttemptAuthorization::Linked
+            if case == "restart" {
+                // The resolution begins the first attempt under its mint.
+                fx.resolve(&context, &envelope, now, true).await.unwrap();
             } else {
                 let decoded =
                     stellar_xdr::TransactionEnvelope::from_xdr_base64(&envelope, Limits::none())
@@ -808,7 +834,8 @@ async fn consented_unminted_intent_survives_waiting_end() {
                     context.network_passphrase(),
                 )
                 .unwrap();
-                AttemptAuthorization::Mint(Box::new(crate::policy_state::MintRequest {
+                let authorization =
+                    AttemptAuthorization::Mint(Box::new(crate::policy_state::MintRequest {
                     chain: fx.f.profile.chain_id,
                     binding: crate::policy_state::DomainBinding::Transaction {
                         unsigned_envelope_sha256: approval_subject_classic(&envelope),
@@ -845,25 +872,22 @@ async fn consented_unminted_intent_survives_waiting_end() {
                     approval_operation: None,
                     native_reservation: None,
                     floor: None,
-                }))
-            };
-            let first =
-                OperationRecorder::new(&fx.f.window, &fx.f.profile, &mut ApprovalRows, "first")
-                    .begin_attempt(
-                        &fx.handle,
-                        &AttemptRequest {
-                            envelope: Some(AttemptEnvelope {
-                                xdr: envelope.clone(),
-                                unsigned_envelope_sha256: approval_subject_classic(&envelope),
-                            }),
-                            authorization,
-                            send_by_ms: u64::MAX,
-                        },
-                    )
-                    .expect("first begin with no prior mint survives waiting expiry");
-            assert_eq!(first.attempt_index, 1);
-            if let Some(auth) = auth {
-                assert_eq!(first.authorization_id, auth.0.header.id);
+                }));
+                let first =
+                    OperationRecorder::new(&fx.f.window, &fx.f.profile, &mut ApprovalRows, "first")
+                        .begin_attempt(
+                            &fx.handle,
+                            &AttemptRequest {
+                                envelope: Some(AttemptEnvelope {
+                                    xdr: envelope.clone(),
+                                    unsigned_envelope_sha256: approval_subject_classic(&envelope),
+                                }),
+                                authorization,
+                                send_by_ms: u64::MAX,
+                            },
+                        )
+                        .expect("first begin with no prior mint survives waiting expiry");
+                assert_eq!(first.attempt_index, 1);
             }
             assert_eq!(
                 record_facts(&fx.f, &fx.witness).record().disposition,
@@ -917,20 +941,6 @@ async fn canonical_header_binds_attempt_and_intent() {
     let first = fx
         .resolve(&context, &fx.f.envelope, fx.f.now, false)
         .await
-        .unwrap();
-    let envelope = AttemptEnvelope {
-        xdr: fx.f.envelope.clone(),
-        unsigned_envelope_sha256: approval_subject_classic(&fx.f.envelope),
-    };
-    OperationRecorder::new(&fx.f.window, &fx.f.profile, &mut ApprovalRows, "first")
-        .begin_attempt(
-            &fx.handle,
-            &AttemptRequest {
-                envelope: Some(envelope),
-                authorization: AttemptAuthorization::Linked,
-                send_by_ms: u64::MAX,
-            },
-        )
         .unwrap();
     fx.sign(&context, &fx.f.envelope, &first).await;
     let crate::policy_state::DomainBinding::Transaction {
@@ -1266,4 +1276,72 @@ fn revoked_consent_wins_over_stale_process_handle() {
         "locked begin observes the other process's revocation: {result:?}"
     );
     assert_eq!(fx.f.wire(), before);
+}
+
+/// A candidate envelope whose amount differs from the stored canonical
+/// intent refuses with `intent_divergence`, which renders
+/// `simulation.divergence`, and writes nothing. An elapsed envelope
+/// deadline, another precondition, keeps
+/// `network.mainnet_authorization_refused`.
+#[tokio::test]
+#[serial_test::serial]
+async fn canonical_divergence_renders_at_the_resolver_exit() {
+    let fx = CanonicalFx::new(false, 900_000, str::to_owned);
+    let server = fx.f.server().await;
+    let context = fx.context(&server);
+    let other = classic_intent(
+        IntentBaseFacts {
+            chain_id: fx.f.profile.chain_id.caip2_str(),
+            source: fx.f.source.source(),
+            policy_digest: fx.f.policy.digest(),
+            signed_fee_cap: Some(500),
+            profile_fee_cap: None,
+            fee_choice: crate::fees::ClassicFeeChoice::ProfileDefault,
+            memo: MemoFact::Text("approved".to_owned()),
+        },
+        IntentPayload::Pay {
+            destination: fx.f.source.destination().to_owned(),
+            asset: IntentAsset::Native,
+            amount_stroops: 11,
+        },
+    )
+    .unwrap();
+    let diverged =
+        intent_envelope(&other, context.network_passphrase(), 1, 100, fx.f.now / 1000 + 120)
+            .unwrap();
+    let elapsed = intent_envelope(
+        &fx.intent,
+        context.network_passphrase(),
+        1,
+        100,
+        fx.f.now / 1000 - 10,
+    )
+    .unwrap();
+    for (envelope, precondition, code) in [
+        (
+            &diverged,
+            P::IntentDivergence,
+            "simulation.divergence",
+        ),
+        (
+            &elapsed,
+            P::DeadlineElapsed,
+            "network.mainnet_authorization_refused",
+        ),
+    ] {
+        let before = fx.f.wire();
+        let refused = fx
+            .resolve_with(&context, envelope, fx.f.now, false, |_| ())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(refused, MainnetAuthorizationError::Refused(p) if p == precondition),
+            "{refused:?}"
+        );
+        assert_eq!(
+            stellar_agent_core::error::WalletError::from(refused).code(),
+            code
+        );
+        assert_eq!(fx.f.wire(), before);
+    }
 }

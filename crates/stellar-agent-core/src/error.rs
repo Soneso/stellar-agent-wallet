@@ -2657,6 +2657,16 @@ pub enum NetworkError {
         sequence_delta: Option<u64>,
     },
 
+    /// A field of the transaction, the ledger state the resolver rereads for
+    /// it, or the intent digest it matches differs from the canonical intent
+    /// its operation record stores. The reread state is the claimable balance
+    /// of a claim: its asset or amount differs, or the entry is gone.
+    #[error(
+        "the transaction or the ledger state it reads differs from the intent its operation \
+         stored; the wallet did not sign or send. Prepare the action again under its business id"
+    )]
+    IntentDivergence,
+
     /// The RPC endpoint did not respond within the configured timeout.
     ///
     /// `url` holds the RPC endpoint URL.  `timeout_secs` holds the timeout
@@ -3189,7 +3199,7 @@ impl NetworkError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::WitnessUnavailable { .. } => "network.witness_unavailable",
-            Self::WitnessDivergence { .. } => "simulation.divergence",
+            Self::WitnessDivergence { .. } | Self::IntentDivergence => "simulation.divergence",
             Self::RpcTimeout { .. } => "network.rpc_timeout",
             Self::RpcUnreachable { .. } => "network.rpc_unreachable",
             Self::FriendbotMainnetForbidden => "network.friendbot_mainnet_forbidden",
