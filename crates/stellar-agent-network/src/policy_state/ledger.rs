@@ -1282,8 +1282,9 @@ pub(super) struct MintOptions {
     /// A successor attempt's mint does not count against
     /// [`MAX_OPEN_AUTHORIZATIONS`].
     pub(super) exempt_cap: bool,
-    /// The operation whose earlier, unused authorizations may carry the
-    /// same approval nonce.
+    /// The operation whose earlier authorizations may carry the same
+    /// approval nonce: an unused one, or one whose attempt ended in a
+    /// checked non-inclusion.
     pub(super) lineage: Option<OperationId>,
 }
 
@@ -2034,6 +2035,7 @@ pub(super) fn mint_into(
                     !wire.authorizations.iter().any(|auth| {
                         auth.approval_nonce.as_ref() == Some(nonce)
                             && !earlier_unused_carrier(auth, options.lineage, &exposed)
+                            && !operations::checked_lineage_member(wire, auth, options.lineage)
                     }),
                     P::ApprovalNonceReused,
                 )?;
@@ -2230,6 +2232,10 @@ impl PersistedWindowStore {
     /// admitted against the window's spend, its pending records, and every
     /// other hold.
     ///
+    /// A request whose link or approval operation names an operation that
+    /// holds a canonical intent refuses `IntentMismatch` and writes nothing:
+    /// only the operation's attempt begin mints that authorization.
+    ///
     /// Conflicting operation identities refuse before every store read.
     /// Retained approvals are checked after the chain and before the other
     /// prechecks, using a non-minting read under the lock. An approval without
@@ -2273,6 +2279,13 @@ impl PersistedWindowStore {
             hook();
         }
         let mut wire = self.retired_successor(&lock, profile, &original)?;
+        // A canonical operation's authorization is minted only inside its
+        // attempt's begin, which commits the mint with the attempt; the
+        // operation may be named by the link or by the approval identity.
+        check(
+            !operations::links_canonical(&wire, approval_identity),
+            MainnetPrecondition::IntentMismatch,
+        )?;
         sweep_expired(&mut wire, now);
         let minted = mint_into(
             &mut wire,
@@ -3071,9 +3084,12 @@ mod tests {
                                 business_id: BusinessId::parse(witness.nonce()).unwrap(),
                                 tool: OperationTool::CliPay,
                                 kind: OperationKind::Pay,
-                                intent: IntentSlot::Canonical {
+                                // A public mint under an approval identity
+                                // serves an envelope record only.
+                                intent: IntentSlot::Envelope {
+                                    unsigned_envelope_sha256: [1; 32],
                                     intent_digest: [1; 32],
-                                    intent: serde_json::json!({"op":"pay"}),
+                                    max_time: 0,
                                 },
                                 envelope_xdr: None,
                                 prepared_decision: None,
@@ -8880,9 +8896,12 @@ mod tests {
                 business_id: BusinessId::parse("order-1").unwrap(),
                 tool: OperationTool::CliPay,
                 kind: OperationKind::Pay,
-                intent: IntentSlot::Canonical {
+                // A canonical operation's authorization is minted only inside
+                // its attempt's begin; an envelope record takes a linked mint.
+                intent: IntentSlot::Envelope {
+                    unsigned_envelope_sha256: [1; 32],
                     intent_digest: [1; 32],
-                    intent: serde_json::json!({ "op": "pay" }),
+                    max_time: 0,
                 },
                 envelope_xdr: Some("AAAASTORED".to_owned()),
                 prepared_decision: None,
@@ -8913,7 +8932,6 @@ mod tests {
         ] {
             let mut request = l.request(tx(1), vec![]);
             request.operation = Some(stray);
-            request.intent_digest = Some(handle.intent().intent_digest());
             assert!(
                 matches!(
                     l.mint(&request),
@@ -8925,7 +8943,6 @@ mod tests {
         }
         let mut request = l.request(tx(1), vec![]);
         request.operation = Some(link);
-        request.intent_digest = Some(handle.intent().intent_digest());
         let minted = l.mint(&request).unwrap();
         assert_eq!(l.record(minted.id).operation, Some(link));
         let reopened = PersistedWindowStore::at_path(l.store.path().to_owned());

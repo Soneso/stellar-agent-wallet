@@ -2020,6 +2020,15 @@ pub(super) fn check_mint_link(
     Ok(())
 }
 
+/// Whether `operation` names a retained operation that holds a canonical intent.
+pub(super) fn links_canonical(wire: &WireFile, operation: Option<OperationId>) -> bool {
+    operation.is_some_and(|operation| {
+        records(wire).iter().any(|record| {
+            record.id == operation && matches!(record.intent, IntentSlot::Canonical { .. })
+        })
+    })
+}
+
 /// Checks canonical lineage on the same locked image as the mint.
 pub(super) fn check_mint_lineage(
     wire: &WireFile,
@@ -2029,12 +2038,7 @@ pub(super) fn check_mint_lineage(
 ) -> Result<(), WindowStoreError> {
     let refuse = |precondition| WindowStoreError::AuthorizationRefused { precondition };
     if digest.is_none() {
-        if link.is_some_and(|link| {
-            records(wire).iter().any(|record| {
-                record.id == link.operation_id
-                    && matches!(record.intent, IntentSlot::Canonical { .. })
-            })
-        }) {
+        if links_canonical(wire, link.map(|link| link.operation_id)) {
             return Err(refuse(MainnetPrecondition::IntentMismatch));
         }
         return if predecessor.is_none() {
@@ -2046,10 +2050,12 @@ pub(super) fn check_mint_lineage(
     let record = link
         .and_then(|link| records(wire).iter().find(|r| r.id == link.operation_id))
         .ok_or_else(|| refuse(MainnetPrecondition::IntentMismatch))?;
-    if !matches!(&record.intent, IntentSlot::Canonical { intent_digest, .. }
-        if Some(*intent_digest) == digest)
-    {
-        return Err(refuse(MainnetPrecondition::IntentMismatch));
+    match &record.intent {
+        IntentSlot::Canonical { intent_digest, .. } if Some(*intent_digest) == digest => {}
+        IntentSlot::Canonical { .. } => {
+            return Err(refuse(MainnetPrecondition::IntentDivergence));
+        }
+        _ => return Err(refuse(MainnetPrecondition::IntentMismatch)),
     }
     if predecessor
         != record
@@ -4318,19 +4324,72 @@ fn check_successor_proof(record: &WireOperation) -> Result<(), WindowStoreError>
         }
         if record
             .current_attempt()
-            .is_none_or(|attempt| attempt.not_included.is_none())
-        {
-            return Err(WindowStoreError::RetryRefused);
-        }
-        if record
-            .current_attempt()
-            .and_then(|attempt| attempt.decision.as_ref())
-            .is_none_or(|decision| !decision.projected)
+            .is_none_or(|attempt| !checked_not_included(attempt))
         {
             return Err(WindowStoreError::RetryRefused);
         }
     }
     Ok(())
+}
+
+/// Whether `attempt` holds a non-inclusion proof and the projection marker of
+/// the checked decision that committed it.
+fn checked_not_included(attempt: &WireAttempt) -> bool {
+    attempt.not_included.is_some()
+        && attempt
+            .decision
+            .as_ref()
+            .is_some_and(|decision| decision.projected)
+}
+
+/// The retained record of `operation` when it holds a canonical intent, the
+/// only slot whose successors may reuse an approval nonce.
+fn canonical_record(wire: &WireFile, operation: OperationId) -> Option<&WireOperation> {
+    records(wire).iter().find(|record| {
+        record.id == operation && matches!(record.intent, IntentSlot::Canonical { .. })
+    })
+}
+
+/// Whether `auth` is the settled authorization of an attempt of `lineage`'s
+/// canonical operation that ended in a checked non-inclusion, so its
+/// approval nonce may carry a successor attempt of the same operation.
+pub(super) fn checked_lineage_member(
+    wire: &WireFile,
+    auth: &WireAuthorization,
+    lineage: Option<OperationId>,
+) -> bool {
+    lineage.is_some_and(|operation| {
+        !auth.state.holds()
+            && canonical_record(wire, operation).is_some_and(|record| {
+                record.attempts.iter().any(|attempt| {
+                    attempt.authorization_id == auth.id && checked_not_included(attempt)
+                })
+            })
+    })
+}
+
+/// The canonical record and attempt whose committed exposure names the
+/// signed envelope `signed`.
+fn canonical_attempt<'w>(
+    wire: &'w WireFile,
+    signed: &[u8; 32],
+) -> Option<(&'w WireOperation, &'w WireAttempt)> {
+    records(wire)
+        .iter()
+        .filter(|record| matches!(record.intent, IntentSlot::Canonical { .. }))
+        .find_map(|record| {
+            record
+                .attempts
+                .iter()
+                .find(|attempt| {
+                    matches!(
+                        attempt.exposure.as_ref().map(|exposure| &exposure.identity),
+                        Some(ExposureIdentity::Classic { envelope_sha256, .. })
+                            if envelope_sha256 == signed
+                    )
+                })
+                .map(|attempt| (record, attempt))
+        })
 }
 
 /// Refuses a successor attempt whose authorization names another policy
@@ -5690,7 +5749,7 @@ impl<'a> OperationStatus<'a> {
         };
         let operation = records(&wire)
             .iter()
-            .find(|r| r.id == approval.operation_id && r.approval_record_id == Some(approval.id))
+            .find(|r| r.id == approval.operation_id)
             .ok_or_else(|| invalid("the approval and operation links disagree"))?;
         Ok(Some((OperationHandle::of(operation), approval.clone())))
     }
@@ -6189,6 +6248,89 @@ impl SequenceReleases for OperationStatus<'_> {
                 );
                 false
             })
+    }
+}
+
+/// The receipt facts of a claim, or of a gate, that continues one operation:
+/// committed sequence releases, and the attempts of that operation whose
+/// receipts may carry its approval nonce.
+///
+/// A holder carries the nonce when its signed envelope names an exposed
+/// attempt of the canonical operation that ended in a checked
+/// non-inclusion. The reads take no lock; a claim holds the window lock
+/// across them.
+pub struct ApprovalLineage<'a> {
+    status: OperationStatus<'a>,
+    operation: Option<OperationId>,
+}
+
+impl<'a> ApprovalLineage<'a> {
+    /// The facts of `store` for a claim that continues `operation`; `None`
+    /// confirms no carrier.
+    #[must_use]
+    pub fn new(
+        store: &'a PersistedWindowStore,
+        profile: &'a Profile,
+        operation: Option<OperationId>,
+    ) -> Self {
+        Self {
+            status: OperationStatus::new(store, profile),
+            operation,
+        }
+    }
+
+    fn carried(&self, holder: &AttemptRef) -> Result<bool, WindowStoreError> {
+        let AttemptRef::EnvelopeHash(signed) = holder;
+        let Some(operation) = self.operation else {
+            return Ok(false);
+        };
+        let Some(wire) = self.status.store.read_for_inspection(self.status.profile)? else {
+            return Ok(false);
+        };
+        Ok(
+            canonical_attempt(&wire, signed).is_some_and(|(record, attempt)| {
+                record.id == operation && checked_not_included(attempt)
+            }),
+        )
+    }
+}
+
+impl OperationStatus<'_> {
+    /// Whether the approval nonce of the receipt whose signed envelope is
+    /// `signed` stays held for a successor attempt: the receipt's attempt
+    /// belongs to a canonical operation that is neither terminal nor past its
+    /// execution expiry at the store clock. The receipt then owes its
+    /// approval tombstone until one of those ends.
+    ///
+    /// # Errors
+    ///
+    /// Every integrity, keyring and I/O error of the store's read, and the
+    /// clock's.
+    pub fn approval_kept_for_retry(&self, signed: &[u8; 32]) -> Result<bool, WindowStoreError> {
+        let Some(wire) = self.store.read_for_inspection(self.profile)? else {
+            return Ok(false);
+        };
+        let now = now_ms()?;
+        Ok(canonical_attempt(&wire, signed).is_some_and(|(record, _)| {
+            !record.state.is_terminal()
+                && record.execution_expires_at_ms.is_none_or(|end| now < end)
+        }))
+    }
+}
+
+impl SequenceReleases for ApprovalLineage<'_> {
+    fn sequence_released(&self, attempt: &AttemptRef) -> bool {
+        self.status.sequence_released(attempt)
+    }
+
+    fn carries_approval(&self, holder: &AttemptRef) -> bool {
+        self.carried(holder).unwrap_or_else(|error| {
+            tracing::warn!(
+                code = error.submission_code(),
+                "operation store: an approval holder could not be read; the approval stays held"
+            );
+            false
+        })
     }
 }
 
@@ -6967,9 +7109,26 @@ pub(crate) mod tests {
         /// mint of `tx(n)`: begin, claim, expose, unknown outcome and a
         /// checked, projected non-inclusion.
         fn not_included_attempt(&mut self, handle: &OperationHandle, n: u8) -> u32 {
-            let request = self.operation_mint_request(handle, tx(n), self.policy(), vec![]);
+            let policy = self.policy();
+            self.not_included_attempt_under(handle, n, policy)
+        }
+
+        /// [`Self::not_included_attempt`] under `authority`.
+        fn not_included_attempt_under(
+            &mut self,
+            handle: &OperationHandle,
+            n: u8,
+            authority: MintAuthority,
+        ) -> u32 {
+            let approval = matches!(authority, MintAuthority::Approval { .. });
+            let request = self.operation_mint_request(handle, tx(n), authority, vec![]);
             let started = self.begin_mint(handle, &request).unwrap();
-            self.claim(&request, started.minted.as_ref().unwrap());
+            let minted = started.minted.as_ref().unwrap();
+            self.claim(&request, minted);
+            if approval {
+                // A sent attempt's authorization is consumed before the send.
+                total_budget::consume(self, &request, minted, n);
+            }
             let index = started.attempt_index;
             self.recorder()
                 .expose(handle.id(), index, &classic_exposure(n), Some(10))
@@ -7052,6 +7211,13 @@ pub(crate) mod tests {
             intent_digest: [n; 32],
             intent: serde_json::json!({ "op": "pay", "n": n }),
         }
+    }
+
+    /// An envelope slot without a deadline, whose next attempt a public mint
+    /// may link; a canonical slot's authorization is minted only inside its
+    /// attempt's begin.
+    pub(crate) fn linkable(n: u8) -> IntentSlot {
+        envelope(n, n, 0)
     }
 
     fn envelope(unsigned: u8, digest: u8, max_time: u64) -> IntentSlot {
@@ -7748,7 +7914,7 @@ pub(crate) mod tests {
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
-        let handle = fx.open_new(&request("order-1", canonical(1)));
+        let handle = fx.open_new(&request("order-1", linkable(1)));
         fx.recorder()
             .transition(
                 handle.id(),
@@ -7763,7 +7929,7 @@ pub(crate) mod tests {
             attempt_index: 1,
         });
         let minted = fx.store.mint_authorization(&fx.profile, &linked).unwrap();
-        let handle = match fx.open(&request("order-1", canonical(1))).unwrap() {
+        let handle = match fx.open(&request("order-1", linkable(1))).unwrap() {
             OpenOutcome::Resumable(handle) => handle,
             other => panic!("expected the adopted record, got {other:?}"),
         };
@@ -8586,7 +8752,7 @@ pub(crate) mod tests {
                 };
                 let (slot, binding) = match case {
                     Case::X402 => (x402([1; 32]), soroban(1)),
-                    Case::ApprovalClassic | Case::PolicyClassic => (canonical(1), tx(1)),
+                    Case::ApprovalClassic | Case::PolicyClassic => (linkable(1), tx(1)),
                 };
                 let mut open = request("order-1", slot);
                 open.rule_ttl_ms = Some(300_000);
@@ -8763,7 +8929,7 @@ pub(crate) mod tests {
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
         cover(&fx);
-        let handle = fx.open_new(&request("order-1", canonical(1)));
+        let handle = fx.open_new(&request("order-1", linkable(1)));
         let authority = fx.fresh_policy();
         let mut linked =
             fx.operation_mint_request(&handle, tx(1), authority.clone(), vec![hold(70)]);
@@ -8781,7 +8947,7 @@ pub(crate) mod tests {
             71,
             "the linked mint reserves once"
         );
-        let handle = match fx.open(&request("order-1", canonical(1))).unwrap() {
+        let handle = match fx.open(&request("order-1", linkable(1))).unwrap() {
             OpenOutcome::Resumable(handle) => handle,
             other => panic!("expected the adopted record, got {other:?}"),
         };
@@ -10033,7 +10199,7 @@ pub(crate) mod tests {
         });
         obliged.unwrap();
         check(committed, vec![(S::Expired, Some(1), T0 + 11)]);
-        let handle = fx.open_new(&request("order-10", canonical(10)));
+        let handle = fx.open_new(&request("order-10", linkable(10)));
         let linked = linked_mint(&fx, &handle, tx(10), fx.policy(), 1);
         fx.store.mint_authorization(&fx.profile, &linked).unwrap();
         fx.clock.set(T0 + 12);
@@ -10053,7 +10219,7 @@ pub(crate) mod tests {
         // An authorization that expired while linked adopts through the
         // sweep, as in `sweep_adopts_waiting_operation_before_restart`.
         let mut fx = Fx::new();
-        let mut open = request("order-1", canonical(1));
+        let mut open = request("order-1", linkable(1));
         open.rule_ttl_ms = Some(300_000);
         let handle = fx.open_new(&open);
         fx.clock.set(T0 + 299_000);
@@ -10076,7 +10242,7 @@ pub(crate) mod tests {
         check(committed, vec![]);
         assert_eq!(fx.record(waiting.id()).approval_record_id, Some([9; 32]));
         let handle = unknown_named(&mut fx, 2);
-        let adoptable = fx.open_new(&request("order-3", canonical(3)));
+        let adoptable = fx.open_new(&request("order-3", linkable(3)));
         let linked = linked_mint(&fx, &adoptable, tx(3), fx.policy(), 1);
         fx.store.mint_authorization(&fx.profile, &linked).unwrap();
         fx.clock.set(T0 + 20);
@@ -10725,7 +10891,7 @@ pub(crate) mod tests {
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::with_approvals();
-        let handle = fx.open_new(&request("order-1", canonical(1)));
+        let handle = fx.open_new(&request("order-1", linkable(1)));
         let authority = fx.approve(handle.id());
         let carrier = linked_mint(&fx, &handle, tx(1), authority.clone(), 1);
         let minted = fx.store.mint_authorization(&fx.profile, &carrier).unwrap();
@@ -10841,7 +11007,7 @@ pub(crate) mod tests {
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
-        let handle = fx.open_new(&request("order-1", canonical(1)));
+        let handle = fx.open_new(&request("order-1", linkable(1)));
         let linked = linked_mint(&fx, &handle, tx(1), fx.fresh_policy(), 1);
         let minted = fx.store.mint_authorization(&fx.profile, &linked).unwrap();
         assert!(
@@ -10919,7 +11085,7 @@ pub(crate) mod tests {
         assert_eq!(file_bytes(&fx), bytes);
         assert_eq!(fx.record(handle.id()).state, OperationState::Prepared);
 
-        let mut open = request("order-2", canonical(2));
+        let mut open = request("order-2", linkable(2));
         open.rule_ttl_ms = Some(300_000);
         let adopted = fx.open_new(&open);
         fx.clock.set(T0 + 699_000);
@@ -11076,7 +11242,7 @@ pub(crate) mod tests {
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
-        let waiting = fx.open_new(&request("order-1", canonical(1)));
+        let waiting = fx.open_new(&request("order-1", linkable(1)));
         let mut linked = linked_mint(&fx, &waiting, tx(1), fx.fresh_policy(), 1);
         linked.holds = vec![hold(10)];
         let minted = fx.store.mint_authorization(&fx.profile, &linked).unwrap();
@@ -11277,7 +11443,7 @@ pub(crate) mod tests {
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
-        let handle = fx.open_new(&request("order-1", canonical(1)));
+        let handle = fx.open_new(&request("order-1", linkable(1)));
         step(&mut fx, &handle, None, OperationState::Expired);
         let before = fx.generation();
         let bytes = file_bytes(&fx);
@@ -11303,7 +11469,7 @@ pub(crate) mod tests {
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let mut fx = Fx::new();
-        let fresh = fx.open_new(&request("order-1", canonical(1)));
+        let fresh = fx.open_new(&request("order-1", linkable(1)));
         let before = fx.generation();
         let bytes = file_bytes(&fx);
         let ahead = linked_mint(&fx, &fresh, tx(1), fx.fresh_policy(), 2);
@@ -11320,7 +11486,7 @@ pub(crate) mod tests {
         let next = linked_mint(&fx, &fresh, tx(1), fx.fresh_policy(), 1);
         fx.store.mint_authorization(&fx.profile, &next).unwrap();
 
-        let retried = fx.open_new(&request("order-2", canonical(2)));
+        let retried = fx.open_new(&request("order-2", linkable(2)));
         fx.not_included_attempt(&retried, 2);
         let current = linked_mint(&fx, &retried, tx(3), fx.policy(), 1);
         let error = fx
@@ -11349,7 +11515,7 @@ pub(crate) mod tests {
         let mut open = request("order-1", canonical(1));
         open.rule_ttl_ms = Some(300_000);
         let waiting = fx.open_new(&open);
-        let adopted = fx.open_new(&request("order-2", canonical(2)));
+        let adopted = fx.open_new(&request("order-2", linkable(2)));
         let linked = linked_mint(&fx, &adopted, tx(2), fx.fresh_policy(), 1);
         let minted = fx.store.mint_authorization(&fx.profile, &linked).unwrap();
         let stored = [fx.record(waiting.id()), fx.record(adopted.id())];
@@ -11418,7 +11584,18 @@ pub(crate) mod tests {
         authority: MintAuthority,
         sequence: i64,
     ) -> (OperationHandle, RecoveryAttempt) {
-        let handle = fx.open_new(&request(&format!("order-{n}"), canonical(n)));
+        decided_attempt_in(fx, n, canonical(n), authority, sequence)
+    }
+
+    /// [`decided_attempt_under`] of a record holding `slot`.
+    pub(crate) fn decided_attempt_in(
+        fx: &mut Fx,
+        n: u8,
+        slot: IntentSlot,
+        authority: MintAuthority,
+        sequence: i64,
+    ) -> (OperationHandle, RecoveryAttempt) {
+        let handle = fx.open_new(&request(&format!("order-{n}"), slot));
         let binding = DomainBinding::Transaction {
             unsigned_envelope_sha256: [n; 32],
             tx_hash: [n ^ 0x80; 32],
@@ -12646,7 +12823,17 @@ pub(crate) mod tests {
     /// Commits a checked non-inclusion of `order-{n}`'s first attempt and
     /// returns its handle and commit.
     fn checked_not_included(fx: &mut Fx, n: u8) -> (OperationHandle, CommitId) {
-        let (handle, _) = decided_attempt(fx, n);
+        checked_not_included_in(fx, n, canonical(n))
+    }
+
+    /// [`checked_not_included`] of a record holding `slot`.
+    fn checked_not_included_in(
+        fx: &mut Fx,
+        n: u8,
+        slot: IntentSlot,
+    ) -> (OperationHandle, CommitId) {
+        let authority = fx.policy();
+        let (handle, _) = decided_attempt_in(fx, n, slot, authority, 100 + i64::from(n));
         let attempt = OperationStatus::new(&fx.store, &fx.profile)
             .outcome_snapshot(Some(&[n ^ 0x80; 32]))
             .unwrap()
@@ -12775,7 +12962,17 @@ pub(crate) mod tests {
         n: u8,
         checked: Checked,
     ) -> (OperationHandle, CommitId, String) {
-        let handle = fx.open_new(&request(&format!("order-{n}"), canonical(n)));
+        commit_approved_in(fx, n, canonical(n), checked)
+    }
+
+    /// [`commit_approved`] of a record holding `slot`.
+    pub(crate) fn commit_approved_in(
+        fx: &mut Fx,
+        n: u8,
+        slot: IntentSlot,
+        checked: Checked,
+    ) -> (OperationHandle, CommitId, String) {
+        let handle = fx.open_new(&request(&format!("order-{n}"), slot));
         let authority = fx.approve(handle.id());
         let MintAuthority::Approval { nonce, .. } = &authority else {
             panic!("an approval authority is required");
@@ -12794,6 +12991,69 @@ pub(crate) mod tests {
             checked_transition(n, checked, &failed_result_xdr(0)),
         );
         (handle, commit, nonce)
+    }
+
+    /// Continues [`commit_approved`]'s operation of envelope `previous`, whose
+    /// checked non-inclusion is projected, under the same approval `nonce`:
+    /// the predecessor's authorization is consumed as its send consumed it,
+    /// and attempt envelope `n` runs to the checked outcome `checked`, or
+    /// stays `SentOutcomeUnknown` without one.
+    pub(crate) fn approved_successor(
+        fx: &mut Fx,
+        handle: &OperationHandle,
+        nonce: &str,
+        previous: u8,
+        n: u8,
+        checked: Option<Checked>,
+    ) -> Option<CommitId> {
+        use crate::policy_state::ledger::{ConsumptionBinding, SubmissionBinding};
+        let first = fx
+            .record(handle.id())
+            .current_attempt()
+            .unwrap()
+            .authorization_id;
+        fx.rewrite(|wire| {
+            wire.holds.retain(|hold| hold.authorization_id != first);
+            let auth = wire
+                .authorizations
+                .iter_mut()
+                .find(|auth| auth.id == first)
+                .unwrap();
+            auth.state = AuthorizationState::Used;
+            auth.settled_ms = Some(T0);
+            auth.disposition = Some(Disposition::Used);
+            auth.consumption = Some(ConsumptionBinding::Transaction(SubmissionBinding {
+                destinations: Default::default(),
+                chain_scope: Some(ChainScope::for_chain(Caip2::Mainnet)),
+                fee_bump: None,
+                envelope_hash: Sha256::digest(envelope_text(previous)).into(),
+                tx_hash: [previous ^ 0x80; 32],
+                source: SOURCE.to_owned(),
+                sequence: 100 + i64::from(previous),
+                max_time: T0 / 1_000 + 60,
+                pending_since_ms: T0,
+                submission_ledger: 1,
+                submission_anchor: None,
+            }));
+        });
+        let authority = MintAuthority::Approval {
+            nonce: nonce.to_owned(),
+            expires_at_ms: T0 + APPROVAL_MS,
+        };
+        let binding = DomainBinding::Transaction {
+            unsigned_envelope_sha256: [n; 32],
+            tx_hash: [n ^ 0x80; 32],
+            source: SOURCE.to_owned(),
+            sequence: 100 + i64::from(n),
+        };
+        decidable_attempt(fx, handle, n, binding, authority);
+        checked.map(|checked| {
+            commit_on(
+                fx,
+                [n ^ 0x80; 32],
+                checked_transition(n, checked, &failed_result_xdr(0)),
+            )
+        })
     }
 
     /// Expires the accounting of envelope `n`'s reservation past its
@@ -13396,7 +13656,7 @@ pub(crate) mod tests {
         };
         for (n, sequence, digest) in [(1_u8, 7, [8; 32]), (2, 8, [7; 32])] {
             let mut fx = Fx::new();
-            let (handle, commit) = checked_not_included(&mut fx, n);
+            let (handle, commit) = checked_not_included_in(&mut fx, n, linkable(n));
             fx.recorder()
                 .acknowledge_projection(handle.id(), 1, commit)
                 .unwrap();
@@ -13424,7 +13684,7 @@ pub(crate) mod tests {
         }
 
         let mut fx = Fx::new();
-        let (handle, commit) = checked_not_included(&mut fx, 3);
+        let (handle, commit) = checked_not_included_in(&mut fx, 3, linkable(3));
         fx.recorder()
             .acknowledge_projection(handle.id(), 1, commit)
             .unwrap();
@@ -13490,7 +13750,16 @@ pub(crate) mod tests {
     /// record opens while the operation is prepared, and the first attempt
     /// runs under the policy. Returns the handle and the approval authority.
     fn approved_not_included(fx: &mut Fx, n: u8) -> (OperationHandle, MintAuthority) {
-        let handle = fx.open_new(&request(&format!("order-{n}"), canonical(n)));
+        approved_not_included_in(fx, n, canonical(n))
+    }
+
+    /// [`approved_not_included`] of a record holding `slot`.
+    fn approved_not_included_in(
+        fx: &mut Fx,
+        n: u8,
+        slot: IntentSlot,
+    ) -> (OperationHandle, MintAuthority) {
+        let handle = fx.open_new(&request(&format!("order-{n}"), slot));
         let approval = fx.approve(handle.id());
         let binding = DomainBinding::Transaction {
             unsigned_envelope_sha256: [n; 32],
@@ -13520,7 +13789,16 @@ pub(crate) mod tests {
 
     /// A checked, projected classic non-inclusion of `order-{n}`.
     fn projected_not_included(fx: &mut Fx, n: u8) -> OperationHandle {
-        let (handle, commit) = checked_not_included(fx, n);
+        projected_not_included_in(fx, n, canonical(n))
+    }
+
+    /// [`projected_not_included`] of a record holding `slot`.
+    pub(crate) fn projected_not_included_in(
+        fx: &mut Fx,
+        n: u8,
+        slot: IntentSlot,
+    ) -> OperationHandle {
+        let (handle, commit) = checked_not_included_in(fx, n, slot);
         fx.recorder()
             .acknowledge_projection(handle.id(), 1, commit)
             .unwrap();
@@ -13663,7 +13941,7 @@ pub(crate) mod tests {
             );
         };
         let mut fx = Fx::new();
-        let handle = projected_not_included(&mut fx, 1);
+        let handle = projected_not_included_in(&mut fx, 1, linkable(1));
         let minted = link_next(&fx, &handle, 21, fx.policy());
         repin_policy(&fx, 8, [8; 32]);
         assert!(
@@ -13701,7 +13979,7 @@ pub(crate) mod tests {
         assert_eq!(serde_json::to_vec(&record.attempts).unwrap(), attempts);
 
         let mut fx = Fx::new();
-        let handle = projected_not_included(&mut fx, 2);
+        let handle = projected_not_included_in(&mut fx, 2, linkable(2));
         let minted = link_next(&fx, &handle, 23, fx.policy());
         let started = begin_linked(&mut fx, &handle).unwrap();
         assert_eq!(started.attempt_index, 2);
@@ -13710,8 +13988,9 @@ pub(crate) mod tests {
         assert_eq!(record.attempts[1].authorization_id, minted.id);
     }
 
-    /// A successor under a fresh approval authorization admits, minted in
-    /// the admission or linked before it, while the pin names its policy.
+    /// A canonical successor under a fresh approval authorization admits,
+    /// minted in the admission, while the pin names its policy; a public
+    /// mint linked to it before the admission refuses.
     #[test]
     #[serial(mainnet_clock)]
     #[serial]
@@ -13730,27 +14009,295 @@ pub(crate) mod tests {
         let mint = fx.operation_mint_request(&handle, tx(21), approval.clone(), vec![]);
         assert_eq!(fx.begin_mint(&handle, &mint).unwrap().attempt_index, 2);
         assert_eq!(fx.record(handle.id()).state, OperationState::Sending);
-        // The successor consumed the record for its operation; a public mint
-        // of other content under the same nonce and identity refuses.
+        // A public mint of other content under the same nonce, naming the
+        // canonical operation as its approval identity, refuses after the
+        // record check and before the retained authorization's nonce
+        // decides: only the begin mints for that operation.
         let mut reuse = fx.mint_request(tx(23), approval, vec![]);
         reuse.approval_operation = Some(handle.id());
         let before = file_bytes(&fx);
         assert!(matches!(
             fx.store.mint_authorization(&fx.profile, &reuse),
             Err(WindowStoreError::AuthorizationRefused {
-                precondition: MainnetPrecondition::ApprovalNonceReused
+                precondition: MainnetPrecondition::IntentMismatch
             })
         ));
         assert_eq!(file_bytes(&fx), before);
 
+        // A canonical successor is minted only inside its begin: a public
+        // mint linked before it refuses and writes nothing.
         let mut fx = Fx::with_approvals();
         let (handle, approval) = approved_not_included(&mut fx, 2);
-        let minted = link_next(&fx, &handle, 22, approval);
-        assert_eq!(begin_linked(&mut fx, &handle).unwrap().attempt_index, 2);
+        let mut linked = fx.operation_mint_request(&handle, tx(22), approval, vec![]);
+        linked.operation = Some(OperationLink {
+            operation_id: handle.id(),
+            attempt_index: 2,
+        });
+        let before = file_bytes(&fx);
+        assert!(matches!(
+            fx.store.mint_authorization(&fx.profile, &linked),
+            Err(WindowStoreError::AuthorizationRefused {
+                precondition: MainnetPrecondition::IntentMismatch
+            })
+        ));
+        assert_eq!(file_bytes(&fx), before);
+    }
+
+    /// The nonce of an approval authority.
+    fn approval_nonce(authority: &MintAuthority) -> String {
+        let MintAuthority::Approval { nonce, .. } = authority else {
+            panic!("an approval authority is required");
+        };
+        nonce.clone()
+    }
+
+    /// The disposition of `nonce`'s durable record in `store`.
+    fn approval_disposition(
+        store: &PersistedWindowStore,
+        profile: &Profile,
+        nonce: &str,
+    ) -> stellar_agent_core::approval::witness::ApprovalDisposition {
+        crate::policy_state::ApprovalStatus::new(store, profile)
+            .facts_by_nonce(nonce)
+            .unwrap()
+            .unwrap()
+            .record()
+            .disposition
+    }
+
+    /// A canonical operation's authorization is minted only inside its
+    /// attempt's begin: the public mint refuses a linked request with and
+    /// without the intent digest and an unlinked one naming the operation as
+    /// its approval operation, and writes nothing; the begin commits the mint, the
+    /// approval's consumption and the `Sending` attempt in one generation. A
+    /// crash after the prepared image leaves none of them after a restart;
+    /// a crash after the counter leaves all three.
+    #[test]
+    #[serial]
+    fn canonical_begin_mints_consumes_and_opens_once() {
+        use super::super::store::{
+            COMMIT_FAULT_AFTER_COUNTER, COMMIT_FAULT_AFTER_PREPARED, arm_accounting_fault,
+        };
+        use stellar_agent_core::approval::witness::ApprovalDisposition;
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        for (seam, durable) in [
+            (None, true),
+            (Some(COMMIT_FAULT_AFTER_PREPARED), false),
+            (Some(COMMIT_FAULT_AFTER_COUNTER), true),
+        ] {
+            let mut fx = Fx::with_approvals();
+            let handle = fx.open_new(&request("order-1", canonical(1)));
+            let approval = fx.approve(handle.id());
+            let nonce = approval_nonce(&approval);
+            let mint = fx.operation_mint_request(&handle, tx(1), approval, vec![]);
+            let mut without_digest = mint.clone();
+            without_digest.intent_digest = None;
+            // An unlinked request naming the operation through its approval
+            // identity.
+            let mut unlinked = without_digest.clone();
+            unlinked.operation = None;
+            unlinked.predecessor = None;
+            unlinked.approval_operation = Some(handle.id());
+            let before = file_bytes(&fx);
+            for (case, raw) in [
+                ("linked", &mint),
+                ("linked without digest", &without_digest),
+                ("approval operation", &unlinked),
+            ] {
+                assert!(
+                    matches!(
+                        fx.store.mint_authorization(&fx.profile, raw),
+                        Err(WindowStoreError::AuthorizationRefused {
+                            precondition: MainnetPrecondition::IntentMismatch
+                        })
+                    ),
+                    "a public canonical mint refuses: {case}"
+                );
+                assert_eq!(file_bytes(&fx), before, "{case}");
+            }
+            let armed = seam.map(arm_accounting_fault);
+            let started = fx.begin_mint(&handle, &mint);
+            drop(armed);
+            assert_eq!(started.is_ok(), seam.is_none(), "seam {seam:?}");
+            let reopened = PersistedWindowStore::at_path(fx.store.path().to_owned());
+            let wire = reopened.read_for_inspection(&fx.profile).unwrap().unwrap();
+            let record = records(&wire)
+                .iter()
+                .find(|record| record.id == handle.id())
+                .unwrap();
+            let minted: Vec<_> = wire
+                .authorizations
+                .iter()
+                .filter(|auth| auth.approval_nonce.as_deref() == Some(nonce.as_str()))
+                .collect();
+            let disposition = approval_disposition(&reopened, &fx.profile, &nonce);
+            if durable {
+                assert_eq!(record.state, OperationState::Sending, "seam {seam:?}");
+                assert_eq!(minted.len(), 1, "seam {seam:?}");
+                assert_eq!(record.attempts.len(), 1, "seam {seam:?}");
+                assert_eq!(record.attempts[0].authorization_id, minted[0].id);
+                assert_eq!(disposition, ApprovalDisposition::Consumed);
+            } else {
+                assert!(record.attempts.is_empty(), "seam {seam:?}");
+                assert!(minted.is_empty(), "seam {seam:?}");
+                assert_eq!(disposition, ApprovalDisposition::Pending);
+            }
+        }
+    }
+
+    /// A successor attempt reuses its canonical operation's approval nonce
+    /// after each predecessor's checked, projected non-inclusion: three
+    /// attempts under one nonce, with the first consumption time kept. An
+    /// unprojected predecessor refuses `recovery.retry_refused`; a claimed
+    /// holder, an older attempt without its projection and a holder that is
+    /// no attempt's authorization refuse `approval_nonce_reused`. A refusal
+    /// writes nothing.
+    #[test]
+    #[serial]
+    fn same_nonce_successor_requires_complete_lineage() {
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let mut fx = Fx::with_approvals();
+        let handle = fx.open_new(&request("order-1", canonical(1)));
+        let approval = fx.approve(handle.id());
+        let nonce = approval_nonce(&approval);
         assert_eq!(
-            fx.record(handle.id()).attempts[1].authorization_id,
-            minted.id
+            fx.not_included_attempt_under(&handle, 1, approval.clone()),
+            1
         );
+        let consumed_at = fx.wire().approvals.unwrap().records[0].consumed_at_ms;
+        assert!(consumed_at.is_some());
+        assert_eq!(
+            fx.not_included_attempt_under(&handle, 2, approval.clone()),
+            2
+        );
+        let mint = fx.operation_mint_request(&handle, tx(3), approval.clone(), vec![]);
+        assert_eq!(fx.begin_mint(&handle, &mint).unwrap().attempt_index, 3);
+        // A second process begins from the same non-inclusion under the same
+        // nonce after the first one's begin committed.
+        let mut racing = mint.clone();
+        racing.binding = tx(4);
+        let before = file_bytes(&fx);
+        let refused = fx.begin_mint(&handle, &racing).unwrap_err();
+        assert_eq!(refused.submission_code(), "operation.attempt_open");
+        assert_eq!(file_bytes(&fx), before);
+        let wire = fx.wire();
+        let record = records(&wire)
+            .iter()
+            .find(|record| record.id == handle.id())
+            .unwrap();
+        assert_eq!(record.state, OperationState::Sending);
+        assert_eq!(
+            wire.authorizations
+                .iter()
+                .filter(|auth| auth.approval_nonce.as_deref() == Some(nonce.as_str()))
+                .count(),
+            3
+        );
+        assert_eq!(
+            wire.approvals.unwrap().records[0].consumed_at_ms,
+            consumed_at
+        );
+
+        for case in ["unprojected", "claimed", "older-unprojected", "foreign"] {
+            let mut fx = Fx::with_approvals();
+            let handle = fx.open_new(&request("order-1", canonical(1)));
+            let approval = fx.approve(handle.id());
+            fx.not_included_attempt_under(&handle, 1, approval.clone());
+            fx.not_included_attempt_under(&handle, 2, approval.clone());
+            let first = fx.record(handle.id()).attempts[0].authorization_id;
+            fx.rewrite(|wire| {
+                let index = section_mut(wire)
+                    .records
+                    .iter()
+                    .position(|record| record.id == handle.id())
+                    .unwrap();
+                let attempts = &mut section_mut(wire).records[index].attempts;
+                match case {
+                    "unprojected" => attempts[1].decision.as_mut().unwrap().projected = false,
+                    "older-unprojected" => {
+                        attempts[0].decision.as_mut().unwrap().projected = false;
+                    }
+                    "claimed" => {
+                        let auth = wire
+                            .authorizations
+                            .iter_mut()
+                            .find(|auth| auth.id == first)
+                            .unwrap();
+                        // An exposed attempt whose authorization was never
+                        // consumed, as after a crash before the send.
+                        auth.state = AuthorizationState::Claimed;
+                        auth.disposition = None;
+                        auth.consumption = None;
+                        auth.settled_ms = None;
+                    }
+                    _ => {
+                        let mut holder = wire
+                            .authorizations
+                            .iter()
+                            .find(|auth| auth.id == first)
+                            .unwrap()
+                            .clone();
+                        holder.id = AuthorizationId::from_bytes([0x3c; 32]);
+                        holder.operation = None;
+                        holder.binding = tx(0x3c);
+                        holder.content_digest = holder.binding.content_digest();
+                        wire.authorizations.push(holder);
+                    }
+                }
+            });
+            let before = file_bytes(&fx);
+            let mint = fx.operation_mint_request(&handle, tx(3), approval, vec![]);
+            let refused = match fx.begin_mint(&handle, &mint) {
+                Ok(started) => panic!("{case}: the successor was admitted: {started:?}"),
+                Err(refused) => refused,
+            };
+            if case == "unprojected" {
+                assert!(
+                    matches!(refused, WindowStoreError::RetryRefused),
+                    "{case}: {refused:?}"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        refused,
+                        WindowStoreError::AuthorizationRefused {
+                            precondition: MainnetPrecondition::ApprovalNonceReused
+                        }
+                    ),
+                    "{case}: {refused:?}"
+                );
+            }
+            assert_eq!(file_bytes(&fx), before, "{case}");
+        }
+    }
+
+    /// Eight attempts of one canonical operation run under one approval
+    /// nonce; the ninth refuses `operation.attempt_limit` and writes nothing.
+    #[test]
+    #[serial]
+    fn same_nonce_successor_stops_at_attempt_limit() {
+        let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+        let mut fx = Fx::with_approvals();
+        let handle = fx.open_new(&request("order-1", canonical(1)));
+        let approval = fx.approve(handle.id());
+        for n in 1..=8_u8 {
+            assert_eq!(
+                fx.not_included_attempt_under(&handle, n, approval.clone()),
+                u32::from(n)
+            );
+        }
+        let before = file_bytes(&fx);
+        let mint = fx.operation_mint_request(&handle, tx(9), approval, vec![]);
+        let refused = fx.begin_mint(&handle, &mint).unwrap_err();
+        assert!(
+            matches!(refused, WindowStoreError::AttemptLimit),
+            "{refused:?}"
+        );
+        assert_eq!(refused.submission_code(), "operation.attempt_limit");
+        assert_eq!(file_bytes(&fx), before);
     }
 
     /// The successor's `not_included -> sending` row names the permitting
@@ -14294,7 +14841,7 @@ pub(crate) mod tests {
         }
 
         /// Consumes `minted` with the transaction binding of `tx(n)`.
-        fn consume(fx: &Fx, request: &MintRequest, minted: &MintedRecord, n: u8) {
+        pub(super) fn consume(fx: &Fx, request: &MintRequest, minted: &MintedRecord, n: u8) {
             consume_as(fx, request, minted, n, [n ^ 0x5a; 32]);
         }
 
@@ -14459,7 +15006,7 @@ pub(crate) mod tests {
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let mut fx = Fx::new();
-            let handle = fx.open_new(&request("order-1", canonical(1)));
+            let handle = fx.open_new(&request("order-1", linkable(1)));
             let authority = fx.fresh_policy();
             let mut linked =
                 fx.operation_mint_request(&handle, tx(1), authority.clone(), vec![total(6)]);
@@ -14468,7 +15015,7 @@ pub(crate) mod tests {
                 attempt_index: 1,
             });
             fx.store.mint_authorization(&fx.profile, &linked).unwrap();
-            let handle = match fx.open(&request("order-1", canonical(1))).unwrap() {
+            let handle = match fx.open(&request("order-1", linkable(1))).unwrap() {
                 OpenOutcome::Resumable(handle) => handle,
                 other => panic!("expected the adopted record, got {other:?}"),
             };
@@ -14492,7 +15039,7 @@ pub(crate) mod tests {
             let _guard_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
             let mut fx = Fx::new();
-            let handle = fx.open_new(&request("order-1", canonical(1)));
+            let handle = fx.open_new(&request("order-1", linkable(1)));
             let mut linked =
                 fx.operation_mint_request(&handle, tx(1), fx.fresh_policy(), vec![total(6)]);
             linked.operation = Some(OperationLink {
@@ -14500,7 +15047,7 @@ pub(crate) mod tests {
                 attempt_index: 1,
             });
             let first = fx.store.mint_authorization(&fx.profile, &linked).unwrap();
-            let handle = match fx.open(&request("order-1", canonical(1))).unwrap() {
+            let handle = match fx.open(&request("order-1", linkable(1))).unwrap() {
                 OpenOutcome::Resumable(handle) => handle,
                 other => panic!("expected the adopted record, got {other:?}"),
             };
@@ -14960,7 +15507,7 @@ pub(crate) mod tests {
         /// A live operation `order-1` with an unused linked hold of 6,
         /// minted at `T0`. Returns the mint request and record.
         fn live_linked_hold(fx: &mut Fx) -> (MintRequest, MintedRecord) {
-            let handle = fx.open_new(&request("order-1", canonical(1)));
+            let handle = fx.open_new(&request("order-1", linkable(1)));
             let mut linked =
                 fx.operation_mint_request(&handle, tx(1), fx.fresh_policy(), vec![total(6)]);
             linked.operation = Some(OperationLink {
@@ -15117,7 +15664,7 @@ pub(crate) mod tests {
             fx.recorder()
                 .expose(exposed.id(), 1, &timed_exposure(2), None)
                 .unwrap();
-            let live = fx.open_new(&request("order-3", canonical(3)));
+            let live = fx.open_new(&request("order-3", linkable(3)));
             let mut linked =
                 fx.operation_mint_request(&live, tx(3), fx.fresh_policy(), vec![total(1)]);
             linked.operation = Some(OperationLink {

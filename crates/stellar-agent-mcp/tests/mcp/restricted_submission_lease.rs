@@ -558,6 +558,7 @@ async fn owed_approval_consumption_is_completed_by_the_receipt_repair() {
         &owed.envelope_hash,
         &approvals,
         PROFILE,
+        None,
     )
     .unwrap();
     assert!(

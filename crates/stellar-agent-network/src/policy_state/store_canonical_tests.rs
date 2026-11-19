@@ -31,7 +31,22 @@ fn canonical_wire_compatibility_and_lifecycle() {
         operation_id: handle.id(),
         attempt_index: 1,
     });
-    let minted = store.mint_authorization(&profile, &mint).unwrap();
+    // A canonical authorization is minted inside its attempt's begin.
+    let minted = operations::OperationRecorder::new(&store, &profile, &mut audit, "begin")
+        .begin_attempt(
+            &handle,
+            &operations::AttemptRequest {
+                envelope: Some(operations::AttemptEnvelope {
+                    xdr: "AAAAENVELOPE".to_owned(),
+                    unsigned_envelope_sha256: [2; 32],
+                }),
+                authorization: operations::AttemptAuthorization::Mint(Box::new(mint)),
+                send_by_ms: u64::MAX,
+            },
+        )
+        .unwrap()
+        .minted
+        .unwrap();
     let wire = store.read_for_inspection(&profile).unwrap().unwrap();
     assert_eq!(
         wire.version, WIRE_VERSION_NATIVE_COVERAGE,

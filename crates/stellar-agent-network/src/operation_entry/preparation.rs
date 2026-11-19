@@ -206,6 +206,9 @@ impl Preparation {
 /// Looks up canonical lasting facts, filling a partial claim only from a retained slot.
 /// A compacted partial claim refuses because its asset and amount are no longer stored.
 /// No ledger client is needed, including after the balance or its predicate expires.
+/// An envelope record of the same identity answers as [`lookup_classic`] does: the
+/// caller signs its stored envelope or replays it, and the record stays an envelope
+/// record, so a rebuilt envelope with a fresh sequence refuses at its attempt.
 ///
 /// # Errors
 /// Returns `operation.business_id_conflict` for another binding or invalid intent,
@@ -219,6 +222,14 @@ pub fn lookup_canonical(
     let Some(found) = recorder.lookup(business_id).map_err(operation_refusal)? else {
         return Ok(ClassicEntry::Build);
     };
+    // A record prepared with its exact envelope keeps it: the request signs
+    // that stored envelope or replays it, and the record is never rebuilt.
+    if found.binding().0 == SlotKind::Envelope {
+        if found.binding().1 != operation_identity(base.clone(), facts.clone())? {
+            return Err(conflict());
+        }
+        return classic_dispatch(found);
+    }
     if found.binding().0 != SlotKind::Canonical {
         return Err(conflict());
     }

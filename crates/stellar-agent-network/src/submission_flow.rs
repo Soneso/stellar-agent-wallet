@@ -1242,6 +1242,7 @@ pub async fn transaction_status_committed(
             &record.envelope_hash,
             &approval_dir,
             profile_name,
+            profile.chain_id.is_mainnet().then_some((window, profile)),
         )
         .map_err(StatusFailure::RepairRefused)?;
     }

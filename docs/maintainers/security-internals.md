@@ -859,6 +859,15 @@ store failure refuses with `policy.engine_required`.
 
 An approval releases one signature. The submitting tool's recorder binds the
 nonce to the send receipt and tombstones the approval on every sent outcome.
+On mainnet, where canonical records exist, a receipt of a canonical
+operation's attempt keeps the nonce for a successor attempt instead. Its
+tombstone stays owed while the operation is neither terminal nor past its
+execution expiry. The next repair after that writes the tombstone and
+acknowledges every sent receipt of the nonce. The receipt
+claim, under the writer, window and receipt locks, and the CLI and MCP
+receipt checks admit a nonce that another receipt holds only when that
+receipt's attempt has a checked non-inclusion of the same canonical
+operation.
 The sign-only tool opens the approval store after signing and, under the
 store's writer lock, checks the entry is live and consumes it with the local
 transaction hash and `ConsumedOutcome::Unknown`. A failed check or write
@@ -1230,7 +1239,8 @@ their own consent view digest.
 
 #### Mainnet presence consent
 
-A mainnet consent is a version 5 attestation with a mainnet passkey approver
+A mainnet consent is a version 5 attestation, or version 6 for a canonical
+intent, with a mainnet passkey approver
 and a WebAuthn presence receipt. The attester takes a sealed
 `ConsentAuthorization`: `Standard` (local or remote approver) refuses on a
 mainnet binding with `approval.presence_required` before any row or store
@@ -2142,7 +2152,12 @@ A claimed attempt without an exposure stays `sending`. A remint retires an
 unused, unexposed authorization with a `retired_unused` row in the commit that
 mints its successor; an exposed authorization refuses retirement. An approval
 nonce carries a remint only while every earlier authorization under it was
-never claimed and no exposure names it. Once an operation ends, every linked
+never claimed and no exposure names it. For a canonical operation it also
+carries a successor attempt when every other earlier authorization under it
+is neither open nor claimed and belongs to an attempt of that operation with
+a checked non-inclusion and its projection marker. Any other holder refuses
+with `approval_nonce_reused`, and the ninth attempt refuses with
+`operation.attempt_limit`. Once an operation ends, every linked
 authorization that was never claimed and is not exposed gets a
 `proved_unspent` row in that commit.
 
@@ -2439,6 +2454,14 @@ The signed waiting-expiry getter retains its original meaning.
 
 A canonical authorization carries its intent digest, operation link, and predecessor in its sealed header and signing claim.
 The mint compares the digest with the stored slot and the predecessor with the latest attempt's authorization under the window lock.
+`resolve_canonical_tx_sign` runs every resolution check and mints nothing. `begin_canonical_attempt` mints the checked request inside the operation's attempt begin, so the authorization, the approval's consumption and the `sending` attempt commit in one generation or not at all.
+`resolve_tx_sign` refuses a canonical operation with `intent_mismatch`.
+The public mint refuses with `intent_mismatch` before any write a request whose link or approval operation names one.
+A field of the candidate envelope that differs from the stored intent refuses with `intent_divergence`, and so does a claim whose reread claimable balance differs in asset or amount or no longer exists.
+A begin mint whose intent digest differs from the stored slot refuses with `intent_divergence` too.
+That precondition renders `simulation.divergence` from the resolver error and from `operation_refusal`; every other precondition keeps `network.mainnet_authorization_refused`.
+Under a canonical preparation, `lookup_canonical` answers an envelope record of the same identity as `lookup_classic` does, with its stored envelope or its replay.
+The record stays an envelope record, so a rebuilt envelope with a fresh sequence refuses at its attempt with `operation.business_id_conflict`.
 The x402 parent retains its separate meaning. Malformed canonical content refuses resolution while lifecycle operations remain available.
 Current commands create envelope slots; canonical slot creation is not exposed by the command or tool surfaces.
 

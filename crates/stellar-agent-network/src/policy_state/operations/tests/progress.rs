@@ -228,7 +228,12 @@ fn submission_progress_and_admission_share_predecessor_guards() {
     }
     for linked in [false, true] {
         let mut fx = Fx::with_approvals();
-        let (handle, approval) = approved_not_included(&mut fx, 1);
+        // Only an envelope record's successor can be linked before its begin.
+        let (handle, approval) = if linked {
+            approved_not_included_in(&mut fx, 1, linkable(1))
+        } else {
+            approved_not_included(&mut fx, 1)
+        };
         fx.rewrite(|wire| section_mut(wire).records[0].execution_expires_at_ms = None);
         assert!(
             progress(&fx, 1).retry_eligible,
@@ -650,7 +655,9 @@ fn submission_progress_two_process_generations() {
 fn submission_progress_candidate_checks_remain_admission_only() {
     let (_guard, _home) = homed();
     let mut fx = Fx::with_approvals();
-    let (handle, commit, nonce) = commit_approved(&mut fx, 1, Checked::NotIncluded);
+    // An envelope record: its successor may be linked before its begin, and
+    // its approval nonce carries no successor.
+    let (handle, commit, nonce) = commit_approved_in(&mut fx, 1, linkable(1), Checked::NotIncluded);
     fx.recorder()
         .acknowledge_projection(handle.id(), 1, commit)
         .unwrap();

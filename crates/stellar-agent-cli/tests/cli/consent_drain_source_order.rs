@@ -294,7 +294,7 @@ fn the_committed_consent_is_verified_from_the_captured_proof_after_the_commit() 
         "common/mainnet_confirm.rs",
         MAINNET_CONFIRM,
         "fn verify_committed(",
-        "find_by_approval_nonce(nonce)",
+        "find_approval_holder(nonce, &lineage)",
         "facts_by_nonce(nonce)",
         "verify_durable_approval(",
     );

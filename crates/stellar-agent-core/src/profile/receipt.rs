@@ -1187,6 +1187,28 @@ pub trait SequenceReleases {
     /// release. An attempt the reader cannot find or read answers `false`,
     /// so an unproven release keeps the sequence held.
     fn sequence_released(&self, attempt: &AttemptRef) -> bool;
+
+    /// Whether the attempt `holder` names, whose receipt already holds the
+    /// approval nonce of the claim, ended in a checked non-inclusion of the
+    /// operation the claim continues, so the nonce may carry the claim. An
+    /// attempt the reader cannot find or read answers `false`, so the nonce
+    /// stays held. The default answers `false` for every attempt.
+    fn carries_approval(&self, holder: &AttemptRef) -> bool {
+        let _ = holder;
+        false
+    }
+}
+
+/// Whether `receipt` holds `nonce` without `lineage` confirming it as a
+/// carrier of the claim's operation.
+fn holds_approval(
+    receipt: &SubmissionReceipt,
+    nonce: &str,
+    lineage: &dyn SequenceReleases,
+) -> bool {
+    receipt.approval_nonce.as_deref() == Some(nonce)
+        && !crate::hex::decode_hex32(&receipt.envelope_hash)
+            .is_ok_and(|hash| lineage.carries_approval(&AttemptRef::EnvelopeHash(hash)))
 }
 
 struct NoSequenceReleases;
@@ -1615,6 +1637,10 @@ impl ReceiptStore {
     /// records the original muxed destination on the new receipt.
     ///
     /// `releases` of `None` admits no released claimant.
+    /// An approval nonce another receipt holds refuses as
+    /// [`BeginSubmissionOutcome::DuplicateApproval`] unless `releases`
+    /// confirms every such holder through
+    /// [`SequenceReleases::carries_approval`].
     /// `destinations` records the envelope's complete payment provenance.
     ///
     /// # Errors
@@ -1642,7 +1668,7 @@ impl ReceiptStore {
                 .guard
                 .map
                 .values()
-                .find(|r| r.approval_nonce.as_deref() == Some(nonce))
+                .find(|r| holds_approval(r, nonce, releases))
         {
             return Ok(BeginSubmissionOutcome::DuplicateApproval(existing.clone()));
         }
@@ -1679,6 +1705,9 @@ impl ReceiptStore {
     }
 
     /// Finds the submission that holds an approval, including an owed tombstone.
+    /// It returns the first holder only; the receipt gates use
+    /// [`Self::find_approval_holder`] and the claim applies the same check to
+    /// every holder.
     ///
     /// # Errors
     ///
@@ -1691,6 +1720,24 @@ impl ReceiptStore {
             .all()?
             .into_iter()
             .find(|r| r.approval_nonce.as_deref() == Some(nonce)))
+    }
+
+    /// Finds a submission that holds `nonce` and that `lineage` does not
+    /// confirm through [`SequenceReleases::carries_approval`]: the receipt a
+    /// new claim of the nonce would refuse on.
+    ///
+    /// # Errors
+    ///
+    /// Returns a receipt-store error if the current file cannot be read.
+    pub fn find_approval_holder(
+        &self,
+        nonce: &str,
+        lineage: &dyn SequenceReleases,
+    ) -> Result<Option<SubmissionReceipt>, ReceiptStoreError> {
+        Ok(self
+            .all()?
+            .into_iter()
+            .find(|r| holds_approval(r, nonce, lineage)))
     }
 
     /// Acknowledges a durably written approval tombstone.
@@ -5127,6 +5174,91 @@ mod tests {
                 .unwrap()
                 .approval_consumed
         );
+    }
+
+    /// A lineage oracle that confirms the holders whose envelope hash it lists.
+    struct Carriers(Vec<[u8; 32]>);
+
+    impl SequenceReleases for Carriers {
+        fn sequence_released(&self, _attempt: &AttemptRef) -> bool {
+            false
+        }
+
+        fn carries_approval(&self, holder: &AttemptRef) -> bool {
+            let AttemptRef::EnvelopeHash(hash) = holder;
+            self.0.contains(hash)
+        }
+    }
+
+    /// A held approval nonce admits a further claim only when the caller's
+    /// oracle confirms every receipt that holds it; an unconfirmed holder
+    /// refuses `DuplicateApproval` beside a confirmed one, through the claim
+    /// and through [`ReceiptStore::find_approval_holder`]. Without an oracle
+    /// the hold refuses as before.
+    #[test]
+    fn approval_lineage_admits_only_confirmed_holders() {
+        let first = "a".repeat(64);
+        let second = "b".repeat(64);
+        let third = "c".repeat(64);
+        let carried = Carriers(vec![[0xaa; 32]]);
+        let claim =
+            |store: &ReceiptStore, hash: &str, sequence: i64, lineage: &dyn SequenceReleases| {
+                store
+                    .begin_submission_to(
+                        hash,
+                        hash,
+                        "source",
+                        sequence,
+                        0,
+                        100,
+                        Some("approval"),
+                        Some(lineage),
+                        &PaymentDestinations::None,
+                    )
+                    .unwrap()
+            };
+        let dir = tempfile::tempdir().unwrap();
+        let store = ReceiptStore::open_at(dir.path(), "lineage").unwrap();
+        assert!(matches!(
+            claim(&store, &first, 1, &NoSequenceReleases),
+            BeginSubmissionOutcome::Recorded
+        ));
+        assert!(matches!(
+            claim(&store, &second, 2, &NoSequenceReleases),
+            BeginSubmissionOutcome::DuplicateApproval(existing) if existing.envelope_hash == first
+        ));
+        assert!(matches!(
+            claim(&store, &second, 2, &carried),
+            BeginSubmissionOutcome::Recorded
+        ));
+        // Each reopen iterates a new map, so a check of the first holder alone
+        // would admit on some reopening.
+        for _ in 0..16 {
+            let store = ReceiptStore::open_at(dir.path(), "lineage").unwrap();
+            assert!(matches!(
+                claim(&store, &third, 3, &carried),
+                BeginSubmissionOutcome::DuplicateApproval(existing) if existing.envelope_hash == second
+            ));
+            assert_eq!(
+                store
+                    .find_approval_holder("approval", &carried)
+                    .unwrap()
+                    .map(|holder| holder.envelope_hash),
+                Some(second.clone())
+            );
+            assert!(store.get(&third).unwrap().is_none());
+        }
+        let both = Carriers(vec![[0xaa; 32], [0xbb; 32]]);
+        assert!(
+            store
+                .find_approval_holder("approval", &both)
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            claim(&store, &third, 3, &both),
+            BeginSubmissionOutcome::Recorded
+        ));
     }
 
     // ── Release evidence ──────────────────────────────────────────────────────
