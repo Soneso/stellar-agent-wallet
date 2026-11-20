@@ -217,6 +217,12 @@ fn fixed_argument_refusal(
     if !deserialization_failed {
         return result;
     }
+    argument_refusal(tool)
+}
+
+/// The fixed tool result for arguments of `tool` with a missing field or a
+/// field of the wrong type or value.
+pub(crate) fn argument_refusal(tool: &str) -> rmcp::model::CallToolResult {
     rmcp::model::CallToolResult::error(vec![rmcp::model::Content::text(format!(
         "{tool}: the arguments have a missing field or a field of the wrong type or value"
     ))])

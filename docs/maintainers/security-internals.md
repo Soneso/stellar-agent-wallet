@@ -2176,10 +2176,16 @@ endpoint refusals and before any build, and in the CLI before the
 confirmation ceremony. A claim looks its id up before the balance read and
 the predicate check. A retained record answers with its stored state and a
 waiting envelope record yields its stored envelope. An unknown id of an MCP
-tool opens an `Envelope` slot over the unsigned envelope just built, with the
-intent digest beside its hash. An unknown id of a CLI verb opens a `Canonical`
-slot with the full intent, the policy decision and the unsigned envelope just
-built; a claim's intent takes the asset and amount of the balance it read.
+tool opens an `Envelope` slot over the unsigned envelope just built, with the intent
+digest beside its hash. On mainnet the MCP tools `stellar_create_account`,
+`stellar_trustline` and `stellar_claim` look the id up by their canonical
+intent instead. After the policy gate they open a `Canonical` slot of the full
+intent, a claim's asset and amount included, with the governing decision of
+the preparation and its commit. Under an approval requirement that decision's
+lifetime is the record's waiting interval, and the approval binds the intent
+digest. An unknown id of a CLI verb opens a `Canonical` slot with the full
+intent, the policy decision and the unsigned envelope just built; a claim's
+intent takes the asset and amount of the balance it read.
 
 A classic commit reads its record before it verifies the approval, rebuilds
 the envelope or consumes the nonce. One window read yields the record under
@@ -2193,6 +2199,33 @@ current policy, with the envelope's fee or the cap bound as the fee bound. Any
 other tombstone refuses with that conflict. A retained record answers there
 without a lock or a write. A record that continues runs
 the gates and is decided again under the recorder.
+
+A mainnet commit of those three MCP tools first reads the record under its
+id without a lock. A `Canonical` record takes the canonical route; any other
+record, an unknown id and an unreadable window keep the envelope route above
+when the call presents all three fields. A call that omits one answers the
+fixed argument refusal for an envelope record, and for a missing, malformed
+or unknown id or an unreadable window the id's own refusal. After the
+argument checks and the endpoint probe, the canonical route looks the id up
+under the recorder. The commit's lasting arguments must name the stored
+intent of the tool's own kind: the account and the destination and starting
+balance, the trustline account, or the claim's balance and claimant. Any
+other refuses with `operation.business_id_conflict`, also against a record
+that already ran; a matching record that does no further work answers with
+its stored state. The route then rebuilds the envelope with
+`rebuild_canonical` at the fee per operation of the prepared envelope the
+record stores, bounded by the intent's fee bound and the current caps. Its
+deadline is the earlier of 120 seconds after the rebuild and the last whole
+second strictly before the authority's end; for a successor that end is the
+earlier of the current authority's end and the record's execution end. The
+policy gate evaluates the rebuilt envelope's arguments with a source read
+that requests a trustline intent's trustline, so removing a held trustline
+adds no reserve, and a proof verifies
+as the consent to the stored intent under the governing decision. The
+signing runs `resolve_canonical_tx_sign`, which refuses with
+`DeadlineTooFar` a canonical envelope whose deadline does not lie before that
+end, and `begin_canonical_attempt`. No protocol nonce is verified or
+consumed.
 
 Each classic attempt begins before the signature: the mint carries the link to
 the next attempt, and the begin commits `authorized` and `sending` in one
@@ -2465,7 +2498,8 @@ That precondition renders `simulation.divergence` from the resolver error and fr
 Under a canonical preparation, `lookup_canonical` answers an envelope record of the same identity as `lookup_classic` does, with its stored envelope or its replay.
 The record stays an envelope record, so a rebuilt envelope with a fresh sequence refuses at its attempt with `operation.business_id_conflict`.
 The x402 parent retains its separate meaning. Malformed canonical content refuses resolution while lifecycle operations remain available.
-The CLI verbs `pay`, `claim`, `trustline` and sponsored `accounts create` create canonical slots; the MCP tools create envelope slots.
+The CLI verbs `pay`, `claim`, `trustline` and sponsored `accounts create` create canonical slots.
+On mainnet the MCP create-account, trustline and claim tools create canonical slots; the other MCP tools, and every MCP tool off mainnet, create envelope slots.
 A CLI run of a canonical record shows the stored intent at the confirmation, whose challenge is the stored envelope.
 Before the ceremony, the confirmation requires the durable record's subject to equal the stored intent digest and the entry's challenge subject to equal the stored envelope's subject.
 After the confirmation it rebuilds the envelope with `rebuild_canonical`: the readiness check, the source account's current sequence, the fee the caller's choice gives now, a fresh deadline, and the oracle check bound to the rebuilt envelope.
@@ -2474,6 +2508,7 @@ It then resolves through `resolve_canonical_tx_sign` and begins through `begin_c
 A run of an envelope record signs its stored envelope through `resolve_tx_sign` and the linked begin, and is never rebuilt.
 A CLI divergence renders `simulation.divergence` with the sentence that the signature was withheld and nothing was sent.
 A published consent of a canonical record completes as a consent to the stored intent, on `approve --id` and at the confirmation.
+An MCP commit of a canonical record takes no process nonce, envelope or expiry; it rebuilds through `rebuild_canonical` with the same deadline rule, resolves through `resolve_canonical_tx_sign` and begins through `begin_canonical_attempt`.
 
 The shared staging helpers can open canonical records with the full intent digest
 and the prepare audit decision. A retained claim retry uses its stored asset and

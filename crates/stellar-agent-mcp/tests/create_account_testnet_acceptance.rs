@@ -229,9 +229,9 @@ async fn t1_sponsored_create_account_two_phase_happy_path() {
             destination: destination_g.clone(),
             starting_balance: serde_json::from_str(STARTING_BALANCE_XLM_JSON)
                 .expect("starting_balance parses as McpAmountArgument"),
-            nonce,
-            expires_at_unix_ms,
-            envelope_xdr,
+            nonce: Some(nonce),
+            expires_at_unix_ms: Some(expires_at_unix_ms),
+            envelope_xdr: Some(envelope_xdr),
             approval_nonce: None,
             approval_attestation: None,
             business_id: None,

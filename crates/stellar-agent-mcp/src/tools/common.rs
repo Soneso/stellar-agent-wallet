@@ -2717,13 +2717,20 @@ enum GateMode<'a> {
 }
 
 fn window_refresh_error(e: &stellar_agent_network::policy_state::WindowStoreError) -> ToolError {
+    ToolError::Business(window_refresh_refusal(e))
+}
+
+/// The tool result of a policy gate whose window read failed with `e`.
+pub(crate) fn window_refresh_refusal(
+    e: &stellar_agent_network::policy_state::WindowStoreError,
+) -> rmcp::model::CallToolResult {
     if e.chain_validation_error().is_some() || e.operation_error().is_some() {
-        return ToolError::Business(business_error_result(e.submission_code(), e.to_string()));
+        return business_error_result(e.submission_code(), e.to_string());
     }
-    ToolError::Business(business_error_result(
+    business_error_result(
         "policy.engine_required",
         e.with_recovery_notice(format!("policy window-state store failed to refresh ({e})")),
-    ))
+    )
 }
 
 /// Which side of a pair is the commit name's. Its approval requirement
@@ -3137,7 +3144,9 @@ impl SuppliedProof {
 /// requirement asks for the approval of `expected`. A proof, complete or
 /// partial, runs [`verify_attestation_subject_gate`], whose step 1 refuses a
 /// partial pair. The proof's durable record must name `operation`, the
-/// operation the call continues. A verified witness goes into `witness`, and
+/// operation the call continues. With `intent`, the operation's validated
+/// stored canonical intent, the proof must be the consent to that intent
+/// under the outcome's decision. A verified witness goes into `witness`, and
 /// the authority borrows it. The wrapper never writes the approval store.
 ///
 /// # Errors
@@ -3148,12 +3157,14 @@ impl SuppliedProof {
 /// or a decision that gives no authority.
 #[allow(
     clippy::result_large_err,
-    reason = "the refusal carries the gate's tool result, which each handler returns as is"
+    clippy::too_many_arguments,
+    reason = "the refusal carries the gate's tool result; each input is one fact of the proof"
 )]
 pub(crate) async fn mainnet_authority<'w>(
     server: &WalletServer,
     outcome: &DispatchOutcome,
     expected: stellar_agent_core::approval::witness::ApprovalExpectation,
+    intent: Option<&stellar_agent_core::approval::ClassicIntent>,
     proof: &SuppliedProof,
     operation: Option<stellar_agent_network::policy_state::OperationId>,
     tool: &'static str,
@@ -3182,6 +3193,7 @@ pub(crate) async fn mainnet_authority<'w>(
         server,
         outcome,
         expected,
+        intent.map(|intent| (intent, decision)),
         proof.nonce.as_deref(),
         proof.attestation.as_deref(),
         operation,
@@ -3295,6 +3307,7 @@ pub(crate) async fn verify_attestation_gate(
         server,
         dispatch_outcome,
         expected,
+        None,
         approval_nonce,
         approval_attestation,
         None,
@@ -3307,11 +3320,21 @@ pub(crate) async fn verify_attestation_gate(
 ///
 /// On a mainnet server, after the receipt check, [`mainnet_proof_gate`]
 /// decides the proof for the call's admitted `operation`, and the approval
-/// inbox grants nothing. Off mainnet `operation` is unused.
+/// inbox grants nothing. Off mainnet `operation` is unused. `intent` names
+/// the canonical intent and the decision a mainnet proof must consent to,
+/// for a commit of a canonical operation.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each input is one fact of the presented proof"
+)]
 pub(crate) async fn verify_attestation_subject_gate(
     server: &WalletServer,
     dispatch_outcome: &DispatchOutcome,
     expected: stellar_agent_core::approval::witness::ApprovalExpectation,
+    intent: Option<(
+        &stellar_agent_core::approval::ClassicIntent,
+        &stellar_agent_core::mainnet::decision::MainnetDecision,
+    )>,
     approval_nonce: Option<&str>,
     approval_attestation: Option<&str>,
     operation: Option<stellar_agent_network::policy_state::OperationId>,
@@ -3384,6 +3407,7 @@ pub(crate) async fn verify_attestation_subject_gate(
         return mainnet_proof_gate(
             server,
             &expected,
+            intent,
             approval_nonce_str,
             &attestation_bytes,
             operation,
@@ -3633,6 +3657,10 @@ pub(crate) async fn verify_attestation_subject_gate(
 async fn mainnet_proof_gate(
     server: &WalletServer,
     expected: &stellar_agent_core::approval::witness::ApprovalExpectation,
+    intent: Option<(
+        &stellar_agent_core::approval::ClassicIntent,
+        &stellar_agent_core::mainnet::decision::MainnetDecision,
+    )>,
     nonce: &str,
     presented: &[u8; 32],
     operation: Option<stellar_agent_network::policy_state::OperationId>,
@@ -3659,27 +3687,29 @@ async fn mainnet_proof_gate(
         );
         return Err(approval_required_indistinguishable(&profile_name));
     };
-    let witness = durable_proof_witness(server, nonce, presented, expected, policy, operation)
-        .map_err(|error| {
-            tracing::debug!(
-                tool = tool_name,
-                code = error.code(),
-                "approval proof refused"
-            );
-            if error.code() == "validation.key_matches_owner_public_key" {
-                tracing::warn!(code = error.code(), "attestation owner key refused");
-            }
-            match error {
-                stellar_agent_core::WalletError::Approval(
-                    stellar_agent_core::ApprovalFailure::Revoked { .. },
-                ) => ledger_err_result(&error),
-                stellar_agent_core::WalletError::Approval(
-                    stellar_agent_core::ApprovalFailure::Consumed { .. },
-                ) => approval_consumed_error(),
-                _ => live_rejection(server, nonce)
-                    .unwrap_or_else(|| approval_required_indistinguishable(&profile_name)),
-            }
-        })?;
+    let witness = durable_proof_witness(
+        server, nonce, presented, expected, intent, policy, operation,
+    )
+    .map_err(|error| {
+        tracing::debug!(
+            tool = tool_name,
+            code = error.code(),
+            "approval proof refused"
+        );
+        if error.code() == "validation.key_matches_owner_public_key" {
+            tracing::warn!(code = error.code(), "attestation owner key refused");
+        }
+        match error {
+            stellar_agent_core::WalletError::Approval(
+                stellar_agent_core::ApprovalFailure::Revoked { .. },
+            ) => ledger_err_result(&error),
+            stellar_agent_core::WalletError::Approval(
+                stellar_agent_core::ApprovalFailure::Consumed { .. },
+            ) => approval_consumed_error(),
+            _ => live_rejection(server, nonce)
+                .unwrap_or_else(|| approval_required_indistinguishable(&profile_name)),
+        }
+    })?;
     #[cfg(all(test, feature = "mainnet-write"))]
     if let Some((barrier, arrivals)) = &server.payment_proof_barrier {
         arrivals.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -3749,11 +3779,20 @@ async fn mainnet_proof_gate(
 /// operation and `approval.consumed` for a verified proof of another
 /// operation. A store, clock or evidence floor failure refuses with its own
 /// wallet error.
+///
+/// With `intent`, the record must hold the consent to that canonical intent
+/// under the given decision, which
+/// [`verify_durable_intent_approval`](stellar_agent_core::approval::witness::verify_durable_intent_approval)
+/// checks in place of `expected`.
 pub(crate) fn durable_proof_witness(
     server: &WalletServer,
     nonce: &str,
     presented: &[u8; 32],
     expected: &stellar_agent_core::approval::witness::ApprovalExpectation,
+    intent: Option<(
+        &stellar_agent_core::approval::ClassicIntent,
+        &stellar_agent_core::mainnet::decision::MainnetDecision,
+    )>,
     policy: &stellar_agent_core::mainnet::verified_policy::VerifiedPolicy,
     operation: Option<stellar_agent_network::policy_state::OperationId>,
 ) -> Result<stellar_agent_core::approval::witness::ApprovalWitness, stellar_agent_core::WalletError>
@@ -3774,15 +3813,29 @@ pub(crate) fn durable_proof_witness(
         }
         _ => wall,
     };
-    let witness = stellar_agent_core::approval::witness::verify_durable_approval(
-        facts.as_ref(),
-        presented,
-        profile,
-        &profile_name,
-        expected,
-        policy,
-        now,
-    )?;
+    let witness = match intent {
+        Some((intent, decision)) => {
+            stellar_agent_core::approval::witness::verify_durable_intent_approval(
+                facts.as_ref(),
+                presented,
+                profile,
+                &profile_name,
+                intent,
+                decision,
+                policy,
+                now,
+            )?
+        }
+        None => stellar_agent_core::approval::witness::verify_durable_approval(
+            facts.as_ref(),
+            presented,
+            profile,
+            &profile_name,
+            expected,
+            policy,
+            now,
+        )?,
+    };
     let recorded = facts.as_ref().map(|facts| facts.record().operation_id);
     match operation {
         None => Err(stellar_agent_core::WalletError::Approval(
@@ -3878,6 +3931,21 @@ impl WalletServer {
             .map(|body| body.classic_max_fee_per_op_stroops)
     }
 
+    /// The cross-check thresholds of `context`'s profile and the verified
+    /// mainnet policy.
+    pub(crate) fn mainnet_thresholds<'a>(
+        &'a self,
+        context: &'a stellar_agent_network::MainnetWriteContext,
+    ) -> stellar_agent_core::cross_check::ThresholdSet<'a> {
+        stellar_agent_core::cross_check::ThresholdSet::from_profile_and_signed(
+            context.profile(),
+            self.verified_policy
+                .as_ref()
+                .and_then(|policy| policy.mainnet())
+                .and_then(|body| body.cross_check_thresholds.as_ref()),
+        )
+    }
+
     pub(crate) async fn classic_witness(
         &self,
         value: stellar_agent_core::cross_check::CrossCheckValue<'_>,
@@ -3889,13 +3957,7 @@ impl WalletServer {
         stellar_agent_core::WalletError,
     > {
         if let Some(context) = &self.mainnet_context {
-            let thresholds = stellar_agent_core::cross_check::ThresholdSet::from_profile_and_signed(
-                context.profile(),
-                self.verified_policy
-                    .as_ref()
-                    .and_then(|policy| policy.mainnet())
-                    .and_then(|body| body.cross_check_thresholds.as_ref()),
-            );
+            let thresholds = self.mainnet_thresholds(context);
             stellar_agent_network::cross_check::obtain_classic_witness_bound(
                 context.profile(),
                 &context.network_context(),
@@ -8921,6 +8983,7 @@ pub(crate) mod tests {
                     "{tool:?}: preparation pair"
                 );
                 let run = ClassicRun {
+                    identity: ClassicRun::prepared_identity(&f, &args),
                     f,
                     _primary: primary,
                     _oracle: oracle,
@@ -9055,6 +9118,7 @@ pub(crate) mod tests {
                         &f.server,
                         &outcome,
                         GatedApprovalKind::Payment.expectation(approval_subject_classic(xdr)),
+                        None,
                         &supplied,
                         operation,
                         "stellar_pay_commit",
@@ -9104,6 +9168,7 @@ pub(crate) mod tests {
                         &f.server,
                         &outcome,
                         GatedApprovalKind::Payment.expectation(approval_subject_classic(xdr)),
+                        None,
                         &SuppliedProof::default(),
                         operation,
                         "stellar_pay_commit",
@@ -9438,6 +9503,7 @@ pub(crate) mod tests {
                     &f.server,
                     &outcome,
                     GatedApprovalKind::Payment.expectation(approval_subject_classic(subject)),
+                    None,
                     Some(&entry.approval_nonce),
                     Some(blob),
                     operation,
@@ -9610,6 +9676,7 @@ pub(crate) mod tests {
                     kind.expectation(
                         stellar_agent_core::approval::subject::approval_subject_classic(xdr),
                     ),
+                    None,
                     Some(&entry.approval_nonce),
                     Some(&blob),
                     operation,
@@ -9680,7 +9747,15 @@ pub(crate) mod tests {
         }
 
         pub(crate) fn wire(result: &rmcp::model::CallToolResult) -> serde_json::Value {
-            serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap()
+            let text = &result.content[0].as_text().unwrap().text;
+            serde_json::from_str(text).unwrap_or_else(|error| {
+                panic!("the answer is not a JSON envelope ({error}): {text}")
+            })
+        }
+
+        /// The text of `result`'s first content block.
+        pub(crate) fn answer_text(result: &rmcp::model::CallToolResult) -> String {
+            result.content[0].as_text().unwrap().text.clone()
         }
 
         /// The authorization ledger, or `None` before its first write.
@@ -9843,6 +9918,10 @@ pub(crate) mod tests {
             pub health_lead_secs: std::sync::atomic::AtomicU64,
             /// Ledger entries that replace the fixture's.
             pub entries: std::sync::Mutex<Option<Vec<serde_json::Value>>>,
+            /// `getLedgers` answers the requested ledger, closed at the moved
+            /// clock, and an unknown transaction's `NOT_FOUND` carries its
+            /// close times, so recovery can prove a non-inclusion.
+            pub ledger_history: AtomicBool,
             /// Runs before each answer with the request method.
             pub on_request: std::sync::Mutex<Option<RequestHook>>,
         }
@@ -10158,12 +10237,25 @@ pub(crate) mod tests {
                             "latestLedgerCloseTime":stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1000
                                 + self.control.health_lead_secs.load(Ordering::SeqCst)}),
                     ),
-                    "getLedgers" => answer(serde_json::json!({
-                        "latestLedger":100, "oldestLedger":1,
-                        "latestLedgerCloseTime":(stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1000)
-                            .to_string(),
-                        "oldestLedgerCloseTime":1, "cursor":"100", "ledgers":[]
-                    })),
+                    "getLedgers" => {
+                        let host_secs = stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1000;
+                        // With `ledger_history`, the page holds the requested
+                        // ledger, closed at the moved clock.
+                        let ledgers = if self.control.ledger_history.load(Ordering::SeqCst) {
+                            let start = body["params"]["startLedger"].as_u64().unwrap();
+                            let close =
+                                host_secs + self.control.health_lead_secs.load(Ordering::SeqCst);
+                            serde_json::json!([{"sequence":start, "ledgerCloseTime":close.to_string(),
+                                "hash":"00".repeat(32), "headerXdr":"", "metadataXdr":""}])
+                        } else {
+                            serde_json::json!([])
+                        };
+                        answer(serde_json::json!({
+                            "latestLedger":100, "oldestLedger":1,
+                            "latestLedgerCloseTime":host_secs.to_string(),
+                            "oldestLedgerCloseTime":1, "cursor":"100", "ledgers":ledgers
+                        }))
+                    }
                     "sendTransaction" => {
                         answer(self.send(&body)).set_delay(std::time::Duration::from_millis(
                             self.control.send_delay_ms.load(Ordering::SeqCst),
@@ -10184,9 +10276,16 @@ pub(crate) mod tests {
                         }))
                     }
                     "getTransaction" if self.control.transaction_unknown.load(Ordering::SeqCst) => {
-                        answer(
-                            serde_json::json!({"status":"NOT_FOUND", "latestLedger":100, "oldestLedger":1}),
-                        )
+                        let mut absent = serde_json::json!({"status":"NOT_FOUND", "latestLedger":100, "oldestLedger":1});
+                        if self.control.ledger_history.load(Ordering::SeqCst) {
+                            absent["oldestLedgerCloseTime"] = serde_json::json!("1");
+                            absent["latestLedgerCloseTime"] = serde_json::json!(
+                                (stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1000
+                                    + self.control.health_lead_secs.load(Ordering::SeqCst))
+                                .to_string()
+                            );
+                        }
+                        answer(absent)
                     }
                     "getTransaction" => answer(serde_json::json!({
                         "status":"SUCCESS", "ledger":101, "txHash":body["params"]["hash"],
@@ -10457,6 +10556,9 @@ pub(crate) mod tests {
             /// every kind; a test's later enforcement guard overrides them.
             _unenforced:
                 Vec<stellar_agent_network::policy_state::approvals::ConsentEvidenceDisableGuard>,
+            /// The operation identity an envelope preparation of the run's
+            /// request binds, which the fixture's envelope records carry.
+            pub identity: [u8; 32],
         }
 
         impl ClassicRun {
@@ -10663,6 +10765,177 @@ pub(crate) mod tests {
                 reference
             }
 
+            /// [`Self::delivery_fixture`] for a canonical record: it writes
+            /// the consent row of the run's attested entry, queued in the
+            /// keyed outbox when `queued` and anchored in the log otherwise,
+            /// and records the consent with the matching delivery. The
+            /// witness is the consent step's verification against the
+            /// record's kind and subject, the stored intent's digest.
+            /// `dropped` truncates the outbox past a queued row. Returns the
+            /// queued row.
+            pub(crate) fn canonical_delivery_fixture(
+                &self,
+                queued: bool,
+                dropped: bool,
+            ) -> Option<stellar_agent_core::audit_log::OutboxRowRef> {
+                use base64::Engine as _;
+                use stellar_agent_core::audit_log::{
+                    AuditEntry, AuditOutbox, BindingCheck, EvidenceReservation,
+                };
+                use stellar_agent_network::policy_state::approvals::{
+                    ApprovalRecorder, ConsentDeliveryV1, ConsentPayload, PendingApprovalFacts,
+                    record_consent_with_row_for_test,
+                };
+                use stellar_agent_network::policy_state::{ApprovalStatus, ConsentRow};
+                let server = &self.f.server;
+                let profile = server.security_profile();
+                let name = server.profile_name_for_approval();
+                let record = ApprovalStatus::new(&server.window_store, profile)
+                    .find_by_nonce(&self.entry.approval_nonce)
+                    .unwrap()
+                    .expect("the preparation opens the durable record")
+                    .record;
+                assert_eq!(
+                    record.subject_kind,
+                    stellar_agent_core::approval::subject::SubjectKind::IntentDigest,
+                    "a canonical record"
+                );
+                assert!(record.consent.is_none(), "the fixture records the consent");
+                let authority =
+                    stellar_agent_core::approval::MainnetApprovalAuthority::for_profile(&name)
+                        .unwrap();
+                let policy = authority.load_current().unwrap().into_policy();
+                let admission = authority.admit().unwrap();
+                let inbox = stellar_agent_core::approval::PendingApprovalStore::open(
+                    server
+                        .resolve_approval_dir()
+                        .unwrap()
+                        .join(format!("{name}.toml")),
+                )
+                .unwrap();
+                let entry = inbox.get(&self.entry.approval_nonce).unwrap().clone();
+                let witness = stellar_agent_network::operation_entry::consent_completion(
+                    &inbox,
+                    &server.window_store,
+                    profile,
+                    &name,
+                    &self.entry.approval_nonce,
+                    &policy,
+                    ConsentRow::Written,
+                    &admission,
+                )
+                .unwrap()
+                .into_witness();
+                drop(inbox);
+                drop(admission);
+                let payload = ConsentPayload {
+                    attestation: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(entry.attestation_blob_b64.as_ref().unwrap())
+                        .unwrap()
+                        .try_into()
+                        .unwrap(),
+                    receipt: entry.mainnet_presence.unwrap(),
+                    process_uid: entry.process_uid,
+                    outbox_row: None,
+                    challenge_subject: None,
+                    row_provenance: Some(
+                        stellar_agent_network::policy_state::RowProvenance::Written,
+                    ),
+                };
+                let facts = PendingApprovalFacts {
+                    nonce: record.nonce.clone(),
+                    kind: record.kind,
+                    subject_kind: record.subject_kind,
+                    subject: record.subject,
+                    intent_digest: record.intent_digest,
+                    created_at_ms: record.created_at_ms,
+                    waiting_expires_at_ms: record.waiting_expires_at_ms,
+                    rule_ttl_ms: record.rule_ttl_ms,
+                };
+                let (writer, _readiness) = server.write_audit().unwrap();
+                let mut writer = writer.lock().unwrap();
+                writer.initialize_consent_evidence().unwrap();
+                let (key, anchor) = stellar_agent_network::keyring::keyed_audit_access(
+                    profile,
+                    &name,
+                    BindingCheck::Enforce,
+                )
+                .unwrap()
+                .into_parts();
+                let outbox =
+                    AuditOutbox::for_log_keyed(&profile.audit_log_path, anchor, key.clone());
+                let token = outbox
+                    .reserve_evidence(
+                        record.id,
+                        EvidenceReservation::deadline(
+                            record.waiting_expires_at_ms,
+                            record.rule_ttl_ms,
+                        )
+                        .unwrap(),
+                        witness.consent_at_ms(),
+                    )
+                    .unwrap();
+                let reference = queued.then(|| {
+                    outbox
+                        .clone()
+                        .with_evidence_reservation(token)
+                        .append_queued(&AuditEntry::new_approval_attested(
+                            record.kind.kind_name(),
+                            self.tool.commit_name(),
+                            None,
+                            &self.entry.approval_nonce,
+                            "mcp",
+                            "delivery-fixture",
+                        ))
+                        .unwrap()
+                });
+                if !queued {
+                    writer
+                        .prepare_entry()
+                        .unwrap()
+                        .write_anchored(AuditEntry::new_approval_attested(
+                            record.kind.kind_name(),
+                            self.tool.commit_name(),
+                            None,
+                            &self.entry.approval_nonce,
+                            "mcp",
+                            "strict-direct",
+                        ))
+                        .unwrap();
+                }
+                if dropped {
+                    std::fs::write(
+                        outbox.path(),
+                        stellar_agent_core::audit_log::outbox::test_seam::generation_line(
+                            &key,
+                            reference.as_ref().unwrap().generation(),
+                        ),
+                    )
+                    .unwrap();
+                }
+                let delivery = if queued {
+                    ConsentDeliveryV1::queued(record.id)
+                } else {
+                    ConsentDeliveryV1::direct_anchored(record.id)
+                };
+                record_consent_with_row_for_test(
+                    &mut ApprovalRecorder::new(
+                        &server.window_store,
+                        profile,
+                        &mut *writer,
+                        "fixture",
+                    ),
+                    record.operation_id,
+                    &facts,
+                    &witness,
+                    &payload,
+                    reference,
+                    delivery,
+                )
+                .unwrap();
+                reference
+            }
+
             pub(crate) async fn new(tool: Tool) -> Self {
                 Self::with(tool, |raw| raw, |_| {}, |_| {}).await
             }
@@ -10775,7 +11048,9 @@ pub(crate) mod tests {
                     Some(complete) => Self::prepared(&f, tool, args, complete).await,
                     None => Self::prepared_allowed(&f, tool, args).await,
                 };
+                let identity = Self::prepared_identity(&f, &args);
                 Self {
+                    identity,
                     f,
                     _primary: primary,
                     _oracle: oracle,
@@ -10872,12 +11147,18 @@ pub(crate) mod tests {
                     .unwrap()
                     .unwrap();
                 let fresh = crate::tools::common::tests::fresh_business_id();
+                // An envelope record binds the request's operation identity,
+                // which a canonical record's intent digest is not.
+                let identity = match view.slot_kind {
+                    stellar_agent_network::policy_state::SlotKind::Canonical => self.identity,
+                    _ => view.intent_digest,
+                };
                 let request = OpenRequest {
                     business_id: BusinessId::parse(&fresh).unwrap(),
                     tool: view.tool.unwrap(),
                     kind: view.kind.unwrap(),
                     intent: operation_entry::envelope_slot(
-                        &view.intent_digest,
+                        &identity,
                         xdr,
                         operation_entry::envelope_max_time(xdr).unwrap(),
                     ),
@@ -10892,6 +11173,67 @@ pub(crate) mod tests {
                     .unwrap();
                 assert!(matches!(opened, OpenedEntry::Resume(_)), "{opened:?}");
                 fresh
+            }
+
+            /// The operation identity an envelope preparation of the request
+            /// `args` prepared binds. For a canonical record it is computed
+            /// from the stored intent's base with the arguments' fee choice
+            /// and the tool's identity facts; the record must be resumable.
+            fn prepared_identity(f: &Fixture, args: &serde_json::Value) -> [u8; 32] {
+                use stellar_agent_core::approval::IntentPayload;
+                use stellar_agent_network::operation_entry::{
+                    self, IdentityFacts, IntentBaseFacts,
+                };
+                use stellar_agent_network::policy_state::{
+                    BusinessId, LookupOutcome, OperationStatus, SlotKind,
+                };
+                let server = &f.server;
+                let business_id = BusinessId::parse(args["business_id"].as_str().unwrap()).unwrap();
+                let view = OperationStatus::new(&server.window_store, server.security_profile())
+                    .view(&business_id)
+                    .unwrap()
+                    .unwrap();
+                if view.slot_kind != SlotKind::Canonical {
+                    return view.intent_digest;
+                }
+                let policy = server.current_mainnet_policy().unwrap();
+                let Some(LookupOutcome::Resumable(handle)) = server
+                    .operation_step(|recorder| {
+                        recorder
+                            .lookup(&business_id)
+                            .map_err(operation_entry::operation_refusal)
+                    })
+                    .unwrap()
+                else {
+                    panic!("a prepared canonical operation is resumable")
+                };
+                let intent =
+                    operation_entry::preparation_intent(&handle, server.security_profile(), policy)
+                        .unwrap()
+                        .unwrap();
+                let facts = match intent.payload().clone() {
+                    IntentPayload::Claim {
+                        balance_id,
+                        claimant,
+                        ..
+                    } => IdentityFacts::Claim {
+                        balance_id,
+                        claimant,
+                    },
+                    payload => IdentityFacts::Intent(payload),
+                };
+                operation_entry::operation_identity(
+                    IntentBaseFacts::new(
+                        server.security_profile(),
+                        intent.base().source(),
+                        policy,
+                        stellar_agent_network::parse_classic_fee_choice(args["fee"].as_str())
+                            .unwrap(),
+                        intent.base().memo().clone(),
+                    ),
+                    facts,
+                )
+                .unwrap()
             }
 
             /// The operation the run's business id names, which its commit
@@ -11075,7 +11417,7 @@ pub(crate) mod tests {
                 wire(&self.commit_raw(args).await.unwrap())
             }
 
-            async fn commit_raw(
+            pub(crate) async fn commit_raw(
                 &self,
                 args: serde_json::Value,
             ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
@@ -11186,6 +11528,61 @@ pub(crate) mod tests {
                 args["approval_nonce"] = serde_json::json!(approval_nonce);
                 args["approval_attestation"] = serde_json::json!(blob);
                 args
+            }
+
+            /// The run with its commit arguments under an envelope record of
+            /// its request, the record an earlier build prepared and the only
+            /// mainnet record a commit of a canonical tool keeps the envelope
+            /// route for. A new business id binds the prepared envelope to the
+            /// request's operation identity, with a consented envelope approval
+            /// when the run requires one. A payment run is returned as it is.
+            pub(crate) fn envelope_route(self) -> Self {
+                self.envelope_route_of(|_| {})
+            }
+
+            /// [`Self::envelope_route`] of a run whose approval is attested in
+            /// the inbox and whose durable record holds no consent, as
+            /// [`Self::unconsented`] leaves it.
+            pub(crate) fn envelope_route_unconsented(mut self) -> Self {
+                if self.tool == Tool::Pay {
+                    return self;
+                }
+                let xdr = self.args["envelope_xdr"].as_str().unwrap().to_owned();
+                let business_id = self.bind_business_id_for(&xdr);
+                let entry = approval_for(self.tool, &self.f, &xdr, 600_000);
+                self.record_pending(&business_id, &entry);
+                let blob = self.f.attest_unrecorded(&entry);
+                self.args = self.commit_args_for(&xdr, &entry.approval_nonce, &blob);
+                self.args["business_id"] = serde_json::json!(business_id);
+                self.entry = entry;
+                self
+            }
+
+            /// [`Self::envelope_route`] over the prepared envelope with
+            /// `change` applied, so the record binds an envelope of its own; a
+            /// change of the deadline keeps the request's identity.
+            pub(crate) fn envelope_route_of(
+                mut self,
+                change: impl FnOnce(&mut stellar_xdr::Transaction),
+            ) -> Self {
+                if self.tool == Tool::Pay {
+                    return self;
+                }
+                let xdr = self.crafted_xdr(change);
+                if self.args["approval_nonce"].is_string() {
+                    let (args, entry) = self.approved_bound(&xdr, 600_000);
+                    self.args = args;
+                    self.entry = entry;
+                } else {
+                    let business_id = self.bind_business_id_for(&xdr);
+                    let mut args = self.commit_args_for(&xdr, "", "");
+                    for field in ["approval_nonce", "approval_attestation"] {
+                        args[field] = self.args[field].clone();
+                    }
+                    args["business_id"] = serde_json::json!(business_id);
+                    self.args = args;
+                }
+                self
             }
         }
 
@@ -11309,6 +11706,7 @@ pub(crate) mod tests {
                                 args["envelope_xdr"].as_str().unwrap(),
                             ),
                         ),
+                        None,
                         args["approval_nonce"].as_str(),
                         args["approval_attestation"].as_str(),
                         Some(run.operation_id()),
@@ -11399,10 +11797,14 @@ pub(crate) mod tests {
                     true,
                 ),
             ] {
+                // The delivery fixture consents an inbox-attested envelope
+                // approval, so the trustline rows run on an envelope record.
                 let run = if allowed {
                     ClassicRun::allowed(tool).await
                 } else {
-                    ClassicRun::unconsented(tool).await
+                    ClassicRun::unconsented(tool)
+                        .await
+                        .envelope_route_unconsented()
                 };
                 let mut args = run.args.clone();
                 if allowed {
@@ -11467,6 +11869,7 @@ pub(crate) mod tests {
                         run.args["envelope_xdr"].as_str().unwrap(),
                     ),
                 ),
+                None,
                 run.args["approval_nonce"].as_str(),
                 run.args["approval_attestation"].as_str(),
                 Some(run.operation_id()),
@@ -11543,6 +11946,7 @@ pub(crate) mod tests {
                             run.args["envelope_xdr"].as_str().unwrap()
                         )
                     ),
+                    None,
                     &SuppliedProof::default(),
                     None,
                     "stellar_pay_commit",
@@ -11563,6 +11967,54 @@ pub(crate) mod tests {
                 "Allow beside rollback evidence"
             );
             assert_eq!(queries.load(Ordering::SeqCst), 0, "Allow reads no evidence");
+        }
+
+        /// The delivered and dropped rows of [`mcp_delivery_gate_precedes_seed`]
+        /// for a canonical trustline consented through its stored intent: a
+        /// nonce-free commit of the queued consent signs once the row is
+        /// delivered, and refuses `approval.consent_undelivered`, naming the
+        /// row, before the seed read when the row is dropped.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn mcp_canonical_delivery_gate_precedes_seed() {
+            use stellar_agent_core::approval::witness::ApprovedKind;
+            use stellar_agent_network::policy_state::approvals::ConsentEvidenceEnforcementGuard;
+            let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+            for dropped in [false, true] {
+                let run = ClassicRun::unconsented(Tool::Trustline).await;
+                let row = run.canonical_delivery_fixture(true, dropped).unwrap();
+                let name = run.f.server.profile_name_for_approval();
+                let _enabled = ConsentEvidenceEnforcementGuard::new(&name, ApprovedKind::Trustline);
+                let mut args = run.args.clone();
+                for field in ["envelope_xdr", "nonce", "expires_at_unix_ms"] {
+                    args.as_object_mut().unwrap().remove(field);
+                }
+                let result = run.commit_with(args).await;
+                if dropped {
+                    assert_eq!(
+                        result["error"]["code"], "approval.consent_undelivered",
+                        "{result}"
+                    );
+                    assert!(
+                        result["error"]["message"]
+                            .as_str()
+                            .unwrap()
+                            .contains(&format!(
+                                "generation {}, row {}",
+                                row.generation(),
+                                row.sequence()
+                            )),
+                        "{result}"
+                    );
+                    assert_eq!(run.seed_reads(), 0, "dropped");
+                    assert!(run.control.sent().is_empty(), "dropped");
+                } else {
+                    assert_eq!(result["ok"], true, "delivered: {result}");
+                    assert!(run.seed_reads() > 0, "delivered");
+                    assert_eq!(run.control.count("sendTransaction"), 1, "delivered");
+                }
+            }
         }
 
         /// A pending approval of the kind `tool` commits, for the envelope
@@ -11781,8 +12233,10 @@ pub(crate) mod tests {
         }
 
         /// Asserts that `sent` carries exactly the approved transaction of
-        /// `approved` with one signature and the consent-bound deadline.
-        fn assert_approved_bytes_sent(approved: &str, sent: &str) {
+        /// `approved` with one signature and the consent-bound deadline. A
+        /// `rebuilt` transaction, the commit's rebuild of a stored canonical
+        /// intent, carries a deadline of its own and equals it otherwise.
+        fn assert_approved_bytes_sent(approved: &str, sent: &str, rebuilt: bool) {
             use stellar_xdr::{Limits, Preconditions, ReadXdr as _, TransactionEnvelope};
             let decode = |xdr: &str| match TransactionEnvelope::from_xdr_base64(xdr, Limits::none())
                 .unwrap()
@@ -11790,7 +12244,10 @@ pub(crate) mod tests {
                 TransactionEnvelope::Tx(envelope) => envelope,
                 _ => panic!("classic envelope expected"),
             };
-            let (approved, sent) = (decode(approved), decode(sent));
+            let (mut approved, sent) = (decode(approved), decode(sent));
+            if rebuilt {
+                approved.tx.cond = sent.tx.cond.clone();
+            }
             assert_eq!(
                 sent.tx, approved.tx,
                 "the sent transaction is the approved one"
@@ -11822,7 +12279,12 @@ pub(crate) mod tests {
             );
             let sent = run.control.sent();
             assert_eq!(sent.len(), 1, "{tool:?}");
-            assert_approved_bytes_sent(run.args["envelope_xdr"].as_str().unwrap(), &sent[0]);
+            let canonical = tool != Tool::Pay;
+            assert_approved_bytes_sent(
+                run.args["envelope_xdr"].as_str().unwrap(),
+                &sent[0],
+                canonical,
+            );
             let at_send = run.control.state_at_send.lock().unwrap()[0].clone();
             assert_eq!(
                 at_send["authorizations"][0]["state"], "used",
@@ -11851,17 +12313,40 @@ pub(crate) mod tests {
                 sum,
                 "{tool:?}"
             );
-            let approval = stored_approval(&run.f, &run.entry.approval_nonce).unwrap();
-            let stellar_agent_core::approval::ApprovalKind::Consumed { tx_hash, .. } =
-                &approval.kind
-            else {
-                panic!("{tool:?}: the approval is spent")
-            };
-            assert_eq!(
-                tx_hash.as_str(),
-                result["data"]["tx_hash"].as_str().unwrap(),
-                "{tool:?}"
-            );
+            if canonical {
+                // A canonical attempt's approval record is consumed at the
+                // attempt's begin; its inbox tombstone stays owed until the
+                // status repair after the operation's outcome.
+                let record = stellar_agent_network::policy_state::ApprovalStatus::new(
+                    &run.f.server.window_store,
+                    run.f.server.security_profile(),
+                )
+                .find_by_nonce(&run.entry.approval_nonce)
+                .unwrap()
+                .unwrap()
+                .record;
+                assert_eq!(
+                    record.state,
+                    stellar_agent_network::policy_state::ApprovalState::Consumed,
+                    "{tool:?}"
+                );
+                assert!(
+                    !is_consumed(&stored_approval(&run.f, &run.entry.approval_nonce).unwrap()),
+                    "{tool:?}: the tombstone is owed after the send"
+                );
+            } else {
+                let approval = stored_approval(&run.f, &run.entry.approval_nonce).unwrap();
+                let stellar_agent_core::approval::ApprovalKind::Consumed { tx_hash, .. } =
+                    &approval.kind
+                else {
+                    panic!("{tool:?}: the approval is spent")
+                };
+                assert_eq!(
+                    tx_hash.as_str(),
+                    result["data"]["tx_hash"].as_str().unwrap(),
+                    "{tool:?}"
+                );
+            }
             assert_eq!(run.seed_reads(), 1, "{tool:?}");
         }
 
@@ -11888,7 +12373,7 @@ pub(crate) mod tests {
             let clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(now);
             for tool in Tool::ALL {
                 clock.set(now);
-                let run = ClassicRun::new(tool).await;
+                let run = ClassicRun::new(tool).await.envelope_route();
                 let approved = run.args["envelope_xdr"].as_str().unwrap();
                 assert_eq!(
                     presented_classic_deadline(approved).unwrap(),
@@ -11899,7 +12384,7 @@ pub(crate) mod tests {
                 assert_eq!(result["ok"], true, "{tool:?}: {result}");
                 let sent = run.control.sent();
                 assert_eq!(sent.len(), 1);
-                assert_approved_bytes_sent(approved, &sent[0]);
+                assert_approved_bytes_sent(approved, &sent[0], false);
                 assert_eq!(
                     presented_classic_deadline(&sent[0]).unwrap(),
                     now / 1000 + 120
@@ -11930,7 +12415,7 @@ pub(crate) mod tests {
             assert_refused_before_mint(&run, &result, "policy.approval_required");
             for tool in Tool::ALL {
                 clock.set(now);
-                let run = ClassicRun::allowed(tool).await;
+                let run = ClassicRun::allowed(tool).await.envelope_route();
                 assert_eq!(
                     presented_classic_deadline(run.args["envelope_xdr"].as_str().unwrap()).unwrap(),
                     now / 1000 + MAINNET_CLASSIC_DEADLINE_SECONDS
@@ -12952,7 +13437,7 @@ pub(crate) mod tests {
         #[serial_test::serial]
         async fn mainnet_classic_commits_refuse_malformed_envelopes_and_mismatched_arguments() {
             for tool in Tool::ALL {
-                let run = ClassicRun::new(tool).await;
+                let run = ClassicRun::new(tool).await.envelope_route();
                 let mut broken = run.args.clone();
                 broken["envelope_xdr"] = serde_json::json!("AAAA");
                 assert_refused_before_mint(
@@ -12986,6 +13471,7 @@ pub(crate) mod tests {
                     assert_approved_bytes_sent(
                         run.args["envelope_xdr"].as_str().unwrap(),
                         &run.control.sent()[0],
+                        false,
                     );
                     continue;
                 }
@@ -13068,10 +13554,18 @@ pub(crate) mod tests {
                 assert_eq!(result["ok"], false, "{tool:?}: {result}");
                 assert!(authorizations(&run.f).is_empty(), "{tool:?}");
                 assert_eq!(run.seed_reads(), 0, "{tool:?}");
-                assert_eq!(
-                    run.control.methods()[..2],
-                    ["getNetwork", "getLedgerEntries"],
-                    "{tool:?}: the probe precedes the first read"
+                // A canonical commit's rebuild checks the endpoint's
+                // readiness between the probe and its account read.
+                let methods = run.control.methods();
+                let first_read = methods
+                    .iter()
+                    .position(|method| method == "getLedgerEntries")
+                    .expect("the commit reads the ledger");
+                assert_eq!(methods[0], "getNetwork", "{tool:?}: {methods:?}");
+                assert!(
+                    methods[1..first_read].iter().all(|method| tool != Tool::Pay
+                        && ["getHealth", "getLedgers"].contains(&method.as_str())),
+                    "{tool:?}: the probe precedes the first read: {methods:?}"
                 );
                 assert_eq!(run.control.count("sendTransaction"), 0, "{tool:?}");
             }
@@ -13942,15 +14436,31 @@ pub(crate) mod tests {
         #[serial_test::serial(keyring)]
         #[serial_test::serial]
         async fn mainnet_classic_commits_refuse_without_audit_readiness() {
-            for tool in Tool::ALL {
-                let run = ClassicRun::new(tool).await;
+            // The canonical lookup runs under the operation recorder, whose
+            // audit writer refuses first; the envelope route reaches the
+            // audit pre-flight.
+            for (tool, canonical) in Tool::ALL
+                .into_iter()
+                .map(|tool| (tool, false))
+                .chain([Tool::Claim, Tool::CreateAccount, Tool::Trustline].map(|tool| (tool, true)))
+            {
+                let run = if canonical {
+                    ClassicRun::new(tool).await
+                } else {
+                    ClassicRun::new(tool).await.envelope_route()
+                };
                 stellar_agent_core::audit_log::AuditWriterRegistry::remove_for_test("operator");
                 let key = &run.f.server.security_profile().audit_log_hash_chain_key_id;
                 keyring_core::Entry::new(&key.service, &key.account)
                     .unwrap()
                     .delete_credential()
                     .unwrap();
-                assert_refused_before_mint(&run, &run.commit().await, "auth.keyring_not_found");
+                let code = if canonical {
+                    "audit.chain_key_unavailable"
+                } else {
+                    "auth.keyring_not_found"
+                };
+                assert_refused_before_mint(&run, &run.commit().await, code);
             }
         }
 
@@ -13959,7 +14469,7 @@ pub(crate) mod tests {
         #[serial_test::serial]
         async fn mainnet_classic_commits_refuse_changed_protocol_nonces() {
             for tool in Tool::ALL {
-                let run = ClassicRun::new(tool).await;
+                let run = ClassicRun::new(tool).await.envelope_route();
                 let nonce = run.args["nonce"].as_str().unwrap();
                 let mut tampered = run.args.clone();
                 let (head, last) = nonce.split_at(nonce.len() - 1);
@@ -14015,7 +14525,7 @@ pub(crate) mod tests {
                 // retry of the failed commit under another business id that
                 // binds the same envelope reaches the nonce check, which
                 // refuses the spent protocol nonce.
-                let run = ClassicRun::allowed(tool).await;
+                let run = ClassicRun::allowed(tool).await.envelope_route();
                 let key = &run.f.server.security_profile().mcp_signer_default;
                 let seed = keyring_core::Entry::new(&key.service, &key.account).unwrap();
                 let stored = seed.get_password().unwrap();
@@ -14344,7 +14854,7 @@ pub(crate) mod tests {
         #[serial_test::serial]
         async fn mainnet_classic_refused_send_keeps_the_converted_rows() {
             for tool in Tool::ALL {
-                let run = ClassicRun::new(tool).await;
+                let run = ClassicRun::new(tool).await.envelope_route();
                 run.control.send_rejected.store(true, Ordering::SeqCst);
                 let result = run.commit().await;
                 assert_eq!(result["ok"], false, "{tool:?}: {result}");
@@ -15787,6 +16297,7 @@ pub(crate) mod tests {
                     GatedApprovalKind::X402.expectation(
                         stellar_agent_core::approval::subject::approval_subject_x402(&digest),
                     ),
+                    None,
                     Some(&entry.approval_nonce),
                     Some(&blob),
                     Some(link.operation_id),
@@ -16730,6 +17241,7 @@ pub(crate) mod tests {
                 GatedApprovalKind::Payment.expectation(
                     stellar_agent_core::approval::subject::approval_subject_classic(xdr),
                 ),
+                None,
                 Some(&entry.approval_nonce),
                 args["approval_attestation"].as_str(),
                 Some(operation),

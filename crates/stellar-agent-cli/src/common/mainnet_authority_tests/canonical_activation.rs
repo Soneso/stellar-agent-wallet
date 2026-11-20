@@ -824,6 +824,134 @@ async fn rebuilt_deadline_row(
     );
 }
 
+/// The clock of [`a_successor_stays_inside_the_record_execution_window`], in
+/// Unix milliseconds: the wallet's clock and the close time the endpoints
+/// report.
+static SUCCESSOR_CLOCK_MS: AtomicU64 = AtomicU64::new(0);
+/// Whether the endpoints answer the transaction as not found and serve the
+/// ledger history a recovery pass reads.
+static SUCCESSOR_ABSENT: AtomicBool = AtomicBool::new(false);
+
+fn successor_close_secs() -> u64 {
+    SUCCESSOR_CLOCK_MS.load(Ordering::SeqCst) / 1000
+}
+
+/// While [`SUCCESSOR_ABSENT`] holds, a `NOT_FOUND` transaction with its
+/// close times and a `getLedgers` page of the requested ledger, closed at
+/// the clock.
+fn successor_script(method: &str, _: usize, body: &Value) -> Option<Value> {
+    if !SUCCESSOR_ABSENT.load(Ordering::SeqCst) {
+        return None;
+    }
+    let close = successor_close_secs().to_string();
+    match method {
+        "getTransaction" => Some(json!({
+            "status": "NOT_FOUND", "latestLedger": 2000, "oldestLedger": 1,
+            "latestLedgerCloseTime": close, "oldestLedgerCloseTime": "1"
+        })),
+        "getLedgers" => {
+            let start = body["params"]["startLedger"].as_u64().unwrap_or(2000);
+            Some(json!({
+                "latestLedger": 2000, "oldestLedger": 1, "latestLedgerCloseTime": close,
+                "oldestLedgerCloseTime": 1, "cursor": "2000",
+                "ledgers": [{"sequence": start, "ledgerCloseTime": close,
+                    "hash": "00".repeat(32), "headerXdr": "", "metadataXdr": ""}]
+            }))
+        }
+        _ => None,
+    }
+}
+
+/// A successor's deadline never passes the record's execution end. Under
+/// policy authority a payment's first attempt, decided at a whole second,
+/// sets the record's execution end 600 seconds later; both endpoints answer
+/// its transaction as not found. Past its deadline the CLI's recovery pass
+/// proves the non-inclusion. A successor under the same id, decided and
+/// rebuilt 60 seconds before the record's end, holds a decision of its own
+/// that ends 540 seconds after the record's, and sends the second before the
+/// record's end.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn a_successor_stays_inside_the_record_execution_window() {
+    let name = "canonical-successor-window";
+    let start = stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1000 * 1000;
+    let record_end_ms = start + 600_000;
+    SUCCESSOR_CLOCK_MS.store(start, Ordering::SeqCst);
+    SUCCESSOR_ABSENT.store(true, Ordering::SeqCst);
+    let _clock = stellar_agent_core::timefmt::test_clock::install(Arc::new(
+        stellar_agent_core::timefmt::MockClock::new(|| {
+            Ok(SUCCESSOR_CLOCK_MS.load(Ordering::SeqCst))
+        }),
+    ));
+    let endpoint = || {
+        Verb::Pay
+            .ledger()
+            .with_close_clock(successor_close_secs)
+            .entries_at_readiness_ledger()
+            .with_script(successor_script)
+    };
+    let primary_endpoint = endpoint();
+    let fixture = Verb::Pay
+        .spec(name)
+        .primary(primary_endpoint.clone())
+        .oracle(endpoint())
+        .submit_timeout_seconds(1)
+        .rules(rules(Verb::Pay, false))
+        .build()
+        .await;
+    let id = crate::common::business_entry::fresh_business_id();
+    let (_, first) = run(Verb::Pay, &fixture, &id).await;
+    let sent = fixture.sent_envelopes().await;
+    assert_eq!(sent.len(), 1, "{name}: {first}");
+    let record = operation(&fixture, &id);
+    assert_eq!(
+        record.state,
+        stellar_agent_network::policy_state::OperationState::SentOutcomeUnknown,
+        "{name}: {first}"
+    );
+    assert_eq!(
+        record.execution_expires_at_ms,
+        Some(record_end_ms),
+        "{name}"
+    );
+
+    // The primary counts an accepted send as a consumed sequence; the
+    // transaction it never included consumed none.
+    primary_endpoint.advance_sequence(&agent(), -1);
+    SUCCESSOR_CLOCK_MS.store((deadline(&sent[0]) + 7) * 1000, Ordering::SeqCst);
+    let primary = stellar_agent_network::StellarRpcClient::new(&fixture.primary.uri()).unwrap();
+    let oracle = stellar_agent_network::StellarRpcClient::new(&fixture.oracle.uri()).unwrap();
+    crate::commands::submission_record::reconcile_open_reservations(
+        &fixture.profile(),
+        fixture.name,
+        crate::common::profile_access::ProfileOrigin::Persisted,
+        &primary,
+        Some(&oracle),
+        SUCCESSOR_CLOCK_MS.load(Ordering::SeqCst),
+        None,
+    )
+    .await;
+    assert_eq!(
+        operation(&fixture, &id).state,
+        stellar_agent_network::policy_state::OperationState::NotIncluded,
+        "{name}: the recovery pass proves the non-inclusion"
+    );
+
+    SUCCESSOR_ABSENT.store(false, Ordering::SeqCst);
+    SUCCESSOR_CLOCK_MS.store(record_end_ms - 60_000, Ordering::SeqCst);
+    let (code, result) = run(Verb::Pay, &fixture, &id).await;
+    SUCCESSOR_ABSENT.store(false, Ordering::SeqCst);
+    assert_eq!(code, 0, "{name}: {result}");
+    let sent = fixture.sent_envelopes().await;
+    assert_eq!(sent.len(), 2, "{name}");
+    assert_eq!(
+        deadline(&sent[1]),
+        record_end_ms / 1000 - 1,
+        "{name}: the successor's deadline is the second before the record's execution end"
+    );
+    assert_eq!(operation(&fixture, &id).attempts, 2, "{name}");
+}
+
 /// The clock of [`cli_canonical_full_path_matrix`], in Unix milliseconds:
 /// the wallet's clock and the close time the endpoints report.
 static MATRIX_CLOCK_MS: AtomicU64 = AtomicU64::new(0);

@@ -288,12 +288,24 @@ impl CanonicalFx {
     }
 
     fn envelope_at(&self, now: u64, sequence: i64) -> String {
+        self.envelope_until(now / 1000 + 120, sequence)
+    }
+
+    /// The envelope a caller rebuilds at `now` under an authority ending at
+    /// `end_ms`: its deadline is the earlier of 120 seconds after `now` and
+    /// the last whole second strictly before the end.
+    fn envelope_under(&self, now: u64, end_ms: u64, sequence: i64) -> String {
+        self.envelope_until((now / 1000 + 120).min(end_ms.saturating_sub(1) / 1000), sequence)
+    }
+
+    /// The intent's envelope at `sequence` with the deadline `max_time_s`.
+    fn envelope_until(&self, max_time_s: u64, sequence: i64) -> String {
         intent_envelope(
             &self.intent,
             self.f.context.network_passphrase(),
             sequence,
             100,
-            now / 1000 + 120,
+            max_time_s,
         )
         .unwrap()
     }
@@ -480,6 +492,38 @@ async fn canonical_resolver_binds_intent_and_envelope() {
     fx.sign(&context, &fx.f.envelope, &auth).await;
 }
 
+/// A canonical envelope signs only when its deadline lies strictly before
+/// the authority's end. 60 seconds before an approval's execution end, an
+/// envelope whose deadline is the last whole second before that end signs;
+/// one whose deadline is the first whole second at or after the end refuses
+/// with `DeadlineTooFar` and writes nothing.
+#[tokio::test]
+#[serial_test::serial(mainnet_clock)]
+#[serial_test::serial]
+async fn a_canonical_deadline_lies_strictly_before_the_authority_end() {
+    let fx = CanonicalFx::new(false, 300_000, str::to_owned);
+    let end = fx.witness.execution_expires_at_ms();
+    let now = end - 60_000;
+    let server = fx.f.server().await;
+    let context = fx.context(&server);
+
+    let at_end = fx.envelope_until(end.div_ceil(1000), 1);
+    let before = fx.f.wire();
+    let refused = fx.resolve(&context, &at_end, now, true).await;
+    assert!(
+        matches!(
+            refused,
+            Err(MainnetAuthorizationError::Refused(P::DeadlineTooFar))
+        ),
+        "a deadline at the end: {refused:?}"
+    );
+    assert_eq!(fx.f.wire(), before, "the refusal writes nothing");
+
+    let last_second = fx.envelope_until((end - 1) / 1000, 1);
+    let auth = fx.resolve(&context, &last_second, now, true).await.unwrap();
+    fx.sign(&context, &last_second, &auth).await;
+}
+
 #[tokio::test]
 #[serial_test::serial(mainnet_clock)]
 #[serial_test::serial]
@@ -554,7 +598,7 @@ async fn canonical_resolver_rereads_the_claim() {
 #[serial_test::serial]
 async fn intent_clock_reaches_real_signing() {
     for ttl in [300_000, 900_000] {
-        for offset in [None, Some(-1_i64), Some(0), Some(1)] {
+        for offset in [None, Some(-32_000_i64), Some(-1), Some(0), Some(1)] {
             let fx = CanonicalFx::new(false, ttl, str::to_owned);
             let end = fx.witness.execution_expires_at_ms();
             assert_eq!(end, fx.witness.consent_at_ms() + ttl.min(900_000));
@@ -575,7 +619,15 @@ async fn intent_clock_reaches_real_signing() {
             assert!(now > fx.witness.expires_at_ms());
             let server = fx.f.server().await;
             let context = fx.context(&server);
-            let envelope = fx.envelope_at(now, 1);
+            // Before the end the envelope is the one a caller rebuilds, whose
+            // deadline lies strictly before the end; at and after the end it
+            // keeps the plain 120-second deadline.
+            let envelope = if now < end {
+                fx.envelope_under(now, end, 1)
+            } else {
+                fx.envelope_at(now, 1)
+            };
+            let deadline_ms = (now / 1000 + 120).min((end - 1) / 1000) * 1000;
             if offset.is_none() {
                 let early = fx
                     .resolve(
@@ -593,12 +645,42 @@ async fn intent_clock_reaches_real_signing() {
                     "clock before consent refuses: {early:?}"
                 );
             }
-            let result = fx.resolve(&context, &envelope, now, true).await;
             if now < end {
+                // An envelope whose deadline passes the end refuses while the
+                // authority still holds.
+                let late = fx
+                    .resolve(&context, &fx.envelope_at(now, 1), now, true)
+                    .await;
+                assert!(
+                    matches!(
+                        late,
+                        Err(MainnetAuthorizationError::Refused(P::DeadlineTooFar))
+                    ),
+                    "a deadline past the end: {late:?}"
+                );
+            }
+            let result = fx.resolve(&context, &envelope, now, true).await;
+            if now < end && deadline_ms <= now + 30_000 {
+                // Within the send margin of the last second before the end,
+                // no envelope can sign: that second has passed, or lies
+                // within the margin.
+                let expected = if deadline_ms <= now {
+                    P::DeadlineElapsed
+                } else {
+                    P::DeadlineWithinMargin
+                };
+                assert!(
+                    matches!(
+                        result,
+                        Err(MainnetAuthorizationError::Refused(p)) if p == expected
+                    ),
+                    "{result:?}"
+                );
+            } else if now < end {
                 let auth = result.unwrap();
                 assert_eq!(
                     auth.expires_at_ms(),
-                    (now + 60_000).min(end).min((now / 1000 + 120) * 1000)
+                    (now + 60_000).min(end).min(deadline_ms)
                 );
                 fx.sign(&context, &envelope, &auth).await;
                 assert!(matches!(
@@ -823,7 +905,9 @@ async fn consented_unminted_intent_survives_waiting_end() {
             let context = fx.context(&server);
             let envelope = fx.envelope_at(now, 1);
             if case == "restart" {
-                // The resolution begins the first attempt under its mint.
+                // The resolution begins the first attempt under its mint,
+                // with the deadline a caller rebuilds under the execution end.
+                let envelope = fx.envelope_under(now, end, 1);
                 fx.resolve(&context, &envelope, now, true).await.unwrap();
             } else {
                 let decoded =

@@ -1394,6 +1394,8 @@ mod enabled {
     struct CanonicalResolution {
         digest: [u8; 32],
         predecessor: Option<super::super::AuthorizationId>,
+        /// The record's execution end, once an authority stands.
+        execution_end_ms: Option<u64>,
     }
 
     async fn canonical_resolution(
@@ -1410,9 +1412,10 @@ mod enabled {
         let Some(link) = req.operation else {
             return Ok(None);
         };
-        let (slot, predecessor) = OperationStatus::new(req.store, req.context.profile())
-            .intent_for_resolution(link.operation_id)
-            .map_err(mint::store_error)?;
+        let (slot, predecessor, execution_end_ms) =
+            OperationStatus::new(req.store, req.context.profile())
+                .intent_for_resolution(link.operation_id)
+                .map_err(mint::store_error)?;
         if !matches!(slot, IntentSlot::Canonical { .. }) {
             return Ok(None);
         }
@@ -1471,6 +1474,7 @@ mod enabled {
         Ok(Some(CanonicalResolution {
             digest: *matched.digest.as_bytes(),
             predecessor,
+            execution_end_ms,
         }))
     }
     /// Authorizes the signature of one classic mainnet transaction.
@@ -1671,6 +1675,25 @@ mod enabled {
             req.operation,
             None,
         )?;
+        // A canonical envelope signs only when its deadline lies strictly
+        // before the end of the live authority, which holds strictly before
+        // that end: a ledger closing at the deadline can still include it.
+        // A record whose execution window stands bounds a successor too.
+        if let Some(resolution) = &canonical {
+            let end_ms = match req.authority {
+                crate::mainnet::authority::MainnetAuthority::Approval(approval) => {
+                    approval.expires_at_ms()
+                }
+                crate::mainnet::authority::MainnetAuthority::Policy(policy) => {
+                    policy.governing_until_ms()
+                }
+            }
+            .min(resolution.execution_end_ms.unwrap_or(u64::MAX));
+            require(
+                chain_deadline.saturating_mul(1000) < end_ms,
+                P::DeadlineTooFar,
+            )?;
+        }
         let mut request = request(
             req.context,
             DomainBinding::Transaction {

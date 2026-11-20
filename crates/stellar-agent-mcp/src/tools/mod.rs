@@ -40,6 +40,7 @@ pub(crate) mod amount_wire;
 pub(crate) mod approval_status;
 pub(crate) mod balances;
 pub(crate) mod business_entry;
+pub(crate) mod canonical_commit;
 pub(crate) mod common;
 pub(crate) mod create_account;
 pub(crate) mod fee_stats;
@@ -107,6 +108,9 @@ mod operation_replay_tests;
 
 #[cfg(all(test, feature = "mainnet-write"))]
 mod toolsets_mainnet_tests;
+// Canonical preparation and commit of the create-account, trustline and claim tools.
+#[cfg(all(test, feature = "mainnet-write"))]
+mod canonical_commit_tests;
 
 // The status views and the audit outbox of every mainnet value kind.
 #[cfg(all(test, feature = "mainnet-write"))]

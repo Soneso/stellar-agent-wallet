@@ -104,17 +104,22 @@ pub struct StellarClaimCommitArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_account: Option<String>,
 
-    /// Base64-url-no-pad nonce returned by the simulate step.
-    pub nonce: String,
+    /// Base64-url-no-pad nonce returned by the simulate step. A mainnet
+    /// commit of an intent stored under `business_id` needs none of the three
+    /// fields; every other commit requires them.
+    #[serde(default)]
+    pub nonce: Option<String>,
 
     /// Unix timestamp (milliseconds) at which the nonce expires.
-    pub expires_at_unix_ms: u64,
+    #[serde(default)]
+    pub expires_at_unix_ms: Option<u64>,
 
     /// Base64 XDR envelope returned by the simulate step.
     ///
     /// Compared byte-for-byte to a freshly re-built envelope; mismatch returns
     /// `simulation.divergence`. Passed verbatim to HMAC verification.
-    pub envelope_xdr: String,
+    #[serde(default)]
+    pub envelope_xdr: Option<String>,
 
     /// Wallet-issued approval nonce from the simulate-step `approval` block.
     ///
@@ -241,6 +246,83 @@ impl WalletServer {
 
         Ok(entry)
     }
+
+    /// The commit of the canonical claim under `business_id`: the endpoint is
+    /// checked as on the envelope route, the record is looked up, the balance
+    /// is read again and its claimant and predicate are checked, then the
+    /// envelope is rebuilt from the stored intent and signed.
+    async fn claim_canonical(
+        &self,
+        guard: &crate::server::MainnetWriteGuard<'_>,
+        args: &StellarClaimCommitArgs,
+        business_id: stellar_agent_network::policy_state::BusinessId,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let id = match BalanceId::parse(&args.balance_id) {
+            Ok(id) => id,
+            Err(err) => return Ok(claim_error_result(&err)),
+        };
+        let source = args
+            .source_account
+            .clone()
+            .unwrap_or_else(|| self.security_profile().mcp_signer_default.account.clone());
+        let entry = self.canonical_entry(guard, business_id, &source, |intent| {
+            matches!(
+                intent.payload(),
+                stellar_agent_core::approval::IntentPayload::Claim {
+                    balance_id,
+                    claimant,
+                    ..
+                } if *balance_id == id.to_hex72() && *claimant == source
+            ) && intent.base().source() == source
+        });
+        let (client, target) = match entry.await {
+            Ok(entry) => entry,
+            Err(answer) => return answer,
+        };
+        let entry = match fetch_claimable_balance_entry(&client, &id).await {
+            Ok(e) => e,
+            Err(err) => return Ok(claim_error_result(&err)),
+        };
+        let now_secs = now_unix_ms()
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("clock_error: {e}"), None))?
+            / 1000;
+        let preview = match ClaimPreview::build(&entry, &source, now_secs) {
+            Ok(p) => p,
+            Err(err) => return Ok(claim_error_result(&err)),
+        };
+        if let Err(err) =
+            require_claimant(&preview).and_then(|()| require_predicate_satisfied(&preview))
+        {
+            return Ok(claim_error_result(&err));
+        }
+        let witness_inputs = stellar_agent_network::cross_check::ClaimWitnessInputs {
+            source: crate::tools::canonical_commit::placeholder_source(&target.intent),
+            trustline: None,
+            balance: Some(
+                stellar_agent_network::cross_check::ClaimableBalanceObservation {
+                    balance_id: id.hash(),
+                    entry: Some(entry),
+                },
+            ),
+        };
+        self.canonical_commit(
+            guard,
+            &client,
+            &target,
+            crate::tools::canonical_commit::CanonicalCommit {
+                consumer: stellar_agent_network::mainnet::MainnetConsumer::McpClaim,
+                prepare_tool: "stellar_claim",
+                commit_tool: "stellar_claim_commit",
+                chain_id: &args.chain_id,
+                proof: crate::tools::common::SuppliedProof {
+                    nonce: args.approval_nonce.clone(),
+                    attestation: args.approval_attestation.clone(),
+                },
+                witness_inputs: witness_inputs.into(),
+            },
+        )
+        .await
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -359,7 +441,7 @@ impl WalletServer {
         // name. A retained operation thus answers here with its stored state
         // before the balance read and the predicate and trustline checks, whose
         // answers change once the claim ran.
-        let operation = match business_id
+        let mut operation = match business_id
             .clone()
             .filter(|_| self.context.chain_id.is_mainnet())
         {
@@ -371,7 +453,7 @@ impl WalletServer {
                             None,
                         )
                     })?;
-                match self.classic_prepare_entry(
+                match self.canonical_prepare_entry(
                     business_id,
                     stellar_agent_network::mainnet::MainnetConsumer::McpClaim,
                     &source,
@@ -559,6 +641,43 @@ impl WalletServer {
             }
         };
 
+        // The governing decision of this preparation and its commit is the
+        // one the record keeps, so it is evaluated before the record opens.
+        let dispatch_outcome = match self
+            .paired_commit_outcome(
+                dispatch_outcome,
+                &envelope_xdr,
+                "stellar_claim_commit",
+                &args.chain_id,
+                Some(source_view),
+                None,
+            )
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => return error.into_result(),
+        };
+        if let Err(result) = self.stage_canonical(
+            operation.as_mut(),
+            stellar_agent_core::approval::IntentPayload::Claim {
+                balance_id: id.to_hex72(),
+                claimant: source.clone(),
+                asset: match (&preview.asset_code, &preview.asset_issuer) {
+                    (Some(code), Some(issuer)) => {
+                        stellar_agent_core::approval::IntentAsset::Issued {
+                            code: code.clone(),
+                            issuer: issuer.clone(),
+                        }
+                    }
+                    _ => stellar_agent_core::approval::IntentAsset::Native,
+                },
+                amount_stroops: preview.amount_stroops,
+            },
+            &dispatch_outcome,
+        ) {
+            return Ok(result);
+        }
+
         let prepared = match self.prepared_envelope(
             operation.as_ref(),
             stellar_agent_network::policy_state::OperationTool::StellarClaim,
@@ -604,20 +723,6 @@ impl WalletServer {
 
         // ── Persist pending approval if policy requires it ────────────────────
         let asset_str = preview_asset_string(&preview);
-        let dispatch_outcome = match self
-            .paired_commit_outcome(
-                dispatch_outcome,
-                &envelope_xdr,
-                "stellar_claim_commit",
-                &args.chain_id,
-                Some(source_view),
-                None,
-            )
-            .await
-        {
-            Ok(outcome) => outcome,
-            Err(error) => return error.into_result(),
-        };
 
         let approval_block =
             if let DispatchOutcome::RequireApproval(ref approval) = dispatch_outcome {
@@ -691,6 +796,15 @@ impl WalletServer {
     /// The agent supplies the `(nonce, expires_at_unix_ms, envelope_xdr)` triple
     /// returned by `stellar_claim`, plus the original call arguments.
     ///
+    /// A mainnet commit under a `business_id` whose record holds a stored
+    /// intent takes none of the three: after the entry re-fetch and its
+    /// claimant and predicate checks it rebuilds the envelope from that intent
+    /// with a fresh sequence and deadline at the fee per operation of the
+    /// prepared envelope, takes its authority from the stored record, verifies
+    /// no nonce, and refuses `simulation.divergence` when the balance no longer
+    /// matches the stored intent. Invariants 1, 3 and 5 below hold for every
+    /// other commit.
+    ///
     /// # Security invariants
     ///
     /// 1. Policy re-evaluation on authoritative args re-derived from the
@@ -728,15 +842,16 @@ impl WalletServer {
     #[tool(
         name = "stellar_claim_commit",
         description = "Sign and submit a ClaimClaimableBalance transaction (commit step). \
-                       Requires the nonce, expires_at_unix_ms, and envelope_xdr returned by \
-                       stellar_claim. Also pass approval_nonce and approval_attestation \
-                       when the simulate step returned an approval block. Pass business_id \
-                       on mainnet. Re-derives authoritative args from the envelope, \
-                       re-fetches and re-checks the entry, re-builds the envelope, \
-                       obtains the cross-check witness, verifies the nonce, signs via \
-                       keyring, and submits. \
-                       On mainnet, a matching balance_floor rule adds an endpoint readiness \
-                       check and an operating account read. \
+                       Takes the nonce, expires_at_unix_ms, and envelope_xdr returned by \
+                       stellar_claim. A mainnet commit of an intent stored under business_id \
+                       needs none of the three and rebuilds the envelope from that intent at \
+                       the fee per operation of the prepared envelope; every other commit \
+                       requires them and verifies the nonce. Also pass approval_nonce and \
+                       approval_attestation when the simulate step returned an approval \
+                       block. Pass business_id on mainnet. Re-fetches and re-checks the \
+                       entry, re-builds the envelope, obtains the cross-check witness, signs \
+                       via keyring, and submits. On mainnet, a matching balance_floor rule \
+                       adds an endpoint readiness check and an operating account read. \
                        Returns {tx_hash, ledger, cross_check}. \
                        On submission.tx_timeout the outcome is unknown: pass \
                        error.details.tx_hash to stellar_transaction_status, and never \
@@ -774,10 +889,33 @@ impl WalletServer {
         } else {
             None
         };
+        use crate::tools::business_entry::{CommitRoute, EnvelopeFields};
+        let fields = EnvelopeFields {
+            envelope_xdr: args.envelope_xdr.as_deref(),
+            nonce: args.nonce.as_deref(),
+            expires_at_unix_ms: args.expires_at_unix_ms,
+        };
+        let (envelope_xdr, nonce_b64, expires_at_unix_ms) = match self.commit_route(
+            "stellar_claim_commit",
+            mainnet.as_ref(),
+            &args.chain_id,
+            args.business_id.as_deref(),
+            fields,
+        ) {
+            CommitRoute::Canonical(guard, business_id) => {
+                return self.claim_canonical(guard, &args, business_id).await;
+            }
+            CommitRoute::Answer(result) => return Ok(result),
+            CommitRoute::Envelope {
+                envelope_xdr,
+                nonce,
+                expires_at_unix_ms,
+            } => (envelope_xdr, nonce, expires_at_unix_ms),
+        };
 
         // ── Re-derive authoritative args from the HMAC-bound envelope_xdr ─────
         let mut authoritative_args =
-            match decode_authoritative_args(&args.envelope_xdr, "stellar_claim_commit") {
+            match decode_authoritative_args(envelope_xdr, "stellar_claim_commit") {
                 Ok(a) => a,
                 Err(e) => {
                     tracing::debug!(
@@ -858,7 +996,7 @@ impl WalletServer {
             mainnet.as_ref().map(|guard| guard.policy),
             stellar_agent_network::policy_state::OperationKind::Claim,
             business_id.as_ref(),
-            &args.envelope_xdr,
+            envelope_xdr,
         ) {
             Ok(operation) => operation,
             Err(result) => return Ok(result),
@@ -940,10 +1078,9 @@ impl WalletServer {
                 self,
                 &dispatch_outcome,
                 super::common::GatedApprovalKind::Claim.expectation(
-                    stellar_agent_core::approval::subject::approval_subject_classic(
-                        &args.envelope_xdr,
-                    ),
+                    stellar_agent_core::approval::subject::approval_subject_classic(envelope_xdr),
                 ),
+                None,
                 &super::common::SuppliedProof {
                     nonce: args.approval_nonce.clone(),
                     attestation: args.approval_attestation.clone(),
@@ -964,7 +1101,7 @@ impl WalletServer {
                 self,
                 &dispatch_outcome,
                 super::common::GatedApprovalKind::Claim,
-                &args.envelope_xdr,
+                envelope_xdr,
                 args.approval_nonce.as_deref(),
                 args.approval_attestation.as_deref(),
                 "stellar_claim_commit",
@@ -980,7 +1117,7 @@ impl WalletServer {
             .map(stellar_agent_core::mainnet::decision::MainnetDecision::provenance);
 
         // ── Decode nonce ─────────────────────────────────────────────────────
-        let nonce = match stellar_agent_nonce::Nonce::from_base64(&args.nonce) {
+        let nonce = match stellar_agent_nonce::Nonce::from_base64(nonce_b64) {
             Ok(n) => n,
             Err(_) => return Ok(commit_path_error_result("nonce parse failed")),
         };
@@ -1051,7 +1188,7 @@ impl WalletServer {
             })?;
 
         let presented_deadline = if self.context.chain_id.is_mainnet() {
-            match crate::tools::common::presented_classic_deadline(&args.envelope_xdr) {
+            match crate::tools::common::presented_classic_deadline(envelope_xdr) {
                 Ok(max_time) => Some(max_time),
                 Err(result) => return Ok(result),
             }
@@ -1084,7 +1221,7 @@ impl WalletServer {
         };
 
         // ── Envelope divergence check ────────────────────────────────────────
-        if rebuilt_envelope_xdr != args.envelope_xdr {
+        if rebuilt_envelope_xdr != envelope_xdr {
             return Ok(crate::tools::common::business_error_result(
                 "simulation.divergence",
                 "re-built envelope does not match presented envelope_xdr; \
@@ -1118,7 +1255,7 @@ impl WalletServer {
                         },
                     ),
                 },
-                &args.envelope_xdr,
+                envelope_xdr,
                 "stellar_claim_commit",
             )
             .await
@@ -1172,8 +1309,8 @@ impl WalletServer {
             &self.nonce_mint,
             &self.replay_window,
             &nonce,
-            &args.envelope_xdr,
-            args.expires_at_unix_ms,
+            envelope_xdr,
+            expires_at_unix_ms,
             &args.chain_id,
             "stellar_claim_commit",
             now_ms,
@@ -1190,7 +1327,7 @@ impl WalletServer {
             mainnet.as_ref().map(|guard| guard.policy),
             stellar_agent_network::policy_state::OperationKind::Claim,
             business_id.as_ref(),
-            &args.envelope_xdr,
+            envelope_xdr,
         ) {
             Ok(operation) => operation,
             Err(result) => return Ok(result),
@@ -1209,7 +1346,7 @@ impl WalletServer {
             audit_readiness,
             stellar_agent_network::mainnet::MainnetConsumer::McpClaim,
             &client,
-            &args.envelope_xdr,
+            envelope_xdr,
             &source,
             crate::tools::submission_record::CommitRecord {
                 policy_decision: dispatch_outcome.audit_decision(),

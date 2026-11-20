@@ -274,10 +274,15 @@ async fn a_rejected_argument_stays_out_of_the_log() {
 
 /// The tool call response for `name` with `arguments`.
 async fn tool_response(name: &str, arguments: Value) -> Value {
+    tool_response_on(testnet_server(), name, arguments).await
+}
+
+/// The tool call response for `name` with `arguments` from `server`.
+async fn tool_response_on(server: WalletServer, name: &str, arguments: Value) -> Value {
     let (client, server_side) = tokio::io::duplex(1 << 20);
     let (server_read, server_write) = tokio::io::split(server_side);
     let session = tokio::spawn(async move {
-        let _ = serve_on_send(server_read, server_write).await;
+        let _ = serve_on_send(server, server_read, server_write).await;
     });
     let (client_read, mut client_write) = tokio::io::split(client);
     let mut lines = BufReader::new(client_read).lines();
@@ -310,10 +315,11 @@ async fn tool_response(name: &str, arguments: Value) -> Value {
 
 /// [`serve_on`] with a text error, so that a spawned task can hold it.
 async fn serve_on_send(
+    server: WalletServer,
     read: tokio::io::ReadHalf<tokio::io::DuplexStream>,
     write: tokio::io::WriteHalf<tokio::io::DuplexStream>,
 ) -> Result<(), String> {
-    serve_on(testnet_server(), BoundedTransport::over(read, write))
+    serve_on(server, BoundedTransport::over(read, write))
         .await
         .map_err(|e| e.to_string())
 }
@@ -358,6 +364,229 @@ async fn a_rejected_argument_stays_out_of_the_tool_result() {
             )
         );
         assert!(!response.to_string().contains(MARKER), "{response}");
+    }
+}
+
+/// Off mainnet every classic commit requires its envelope, protocol nonce
+/// and nonce expiry. A commit that omits one answers the same fixed tool
+/// result on all four tools, the payment commit's deserialization refusal
+/// included; a present empty envelope refuses `simulation.divergence`.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_classic_commit_without_its_envelope_fields_answers_the_fixed_refusal() {
+    let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+    let account = stellar_agent_test_support::signed_envelope::account_id_for_seed([5; 32]);
+    let other = stellar_agent_test_support::signed_envelope::account_id_for_seed([6; 32]);
+    let base = json!({ "chain_id": "stellar:testnet", "nonce": "AAAA",
+        "expires_at_unix_ms": 1, "envelope_xdr": "AAAA" });
+    let tools = [
+        (
+            "stellar_pay_commit",
+            json!({ "source": account, "destination": other, "amount": "1 XLM", "asset": "native" }),
+        ),
+        (
+            "stellar_create_account_commit",
+            json!({ "source": account, "destination": other, "starting_balance": "1 XLM" }),
+        ),
+        ("stellar_trustline_commit", json!({ "from": account })),
+        (
+            "stellar_claim_commit",
+            json!({ "balance_id": "ab".repeat(32), "source_account": account }),
+        ),
+    ];
+    for (tool, own) in tools {
+        let mut complete = base.clone();
+        complete
+            .as_object_mut()
+            .unwrap()
+            .extend(own.as_object().unwrap().clone());
+        for field in ["nonce", "expires_at_unix_ms", "envelope_xdr"] {
+            let mut arguments = complete.clone();
+            arguments.as_object_mut().unwrap().remove(field);
+            let response = tool_response(tool, arguments).await;
+            let result = &response["result"];
+            assert_eq!(result["isError"], true, "{tool} {field}: {response}");
+            assert_eq!(
+                result["content"][0]["text"],
+                format!(
+                    "{tool}: the arguments have a missing field or a field of the wrong type or value"
+                ),
+                "{tool} {field}: {response}"
+            );
+        }
+        if tool != "stellar_pay_commit" {
+            let mut arguments = complete.clone();
+            arguments["envelope_xdr"] = json!("");
+            let response = tool_response(tool, arguments).await;
+            let text = response["result"]["content"][0]["text"].as_str().unwrap();
+            let envelope: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(
+                envelope["error"]["code"], "simulation.divergence",
+                "{tool}: {response}"
+            );
+        }
+    }
+}
+
+/// The unsigned envelope of `source` with the one operation `body`.
+fn testnet_envelope(source: &str, body: stellar_xdr::OperationBody) -> String {
+    use stellar_xdr::{
+        Limits, Memo, MuxedAccount, Operation, Preconditions, SequenceNumber, Transaction,
+        TransactionEnvelope, TransactionExt, TransactionV1Envelope, Uint256, VecM, WriteXdr,
+    };
+    let key = stellar_strkey::ed25519::PublicKey::from_string(source)
+        .unwrap()
+        .0;
+    TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx: Transaction {
+            source_account: MuxedAccount::Ed25519(Uint256(key)),
+            fee: 100,
+            seq_num: SequenceNumber(101),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![Operation {
+                source_account: None,
+                body,
+            }]
+            .try_into()
+            .unwrap(),
+            ext: TransactionExt::V0,
+        },
+        signatures: VecM::default(),
+    })
+    .to_xdr_base64(Limits::none())
+    .unwrap()
+}
+
+fn testnet_account_id(account: &str) -> stellar_xdr::AccountId {
+    stellar_xdr::AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+        stellar_xdr::Uint256(
+            stellar_strkey::ed25519::PublicKey::from_string(account)
+                .unwrap()
+                .0,
+        ),
+    ))
+}
+
+/// On testnet a present empty `nonce` or a zero `expires_at_unix_ms` with a
+/// valid envelope reaches the nonce check and answers the uniform nonce
+/// refusal `nonce.expired`, as on a mainnet envelope record, for the
+/// create-account, trustline and claim commits. The endpoint serves the
+/// testnet, the funded source, the trustline issuer and the claimable
+/// balance, so each call passes the checks before the nonce.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_present_empty_nonce_or_zero_expiry_answers_the_nonce_refusal_on_testnet() {
+    use stellar_agent_test_support::xdr_fixtures::{
+        account_entry_xdr_with_seq, account_ledger_key_xdr,
+    };
+    use stellar_xdr::{
+        AlphaNum4, Asset, AssetCode4, ChangeTrustAsset, ChangeTrustOp, ClaimClaimableBalanceOp,
+        ClaimPredicate, ClaimableBalanceEntry, ClaimableBalanceEntryExt, ClaimableBalanceId,
+        Claimant, ClaimantV0, CreateAccountOp, Hash, LedgerEntryData, LedgerKey,
+        LedgerKeyClaimableBalance, Limits, OperationBody, WriteXdr,
+    };
+    let _data_root = crate::common::isolated_data_root();
+    stellar_agent_test_support::keyring_mock::install().unwrap();
+    let account = stellar_agent_test_support::signed_envelope::account_id_for_seed([5; 32]);
+    let other = stellar_agent_test_support::signed_envelope::account_id_for_seed([6; 32]);
+    let issuer = stellar_agent_test_support::signed_envelope::account_id_for_seed([7; 32]);
+    let balance_id = ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([0xab; 32]));
+    let balance_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
+        balance_id: balance_id.clone(),
+    })
+    .to_xdr_base64(Limits::none())
+    .unwrap();
+    let balance_entry = LedgerEntryData::ClaimableBalance(ClaimableBalanceEntry {
+        balance_id: balance_id.clone(),
+        claimants: vec![Claimant::ClaimantTypeV0(ClaimantV0 {
+            destination: testnet_account_id(&account),
+            predicate: ClaimPredicate::Unconditional,
+        })]
+        .try_into()
+        .unwrap(),
+        asset: Asset::Native,
+        amount: 10,
+        ext: ClaimableBalanceEntryExt::V0,
+    })
+    .to_xdr_base64(Limits::none())
+    .unwrap();
+    let endpoint = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(
+            crate::common::TimeoutRpc::new(vec![
+                (
+                    account_ledger_key_xdr(&account),
+                    account_entry_xdr_with_seq(&account, 100_000_000_000_000, 0, 100),
+                ),
+                (
+                    account_ledger_key_xdr(&issuer),
+                    account_entry_xdr_with_seq(&issuer, 100_000_000_000, 0, 1),
+                ),
+                (balance_key, balance_entry),
+            ])
+            .with_network(crate::common::EndpointNetwork::testnet()),
+        )
+        .mount(&endpoint)
+        .await;
+    let mut profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
+        .with_noop_engine()
+        .build();
+    profile.rpc_url = endpoint.uri();
+    crate::common::install_test_audit_key(&mut profile);
+
+    let usd = AlphaNum4 {
+        asset_code: AssetCode4(*b"USD\0"),
+        issuer: testnet_account_id(&issuer),
+    };
+    let tools = [
+        (
+            "stellar_create_account_commit",
+            json!({ "source": account, "destination": other, "starting_balance": "1 XLM" }),
+            OperationBody::CreateAccount(CreateAccountOp {
+                destination: testnet_account_id(&other),
+                starting_balance: 10_000_000,
+            }),
+        ),
+        (
+            "stellar_trustline_commit",
+            json!({ "from": account }),
+            OperationBody::ChangeTrust(ChangeTrustOp {
+                line: ChangeTrustAsset::CreditAlphanum4(usd),
+                limit: 10,
+            }),
+        ),
+        (
+            "stellar_claim_commit",
+            json!({ "balance_id": "ab".repeat(32), "source_account": account }),
+            OperationBody::ClaimClaimableBalance(ClaimClaimableBalanceOp { balance_id }),
+        ),
+    ];
+    let valid_nonce = URL_SAFE_NO_PAD.encode([0; 48]);
+    for (tool, own, body) in tools {
+        for (field, nonce, expires_at_unix_ms) in [
+            ("nonce", json!(""), json!(u64::MAX)),
+            ("expires_at_unix_ms", json!(valid_nonce), json!(0)),
+        ] {
+            let mut arguments = own.clone();
+            let object = arguments.as_object_mut().unwrap();
+            object.insert("chain_id".to_owned(), json!("stellar:testnet"));
+            object.insert(
+                "envelope_xdr".to_owned(),
+                json!(testnet_envelope(&account, body.clone())),
+            );
+            object.insert("nonce".to_owned(), nonce);
+            object.insert("expires_at_unix_ms".to_owned(), expires_at_unix_ms);
+            let server = WalletServer::new(profile.clone()).unwrap();
+            let response = tool_response_on(server, tool, arguments).await;
+            let text = response["result"]["content"][0]["text"].as_str().unwrap();
+            let envelope: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(
+                envelope["error"]["code"], "nonce.expired",
+                "{tool} {field}: {response}"
+            );
+        }
     }
 }
 
