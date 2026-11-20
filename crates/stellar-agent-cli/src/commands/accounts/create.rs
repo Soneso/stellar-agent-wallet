@@ -1691,7 +1691,7 @@ where
         operation: Some(signing.handle()),
         rebuild: signing.rebuild(
             fee_choice,
-            DEFAULT_FEE_STROOPS,
+            (DEFAULT_FEE_STROOPS, FeeSource::CommandDefault),
             CreateAccountWitnessInputs { source },
             &thresholds,
         ),

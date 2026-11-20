@@ -552,6 +552,17 @@ pub struct CanonicalRebuildRequest<'a> {
     pub fee_choice: ClassicFeeChoice,
     /// The fee per operation a [`ClassicFeeChoice::ProfileDefault`] gives.
     pub default_fee_per_op_stroops: u32,
+    /// Where `default_fee_per_op_stroops` comes from, which a fee-cap
+    /// refusal of a [`ClassicFeeChoice::ProfileDefault`] choice names:
+    /// [`FeeSource::CommandDefault`] for a verb's built-in fee,
+    /// [`FeeSource::ProfileDefault`] for the profile's
+    /// `classic_fee_per_op_stroops`, [`FeeSource::Envelope`] for the fee of
+    /// a prepared envelope.
+    ///
+    /// [`FeeSource::CommandDefault`]: stellar_agent_core::error::FeeSource::CommandDefault
+    /// [`FeeSource::ProfileDefault`]: stellar_agent_core::error::FeeSource::ProfileDefault
+    /// [`FeeSource::Envelope`]: stellar_agent_core::error::FeeSource::Envelope
+    pub default_fee_source: stellar_agent_core::error::FeeSource,
     /// The current effective classic fee cap per operation.
     pub fee_cap_stroops: u32,
     /// The oracle observations of the operation; the fresh source read
@@ -614,7 +625,9 @@ pub fn canonical_max_time_s(now_ms: u64, authority_end_ms: u64) -> u64 {
 /// - `network.endpoint_not_ready` and the readiness errors, before any
 ///   other read.
 /// - `fees.percentile_exceeds_cap` for a fee above the intent's bound or
-///   the current cap.
+///   the current cap; it names the source
+///   [`classic_fee_source`](crate::fees::classic_fee_source) gives for the
+///   request's fee choice and `default_fee_source`.
 /// - `protocol.xdr_codec_failed` for an account sequence with no successor.
 /// - The account, fee, clock, builder and oracle errors.
 pub async fn rebuild_canonical(
@@ -642,10 +655,8 @@ pub async fn rebuild_canonical(
         .fee_bound_stroops()
         .min(request.fee_cap_stroops);
     if fee > cap {
-        let fee_source = crate::fees::classic_fee_source(
-            request.fee_choice,
-            stellar_agent_core::error::FeeSource::ProfileDefault,
-        );
+        let fee_source =
+            crate::fees::classic_fee_source(request.fee_choice, request.default_fee_source);
         return Err(WalletError::Validation(ValidationError::FeeAboveCap {
             per_op: DerivedFee::new(fee, &fee_source),
             cap,
@@ -2700,8 +2711,10 @@ pub(crate) mod tests {
     /// the oracle, and binds the envelope and the oracle proof to the account
     /// read then. A sequence that moves during consent gives a new envelope,
     /// hash and proof. A readiness refusal reads nothing further, and a fee
-    /// above the bound or an exhausted sequence asks the oracle nothing. An
-    /// exhausted sequence refuses before the deadline clock is read.
+    /// above the bound or an exhausted sequence asks the oracle nothing. A fee
+    /// refusal names the explicit fee, the selected percentile, or the source
+    /// the caller passed with its default fee. An exhausted sequence refuses
+    /// before the deadline clock is read.
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
     #[serial_test::serial(mainnet_clock)]
@@ -2713,6 +2726,7 @@ pub(crate) mod tests {
         };
         use crate::mainnet::canonical::{CanonicalCheck, match_envelope};
         use crate::mainnet::fixtures::ResolverFixture;
+        use stellar_agent_core::error::FeeSource;
         let f = ResolverFixture::configured(
             |profile| {
                 use stellar_agent_core::profile::schema::{PrimaryProviderRecord, ProviderRecord};
@@ -2763,7 +2777,10 @@ pub(crate) mod tests {
             subentry_count: 0,
             flags: None,
         };
-        let rebuild_until = |fee_choice, authority_end_ms| {
+        let rebuild_with = |fee_choice,
+                            authority_end_ms,
+                            default_fee_per_op_stroops,
+                            default_fee_source| {
             rebuild_canonical(CanonicalRebuildRequest {
                 profile: &f.profile,
                 network: &network,
@@ -2771,7 +2788,8 @@ pub(crate) mod tests {
                 deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(10),
                 intent: &intent,
                 fee_choice,
-                default_fee_per_op_stroops: 100,
+                default_fee_per_op_stroops,
+                default_fee_source,
                 fee_cap_stroops: 500,
                 witness_inputs: PayWitnessInputs {
                     source: prepared.clone(),
@@ -2785,7 +2803,16 @@ pub(crate) mod tests {
                 authority_end_ms,
             })
         };
+        let rebuild_until = |fee_choice, authority_end_ms| {
+            rebuild_with(fee_choice, authority_end_ms, 100, FeeSource::ProfileDefault)
+        };
         let rebuild = |fee_choice| rebuild_until(fee_choice, u64::MAX);
+        let refused_source = |error: WalletError| match error {
+            WalletError::Validation(ValidationError::FeeAboveCap {
+                per_op, fee_source, ..
+            }) => (per_op.stroops(), fee_source),
+            other => panic!("a fee-cap refusal, got {other:?}"),
+        };
         let subject = |rebuilt: &CanonicalRebuild| match &rebuilt.cross_check {
             CrossCheckOutcome::Passed(witness) => witness.subject().unwrap(),
             other => panic!("a bound witness, got {other:?}"),
@@ -2869,7 +2896,27 @@ pub(crate) mod tests {
         serve_chain(&f, &primary, &oracle, 5, "healthy").await;
         let above = rebuild(ClassicFeeChoice::Explicit(501)).await.unwrap_err();
         assert_eq!(above.code(), "fees.percentile_exceeds_cap");
+        assert_eq!(refused_source(above), (None, FeeSource::Explicit));
         assert!(rebuild(ClassicFeeChoice::Explicit(500)).await.is_ok());
+        // A default fee above the cap names the source the caller passed
+        // with it, and asks the oracle nothing.
+        for (default_source, derived) in [
+            (FeeSource::CommandDefault, Some(501)),
+            (FeeSource::ProfileDefault, None),
+        ] {
+            serve_chain(&f, &primary, &oracle, 5, "healthy").await;
+            let refused = rebuild_with(
+                ClassicFeeChoice::ProfileDefault,
+                u64::MAX,
+                501,
+                default_source.clone(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(refused.code(), "fees.percentile_exceeds_cap");
+            assert_eq!(refused_source(refused), (derived, default_source));
+            assert!(methods(&oracle).await.is_empty());
+        }
         for selected in [240_u32, 500, 501] {
             use stellar_agent_test_support::EchoIdResponder;
             use wiremock::{Mock, matchers::body_partial_json};
@@ -2906,7 +2953,17 @@ pub(crate) mod tests {
                 );
                 assert_eq!(subject(&rebuilt), tx_hash(&rebuilt.unsigned_envelope_b64));
             } else {
-                assert_eq!(result.unwrap_err().code(), "fees.percentile_exceeds_cap");
+                let refused = result.unwrap_err();
+                assert_eq!(refused.code(), "fees.percentile_exceeds_cap");
+                assert_eq!(
+                    refused_source(refused),
+                    (
+                        Some(501),
+                        FeeSource::Selected {
+                            percentile: "p95".to_owned()
+                        }
+                    )
+                );
                 assert!(methods(&oracle).await.is_empty());
             }
         }

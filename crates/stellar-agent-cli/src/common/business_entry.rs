@@ -14,7 +14,7 @@ use std::io::Write;
 use stellar_agent_core::approval::{IntentPayload, MemoFact};
 use stellar_agent_core::cross_check::ThresholdSet;
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
-use stellar_agent_core::error::{InternalError, WalletError};
+use stellar_agent_core::error::{FeeSource, InternalError, WalletError};
 use stellar_agent_core::mainnet::verified_policy::VerifiedPolicy;
 use stellar_agent_core::profile::Profile;
 use stellar_agent_core::profile::receipt::PaymentDestinations;
@@ -146,17 +146,19 @@ impl Signing {
 
     /// The inputs that rebuild a canonical record's envelope after the
     /// confirmation; `None` for an envelope record, which signs its stored
-    /// envelope.
+    /// envelope. `default_fee_source` names where
+    /// `default_fee_per_op_stroops` comes from.
     pub(crate) fn rebuild<'a>(
         &self,
         fee_choice: ClassicFeeChoice,
-        default_fee_per_op_stroops: u32,
+        (default_fee_per_op_stroops, default_fee_source): (u32, FeeSource),
         witness_inputs: impl Into<ClassicInputs>,
         thresholds: &'a ThresholdSet<'a>,
     ) -> Option<RebuildInputs<'a>> {
         self.is_canonical().then(|| RebuildInputs {
             fee_choice,
             default_fee_per_op_stroops,
+            default_fee_source,
             witness_inputs: witness_inputs.into(),
             thresholds,
         })

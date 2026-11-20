@@ -116,7 +116,8 @@ impl WalletServer {
     ///
     /// The envelope is rebuilt from the stored intent. The fee per operation
     /// is the one of the prepared envelope the record stores; a fee above the
-    /// current caps refuses as on the envelope route. The
+    /// current caps refuses as on the envelope route, and the refusals of the
+    /// fee check and of the rebuild name the envelope as the fee's source. The
     /// policy gate evaluates the rebuilt envelope's arguments with the source
     /// read before the rebuild, which requests a trustline intent's trustline
     /// as the envelope route does, and a payment's destination view; the
@@ -198,6 +199,7 @@ impl WalletServer {
                     intent,
                     fee_choice: ClassicFeeChoice::ProfileDefault,
                     default_fee_per_op_stroops: prepared_fee,
+                    default_fee_source: stellar_agent_core::error::FeeSource::Envelope,
                     fee_cap_stroops: fee_cap,
                     witness_inputs: commit.witness_inputs.clone(),
                     thresholds: &thresholds,

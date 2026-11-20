@@ -2267,7 +2267,12 @@ where
         witness: cross_check.witness(),
         ledger: built.operational.clone(),
         operation: Some(signing.handle()),
-        rebuild: signing.rebuild(built.fee_choice, DEFAULT_FEE_STROOPS, inputs, &thresholds),
+        rebuild: signing.rebuild(
+            built.fee_choice,
+            (DEFAULT_FEE_STROOPS, FeeSource::CommandDefault),
+            inputs,
+            &thresholds,
+        ),
     })
     .await
     {
