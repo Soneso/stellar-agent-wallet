@@ -8,7 +8,9 @@
 //! pending entry exactly as production does, the approval-inbox server is
 //! started against the same store + attestation key, and a `reqwest` client
 //! drives the bootstrap → session cookie and session proof → CSRF →
-//! approve/reject flow a browser would.
+//! approve/reject flow a browser would. A signed, verified fixture policy
+//! binds each pending entry for recovery; a direct preparation queues a new
+//! payment approval only under one.
 //!
 //! Gated behind the `testnet-acceptance` feature flag:
 //!
@@ -57,6 +59,52 @@ const TESTNET_FRIENDBOT_URL: &str = "https://friendbot.stellar.org";
 const TESTNET_CHAIN_ID: &str = "stellar:testnet";
 const FEE_STROOPS: u32 = 100_000;
 const PAYMENT_STROOPS: i64 = 10_000_000; // 1 XLM
+
+/// A signed, verified allow-all policy for `server`'s approval profile.
+///
+/// A direct `stellar_pay` preparation queues a new payment approval only
+/// under a verified policy, which binds the entry for recovery. The
+/// synthetic engine set through `set_policy_engine_for_test` carries none,
+/// so each scenario supplies this one through
+/// `set_payment_recovery_policy_for_test`.
+///
+/// This target keeps its own copy of the fixture in `tests/common/mod.rs`:
+/// `mod common;` would compile the shared module's child-process tests into
+/// this live target.
+fn payment_recovery_policy(
+    server: &WalletServer,
+) -> stellar_agent_core::mainnet::verified_policy::VerifiedPolicy {
+    use stellar_agent_core::policy::v1::{
+        PolicyStateStore,
+        verified::{OwnerKeySource, PinMode, PolicyLoad, load_verified_policy},
+    };
+    let dir = tempfile::tempdir().expect("fixture policy directory");
+    let path = dir.path().join("policy.toml");
+    let name = server.profile_name_for_approval();
+    let body = format!(
+        "version = 1\nscope = \"profile:{name}\"\n[[rules]]\nmatch = {{ tool = \"*\", chain = \"*\" }}\ncriteria = []\ndecision = \"allow\"\n"
+    );
+    let profile = Profile::builder_testnet("fixture", "signer", "fixture", "nonce").build();
+    let owner = ed25519_dalek::SigningKey::from_bytes(&[61; 32]);
+    std::fs::write(
+        &path,
+        stellar_agent_core::approval::mainnet_fixtures::signed_policy_text(&body, &owner),
+    )
+    .expect("signed fixture policy");
+    load_verified_policy(
+        &PolicyLoad {
+            path: &path,
+            profile: &profile,
+            profile_name: &name,
+            owner_pubkey: &owner.verifying_key().to_bytes(),
+            owner_source: OwnerKeySource::Keyring,
+            window_path: &dir.path().join("window"),
+        },
+        PolicyStateStore::new(),
+        PinMode::CompareOnly,
+    )
+    .expect("fixture signature verifies")
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // RequireApproval engine — forces the simulate call to park a pending entry
@@ -370,6 +418,9 @@ async fn t1_serve_approve_then_commit_on_testnet() {
     let mut server = WalletServer::new(profile.clone()).expect("WalletServer::new");
     server.set_approval_dir_for_test(approval_dir.path().to_path_buf());
     server.set_policy_engine_for_test(Arc::new(RequireApprovalEngine));
+    // A direct preparation queues a new payment approval only under a
+    // signed, verified policy; the synthetic engine above carries none.
+    server.set_payment_recovery_policy_for_test(payment_recovery_policy(&server));
 
     // ── 1. Simulate under RequireApproval: production persists the pending ──
     //    entry itself (WalletServer::persist_pay_pending_approval), exactly as
@@ -627,6 +678,9 @@ async fn t2_serve_reject_then_commit_refused() {
     let mut server = WalletServer::new(profile.clone()).expect("WalletServer::new");
     server.set_approval_dir_for_test(approval_dir.path().to_path_buf());
     server.set_policy_engine_for_test(Arc::new(RequireApprovalEngine));
+    // A direct preparation queues a new payment approval only under a
+    // signed, verified policy; the synthetic engine above carries none.
+    server.set_payment_recovery_policy_for_test(payment_recovery_policy(&server));
 
     // ── 1. Simulate under RequireApproval: parks the pending entry ───────────
     let sim = server

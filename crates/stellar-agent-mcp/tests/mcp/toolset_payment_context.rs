@@ -1119,6 +1119,46 @@ async fn composed_approval_queues_before_the_nonce_and_submits_with_its_proof() 
     assert_eq!(h.audit_decisions(), vec![json!("require_approval")]);
 }
 
+/// A direct testnet preparation that a synthetic engine sends to approval
+/// refuses without a signed, verified policy and queues nothing. With the
+/// fixture policy, the same preparation queues one approval.
+#[tokio::test]
+#[serial]
+async fn direct_approval_queues_only_under_a_verified_policy() {
+    let args = |source: &str| {
+        serde_json::from_value(json!({
+            "chain_id": "stellar:testnet", "source": source,
+            "destination": DEST_G, "asset": "native",
+            "amount_in_stroops": AMOUNT.to_string(),
+        }))
+        .unwrap()
+    };
+    let h = Harness::build("direct-unverified", false).await;
+    h.engine.decide("stellar_pay", approval("direct", 300));
+    let error = h
+        .server
+        .call_stellar_pay(args(&h.source))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.message,
+        "approval.store_error: invalid approval store entry: payment recovery requires a verified policy"
+    );
+    assert!(h.pending().is_empty());
+    drop(h);
+
+    let h = Harness::build("direct-verified", true).await;
+    h.engine.decide("stellar_pay", approval("direct", 300));
+    let prepared = h.prepare(DEST_G, AMOUNT).await;
+    let pending = h.pending();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        prepared["approval"]["approval_nonce"],
+        json!(pending[0].approval_nonce)
+    );
+    assert_eq!(pending[0].reason.as_deref(), Some("direct"));
+}
+
 /// An approved context commit leaves its approval unconsumed on disk while
 /// the restriction holds the grant lease, and consumes it after the lease
 /// drops, before the commit returns.

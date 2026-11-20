@@ -528,7 +528,10 @@ mod tests {
     /// spawn: its bytes lack the isolation literal. The run check alone
     /// also refuses it, because it answers `profile list` from an unmarked
     /// home.
-    #[cfg(unix)]
+    ///
+    /// The live driver runs every ignored test of a suite and names no plain
+    /// build, so a `testnet-acceptance` build compiles this test out.
+    #[cfg(all(unix, not(feature = "testnet-acceptance")))]
     #[test]
     #[ignore = "needs a plain build named by STELLAR_AGENT_TEST_PLAIN_BINARY"]
     fn resolve_refuses_a_plain_build_before_any_spawn() {
