@@ -7,8 +7,9 @@
 //! record: its approval record or a fresh policy decision. The deadline is
 //! the earlier of 120 seconds after the rebuild and the last whole second
 //! strictly before the authority's end, which for a successor is also
-//! bounded by the record's execution end. The preparation's process nonce, envelope and expiry take no
-//! part, so a commit after a server restart proceeds.
+//! bounded by the record's execution end. The preparation's process nonce,
+//! envelope and expiry take no part, so a commit after a server restart
+//! proceeds.
 
 use rmcp::model::{CallToolResult, Content};
 use serde_json::{Value, json};

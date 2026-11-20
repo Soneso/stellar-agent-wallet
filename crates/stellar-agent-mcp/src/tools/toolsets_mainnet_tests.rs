@@ -4060,6 +4060,40 @@ async fn public_canonical_preparation_stores_a_deadline_its_toolset_commit_signs
     );
 }
 
+/// A canonical payment prepared on a whole second under an approval of a
+/// 60-second rule has a decision that ends on a whole second. The stored
+/// deadline is that second minus one, strictly before the end.
+#[tokio::test]
+#[serial_test::serial(keyring, mainnet_clock)]
+#[serial_test::serial]
+async fn public_canonical_preparation_ending_on_a_whole_second_stores_the_second_before() {
+    let run = Run::new(
+        "allow",
+        "require_approval",
+        &["propose-transaction", "sign-payment"],
+    )
+    .await;
+    run.grant(DESTINATIONS[0].0);
+    let args = Tool::Pay.prepare_args(&run.f);
+    let whole_ms = now_unix_ms().unwrap() / 1_000 * 1_000;
+    let network = stellar_agent_network::mainnet::clock::set_now_ms_for_test(whole_ms);
+    let policy =
+        stellar_agent_core::policy::v1::criteria::state_store::set_query_time_for_test(whole_ms);
+    let prepared = run.prepare_route(&args, false).await;
+    drop((network, policy));
+    assert_eq!(prepared["ok"], true, "{prepared}");
+    let entry = run.pending().pop().unwrap();
+    let end_ms = whole_ms + 60_000;
+    assert_eq!(entry.expires_at_unix_ms, end_ms, "the decision's 60 s end");
+    assert_eq!(end_ms % 1_000, 0, "the decision ends on a whole second");
+    let deadline = envelope_deadline(prepared["data"]["envelope_xdr"].as_str().unwrap());
+    assert_eq!(
+        deadline,
+        end_ms / 1_000 - 1,
+        "the stored deadline is the second before the decision's end"
+    );
+}
+
 /// An authority a toolset commit resolves after the preparation, here the
 /// outer consent of a 60-second rule queued at the commit, can end before
 /// the deadline a direct preparation under `Allow` stored. The toolset

@@ -202,7 +202,14 @@ mod tests {
             let _presence = driver::install(driver::fixture_credential());
             let result = durable(&fixture, &context, &envelope, &handle, 900_000).await;
             if missing {
-                assert_eq!(result.unwrap_err().code(), "approval.not_found");
+                let error = result.unwrap_err();
+                assert_eq!(error.code(), "approval.not_found");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("prepare the operation again under a new --business-id"),
+                    "the refusal names its remedy: {error}"
+                );
                 assert!(driver::ceremonies().is_empty());
                 assert!(inbox(&fixture).is_empty());
             } else if mode == "edited" {

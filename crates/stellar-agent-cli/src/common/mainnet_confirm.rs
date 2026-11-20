@@ -628,7 +628,8 @@ fn start_integrated(
             }
             None => {
                 return Err(WalletError::Approval(ApprovalFailure::NotFound {
-                    detail: "the operation's approval entry is gone; prepare the operation again"
+                    detail: "the operation's approval entry is gone; prepare the operation \
+                             again under a new --business-id"
                         .to_owned(),
                 }));
             }
@@ -781,7 +782,8 @@ fn start_durable(
 fn linked_durable_start(store_path: &Path, nonce: &str) -> Result<DurableStart, WalletError> {
     let linked = open_store(store_path)?.get(nonce).cloned().ok_or_else(|| {
         WalletError::Approval(ApprovalFailure::NotFound {
-            detail: "the operation's approval entry is gone; prepare the operation again"
+            detail: "the operation's approval entry is gone; prepare the operation again under \
+                     a new --business-id"
                 .to_owned(),
         })
     })?;
@@ -2803,11 +2805,31 @@ pub(crate) mod tests {
             .truncate(false)
             .open(fixture.store_path().with_extension("producer.lock"))
             .unwrap();
-        let _held = stellar_agent_core::file_lock::HeldFileLock::try_lock(file).unwrap();
+        let held = stellar_agent_core::file_lock::HeldFileLock::try_lock(file).unwrap();
         assert!(
-            matches!(start_durable(&context, &fixture.store_path(), &handle, entry, &facts, PolicyDecision::RequireApproval),
+            matches!(start_durable(&context, &fixture.store_path(), &handle, entry.clone(), &facts, PolicyDecision::RequireApproval),
             Err(error) if error.code() == "approval.writer_locked"),
             "CLI producer lock excludes a competing preparation"
+        );
+        drop(held);
+        pending_store(&fixture)
+            .remove(&entry.approval_nonce)
+            .unwrap();
+        let Err(gone) = start_durable(
+            &context,
+            &fixture.store_path(),
+            &handle,
+            entry,
+            &facts,
+            PolicyDecision::RequireApproval,
+        ) else {
+            panic!("a retry whose linked entry is gone refuses")
+        };
+        assert_eq!(gone.code(), "approval.not_found");
+        assert!(
+            gone.to_string()
+                .contains("prepare the operation again under a new --business-id"),
+            "the refusal names its remedy: {gone}"
         );
     }
 

@@ -32,6 +32,22 @@ fn claim_policy(raw: &str) -> String {
 
 impl CanonicalFx {
     fn new(claim: bool, ttl: u64, policy_edit: impl FnOnce(&str) -> String) -> Self {
+        Self::new_at(
+            claim,
+            ttl,
+            policy_edit,
+            stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+        )
+    }
+
+    /// The fixture whose consent happens at `now`, so its approval's
+    /// execution end is `now + ttl`.
+    fn new_at(
+        claim: bool,
+        ttl: u64,
+        policy_edit: impl FnOnce(&str) -> String,
+        now: u64,
+    ) -> Self {
         let mut f = ResolverFixture::configured(
             |profile| {
                 if claim {
@@ -63,7 +79,7 @@ impl CanonicalFx {
                 })
             },
         );
-        f.now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+        f.now = now;
         f.clock.set(f.now);
         let asset = IntentAsset::Issued {
             code: "UsD".to_owned(),
@@ -496,32 +512,51 @@ async fn canonical_resolver_binds_intent_and_envelope() {
 /// the authority's end. 60 seconds before an approval's execution end, an
 /// envelope whose deadline is the last whole second before that end signs;
 /// one whose deadline is the first whole second at or after the end refuses
-/// with `DeadlineTooFar` and writes nothing.
+/// with `DeadlineTooFar` and writes nothing. When the end is a whole second,
+/// the refused deadline in milliseconds equals the end, and the one that
+/// signs is the second before it.
 #[tokio::test]
 #[serial_test::serial(mainnet_clock)]
 #[serial_test::serial]
 async fn a_canonical_deadline_lies_strictly_before_the_authority_end() {
-    let fx = CanonicalFx::new(false, 300_000, str::to_owned);
-    let end = fx.witness.execution_expires_at_ms();
-    let now = end - 60_000;
-    let server = fx.f.server().await;
-    let context = fx.context(&server);
+    let wall = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+    for whole_second in [false, true] {
+        let fx = if whole_second {
+            CanonicalFx::new_at(false, 300_000, str::to_owned, wall / 1000 * 1000)
+        } else {
+            CanonicalFx::new(false, 300_000, str::to_owned)
+        };
+        let end = fx.witness.execution_expires_at_ms();
+        if whole_second {
+            assert_eq!(end % 1000, 0, "the authority ends on a whole second");
+        }
+        let now = end - 60_000;
+        let server = fx.f.server().await;
+        let context = fx.context(&server);
 
-    let at_end = fx.envelope_until(end.div_ceil(1000), 1);
-    let before = fx.f.wire();
-    let refused = fx.resolve(&context, &at_end, now, true).await;
-    assert!(
-        matches!(
-            refused,
-            Err(MainnetAuthorizationError::Refused(P::DeadlineTooFar))
-        ),
-        "a deadline at the end: {refused:?}"
-    );
-    assert_eq!(fx.f.wire(), before, "the refusal writes nothing");
+        let at_end_s = end.div_ceil(1000);
+        if whole_second {
+            assert_eq!(at_end_s * 1000, end, "the deadline equals the end");
+        }
+        let at_end = fx.envelope_until(at_end_s, 1);
+        let before = fx.f.wire();
+        let refused = fx.resolve(&context, &at_end, now, true).await;
+        assert!(
+            matches!(
+                refused,
+                Err(MainnetAuthorizationError::Refused(P::DeadlineTooFar))
+            ),
+            "a deadline at the end, whole second {whole_second}: {refused:?}"
+        );
+        assert_eq!(fx.f.wire(), before, "the refusal writes nothing");
 
-    let last_second = fx.envelope_until((end - 1) / 1000, 1);
-    let auth = fx.resolve(&context, &last_second, now, true).await.unwrap();
-    fx.sign(&context, &last_second, &auth).await;
+        let last_second = fx.envelope_until((end - 1) / 1000, 1);
+        if whole_second {
+            assert_eq!(last_second, fx.envelope_until(end / 1000 - 1, 1));
+        }
+        let auth = fx.resolve(&context, &last_second, now, true).await.unwrap();
+        fx.sign(&context, &last_second, &auth).await;
+    }
 }
 
 #[tokio::test]
