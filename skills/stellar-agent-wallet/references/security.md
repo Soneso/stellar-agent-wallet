@@ -243,7 +243,8 @@ Smart-account multicall independently requires V1 even on testnet.
 Mainnet selection requires an explicit profile. Writes require a dedicated
 nondefault profile and matching stored chain, endpoint, and installation binding.
 Friendbot remains scoped to testnet and futurenet. MPP, smart-account writes,
-DeFi, pool submission, generic signing, and toolset signing are excluded on mainnet.
+DeFi, pool submission, generic signing, and toolset rule creation are excluded on mainnet.
+On mainnet, `stellar_toolset_invoke` admits only its exact `stellar_pay` and `stellar_pay_commit` actions; every other toolset action refuses.
 
 Prepare and commit probe the endpoint before action reads on their client.
 Submission checks the sending client again. The endpoint network binds every
@@ -365,9 +366,11 @@ Toolset-routed payments use two distinct controls, and only one is suppressible:
   a time-boxed grant (default TTL 30 days) is persisted. Later invocations match
   the grant by toolset, installation, package version and digest, capability,
   destination, asset, and amount range. The grant suppresses only the first-invoke re-prompt.
-- The **per-action payment approval** (`PaymentSimulated`) fires unconditionally on
-  every toolset-routed payment, and its attestation binds the actual executed
-  envelope.
+- The **per-action payment approval** (`PaymentSimulated`) fires on a
+  toolset-routed payment when the stricter of the routed and outer policy
+  decisions requires approval. Its attestation binds the actual executed
+  envelope, or on mainnet the stored intent of a payment that `stellar_pay`
+  prepared.
 
 A matching grant requires a version 3 HMAC that verifies under the profile's
 attestation key and profile/chain binding. It must be unexpired, with a lifetime

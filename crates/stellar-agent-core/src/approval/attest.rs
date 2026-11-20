@@ -101,8 +101,8 @@ pub enum Surface {
 }
 
 impl Surface {
-    /// Returns the wire string for this surface (`"cli"`, `"serve"`, or
-    /// `"serve-remote"`).
+    /// Returns the wire string for this surface: `"cli"`,
+    /// `"cli-mainnet-confirm"`, `"serve"`, or `"serve-remote"`.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {

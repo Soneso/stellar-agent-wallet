@@ -29,8 +29,10 @@ Start local verification with `bash .github/scripts/preflight.sh` and paste its
 table here. Also list issue-specific acceptance commands and their exit codes.
 `bash .github/scripts/preflight.sh --full` runs the complete local registry,
 including coverage. Local coverage, machete, and deny are optional reproductions.
-CI runs the offline workspace suite on every pull request. Pull-request
-coverage requires the `coverage` label; live acceptance uses its separate workflow.
+CI runs the offline gates on every pull request; a docs-only pull request into
+`mainnet-write` runs the reduced set that `docs/maintainers/building.md`
+describes. Pull-request coverage requires the `coverage` label; live
+acceptance uses its separate workflow.
 -->
 
 -

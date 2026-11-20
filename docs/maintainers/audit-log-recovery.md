@@ -618,8 +618,14 @@ A revoked record refuses with `approval.revoked` before that reacquisition.
 A refusal keeps its wire code, such as `approval.evidence_capacity` or `audit.outbox_evidence_unusable`, and exposes no approval block.
 The payment producer binds its recovery entry after the reservation; a retained binding of the same payment refuses with `approval.entry_inconsistent`.
 A crash between the reservation and the inbox insert leaves a reserved record without an entry, and a retry refuses with `approval.not_found`.
-The business id ends there.
 No route, MCP or CLI, rebuilds the entry: its absence is indistinguishable from an entry that was rejected and then collected, and a rejection lives only in the unauthenticated inbox.
+A lost entry of an outer toolset approval leaves the operation open when the payment's own rules allow it.
+A toolset preparation of that record refuses with `approval.not_found`, and so does a toolset commit whose nonce the running server still holds; after a restart that commit refuses with `nonce.expired`.
+A direct `stellar_pay_commit` still completes it under policy authority, because the allowing rule needs no approval.
+A record that `stellar_pay` prepared directly completes this way within its window.
+A record that a toolset preparation opened completes by a direct `stellar_pay` preparation under the same business id, which returns the stored envelope with a fresh nonce.
+A direct `stellar_pay_commit` of that envelope with that nonce and expiry then completes it, more than 30 seconds before the envelope's deadline.
+For every other lost entry the business id ends there.
 That operation ends at its waiting expiry; prepare the operation again under a new business id.
 The readiness proof precedes every admission and every reacquisition.
 

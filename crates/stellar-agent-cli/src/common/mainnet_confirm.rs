@@ -908,6 +908,11 @@ fn commit_durable(
 /// witness that grants authority. The inbox is not read, so collecting or
 /// locking it after the commit changes nothing.
 ///
+/// The run reads the approval record by operation when it opens or resumes
+/// the approval, and [`commit_durable`] commits the consent before it calls
+/// this. The receipt check below therefore runs after that commit and
+/// before the read by nonce that verifies the proof.
+///
 /// The verification time is the wall clock, raised to the consent evidence
 /// floor when the requested kind enforces delivery.
 ///
@@ -916,12 +921,12 @@ fn commit_durable(
 /// In the order the check runs: `submission.record_unavailable` when the
 /// receipt store cannot be read, and `approval.consumed` when a submission
 /// receipt names the nonce and its attempt is no checked non-inclusion of the
-/// admitted canonical operation, both before any approval record read (a
-/// checked non-inclusion of an admitted envelope operation still refuses as
-/// consumed); the store
-/// refusals of the record's read; `approval.clock_error` when the wall clock
-/// cannot be read; `audit.*` when the evidence floor cannot be read; the
-/// refusals of [`verify_durable_approval`] or
+/// admitted canonical operation, both before this function reads the record
+/// (a checked non-inclusion of an admitted envelope operation still refuses
+/// as consumed); the store refusals of the record's read by nonce;
+/// `approval.clock_error` when the wall clock cannot be read; `audit.*` when
+/// the evidence floor cannot be read; the refusals of
+/// [`verify_durable_approval`] or
 /// [`verify_durable_intent_approval`], including `approval.not_found`,
 /// `approval.revoked`, `approval.expired` and `approval.attestation_invalid`;
 /// and `approval.consumed` when the record belongs to another operation.

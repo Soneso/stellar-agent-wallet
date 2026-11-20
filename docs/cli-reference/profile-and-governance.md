@@ -181,7 +181,7 @@ On a no-op it reports `status` `no_op` and the current version; on a migration i
 Profile migration updates the TOML schema. It does not migrate authenticated
 spending state or establish a network for its history. State with no authenticated
 network history refuses; editing the profile or receipt does not migrate it.
-No verb recovers such state in this release; create a profile under a new name.
+No verb recovers such state; create a profile under a new name.
 
 A refused migration exits `1`, writes nothing, and leaves the v1 file unchanged:
 
@@ -823,7 +823,7 @@ Each rotation subcommand generates a fresh 32-byte secret from the OS CSPRNG, en
 | `rotate-attestation-key` | approval-spine attestation HMAC key (`attestation_key_id`) | 32-byte HMAC | Attestations minted under the old key fail verification. Unattested pending requests can still be approved under the new key. |
 | `rotate-audit-key` | audit-log chain-root HMAC key (`audit_log_hash_chain_key_id`) | 32-byte HMAC | Before any key write, rotation checks the log's entry tags under the old key and refuses with that check's code (`audit.entry_tag_invalid` among them). Before the key write, rotation fences the drained outbox. A queue that still holds a row refuses with `internal.unexpected_state` (`audit.outbox_unusable`), and unusable consent evidence refuses with `audit.outbox_evidence_unusable`. It then persists the new key, switches the held writer to it, and appends `audit_entry_tags_rekeyed` (cause `rotation`) once entry tags are in force, then its `keyring_key_written` row, both tagged under the new key. No log file is rewritten; an interrupted rotation is repaired at the next keyed open with an `open_repair` rekey row. Rotation re-signs every existing per-file chain-root sidecar with the new key. A failed re-sign reports `internal.unexpected_state` (`audit.resign_incomplete`); rerun the command. `audit verify` passes under the new key, and the old key stops verifying. Takes the audit writer's exclusive lock, so it refuses while an MCP server holds that writer, and checks the tip anchor before touching the key. Checks the audit binding before it opens the writer: a changed binding refuses with `audit.log_binding_changed` and creates nothing at the path the profile names; an absent one is recorded. Mints a key only where no entry exists: a stored key it cannot read or decode refuses before anything is written, with the read failure's code or `internal.unexpected_state` (`audit.key_decode_failed`, `audit.key_length_error`). Investigate; if the stored audit key is corrupt, restore it from a copy of that keyring entry. A first mint applies only to a log without entry tags: on a log whose entry tags are in force or whose active file holds a tagged row, a rotation without the key refuses with `audit.chain_key_unavailable` and writes no key. A tagged log without a copy of its key is moved aside as evidence before a new key is minted (see [Audit-log recovery](../maintainers/audit-log-recovery.md#10-unreadable-or-undecodable-audit-key)). |
 | `rotate-nonce-key` | HMAC nonce key (`mcp_nonce_key_alias`) | 32-byte HMAC | All outstanding nonces minted with the old key are invalidated. |
-| `rotate-policy-state-key` | policy-window-state HMAC key (`policy_window_state_key_id`) | 32-byte HMAC | The persisted window-state store is re-signed under the new key, so accumulated `per_period_cap` / `rate_limit` history and unlisted and total-budget usage are preserved. Rotation refuses if the store file does not verify under the current key. Integrity failures and missing authenticated network provenance have no recovery verb in this release; create a profile under a new name. Before rotation, file I/O failures refuse without changing state; retry after access is restored. |
+| `rotate-policy-state-key` | policy-window-state HMAC key (`policy_window_state_key_id`) | 32-byte HMAC | The persisted window-state store is re-signed under the new key, so accumulated `per_period_cap` / `rate_limit` history and unlisted and total-budget usage are preserved. Rotation refuses if the store file does not verify under the current key. Integrity failures and missing authenticated network provenance have no recovery verb; create a profile under a new name. Before rotation, file I/O failures refuse without changing state; retry after access is restored. |
 
 All of the above mint raw 32-byte HMAC keys.
 
@@ -935,12 +935,12 @@ reset keeps none.
 
 A missing file with protected history, an unusable key, an integrity failure,
 or a generation mismatch refuses before the reset row and changes no file, key,
-or generation. No verb recovers such state in this release; create a profile
-under a new name. A different authenticated network refuses with
+or generation. No verb recovers such state; create a profile under a new
+name. A different authenticated network refuses with
 `policy.window_chain_mismatch`. Restore the profile's network, or create a
 profile under a new name. Incomplete authenticated network provenance
 refuses with `policy.window_chain_unverifiable`, including decoded versions 1 to 4.
-No verb recovers missing provenance in this release; create a profile under a new name.
+No verb recovers missing provenance; create a profile under a new name.
 File I/O failures refuse without changing state; retry after access is restored.
 An authenticated newer format version refuses on every chain with
 `profile.reset_window_state_newer_version` and changes nothing; use the build
@@ -961,7 +961,7 @@ again. Once the generation is written, the successor is committed, even when
 the file still carries the old body beside it. A first reset, with no store file,
 writes the generation before the file. A failure between those two writes leaves
 a missing file with a committed generation. Reset refuses that state.
-No verb recovers such state in this release; create a profile under a new name.
+No verb recovers such state; create a profile under a new name.
 The reset is complete when the next command that opens the window store loads
 the successor at `generation_after`. On a V1 profile, a value-moving command
 and the MCP server's start open it. Generation equality alone does not establish
@@ -1314,6 +1314,7 @@ stellar-agent approve --id ABCxyzNonce --profile <name>
 Queued success exits zero and includes `audit_code: audit.outbox_queued`; Written omits `audit_code`.
 It returns immediately after persistence, without waiting for delivery.
 Legacy queues commit a count and chain head; owner queues authenticate tagged rows and commit delivered batches.
+Every mainnet approval kind enforces delivery: payment, which covers account creation, claim, trustline, and x402 payment.
 An enforced kind additionally requires exact Delivered evidence before use.
 For an enforced kind, recoverable delivery and evidence errors retry the existing grant without another ceremony.
 
@@ -1344,8 +1345,9 @@ Available timestamps include `created_at_ms`, `expires_at_ms`, and the stored
 mainnet consent time as `attested_at_ms`. Durable records can supply
 `waiting_expires_at_ms`, `execution_expires_at_ms`, an operation-linked
 `business_id`, and `open_attempt`. Missing optional facts are omitted.
-Current preparation paths populate the inbox; durable facts appear only for
-existing authenticated durable records, including after inbox cleanup.
+Preparation populates the inbox.
+Mainnet preparation in the CLI and MCP also opens a durable pending record.
+Durable facts appear only for authenticated durable records, including after inbox cleanup.
 
 Payment, claim, trustline, and x402 approvals expose `verification` with
 `supported`, `valid`, and `reason`. Consent presence determines `attested`;
@@ -1378,7 +1380,8 @@ stellar-agent approve revoke --id <nonce> --profile default --output table
 ```
 
 Revokes an existing authenticated durable approval selected by its inbox nonce.
-Approval preparation creates no durable records, so the command acts only on records that already exist.
+Mainnet approval preparation in the CLI and MCP opens a durable pending record.
+The command acts only on existing durable records.
 The profile owner can revoke pending or consumed records inside their active window,
 including consumed records whose inbox entries are collected.
 The inbox's distinct "Revoke approval" action covers eligible pending, unconsented records only.

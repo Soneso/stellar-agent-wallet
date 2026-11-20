@@ -239,13 +239,18 @@ On success `data` carries `tx_hash` and `ledger`.
 For pay, create-account, trustline, and claim, the simulate call records a pending
 approval when policy requires approval for either the simulate tool or its paired
 commit tool. It returns an `approval` block with `approval_nonce`, `profile`, and
-`chain_id`. Toolset-routed payments also require operator approval at commit. The
+`chain_id`. A toolset-routed payment also requires operator approval at commit
+when the routed payment rule or the outer toolset rule requires approval, or
+when no matching first-invoke grant exists. The
 handshake:
 
 1. The operator consents out-of-band with `stellar-agent approve --id
    <approval_nonce> --profile <name>` at a terminal, `approve list` / `approve serve` (a local
    web inbox), or `approve serve --remote` (a TLS-protected, passkey-authenticated
-   inbox for a device other than the wallet host). The operator reviews the
+   inbox for a device other than the wallet host). On mainnet without a signed
+   approval origin, the command and the local inbox take a passkey assertion on
+   the local approval page. With one, the command prints the signed approval
+   link, and remote approval runs only at that origin. The operator reviews the
    wallet-rendered summary before consenting. See
    `references/approvals-and-audit.md` for all three surfaces.
 2. That step returns an `approval_attestation` — an HMAC blob bound to that

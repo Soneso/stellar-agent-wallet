@@ -1341,9 +1341,9 @@ Other build failures use `policy.engine_unavailable` or `trustline.policy_engine
 | `profile.reset_window_state_signature_invalid` | The owner's signature must verify over this reset's statement. |
 | `sign_policy.owner_key_older_form` | Enroll the owner public key again with `profile enroll-owner-key --force`. |
 | `profile.reset_window_state_newer_version` | This build cannot reset an unsupported newer state format. |
-| `policy.window_state_unverifiable` | Enabled-mainnet state cannot be verified. No verb recovers such state in this release; create a profile under a new name. |
+| `policy.window_state_unverifiable` | Enabled-mainnet state cannot be verified. No verb recovers such state; create a profile under a new name. |
 | `policy.window_chain_mismatch` | The profile network disagrees with authenticated spending state. Restore the profile's network, or create a profile under a new name. |
-| `policy.window_chain_unverifiable` | Spending state lacks complete authenticated network provenance. No verb recovers such state in this release; create a profile under a new name. |
+| `policy.window_chain_unverifiable` | Spending state lacks complete authenticated network provenance. No verb recovers such state; create a profile under a new name. |
 | `profile.reset_window_state_open_authorizations` | Effective open authorizations prevent reset. |
 | `approval.consent_undelivered` | Exact Delivered evidence is missing for this approval's queued row. Preserve the grant and evidence; repair delivery, then retry the existing grant within its lifetime. |
 | `approval.evidence_capacity` | All 4,096 evidence slots are occupied. Retry after an existing approval ends; capacity refusal evicts no live grant. |

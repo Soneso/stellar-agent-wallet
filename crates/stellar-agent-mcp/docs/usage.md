@@ -32,8 +32,16 @@ decision.
 Paired preparation refuses an undecodable envelope with `simulation.divergence`.
 A denied rule retains `policy.deny.*`; an unknown decision uses
 `policy.unexpected_decision`. None of these refusals persists an approval.
-Each commit evaluates both names before attestation validation. A proof
-supplied under Allow is verified and spent like a required one.
+Each commit evaluates both names before attestation validation. On mainnet, a
+proof supplied under Allow to a classic commit or an x402 payment tool verifies
+against its approval's durable record and is spent like a required one. A proof
+without a durable record refuses and stays unspent. Off mainnet, Allow neither
+verifies nor spends a proof supplied to `stellar_pay_commit`,
+`stellar_claim_commit`, `stellar_create_account_commit`,
+`stellar_trustline_commit`, `stellar_x402_create_payment`, or
+`stellar_x402_authenticated_payment`. `stellar_rule_create_commit` always
+requires approval, so it verifies and spends its approval under Allow too.
+`stellar_mpp_charge_commit` takes no approval arguments.
 
 Feature-on startup loads the mainnet write context for a verified enabled
 profile. Failed enablement or policy checks abort startup. Admission refusals

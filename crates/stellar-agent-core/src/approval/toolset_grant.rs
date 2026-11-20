@@ -9,9 +9,9 @@
 //! `stellar-agent approve --id <nonce> --profile <name>`, the gated resolver persists a
 //! `ToolsetGrant` record here.  On subsequent invocations the resolver checks
 //! this store FIRST: if a current, matching grant exists, the first-invoke
-//! gate is short-circuited (but the per-action `PaymentSimulated` approval
-//! ALWAYS fires unconditionally — the grant only suppresses the re-prompt on
-//! the first-invoke gate).
+//! gate is short-circuited (the grant suppresses only the re-prompt of the
+//! first-invoke gate; the per-action `PaymentSimulated` approval follows the
+//! composed policies).
 //!
 //! # Grant matching
 //!
@@ -47,8 +47,10 @@
 //! nothing. The verified lookup binds the grant's fields, kind, lifetime,
 //! profile, and chain under the profile's attestation key.
 //!
-//! The per-action `PaymentSimulated` approval fires on every toolset-routed
-//! payment and binds the actual executed envelope.
+//! A toolset-routed payment needs a per-action `PaymentSimulated` approval
+//! when the stricter of the routed and outer policy decisions requires
+//! approval. That approval binds the executed envelope, or on mainnet the
+//! stored intent of a payment that `stellar_pay` prepared.
 //!
 //! Coverage never rewrites a grant. The attestation binds the stored
 //! destination text, so a G grant and an M grant attest different bytes.

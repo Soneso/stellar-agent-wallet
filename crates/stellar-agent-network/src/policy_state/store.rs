@@ -2385,7 +2385,7 @@ impl PersistedWindowStore {
     ///
     /// See [`WindowStoreError`]. A tampered, deleted, or rolled-back EXISTING
     /// file refuses with `HmacMismatch`, `GenerationMismatch`, or `Invalid`.
-    /// No verb recovers such state in this release; create a profile under a new name.
+    /// No verb recovers such state; create a profile under a new name.
     pub fn record_and_persist(
         &self,
         profile: &Profile,
@@ -24012,8 +24012,7 @@ mod tests {
         ] {
             assert_eq!(
                 error.with_recovery_notice("refused".to_owned()),
-                "refused. No verb recovers such state in this release; create a profile under \
-                 a new name."
+                "refused. No verb recovers such state; create a profile under a new name."
             );
         }
         for error in [

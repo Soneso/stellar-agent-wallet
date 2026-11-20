@@ -835,7 +835,14 @@ fn pool_share_operation(
     }
 }
 
-/// Whether an operation carries no value effect whatever its source is.
+/// Whether an operation carries no value effect of the wallet.
+///
+/// Each listed operation other than a pool share `ChangeTrust` carries none
+/// whatever its source is. A pool share `ChangeTrust` carries none only for a
+/// source other than the wallet. `decode_operation` returns for a pool share
+/// `ChangeTrust` before it calls this, so the one caller that reaches that case
+/// is [`transaction_source_candidates`]. It asks only for another source, and
+/// another source's pool share line adds no source candidate.
 fn has_no_effect(body: &OperationBody) -> bool {
     match body {
         OperationBody::ManageSellOffer(offer) => offer.amount == 0,
@@ -930,6 +937,7 @@ fn decode_operation(
             ChangeTrustAsset::Native
             | ChangeTrustAsset::CreditAlphanum4(_)
             | ChangeTrustAsset::CreditAlphanum12(_) => value(PaymentRoute::Trustline)?,
+            // The early return above handles it; kept so a new variant fails to compile.
             ChangeTrustAsset::PoolShare(_) => {}
         },
         OperationBody::ClaimClaimableBalance(_) => value(PaymentRoute::Claim)?,

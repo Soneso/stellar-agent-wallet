@@ -274,8 +274,9 @@ pub struct StellarPayCommitArgs {
     ///
     /// Required when the simulate step returned an `approval` block. On
     /// mainnet a supplied nonce is verified under `Allow` too.
-    /// When present, the commit handler verifies the HMAC-SHA256 attestation blob
-    /// and confirms the envelope hash matches before proceeding.
+    /// Off mainnet, the commit handler verifies the HMAC-SHA256 attestation
+    /// blob and confirms the envelope hash matches before proceeding. On
+    /// mainnet it verifies the proof against the approval's durable record.
     #[serde(default)]
     pub approval_nonce: Option<String>,
 
@@ -285,9 +286,11 @@ pub struct StellarPayCommitArgs {
     /// <approval_nonce> --profile <name>` after the operator approves. On
     /// testnet the operator confirms at a terminal or in the `approve serve`
     /// page. On mainnet the operator approves with a verified passkey
-    /// assertion, in the local browser or at the signed approval origin. The commit
-    /// handler re-computes and constant-time-compares the HMAC against the stored
-    /// attestation key before proceeding to signing.
+    /// assertion, in the local browser or at the signed approval origin. Off
+    /// mainnet, the commit handler re-computes and constant-time-compares the
+    /// HMAC against the stored attestation key before proceeding to signing.
+    /// On mainnet it verifies the blob against the approval's durable record
+    /// and its presence receipt instead.
     ///
     /// Required alongside `approval_nonce` when the policy engine requires
     /// approval. An absent, invalid, or expired proof returns

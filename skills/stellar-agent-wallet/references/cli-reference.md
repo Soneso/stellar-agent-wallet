@@ -171,12 +171,16 @@ With a signed approval origin, the HTTPS listener serves consent using an owner-
 The CLI prints the signed approval link without opening a browser or requiring a display.
 Ledger signing also requires this passkey ceremony when the CLI policy requires approval.
 After the ceremony the CLI verifies the consent against its durable record and exits 1 before signing on any refusal.
-An unreadable receipt store refuses with `submission.record_unavailable`, and a submission receipt or a record of another operation with `approval.consumed`.
+An unreadable receipt store refuses with `submission.record_unavailable`, and a submission receipt that names the nonce or a record of another operation with `approval.consumed`.
+A receipt whose attempt is a checked non-inclusion of the admitted canonical operation does not refuse.
 The record check refuses with `approval.not_found`, `approval.revoked`, `approval.expired`, `approval.presence_required`, `approval.presence_invalid`, `approval.presence_policy_unavailable`, `approval.attestation_invalid`, `approval.wrong_kind`, or `approval.binding_mismatch`.
 An unreadable wall clock refuses with `approval.clock_error`; window store, keyring, and audit evidence failures keep their own codes.
 
-An MCP mainnet commit accepts only a version 5 approval with its verified
-presence receipt. An invalid proof refuses with `policy.approval_required`.
+An MCP mainnet commit under `allow` signs without an approval.
+A supplied approval, and every approval under `require_approval`, must be a
+version 5 approval of an exact envelope, or version 6 of an intent stored under
+the business id, with its verified presence receipt. An invalid proof refuses
+with `policy.approval_required`.
 Each challenge lasts at most 120 seconds. The command waits until pending
 expiry. A canceled authenticator prompt ends the ceremony; retry the command
 for a fresh challenge.
@@ -1286,6 +1290,7 @@ stellar-agent approve --id ABCxyzNonce --profile <name>
 Queued success exits zero and includes `audit_code: audit.outbox_queued`; Written omits `audit_code`.
 It returns immediately after persistence, without waiting for delivery.
 Legacy queues commit a count and chain head; owner queues authenticate tagged rows and commit delivered batches.
+Every mainnet approval kind enforces delivery: payment, which covers account creation, claim, trustline, and x402 payment.
 An enforced kind additionally requires exact Delivered evidence before use.
 For an enforced kind, recoverable delivery and evidence errors retry the existing grant without another ceremony.
 
@@ -1659,8 +1664,17 @@ A reported failure or missing transaction does not release possible spending. Bo
 
 A reported success time does not backdate accounting. Untimed pending transactions remain reserved until an explicit acknowledgement clears their unbounded exposure.
 
-Classic mainnet envelopes carry a deadline 120 seconds after construction,
-covered by consent. Deadline expiry ends future execution. Accounting expiry
+Classic mainnet envelopes carry a deadline at most 120 seconds after
+construction. For a canonical record, consent covers the stored intent.
+After the confirmation, `pay`, `claim`, `trustline`, and sponsored
+`accounts create` rebuild its envelope with a fresh sequence, the fee their
+`--fee` choice gives now, and a new deadline. Without `--fee`, `pay`, `claim`,
+and `accounts create` take 100 stroops per operation, and `trustline` takes
+the profile's `classic_fee_per_op_stroops`, else 100; a rebuilt fee above the
+intent's fee bound or the current cap refuses with
+`fees.percentile_exceeds_cap` before any signature. The new deadline lies before
+the end of the approval's execution window or the policy decision's authority.
+Deadline expiry ends future execution. Accounting expiry
 uses `submission.accounting_expired` and leaves the chain outcome unknown.
 No failure row follows from an endpoint's failure, absence, or time claim.
 The authenticated reservation controls the bound and chain; editing a receipt

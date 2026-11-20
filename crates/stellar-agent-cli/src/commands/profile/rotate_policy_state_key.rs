@@ -31,7 +31,7 @@
 //! genuine history. The pre-rotation verification step closes this: the
 //! command reads the CURRENT store file and confirms its tag under the OLD
 //! key before rotation. A mismatch aborts rotation and preserves the old key.
-//! No verb recovers such state in this release; create a profile under a new name.
+//! No verb recovers such state; create a profile under a new name.
 //! A missing key beside an existing file also refuses. The scope check requires
 //! authenticated provenance, including a matching protected generation.
 //!
@@ -39,7 +39,7 @@
 //! so the keyring holds the key used for signing. A re-signing failure after
 //! persistence leaves a file the new key does not authenticate, so the next
 //! rotation refuses it.
-//! No verb recovers such state in this release; create a profile under a new name.
+//! No verb recovers such state; create a profile under a new name.
 //!
 //! # Output (JSON envelope)
 //!

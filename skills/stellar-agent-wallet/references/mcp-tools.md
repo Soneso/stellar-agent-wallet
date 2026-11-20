@@ -14,16 +14,20 @@ for build configuration, admitted operations, and exclusions. Per tool on
   `stellar_pay_commit`, `stellar_claim_commit`, `stellar_create_account_commit`,
   `stellar_trustline_commit`, and `stellar_rule_create_commit` also sign and
   submit.
-- Every tool named above and the signing actions of `stellar_toolset_invoke`
-  refuse at handler entry with `network.mainnet_write_forbidden` in every
-  build, except both x402 payment tools and the four classic commits.
+- Every tool named above refuses at handler entry with
+  `network.mainnet_write_forbidden` in every build, except both x402 payment
+  tools and the four classic commits.
   Builds with default features carry `mainnet-write`; a
   `--no-default-features` build omits it. These builds admit the four classic commits and both x402
   payment tools after setup. With the feature off, these tools refuse mainnet
   at entry with the same code.
-- `stellar_toolset_invoke` is annotated destructive, so its own policy gate
-  refuses its other actions on mainnet: the default engine refuses a
-  destructive tool, and a mainnet policy rule cannot name it.
+- On mainnet, `stellar_toolset_invoke` admits only its exact `stellar_pay` and
+  `stellar_pay_commit` actions, after the same setup. Its rule-creation
+  signing action refuses at entry with `network.mainnet_write_forbidden`.
+  Every other action first meets the dispatcher's own policy gate, and an
+  action that gate admits then refuses with the same code.
+  A mainnet rule that names `stellar_toolset_invoke` must meet the payment minimums.
+  That outer rule composes with the routed payment policy.
 
 The `stellar-agent-mcp` server exposes the Stellar Agent Wallet to an MCP client
 over JSON-RPC on stdio. It presents wallet capabilities as MCP tools so an AI
@@ -261,8 +265,16 @@ preparation rule's floor.
 A denied rule retains its wire code, `policy.deny.*` or a balance floor's
 `account.*`; an unknown decision uses
 `policy.unexpected_decision`. None of these refusals persists an approval.
-Each commit evaluates both names before attestation validation. A proof
-supplied under Allow is verified and spent like a required one.
+Each commit evaluates both names before attestation validation. On mainnet, a
+proof supplied under Allow to a classic commit or an x402 payment tool verifies
+against its approval's durable record and is spent like a required one. A proof
+without a durable record refuses and stays unspent. Off mainnet, Allow neither
+verifies nor spends a proof supplied to `stellar_pay_commit`,
+`stellar_claim_commit`, `stellar_create_account_commit`,
+`stellar_trustline_commit`, `stellar_x402_create_payment`, or
+`stellar_x402_authenticated_payment`. `stellar_rule_create_commit` always
+requires approval, so it verifies and spends its approval under Allow too.
+`stellar_mpp_charge_commit` takes no approval arguments.
 
 Classic mainnet previews carry an on-chain deadline 120 seconds after they are
 built, or for `stellar_pay` the last whole second before its decision's end
@@ -336,8 +348,10 @@ approval are required for a retry; do not switch networks. The operator reads
 A submission timeout has an unknown outcome and requires transaction
 reconciliation.
 
-Public SEP-43 signing, generic SEP-53 signing, DeFi, rule writes, and toolset
-signing are excluded on mainnet. Wallet guards use `network.mainnet_write_forbidden`.
+Public SEP-43 signing, generic SEP-53 signing, DeFi, and rule writes are
+excluded on mainnet. On mainnet, `stellar_toolset_invoke` admits only its exact
+`stellar_pay` and `stellar_pay_commit` actions; every other toolset action
+refuses. Wallet guards use `network.mainnet_write_forbidden`.
 MPP uses `mpp.network_forbidden`. Noop allows mainnet reads and refuses
 destructive policy decisions with `policy.engine_required`.
 
@@ -1039,8 +1053,10 @@ Under RequireApproval, call 1 returns `data.approval` without a payment payload.
 `endpoint_host`, `signer`, `summary`, and `instructions`. `summary` contains
 `payTo`, `amount`, and `asset`. Approve x402 payments through
 `stellar-agent approve --id <nonce> --profile <name>`. Mainnet uses the local
-browser or inbox; testnet x402 uses the terminal command. Remote approval
-does not serve mainnet. For an
+browser or inbox; testnet x402 uses the terminal command. On mainnet, remote
+approval runs only at the signed approval origin. Without one, `approve serve
+--remote` refuses on a mainnet profile with
+`approval.mainnet_remote_unsupported`. For an
 x402 payment, `stellar-agent approve` shows the payee, amount, and asset, and a
 `Home domain:` line that reads `none` for the plain tool. The
 authenticated approval subject binds the payment intent digest and home domain.

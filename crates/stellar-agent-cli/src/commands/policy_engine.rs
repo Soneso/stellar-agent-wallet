@@ -221,7 +221,7 @@ pub(crate) fn build_v1_policy_engine(
 ///   coordinate still names `a`, so `b` shares `a`'s generation counter while
 ///   reading a `<b>.window` file that does not exist. That is a rollback by
 ///   the store's own definition and every value-moving command fails closed
-///   with `GenerationMismatch`. No verb recovers such state in this release;
+///   with `GenerationMismatch`. No verb recovers such state;
 ///   create a profile under a new name.
 /// - The copy omits the field: the coordinate is derived as `b`'s, so `b`
 ///   starts a FRESH window with no accumulated history, and `a`'s spend does
@@ -3520,9 +3520,7 @@ decision = "allow"
             "the refusal must name the store that failed ({I114_REQUESTED}); got: {refusal}"
         );
         assert!(
-            refusal.contains(
-                "No verb recovers such state in this release; create a profile under a new name."
-            ),
+            refusal.contains("No verb recovers such state; create a profile under a new name."),
             "the refusal must state that no verb recovers the store; got: {refusal}"
         );
         assert!(

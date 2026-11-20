@@ -799,14 +799,19 @@ projects it onto the receipt. A `pending` or `ambiguous` receipt becomes
 decision identifier as `settlement_decision_id`. A missing receipt is restored
 in that form. The chain outcome stays unknown.
 
-Classic mainnet envelopes carry a deadline 120 seconds after they are built.
-The operator's consent covers the stored intent, not one envelope. After the
-confirmation the CLI verbs `pay`, `claim`, `trustline` and sponsored
+Classic mainnet envelopes carry a deadline at most 120 seconds after they are
+built. The operator's consent covers the stored intent, not one envelope. After
+the confirmation the CLI verbs `pay`, `claim`, `trustline` and sponsored
 `accounts create` rebuild the envelope from that intent with the account's
-current sequence, the fee the `--fee` choice gives now, a new deadline, and a
-fresh oracle check, so a slow confirmation does not stale the transaction. The
-new deadline lies before the end of the approval's execution window or of the
-policy decision's authority.
+current sequence, the fee the verb's `--fee` choice gives now, a new deadline,
+and a fresh oracle check, so a slow confirmation does not stale the
+transaction. Without `--fee`, `pay`, `claim`, and `accounts create` take 100
+stroops per operation, and `trustline` takes the profile's
+`classic_fee_per_op_stroops`, else 100. A rebuilt fee above the intent's fee
+bound or the current cap refuses with `fees.percentile_exceeds_cap` before any
+signature. Run the command again under the same `--business-id` once the fee
+is under the cap, and the consent is reused. The new deadline lies before the
+end of the approval's execution window or of the policy decision's authority.
 Deadline expiry ends future execution; accounting continues through each
 affected spending window. Testnet envelopes can carry no bound. A transaction
 whose deadline passed before signing refuses with

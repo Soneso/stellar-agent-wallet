@@ -394,10 +394,11 @@ async fn a_rebuilt_fee_above_the_cap_refuses_before_any_side_effect() {
 /// The signed cap per operation below the verbs' 100-stroop default fee.
 const CAP_BELOW_DEFAULT: u32 = 50;
 
-/// A run without a fee whose default fee is above the cap refuses before any
-/// side effect, and the refusal names the verb's own default: the built-in
-/// fee of `pay`, `claim` and `accounts create`, the profile's fee of
-/// `trustline`. A run with an explicit fee above the cap names that fee.
+/// A run without a fee whose default fee is above the signed cap refuses
+/// before any side effect, and the signed-cap check before the confirmation
+/// answers. The refusal names the verb's own default: the built-in fee of
+/// `pay`, `claim` and `accounts create`, the profile's fee of `trustline`. A
+/// run with an explicit fee above the cap names `--fee`.
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial]
 async fn a_fee_above_the_cap_names_the_verbs_fee_source() {

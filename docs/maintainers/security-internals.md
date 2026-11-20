@@ -201,8 +201,13 @@ receipt loss or rollback. At the MCP gate's approval-nonce check, the receipt
 hold refuses first. On testnet the approval-store consumption tombstone refuses
 next, with the same code. The receipt covers the
 window in which a tombstone write is still owed, and the approval's lifetime,
-the single-use commit nonce and the chain bound that window. The CLI has no
-approval-nonce gate.
+the single-use commit nonce and the chain bound that window. On mainnet the
+CLI reads the approval record by operation and can commit the consent first.
+It runs its receipt check after that commit and before it verifies the proof
+against the durable record. A receipt that names the nonce refuses with
+`approval.consumed`, unless its attempt is a checked non-inclusion of the
+admitted canonical operation, and an unreadable receipt store refuses with
+`submission.record_unavailable`.
 
 Under a policy with a stateful criterion, the window store refuses an envelope
 hash that any pending or confirmed record carries, and a release removes
@@ -324,7 +329,7 @@ A stored record loads by the shape of its destination, and every use checks the 
 
 Consent views carry complete validated destinations. The payment view decodes `to` from the stored envelope, so a stored summary cannot change it. The `ToolsetFirstInvokeGate` view adds `destination` from the validated stored terms and keeps `destination_redacted` for diagnostics.
 
-The first-invoke grant suppresses only its re-prompt. Per-action `PaymentSimulated` approval fires on every toolset-routed payment and binds the executed envelope through `envelope_sha256`.
+The first-invoke grant suppresses only its re-prompt. A toolset-routed payment needs a per-action `PaymentSimulated` approval when the routed payment rule or the outer toolset rule requires approval. That approval binds the executed envelope through `envelope_sha256`; on the canonical record of a mainnet `stellar_pay` preparation it binds the stored intent digest. A composed `Allow` submits under a current grant without another approval.
 
 ### Payment approval recovery
 
@@ -879,7 +884,7 @@ returns `submission.record_unavailable` and withholds the signature. Its
 | Payment, path payment (either kind) | `stellar_pay_commit` rule, a wallet payment to itself included; an incoming payment from another source has no effect |
 | Create claimable balance | One `stellar_pay_commit` leg per claimant other than the source and, for another source, the wallet |
 | Create account | `stellar_create_account_commit` rule |
-| Change trust (native or credit asset) | `stellar_trustline_commit` rule; a pool share line has no effect |
+| Change trust (native or credit asset) | `stellar_trustline_commit` rule; a wallet-sourced pool share line is its own trustline operation without an asset, another source's has no effect |
 | Claim claimable balance | `stellar_claim_commit` rule |
 | Source-account token `transfer`, `transfer_from`, `approve`, `burn`, `burn_from` | `stellar_pay_commit` rule with the contract address as asset; a zero approval has no effect |
 | Contract call with an unvalued node (mixed tree) | Needs the opt-in; each retained token leg still takes the pay rule |
@@ -1808,7 +1813,12 @@ The outer gate defers minimum_reserve and balance_floor to the routed live read.
 It reads the spending window and records nothing.
 The routed commit enforces approval and records once after confirmation.
 The outer gate has no identity view, so HOME_DOMAIN remains unverifiable.
-On mainnet, a toolset signing action refuses with `network.mainnet_write_forbidden` before the outer gate.
+On mainnet, `stellar_toolset_invoke` admits only its exact `stellar_pay` and `stellar_pay_commit` actions, through mainnet write admission; every other toolset action refuses.
+These actions skip the provisional outer gate.
+Their routed handler evaluates the outer `stellar_toolset_invoke` rule in its own policy snapshot with its account view.
+It composes that decision with the routed decision.
+Other mainnet toolset signing actions refuse with `network.mainnet_write_forbidden` before the outer gate.
+Every other mainnet toolset action meets the outer gate first and then refuses with the gate's code or `network.mainnet_write_forbidden`.
 
 `total_budget` entries carry the policy digest as their epoch, use the key
 `total:<asset>` with a zero window, and count regardless of age. The window
@@ -2175,29 +2185,30 @@ build reads are execution facts. The lookup runs after the argument and
 endpoint refusals and before any build, and in the CLI before the
 confirmation ceremony. A claim looks its id up before the balance read and
 the predicate check. A retained record answers with its stored state and a
-waiting envelope record yields its stored envelope. An unknown id of an MCP
-tool opens an `Envelope` slot over the unsigned envelope just built, with the intent
-digest beside its hash. On mainnet the MCP tools `stellar_pay`,
-`stellar_create_account`, `stellar_trustline` and `stellar_claim` look the id
-up by their canonical intent instead. A payment through a toolset looks the
-id up the same way, so either route resumes the record the first preparation
-opened, `Canonical` or `Envelope`. Under a new id it opens the `Envelope`
-slot its commit's protocol nonce and lease verify. After the policy
-gate they open a `Canonical` slot of the full intent, a claim's asset and
-amount included, with the governing decision of the preparation and its
-commit. Under an approval requirement that decision's lifetime is the
-record's waiting interval, and the approval binds the intent digest. A
+waiting envelope record yields its stored envelope. On mainnet the MCP tools
+`stellar_pay`, `stellar_create_account`, `stellar_trustline` and
+`stellar_claim` look the id up by their canonical intent. A payment through a
+toolset looks the id up the same way, so either route resumes the record the
+first preparation opened, `Canonical` or `Envelope`. Under a new id it opens
+an `Envelope` slot over the unsigned envelope just built, with the intent
+digest beside its hash, which its commit's protocol nonce and lease verify.
+After the policy gate they open a `Canonical` slot of the full intent, a
+claim's asset and amount included, with the governing decision of the
+preparation and its commit. Off mainnet no MCP tool opens a record. Under an
+approval requirement that decision's lifetime is the record's waiting
+interval, and the approval binds the intent digest. A
 payment entry queued after that interval opened, as on a retry after a crash
 before the first approval record opened, keeps the decision's whole lifetime
 and ends with the interval, because consent to the intent must span that
 lifetime. A crash after the approval record's reservation and before its
-inbox insert ends the business id instead, as `audit-log-recovery.md`
-describes. The envelope the payment preparation stores carries a deadline
-before that decision's end, from `canonical_max_time_s`, the bound
-`rebuild_canonical` applies. The
+inbox insert ends the business id instead when the payment's own rules
+require that approval, as `audit-log-recovery.md` describes. The envelope
+the payment preparation stores carries a deadline before that decision's end,
+from `canonical_max_time_s`, the bound `rebuild_canonical` applies. The
 payment producer keeps its recovery binding keyed by the prepared envelope's
 hash, which the canonical record also stores, and its new inbox entry binds
-the intent digest. An unknown id of a CLI verb opens a `Canonical` slot with
+the intent digest. An unknown id of the CLI verb `pay`, `claim`,
+`trustline`, or sponsored `accounts create` opens a `Canonical` slot with
 the full intent, the policy decision and the unsigned envelope just built; a
 claim's intent takes the asset and amount of the balance it read.
 
@@ -2526,11 +2537,12 @@ Under a canonical preparation, `lookup_canonical` answers an envelope record of 
 The record stays an envelope record, so a rebuilt envelope with a fresh sequence refuses at its attempt with `operation.business_id_conflict`.
 The x402 parent retains its separate meaning. Malformed canonical content refuses resolution while lifecycle operations remain available.
 The CLI verbs `pay`, `claim`, `trustline` and sponsored `accounts create` create canonical slots.
-On mainnet the MCP payment, create-account, trustline and claim tools create canonical slots; a payment through a toolset, the other MCP tools, and every MCP tool off mainnet create envelope slots.
+On mainnet the MCP payment, create-account, trustline and claim tools create canonical slots; a payment through a toolset under a new id creates an envelope slot, and both x402 payment tools create `X402` slots. No other MCP tool creates a slot, and off mainnet no MCP tool creates one.
 A CLI run of a canonical record shows the stored intent at the confirmation, whose challenge is the stored envelope.
 Before the ceremony, the confirmation requires the durable record's subject to equal the stored intent digest and the entry's challenge subject to equal the stored envelope's subject.
-After the confirmation it rebuilds the envelope with `rebuild_canonical`: the readiness check, the source account's current sequence, the fee the caller's choice gives now, a fresh deadline, and the oracle check bound to the rebuilt envelope.
-The deadline is the earlier of 120 seconds after the rebuild and the last whole second before the end of the authority: an approval's execution end, or a policy decision's governing end. The authority holds strictly before its end, and a ledger whose close time equals the deadline still includes the transaction, so the deadline lies strictly before the end.
+After the confirmation it rebuilds the envelope with `rebuild_canonical`: the readiness check, the source account's current sequence, the fee the verb's `--fee` choice gives now, a fresh deadline, and the oracle check bound to the rebuilt envelope.
+Without `--fee`, `pay`, `claim`, and `accounts create` take 100 stroops per operation, and `trustline` takes the profile's `classic_fee_per_op_stroops`, else 100; a fee above the smaller of the intent's fee bound and the current cap refuses with `fees.percentile_exceeds_cap` before any side effect.
+The deadline is the earlier of 120 seconds after the rebuild and the last whole second before the end of the authority: an approval's execution end, or a policy decision's governing end. For a successor that end is the earlier of the authority's end and the record's execution end. The authority holds strictly before its end, and a ledger whose close time equals the deadline still includes the transaction, so the deadline lies strictly before the end.
 It then resolves through `resolve_canonical_tx_sign` and begins through `begin_canonical_attempt`, so a refused begin leaves no authorization to invalidate.
 A run of an envelope record signs its stored envelope through `resolve_tx_sign` and the linked begin, and is never rebuilt.
 A CLI divergence renders `simulation.divergence` with the sentence that the signature was withheld and nothing was sent.
@@ -2568,9 +2580,13 @@ waiting timestamps, receipt time and challenge envelope. Fresh, repeated, raced,
 stored-page and consumed-assertion completion all verify before exposing a blob.
 The inbox and admission are released before durable commit. Written, queued and
 recovered audit provenance retain their existing meanings. Envelope consent
-continues to use V5. Ordinary producers still select envelope preparation;
-canonical execution activation and the separate MCP payment producer are outside
-this consent path. The store wire version is unchanged.
+continues to use V5. The CLI producers of `pay`, `claim`, `trustline`, and
+sponsored `accounts create` select canonical preparation, and so do the
+mainnet MCP producers of `stellar_pay`, `stellar_create_account`,
+`stellar_trustline` and `stellar_claim`, the separate payment producer
+included. A payment through a toolset under a new id selects envelope
+preparation and stays outside this consent path. Off mainnet no MCP producer
+opens a record or selects a preparation. The store wire version is unchanged.
 
 `approve revoke --id <nonce> --profile <name>` resolves the nonce through authenticated status.
 Only `ApprovalRecorder::revoke` changes the durable record.
@@ -2608,11 +2624,12 @@ payload. A payload without one names its row `written` or `recovered`.
 The CLI grants approval authority only from the committed record. Before the
 inbox is released, the ceremony keeps the attestation the entry presented.
 After the consent commit, a submission receipt that names the nonce refuses
-with `approval.consumed` before any durable read, and a receipt store that
-cannot be read refuses with `submission.record_unavailable`. The durable verifier then
-checks the presented attestation against the record, the requested kind and
-envelope subject, the current policy and the time. For a kind that enforces
-delivery, the time is raised to the consent evidence floor. A canonical
+with `approval.consumed` before the verifier reads the record, unless its
+attempt is a checked non-inclusion of the admitted canonical operation. A
+receipt store that cannot be read refuses with `submission.record_unavailable`.
+The durable verifier then checks the presented attestation against the
+record, the requested kind and its envelope or intent subject, the current
+policy and the time. For a kind that enforces delivery, the time is raised to the consent evidence floor. A canonical
 intent verifies under the fresh decision. A record of another operation
 refuses with `approval.consumed`; a missing record refuses with
 `approval.not_found`, and a revoked one with `approval.revoked`. This check

@@ -14,9 +14,10 @@ for build configuration, admitted operations, and exclusions. Per tool on
   `stellar_pay_commit`, `stellar_claim_commit`, `stellar_create_account_commit`,
   `stellar_trustline_commit`, and `stellar_rule_create_commit` also sign and
   submit.
-- Every tool named above and the signing actions of `stellar_toolset_invoke`
-  refuse at handler entry with `network.mainnet_write_forbidden` in every
-  build, except both x402 payment tools and the four classic commits.
+- Every tool named above refuses at handler entry with
+  `network.mainnet_write_forbidden` in every build, except both x402 payment
+  tools and the four classic commits. The `stellar_rule_create_commit` action
+  of `stellar_toolset_invoke` refuses at handler entry with the same code.
   Default builds enable the `mainnet-write` feature. These builds admit the four classic commits and both x402
   payment tools after setup. With the feature off, these tools refuse mainnet
   at entry with the same code.
@@ -403,8 +404,17 @@ The preparation may issue a new protocol nonce for committing that envelope.
 A preparation that finds the approval producer lock held refuses with
 `approval.writer_locked`; retry with the same `business_id`.
 When the operation's linked approval entry is gone, the preparation refuses
-with `approval.not_found` and the business id ends; prepare the operation
-again under a new `business_id`.
+with `approval.not_found` and, except in the case below, the business id
+ends; prepare the operation again under a new `business_id`.
+A payment whose own rules allow it, and whose lost entry is the outer toolset
+approval, still completes by a direct `stellar_pay_commit`. Its toolset
+preparation refuses with `approval.not_found`, and its toolset commit too
+while the running server holds its nonce; after a restart that commit refuses
+with `nonce.expired`. A record a toolset preparation opened needs the stored
+envelope, a live nonce and its expiry for the direct commit; a direct
+`stellar_pay` preparation under the same `business_id` returns them. Commit
+it, or let the record's window or, for such a record, its envelope's deadline
+end, before preparing again under a new `business_id`.
 Direct preparation needs a signed, verified policy to queue a new payment
 approval. Without one, a policy-required toolset approval queues an entry with no
 recovery binding.
@@ -493,8 +503,16 @@ both.
 Paired preparation refuses an undecodable envelope with `simulation.divergence`.
 A denied rule retains `policy.deny.*`; an unknown decision uses
 `policy.unexpected_decision`. None of these refusals persists an approval.
-Each commit evaluates both names before attestation validation. A proof
-supplied under Allow is verified and spent like a required one.
+Each commit evaluates both names before attestation validation. On mainnet, a
+proof supplied under Allow to a classic commit or an x402 payment tool verifies
+against its approval's durable record and is spent like a required one. A proof
+without a durable record refuses and stays unspent. Off mainnet, Allow neither
+verifies nor spends a proof supplied to `stellar_pay_commit`,
+`stellar_claim_commit`, `stellar_create_account_commit`,
+`stellar_trustline_commit`, `stellar_x402_create_payment`, or
+`stellar_x402_authenticated_payment`. `stellar_rule_create_commit` always
+requires approval, so it verifies and spends its approval under Allow too.
+`stellar_mpp_charge_commit` takes no approval arguments.
 
 Classic mainnet previews carry an on-chain deadline 120 seconds after they are
 built; a `stellar_pay` preview carries the earlier of that deadline and the
@@ -510,8 +528,9 @@ strictly before its end, and a ledger that closes at the deadline still
 includes the transaction. A successor attempt's deadline also stays before
 the execution end the first attempt set, and the signing refuses a deadline
 that does not lie before the end. An approved commit signs until just before
-the consent's execution end, the consent time plus the rule's lifetime, which
-can lie after the approval's `expires_at_unix_ms`.
+the consent's execution end, the consent time plus the shorter of the rule's
+lifetime and 900 seconds, which can lie after the approval's
+`expires_at_unix_ms`.
 A commit whose envelope carries no valid deadline refuses
 with `simulation.deadline_invalid`; simulate again for a fresh envelope.
 A commit within 30 seconds of the deadline refuses with the same code, so
@@ -589,8 +608,10 @@ approval are required for a retry; do not switch networks. The operator reads
 A submission timeout has an unknown outcome and requires transaction
 reconciliation.
 
-DeFi, public SEP-43 signing, generic SEP-53 signing, rule writes, and toolset
-signing actions are excluded on mainnet. Wallet entry guards use
+DeFi, public SEP-43 signing, generic SEP-53 signing, and rule writes are
+excluded on mainnet. On mainnet, `stellar_toolset_invoke` admits only its exact
+`stellar_pay` and `stellar_pay_commit` actions; every other toolset action
+refuses. Wallet entry guards use
 `network.mainnet_write_forbidden`; library entry points retain their namespaced
 codes. MPP refuses with `mpp.network_forbidden`. Noop permits mainnet reads and
 refuses destructive policy decisions with `policy.engine_required`.
@@ -694,11 +715,16 @@ How a `RequireApproval` verdict is satisfied depends on the tool shape:
   state and can still deny an approved request. An exhausted cap returns
   `policy.deny.per_period_cap_exceeded`. The loaded policy document stays fixed
   for the server's lifetime. The wire error on any approval-path failure is the
-  uniform `policy.approval_required`, with two exceptions. An explicit operator
+  uniform `policy.approval_required`, with these exceptions. An explicit operator
   rejection recorded via the approval inbox is reported as
   `policy.approval_rejected`, so the agent stops retrying. An approval already
   spent on a submission is reported as `policy.approval_consumed`; reconcile
-  that transaction instead of retrying.
+  that transaction instead of retrying. A revoked mainnet approval is reported
+  as `approval.revoked`. Off mainnet, an entry whose stored payment destination
+  is not a canonical G account or M address, or whose payment recovery binding
+  is inconsistent, is reported as `approval.entry_inconsistent`. A verified
+  mainnet approval whose queued consent row has no exact Delivered evidence is
+  reported as `approval.consent_undelivered`.
 - One-shot signing verbs sign in a single call. If the policy returns
   `RequireApproval` for one of these tools, the call is refused fail-closed with
   `policy.approval_required_unsupported`; the wallet never signs without a
@@ -1154,7 +1180,9 @@ effects decision, audit pre-flight, admission, signer, signature.
   `policy.deny.unsizable_value_effect` under every rule.
 - A malformed or legacy envelope, a negative operation amount, a resource fee
   above the total fee, and a text memo that is not UTF-8 on a valued
-  transaction refuse with `sep43.invalid_xdr`.
+  transaction refuse with `sep43.invalid_xdr`. A wallet-sourced pool share
+  `ChangeTrust` makes a transaction valued, as a credit `ChangeTrust` does, so
+  that memo refuses both.
 - A fee the wallet account pays passes the classic per-operation cap, rounded
   up. A transaction with a resource fee also passes its full total through the
   contract transfer fee cap. Without a signed cap, testnet bounds the total at
