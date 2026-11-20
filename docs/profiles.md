@@ -320,6 +320,8 @@ Mainnet excludes staged modes and pool submission.
 
 The native threshold is `max(cross_check_threshold_stroops, 10_000_000_000)`
 stroops. The floor is 1000 XLM, so zero also means 1000 XLM.
+On mainnet a value above the signed native threshold, or above 1000 XLM
+without one, does not apply; see the composition below.
 Payment and account-creation stages require a witness at or above their threshold.
 They use the source debit or starting balance. A memo-less payment requires one
 whenever an oracle is configured, including below threshold on testnet.
@@ -338,23 +340,34 @@ and `stellar_claim_commit`. The x402 payment tools `stellar_x402_create_payment`
 and `stellar_x402_authenticated_payment` are covered by a second simulation on
 the oracle: before the payer signs, the oracle simulates the same unsigned
 transfer, and the answers are compared. For admitted mainnet x402 payments,
-signed and profile thresholds determine the required witness. The oracle compares
+the signed threshold determines the required witness, and a profile threshold
+can only lower it. The oracle compares
 the unsigned transfer before the payer signs. Opaque staged envelopes and the
 SEP-43 signing tools remain uncovered.
 
 On an enabled profile, signed and profile thresholds combine per asset using
-the smaller value. A higher profile threshold warns. One available value
-suffices; another asset's threshold never covers a missing one. A signed
-threshold is a positive TOML integer or a positive decimal string within the
-i128 range. Signed threshold keys are pinned asset identities. Classic assets
-and their SAC representations share network-specific identity. Duplicate
-equivalents and native-SAC aliases refuse.
+the smaller value. A profile threshold above a signed one warns. On mainnet a
+threshold never exceeds the value that applies without a profile value: the
+signed threshold, else 1000 XLM for XLM and its SAC, else none. An unsigned
+profile value therefore only lowers a threshold. Without a signed native
+threshold, XLM uses at most 1000 XLM whatever `cross_check_threshold_stroops`
+says. A token without a signed threshold has none and refuses, whatever the
+profile sets. Such a profile value above 1000 XLM, or for such a token, is not
+applied, and no warning is logged. Off mainnet one available value suffices.
+Another asset's threshold never covers a missing one. A signed threshold is a
+positive TOML integer or a positive decimal string within the i128 range.
+Signed threshold keys are pinned asset identities. Classic assets and their SAC
+representations share network-specific identity. Duplicate equivalents and
+native-SAC aliases refuse.
 
 The legacy key `usd_threshold` also sets the native threshold. Setting both
 names across the file, environment, or CLI sources refuses as a duplicate field.
 
-`[cross_check_thresholds]` sets per-asset thresholds in base units. Keys are
-case-sensitive `CODE:ISSUER` identities or canonical contract addresses (`C...`).
+`[cross_check_thresholds]` sets per-asset thresholds in base units. On mainnet
+it only lowers a threshold that `[mainnet.cross_check_thresholds]` of the
+signed policy sets for the asset; a mainnet token threshold needs that signed
+entry. Keys are case-sensitive `CODE:ISSUER` identities or canonical contract
+addresses (`C...`).
 Native aliases, including `native` and `xlm` in any case, are refused.
 CLI `pay`, `claim`, and `accounts create` report the refusal as `profile.load_failed`, and `profile show` as `validation.config_invalid`.
 Use `cross_check_threshold_stroops` for native XLM and its SAC.
@@ -363,14 +376,16 @@ Naming both identities for one asset refuses the load.
 Values are non-negative integers or ASCII digit strings within the `i128` range.
 The string form supports values above TOML's integer range.
 
-On mainnet, a missing asset threshold refuses with `network.witness_unavailable`,
-including a memo-less payment. On testnet, a payment with a memo and no asset
-threshold skips the comparison with reason `no_threshold_for_asset`.
+On mainnet, a token without a signed threshold refuses with
+`network.witness_unavailable`, including a memo-less payment. On testnet, a
+payment with a memo and no asset threshold skips the comparison with reason
+`no_threshold_for_asset`.
 The memo-less rule above takes precedence on testnet.
 A skipped or not-required outcome makes no oracle comparison of any kind.
 
-This mainnet example sets thresholds for two different tokens: the classic
-EURC asset and the USDC Stellar Asset Contract.
+This example sets thresholds for two different tokens: the classic EURC asset
+and the USDC Stellar Asset Contract. On mainnet these values only lower the
+thresholds that `[mainnet.cross_check_thresholds]` signs for the same assets.
 
 ```toml
 [cross_check_thresholds]
@@ -1057,7 +1072,7 @@ reason = "review"
 | `[mainnet].approval_credentials` | Required. 1 to 16 inline tables with exactly `credential_id_b64url` and `public_key_sec1_b64url`, placed in `[mainnet]` before any `[mainnet.*]` subtable. Both values are canonical unpadded base64url: an ID of 16 to 64 bytes and a 65-byte uncompressed SEC1 P-256 point. IDs are unique. The example entry is a placeholder; use the entry `approve credential enroll` prints. |
 | `[mainnet].approval_origin` | Optional canonical `https://<host>[:<port>]` origin. The RP ID is the entire host, excluding the port. |
 | `[mainnet].approval_cert_spki_sha256` | Optional SHA-256 of the served leaf certificate SPKI DER, encoded as 64 lowercase hexadecimal characters. |
-| `[mainnet.cross_check_thresholds]` | Optional signed thresholds, each a positive TOML integer or a positive decimal string within the i128 range, such as `native = "10000000000"`. |
+| `[mainnet.cross_check_thresholds]` | Optional signed thresholds, each a positive TOML integer or a positive decimal string within the i128 range, such as `native = "10000000000"`. On mainnet a token without an entry here has no threshold and refuses, and XLM without one uses at most 1000 XLM; profile thresholds only lower these values. |
 | Signature coverage | V2 signs sequence and mainnet fields. Match and criterion keys are sorted canonically. The approval credentials are signed sorted by raw credential ID, so reordering entries or their keys keeps the signed bytes. |
 
 #### Generated policy body

@@ -3037,9 +3037,13 @@ pub enum WitnessUnavailableReason {
     )]
     OracleNotConfigured,
     /// The asset has no threshold.
+    ///
+    /// On mainnet a token threshold applies only from the signed policy, so
+    /// the remedy names both tables.
     #[error(
-        "cross-check unavailable: the profile sets no cross-check threshold for asset \
-         '{asset}'; add it to [cross_check_thresholds] in the profile file"
+        "cross-check unavailable: no cross-check threshold applies to asset '{asset}'; on \
+         mainnet add it to [mainnet.cross_check_thresholds] of the signed policy, on other \
+         networks to [cross_check_thresholds] in the profile file"
     )]
     NoThresholdForAsset {
         /// Canonical asset without a threshold.
@@ -5319,6 +5323,28 @@ mod tests {
     }
 
     // ── Network errors ───────────────────────────────────────────────────────
+
+    /// The missing-threshold remedy names the signed table for mainnet and
+    /// the profile table for other networks.
+    #[test]
+    #[allow(clippy::expect_used, reason = "test assertion")]
+    fn missing_threshold_remedy_names_the_table_of_each_network() {
+        let asset = crate::asset_id::CanonicalAsset::contract(
+            &stellar_strkey::Contract([3; 32]).to_string(),
+        )
+        .expect("a contract address");
+        assert_eq!(
+            WitnessUnavailableReason::NoThresholdForAsset {
+                asset: asset.clone()
+            }
+            .to_string(),
+            format!(
+                "cross-check unavailable: no cross-check threshold applies to asset '{asset}'; \
+                 on mainnet add it to [mainnet.cross_check_thresholds] of the signed policy, \
+                 on other networks to [cross_check_thresholds] in the profile file"
+            )
+        );
+    }
 
     fn witness_errors() -> Vec<NetworkError> {
         use crate::cross_check::{WitnessEntry, WitnessField};

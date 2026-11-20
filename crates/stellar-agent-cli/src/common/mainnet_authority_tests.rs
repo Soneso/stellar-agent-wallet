@@ -2414,9 +2414,13 @@ impl X402Row {
                 (method == "simulateTransaction").then(|| x402_simulation(body))
             })
         };
+        // The payment of the token needs a witness threshold, which this
+        // below-threshold amount stays under. On mainnet only the signed
+        // policy supplies a token threshold.
         let spec = Verb::Pay
             .spec(name)
             .rules(vec![rule])
+            .signed_threshold(&token, "10000000000")
             .primary(simulating())
             .oracle(simulating());
         let fixture = if signed_origin {
@@ -2426,16 +2430,6 @@ impl X402Row {
         }
         .build()
         .await;
-        // The payment of the token needs a witness threshold, which this
-        // below-threshold amount stays under.
-        let directory = stellar_agent_core::profile::schema::default_profile_dir().unwrap();
-        let mut stored =
-            stellar_agent_core::profile::loader::load_from_dir(fixture.name, &directory, None)
-                .unwrap();
-        stored.cross_check_thresholds =
-            serde_json::from_value(json!({ token.clone(): "10000000000" })).unwrap();
-        stellar_agent_core::profile::loader::save_to_dir(fixture.name, &stored, &directory)
-            .unwrap();
         let mut server = mcp_server(&fixture);
         let sep10 = sep10_double().await;
         if authenticated {

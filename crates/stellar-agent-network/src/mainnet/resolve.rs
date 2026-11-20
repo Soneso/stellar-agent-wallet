@@ -3946,6 +3946,137 @@ mod tests {
         requirement_refusal(false, P::WitnessOracleMissing).await;
     }
 
+    /// The 1000 XLM payment of a memo-carrying envelope under a raised
+    /// profile threshold and the given signed policy edit.
+    async fn raised_profile_threshold_refusal(
+        policy: impl FnOnce(String) -> String,
+        signs_thresholds: bool,
+    ) {
+        let mut f = ResolverFixture::configured(
+            |profile| {
+                oracle_profile(profile);
+                profile.cross_check_threshold_stroops = 9_000_000_000_000_000;
+            },
+            |raw| {
+                policy(
+                    raw.replace("max_stroops = \"100\"", "max_stroops = \"1000000000000\"")
+                        .replace("max_stroops = \"200\"", "max_stroops = \"1000000000000\""),
+                )
+            },
+        );
+        assert_eq!(
+            f.policy.mainnet().unwrap().cross_check_thresholds.is_some(),
+            signs_thresholds
+        );
+        f.envelope = changed_envelope(&f, |tx| {
+            tx.tx.memo = stellar_xdr::Memo::Text(b"memo".to_vec().try_into().unwrap());
+            let mut op = tx.tx.operations[0].clone();
+            let OperationBody::Payment(payment) = &mut op.body else {
+                unreachable!()
+            };
+            payment.amount = 10_000_000_000;
+            tx.tx.operations = vec![op].try_into().unwrap();
+        });
+        let server = f.server().await;
+        let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
+        let client = context.primary_client().unwrap();
+        let approval = f.approval(&f.envelope, f.now, 600_000);
+        let before = f.wire();
+        let authority = f.approval_authority(&approval);
+        assert_refused(
+            resolve_tx_sign(request(&f, &context, &client, &authority)).await,
+            P::WitnessRequired,
+            &f,
+            &before,
+        );
+    }
+
+    /// Without a signed native threshold, the unsigned profile field cannot
+    /// lift the native threshold above the floor, so the 1000 XLM payment
+    /// still needs the oracle witness.
+    #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
+    #[serial_test::serial]
+    async fn an_unsigned_profile_threshold_keeps_the_witness() {
+        raised_profile_threshold_refusal(
+            |raw| {
+                let start = raw.find("[mainnet.cross_check_thresholds]").unwrap();
+                let end = raw.find("[[rules]]").unwrap();
+                format!("{}{}", &raw[..start], &raw[end..])
+            },
+            false,
+        )
+        .await;
+    }
+
+    /// Under a signed native threshold the same profile edit refuses too.
+    #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
+    #[serial_test::serial]
+    async fn a_signed_threshold_keeps_the_witness() {
+        raised_profile_threshold_refusal(
+            |raw| {
+                assert!(raw.contains("[mainnet.cross_check_thresholds]"));
+                raw
+            },
+            true,
+        )
+        .await;
+    }
+
+    /// A token threshold set only in the profile is no threshold on mainnet:
+    /// the intent refuses as if the profile named none.
+    #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
+    #[serial_test::serial]
+    async fn an_unsigned_profile_token_threshold_is_no_threshold() {
+        let token = token();
+        let f = ResolverFixture::configured(
+            |profile| {
+                profile.cross_check_thresholds =
+                    stellar_agent_core::cross_check::CrossCheckThresholds::new(
+                        std::collections::BTreeMap::from([(
+                            stellar_agent_core::asset_id::CanonicalAsset::contract(&token).unwrap(),
+                            i128::MAX,
+                        )]),
+                    )
+                    .unwrap();
+            },
+            |raw| {
+                raw.replace("stellar_pay", "stellar_x402_create_payment")
+                    .replace("\"native\"", &format!("\"{token}\""))
+            },
+        );
+        assert!(
+            !f.policy
+                .mainnet()
+                .unwrap()
+                .cross_check_thresholds
+                .as_ref()
+                .unwrap()
+                .contains_key(&token)
+        );
+        let root = root(&f);
+        let server = f.server().await;
+        let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
+        let client = context.primary_client().unwrap();
+        let approval = intent_approval(&f, &root, None);
+        let before = f.wire();
+        assert_refused(
+            resolve_soroban_intent(intent_request(
+                &f,
+                &context,
+                &client,
+                &intent(&root),
+                &f.approval_authority(&approval),
+            ))
+            .await,
+            P::WitnessThresholdMissing,
+            &f,
+            &before,
+        );
+    }
+
     #[tokio::test]
     #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]

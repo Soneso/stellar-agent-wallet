@@ -2031,6 +2031,9 @@ pub(super) fn mint_into(
         None => {
             if let MintAuthority::Approval { nonce, .. } = &request.authority {
                 let exposed = operations::exposed_authorizations(wire);
+                // This check alone refuses a second mint under one approval
+                // nonce; `tests::an_approval_nonce_is_single_use_within_retention`
+                // pins it.
                 check(
                     !wire.authorizations.iter().any(|auth| {
                         auth.approval_nonce.as_ref() == Some(nonce)
@@ -2681,6 +2684,8 @@ impl PersistedWindowStore {
                 .iter()
                 .find(|auth| auth.id == *id)
                 .ok_or_else(|| refused(P::UnknownAuthorization))?;
+            // This check alone refuses a second consume of one
+            // authorization; `tests::a_second_consume_refuses` pins it.
             check(auth.state.holds(), P::NotOpen)?;
             // The sweep above leaves an authorization that links a live
             // operation to that operation's own step. Its lifetime is

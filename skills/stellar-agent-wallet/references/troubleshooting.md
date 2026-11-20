@@ -635,7 +635,9 @@ Its message gives a safe reason and at most the oracle authority.
 It also reports an envelope mismatch when the witness binds another envelope or
 intent. The operator then builds the action again.
 The operator corrects `oracle_provider_url`, `[providers.oracle]`, or
-`[cross_check_thresholds]`. Retry after a transient failure.
+`[cross_check_thresholds]`. On mainnet a token threshold applies only when
+the signed policy's `[mainnet.cross_check_thresholds]` names the asset, so the
+operator signs it there. Retry after a transient failure.
 
 ## Fee-cap codes
 
