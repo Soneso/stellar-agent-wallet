@@ -321,12 +321,15 @@ pub async fn resolve_classic_fee_selection(
 }
 
 /// Names the source of the per-operation fee a parsed choice resolves to,
-/// for the fee-cap refusal of [`check_classic_fee_cap`].
+/// for the fee-cap refusals of [`check_classic_fee_cap`] and of
+/// [`rebuild_canonical`](crate::operation_entry::rebuild_canonical).
 ///
 /// `default_source` is the source of the fee a [`ClassicFeeChoice::ProfileDefault`]
 /// choice resolves to: [`FeeSource::ProfileDefault`] for a stage that reads
 /// `classic_fee_per_op_stroops`, [`FeeSource::CommandDefault`] for a stage
-/// that uses its built-in default fee.
+/// that uses its built-in default fee, [`FeeSource::Envelope`] for a stage
+/// that pays a prepared envelope's fee. The rebuild takes it from the
+/// request's `default_fee_source`.
 #[must_use]
 pub fn classic_fee_source(choice: ClassicFeeChoice, default_source: FeeSource) -> FeeSource {
     match choice {

@@ -30,7 +30,7 @@ use std::time::Duration;
 use stellar_agent_core::approval::witness::ApprovalWitness;
 use stellar_agent_core::cross_check::ThresholdSet;
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
+use stellar_agent_core::error::{FeeSource, InternalError, ValidationError, WalletError};
 use stellar_agent_core::mainnet::oracle::require_mainnet_oracle;
 use stellar_agent_core::profile::Profile;
 use stellar_agent_core::profile::name::ResolvedProfileName;
@@ -300,6 +300,9 @@ pub(crate) struct RebuildInputs<'a> {
     pub(crate) fee_choice: ClassicFeeChoice,
     /// The fee per operation a profile-default choice gives.
     pub(crate) default_fee_per_op_stroops: u32,
+    /// Where `default_fee_per_op_stroops` comes from, which the rebuild's
+    /// fee-cap refusal names.
+    pub(crate) default_fee_source: FeeSource,
     /// The oracle observations of the operation; the rebuild's fresh source
     /// read replaces their source observation.
     pub(crate) witness_inputs: ClassicInputs,
@@ -618,6 +621,7 @@ pub(crate) async fn authorize_and_submit(
                 intent,
                 fee_choice: inputs.fee_choice,
                 default_fee_per_op_stroops: inputs.default_fee_per_op_stroops,
+                default_fee_source: inputs.default_fee_source.clone(),
                 fee_cap_stroops: effective_cap,
                 witness_inputs: inputs.witness_inputs.clone(),
                 thresholds: inputs.thresholds,

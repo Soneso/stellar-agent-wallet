@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 
 use serde_json::{Value, json};
 use stellar_agent_core::approval::subject::SubjectKind;
+use stellar_agent_core::error::{DerivedFee, FeeSource, ValidationError};
 use stellar_agent_network::policy_state::{
     ApprovalStatus, BusinessId, OperationStatus, OperationView, PersistedWindowStore, SlotKind,
 };
@@ -107,8 +108,19 @@ impl Moves {
 
 /// Runs `verb` under `business_id` with an automatic fee.
 async fn run(verb: Verb, fixture: &MainnetFixture, business_id: &str) -> (i32, Value) {
+    run_with_fee(verb, fixture, business_id, Some("auto")).await
+}
+
+/// Runs `verb` under `business_id` with `fee` as its fee argument, or
+/// without one for `None`.
+async fn run_with_fee(
+    verb: Verb,
+    fixture: &MainnetFixture,
+    business_id: &str,
+    fee: Option<&str>,
+) -> (i32, Value) {
     let id = Some(business_id.to_owned());
-    let auto = Some("auto".to_owned());
+    let fee = fee.map(str::to_owned);
     let rendered = |code| {
         let documents = crate::common::render::take_rendered_for_test();
         (code, documents.into_iter().last().unwrap_or(Value::Null))
@@ -117,23 +129,23 @@ async fn run(verb: Verb, fixture: &MainnetFixture, business_id: &str) -> (i32, V
     match verb {
         Verb::Pay => {
             let mut args = pay::mainnet_args(fixture);
-            (args.business_id, args.fee) = (id, auto);
+            (args.business_id, args.fee) = (id, fee);
             rendered(pay::run_code(fixture, &args).await)
         }
         Verb::Claim => {
             let mut args = claim::mainnet_args(fixture);
-            (args.business_id, args.fee) = (id, auto);
+            (args.business_id, args.fee) = (id, fee);
             let run = claim::run(fixture, &args).await;
             (run.code, run.envelope)
         }
         Verb::Create => {
             let mut args = create::mainnet_args(fixture);
-            (args.business_id, args.fee) = (id, auto);
+            (args.business_id, args.fee) = (id, fee);
             rendered(create::run_code(fixture, &args).await)
         }
         Verb::Trustline => {
             let mut args = trustline::mainnet_args(fixture);
-            (args.business_id, args.classic_base) = (id, auto);
+            (args.business_id, args.classic_base) = (id, fee);
             let run = trustline::run(fixture, &args).await;
             (run.code, run.envelope)
         }
@@ -292,9 +304,21 @@ async fn cli_four_classics_rebuild_after_consent() {
 /// cap of 500 stroops per operation.
 const FEE_ABOVE_CAP: u32 = 600;
 
+/// The text of the fee-cap refusal of `per_op` stroops above `cap` from
+/// `fee_source`.
+fn cap_text(per_op: u32, cap: u32, fee_source: FeeSource) -> String {
+    ValidationError::FeeAboveCap {
+        per_op: DerivedFee::new(per_op, &fee_source),
+        cap,
+        fee_source,
+    }
+    .to_string()
+}
+
 /// A fee above the cap at the rebuild refuses before any side effect: the
 /// withheld sentence, nothing sent, no authorization, no attempt, and the
-/// approval unspent. Once the fee is back under the cap the same business id
+/// approval unspent. The refusal names the percentile the automatic fee
+/// selected. Once the fee is back under the cap the same business id
 /// completes with the consent already given.
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial]
@@ -323,12 +347,17 @@ async fn a_rebuilt_fee_above_the_cap_refuses_before_any_side_effect() {
             result["error"]["code"], "fees.percentile_exceeds_cap",
             "{name}: {result}"
         );
+        let message = result["error"]["message"].as_str().unwrap();
         assert!(
-            result["error"]["message"]
-                .as_str()
-                .unwrap()
-                .ends_with("The signature was withheld and nothing was sent."),
+            message.ends_with("The signature was withheld and nothing was sent."),
             "{name}: {result}"
+        );
+        let selected = FeeSource::Selected {
+            percentile: "p95".to_owned(),
+        };
+        assert!(
+            message.contains(&cap_text(FEE_ABOVE_CAP, 500, selected)),
+            "{name}: the refusal names the selected percentile: {result}"
         );
         assert!(fixture.sent_envelopes().await.is_empty(), "{name}");
         let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
@@ -360,6 +389,128 @@ async fn a_rebuilt_fee_above_the_cap_refuses_before_any_side_effect() {
             "{name}: the consent is reused"
         );
     }
+}
+
+/// The signed cap per operation below the verbs' 100-stroop default fee.
+const CAP_BELOW_DEFAULT: u32 = 50;
+
+/// A run without a fee whose default fee is above the cap refuses before any
+/// side effect, and the refusal names the verb's own default: the built-in
+/// fee of `pay`, `claim` and `accounts create`, the profile's fee of
+/// `trustline`. A run with an explicit fee above the cap names that fee.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn a_fee_above_the_cap_names_the_verbs_fee_source() {
+    let names = [
+        ["canonical-source-pay", "canonical-source-pay-explicit"],
+        ["canonical-source-claim", "canonical-source-claim-explicit"],
+        [
+            "canonical-source-create",
+            "canonical-source-create-explicit",
+        ],
+        [
+            "canonical-source-trustline",
+            "canonical-source-trustline-explicit",
+        ],
+    ];
+    for (verb, [default_name, explicit_name]) in Verb::ALL.into_iter().zip(names) {
+        let default_source = if matches!(verb, Verb::Trustline) {
+            FeeSource::ProfileDefault
+        } else {
+            FeeSource::CommandDefault
+        };
+        for (name, fee, per_op, fee_source) in [
+            (default_name, None, 100, default_source),
+            (explicit_name, Some("60"), 60, FeeSource::Explicit),
+        ] {
+            let fixture = verb
+                .spec(name)
+                .signed_fee_cap(CAP_BELOW_DEFAULT)
+                .rules(rules(verb, true))
+                .build()
+                .await;
+            let id = crate::common::business_entry::fresh_business_id();
+            let (code, result) = run_with_fee(verb, &fixture, &id, fee).await;
+            assert_eq!(code, 1, "{name}: {result}");
+            assert_eq!(
+                result["error"]["code"], "fees.percentile_exceeds_cap",
+                "{name}: {result}"
+            );
+            let expected = cap_text(per_op, CAP_BELOW_DEFAULT, fee_source);
+            assert!(
+                result["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&expected),
+                "{name}: the refusal names `{expected}`: {result}"
+            );
+            assert!(fixture.sent_envelopes().await.is_empty(), "{name}");
+            let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+            assert!(fixture.open_authorizations(now).is_empty(), "{name}");
+            fixture.assert_no_consent_ceremony();
+        }
+    }
+}
+
+/// A trustline record resumed after the profile's fee rose above the cap
+/// passes the check of its stored envelope, and its rebuild refuses before
+/// any side effect, naming the profile's fee as the source.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn a_rebuilt_profile_fee_above_the_cap_names_the_profile() {
+    let name = "canonical-source-trustline-resumed";
+    // The rebuild's readiness check, the primary's second, finds the
+    // endpoint unhealthy; every later check finds it healthy.
+    let primary = Verb::Trustline.ledger().with_script(|method, index, _| {
+        (method == "getHealth" && index == 1).then(|| {
+            json!({
+                "status": "unhealthy",
+                "latestLedger": 2000,
+                "oldestLedger": 1,
+                "ledgerRetentionWindow": 1999,
+            })
+        })
+    });
+    let fixture = Verb::Trustline
+        .spec(name)
+        .primary(primary)
+        .rules(rules(Verb::Trustline, false))
+        .build()
+        .await;
+    let id = crate::common::business_entry::fresh_business_id();
+    let (code, result) = run_with_fee(Verb::Trustline, &fixture, &id, None).await;
+    assert_eq!(
+        code, 1,
+        "the first rebuild finds the endpoint unready: {result}"
+    );
+    let mut profile = fixture.profile();
+    profile.classic_fee_per_op_stroops = Some(FEE_ABOVE_CAP);
+    stellar_agent_core::profile::loader::save_to_dir(
+        fixture.name,
+        &profile,
+        &stellar_agent_core::profile::schema::default_profile_dir().unwrap(),
+    )
+    .unwrap();
+    let (code, result) = run_with_fee(Verb::Trustline, &fixture, &id, None).await;
+    assert_eq!(code, 1, "{result}");
+    assert_eq!(
+        result["error"]["code"], "fees.percentile_exceeds_cap",
+        "{result}"
+    );
+    let message = result["error"]["message"].as_str().unwrap();
+    assert!(
+        message.ends_with("The signature was withheld and nothing was sent."),
+        "the rebuild refuses: {result}"
+    );
+    let expected = cap_text(FEE_ABOVE_CAP, 500, FeeSource::ProfileDefault);
+    assert!(
+        message.contains(&expected),
+        "the refusal names `{expected}`: {result}"
+    );
+    assert!(fixture.sent_envelopes().await.is_empty());
+    let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+    assert!(fixture.open_authorizations(now).is_empty());
+    assert_eq!(operation(&fixture, &id).attempts, 0);
 }
 
 /// A run that refuses after its record opens and before the confirmation

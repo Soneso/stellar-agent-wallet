@@ -208,6 +208,91 @@ async fn a_canonical_commit_pays_the_prepared_fee() {
     }
 }
 
+/// The rebuild's fee refusal on the commit route names the prepared envelope
+/// as the fee's source. The record is seeded: its intent bounds the fee at 99
+/// stroops and its envelope pays 100, within the current caps, so the
+/// commit's own fee check passes and the rebuild refuses. Nothing is minted
+/// or sent and no attempt begins.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn the_rebuilt_fee_refusal_names_the_prepared_envelope() {
+    use stellar_agent_core::audit_log::PolicyDecision;
+    use stellar_agent_core::error::{DerivedFee, FeeSource, ValidationError};
+    use stellar_agent_network::fees::ClassicFeeChoice;
+    use stellar_agent_network::operation_entry::{IntentBaseFacts, Preparation};
+    use stellar_agent_network::policy_state::{OperationKind, OperationTool};
+    let run = ClassicRun::allowed(Tool::CreateAccount).await;
+    let server = &run.f.server;
+    let prepared = stored_intent(&run);
+    let intent = stellar_agent_network::operation_entry::classic_intent(
+        IntentBaseFacts::new(
+            server.security_profile(),
+            prepared.base().source(),
+            server.current_mainnet_policy().unwrap(),
+            ClassicFeeChoice::Explicit(99),
+            prepared.base().memo().clone(),
+        ),
+        prepared.payload().clone(),
+    )
+    .unwrap();
+    let id = BusinessId::parse("rebuilt-fee-source").unwrap();
+    let operation = server
+        .prepare_entry(
+            id.clone(),
+            Preparation::Canonical {
+                intent: Box::new(intent.clone()),
+                decision: PolicyDecision::Allow,
+                rule_ttl_ms: Some(300_000),
+            },
+        )
+        .unwrap();
+    let envelope = stellar_agent_network::operation_entry::intent_envelope(
+        &intent,
+        server.context.network_passphrase(),
+        2,
+        100,
+        stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1000 + 120,
+    )
+    .unwrap();
+    server
+        .prepared_envelope(
+            Some(&operation),
+            OperationTool::StellarCreateAccount,
+            OperationKind::CreateAccount,
+            envelope,
+        )
+        .unwrap();
+    let mut args = nonce_free(&run);
+    args["business_id"] = json!(id.as_str());
+    let refused = run.commit_with(args).await;
+    assert_eq!(
+        refused["error"]["code"], "fees.percentile_exceeds_cap",
+        "{refused}"
+    );
+    let source = FeeSource::Envelope;
+    let text = ValidationError::FeeAboveCap {
+        per_op: DerivedFee::new(100, &source),
+        cap: 99,
+        fee_source: source,
+    }
+    .to_string();
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(&text),
+        "{text}: {refused}"
+    );
+    assert_eq!(run.control.count("sendTransaction"), 0);
+    assert!(authorizations(&run.f).is_empty(), "nothing is minted");
+    let view = OperationStatus::new(&server.window_store, server.security_profile())
+        .view(&id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(view.attempts, 0, "no attempt begins");
+}
+
 /// The fixture's ledger entries with the source account's sequence set to
 /// `sequence`.
 fn entries_with_source_sequence(f: &Fixture, sequence: i64) -> Vec<Value> {

@@ -1565,7 +1565,7 @@ where
             operation: Some(signing.handle()),
             rebuild: signing.rebuild(
                 built.fee_choice,
-                default_fee_per_op(profile),
+                (default_fee_per_op(profile), FeeSource::ProfileDefault),
                 inputs,
                 &thresholds,
             ),
