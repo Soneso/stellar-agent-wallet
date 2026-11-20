@@ -2109,28 +2109,35 @@ fn signed_threshold_precedence_and_wide_values() {
         cross_check::{
             CrossCheckThresholds, CrossCheckValue, ThresholdSet, cross_check_requirement,
         },
-        profile::schema::MINIMUM_FLOOR,
+        profile::{caip2::Caip2, schema::MINIMUM_FLOOR},
     };
     let mut profile = profile(true);
     let (classic, sac) = classic_and_sac(&profile);
     let asset = CanonicalAsset::parse_threshold_key(&classic).unwrap();
     let sac = CanonicalAsset::contract(&sac).unwrap();
-    for (configured, signed, expected) in [
-        (None, Some(25), Some(25)),
-        (Some(25), None, Some(25)),
-        (Some(50), Some(25), Some(25)),
-        (Some(25), Some(50), Some(25)),
-        (Some(25), Some(25), Some(25)),
-        (None, None, None),
-        (None, Some(i128::MAX), Some(i128::MAX)),
+    // The last column is the off-mainnet composition. On mainnet a token
+    // threshold the owner did not sign applies nothing.
+    for (configured, signed, expected, off_mainnet) in [
+        (None, Some(25), Some(25), Some(25)),
+        (Some(25), None, None, Some(25)),
+        (Some(50), Some(25), Some(25), Some(25)),
+        (Some(25), Some(50), Some(25), Some(25)),
+        (Some(25), Some(25), Some(25), Some(25)),
+        (None, None, None, None),
+        (None, Some(i128::MAX), Some(i128::MAX), Some(i128::MAX)),
     ] {
         profile.cross_check_thresholds =
             CrossCheckThresholds::new(configured.map(|v| (asset.clone(), v)).into_iter().collect())
                 .unwrap();
         let table: BTreeMap<_, _> = signed.map(|v| (classic.clone(), v)).into_iter().collect();
         let thresholds = ThresholdSet::from_profile_and_signed(&profile, Some(&table));
-        assert_eq!(thresholds.threshold_for(&asset), expected);
-        assert_eq!(thresholds.threshold_for(&sac), expected);
+        assert_eq!(thresholds.threshold_for(profile.chain_id, &asset), expected);
+        assert_eq!(thresholds.threshold_for(profile.chain_id, &sac), expected);
+        assert_eq!(
+            thresholds.threshold_for(Caip2::Testnet, &asset),
+            off_mainnet
+        );
+        assert_eq!(thresholds.threshold_for(Caip2::Testnet, &sac), off_mainnet);
         if expected.is_none() {
             assert!(
                 cross_check_requirement(
@@ -2147,12 +2154,14 @@ fn signed_threshold_precedence_and_wide_values() {
             );
         }
     }
-    profile.cross_check_threshold_stroops = 0;
-    assert_eq!(
-        ThresholdSet::from_profile_and_signed(&profile, None)
-            .threshold_for(&CanonicalAsset::Native),
-        Some(i128::from(MINIMUM_FLOOR))
-    );
+    for configured in [0, 9_000_000_000_000_000] {
+        profile.cross_check_threshold_stroops = configured;
+        assert_eq!(
+            ThresholdSet::from_profile_and_signed(&profile, None)
+                .threshold_for(profile.chain_id, &CanonicalAsset::Native),
+            Some(i128::from(MINIMUM_FLOOR))
+        );
+    }
 }
 #[test]
 #[serial_test::serial]
@@ -2179,7 +2188,8 @@ fn signed_threshold_warns_when_profile_is_higher() {
     let _guard = tracing::subscriber::set_default(subscriber);
     tracing::callsite::rebuild_interest_cache();
     assert_eq!(
-        ThresholdSet::from_profile_and_signed(&profile, Some(&table)).threshold_for(&asset),
+        ThresholdSet::from_profile_and_signed(&profile, Some(&table))
+            .threshold_for(profile.chain_id, &asset),
         Some(25)
     );
     let output = capture.captured_str();

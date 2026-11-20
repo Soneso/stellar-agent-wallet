@@ -231,6 +231,11 @@ pub trait Signer: Send + Sync {
     /// [`MessagePayload::sep53`]. The digest carries no network; the callers
     /// refuse a mainnet profile before they build it.
     ///
+    /// No signer refuses mainnet here. The mainnet refusal rests on each tool
+    /// entry: `stellar_sep43_sign_message` and `stellar_sep53_sign_message`
+    /// refuse a mainnet profile before key access, so a new message-signing
+    /// caller needs its own refusal.
+    ///
     /// The signing call sites are `stellar_agent_sep53::sign_message` and
     /// SEP-43 `signMessage` (`stellar_agent_sep43::signing::sign_message_bytes`),
     /// which sign the same digest.

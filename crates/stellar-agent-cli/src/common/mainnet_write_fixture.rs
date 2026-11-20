@@ -287,6 +287,7 @@ pub(crate) struct Spec {
     submit_timeout_seconds: Option<u64>,
     record_keys: bool,
     signed_origin: bool,
+    signed_thresholds: Vec<(String, String)>,
 }
 
 impl Spec {
@@ -314,7 +315,17 @@ impl Spec {
             submit_timeout_seconds: None,
             record_keys: false,
             signed_origin: false,
+            signed_thresholds: Vec::new(),
         }
+    }
+
+    /// Adds `asset` with `value` to the signed
+    /// `[mainnet.cross_check_thresholds]`, the only table a mainnet token
+    /// threshold is read from.
+    pub(crate) fn signed_threshold(mut self, asset: &str, value: &str) -> Self {
+        self.signed_thresholds
+            .push((asset.to_owned(), value.to_owned()));
+        self
     }
 
     /// Serves consent at the signed HTTPS origin: the profile's remote
@@ -793,6 +804,9 @@ impl MainnetFixture {
                 TRUSTLINE_ASSET,
                 toml_edit::value(NATIVE_THRESHOLD_STROOPS.to_string()),
             );
+        }
+        for (asset, value) in &spec.signed_thresholds {
+            thresholds.insert(asset, toml_edit::value(value.as_str()));
         }
         doc["mainnet"]["cross_check_thresholds"] = toml_edit::Item::Table(thresholds);
         let authenticator = stellar_agent_test_support::webauthn::fixture_authenticator();

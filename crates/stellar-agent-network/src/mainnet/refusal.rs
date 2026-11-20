@@ -61,7 +61,8 @@ pub enum MainnetPrecondition {
     AccountUnavailable,
     /// Policy evaluation or sizing failed.
     PolicyEvaluationFailed,
-    /// The signed and stored thresholds name no threshold for the asset.
+    /// No threshold applies to the asset: off mainnet neither table names
+    /// one, and on mainnet the signed table names none for a token.
     WitnessThresholdMissing,
     /// The profile has no oracle.
     WitnessOracleMissing,

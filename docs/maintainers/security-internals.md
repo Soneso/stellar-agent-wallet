@@ -1206,6 +1206,12 @@ authorization that ends during that key access produces no signature and
 refuses with `network.mainnet_authorization_refused` (`expired` or
 `not_yet_valid`). Signing checks freshness again after the signer returns and
 discards a late signature.
+A Soroban authorization payload carries only the agent key, not the interval.
+`MainnetSorobanAuthPayload::sign` runs `check_not_expired` on a fresh mainnet
+clock before the claim and after the signature, not inside the signer. A
+Soroban authorization that ends during the key read therefore produces a
+signature, which the second check discards inside the process before it is
+returned.
 The signature must verify before it is returned. A refusal after the claim keeps
 its spend counted, because a local record cannot withdraw a produced signature.
 
@@ -1527,8 +1533,9 @@ and `stellar_claim_commit`. The x402 payment tools `stellar_x402_create_payment`
 and `stellar_x402_authenticated_payment` are covered by a second simulation on
 the oracle: before the payer signs, the oracle simulates the same unsigned
 transfer, and the answers are compared. The mainnet x402 witness binds the
-expected transfer and payer. It uses thresholds from the profile and signed
-policy. Opaque staged envelopes and the SEP-43 signing tools remain uncovered.
+expected transfer and payer. It uses the signed policy's threshold, which a
+profile threshold can only lower. Opaque staged envelopes and the SEP-43
+signing tools remain uncovered.
 
 The source comparison covers existence, sequence, native balance, subentry count,
 and four authorization flags. Sequence and native balance require exact equality;
@@ -1887,9 +1894,15 @@ threshold respects `MINIMUM_FLOOR`. Native SAC aliases and duplicate classic/SAC
 keys refuse. The optional authorization TTL is 1 to 120 seconds.
 `ThresholdSet::from_profile_and_signed` and `check_classic_fee_cap_signed`
 combine a signed value with the profile's: the effective threshold and fee cap
-are the per-asset minimum, and a profile value above the signed one emits a
-warning. Admitted classic callers use effective signed/profile values, and
-the resolver independently reevaluates them. See the normative
+are the per-asset minimum, and a profile value above a signed one emits a
+warning; without a signed value nothing warns. On mainnet
+`ThresholdSet::threshold_for` also bounds each threshold by the value without a
+profile value: the signed threshold, else `MINIMUM_FLOOR` for XLM and its SAC,
+else none, which refuses. A profile value above that bound, or for a token
+without a signed value, is not applied and logs nothing. An unsigned profile
+edit therefore cannot remove the witness requirement. Admitted classic callers
+use effective signed/profile values, and the resolver independently
+reevaluates them. See the normative
 [policy schema](../profiles.md#mainnet-policy-body),
 [minimum](../profiles.md#enabled-policy-minimum), and
 [fee and threshold rules](../profiles.md#thresholds-and-fees).

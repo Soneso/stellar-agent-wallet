@@ -12002,9 +12002,11 @@ mod tests {
 
     /// Restoring an OLDER, validly-HMAC-signed snapshot of the store file
     /// (e.g. from a stale backup) after the generation has moved on is a
-    /// rollback attempt. The HMAC alone would verify — it was genuinely
-    /// signed under the same key when written — so only the generation
-    /// check catches this.
+    /// rollback attempt. The HMAC alone would verify, because it was genuinely
+    /// signed under the same key when written, so the keyring commitment
+    /// refuses it: both its generation and its digest differ. The generation
+    /// comparison alone is pinned by
+    /// `a_rollback_whose_digest_matches_refuses_on_the_generation`.
     #[test]
     #[serial]
     fn rollback_to_older_valid_file_fails_closed() {
@@ -12040,6 +12042,64 @@ mod tests {
             matches!(result, Err(WindowStoreError::GenerationMismatch)),
             "a validly-signed but stale-generation file must fail closed, got {result:?}"
         );
+    }
+
+    /// A restored older file under a commitment whose digest is that file's
+    /// own digest but whose generation is ahead refuses. The digest check of
+    /// `select_generation` passes here, so the generation comparison alone
+    /// refuses; `rollback_to_older_valid_file_fails_closed` and
+    /// `a_rolled_back_file_cannot_restore_a_pending_record` are refused by
+    /// both checks.
+    #[test]
+    #[serial]
+    fn a_rollback_whose_digest_matches_refuses_on_the_generation() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = test_profile(dir.path(), "rollback-digest");
+        let path = dir.path().join("rollback-digest.window");
+        let store = PersistedWindowStore::at_path(path.clone());
+        let k = key("rollback-digest", "native", 86_400);
+        let now = now_ms().unwrap();
+        store
+            .record_and_persist(&profile, &[entry(k.clone(), now, 100)])
+            .unwrap();
+        let old_bytes = fs::read(&path).unwrap();
+        let old = store.read_for_inspection(&profile).unwrap().unwrap();
+        store
+            .record_and_persist(&profile, &[entry(k.clone(), now, 200)])
+            .unwrap();
+        fs::write(&path, &old_bytes).unwrap();
+        let gen_entry = generation_entry_ref(&profile);
+        let counter = keyring_core::Entry::new(&gen_entry.service, &gen_entry.account).unwrap();
+        let committed = GenerationCommitment {
+            generation: old.generation + 1,
+            body_sha256: body_digest(&old).unwrap(),
+        };
+        counter
+            .set_password(&serde_json::to_string(&committed).unwrap())
+            .unwrap();
+
+        let result = store.load_into("rollback-digest", &profile, &PolicyStateStore::new());
+        assert!(
+            matches!(result, Err(WindowStoreError::GenerationMismatch)),
+            "a file behind the committed generation must fail closed, got {result:?}"
+        );
+
+        let committed = GenerationCommitment {
+            generation: old.generation,
+            body_sha256: body_digest(&old).unwrap(),
+        };
+        counter
+            .set_password(&serde_json::to_string(&committed).unwrap())
+            .unwrap();
+        let memory = PolicyStateStore::new();
+        store
+            .load_into("rollback-digest", &profile, &memory)
+            .unwrap();
+        assert_eq!(memory.query_window(&k, now).unwrap(), (100, 1));
     }
 
     /// Simulates a crash between the keyring generation bump and the

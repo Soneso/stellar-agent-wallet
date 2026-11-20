@@ -403,7 +403,8 @@ commit actions. See `references/toolsets-feature.md`.
   `accounts create`, `trustline`, and sending `pool init` paths. The x402
   payment tools are covered by a second simulation on the oracle, which
   simulates the same unsigned transfer before the payer signs. Mainnet x402
-  witnesses use the signed policy and profile thresholds. The oracle compares
+  witnesses use the signed policy's threshold, which a profile threshold can
+  only lower. The oracle compares
   the unsigned transfer before the payer signs.
   Opaque staged envelopes and the SEP-43 signing tools remain uncovered.
   `fees.percentile_exceeds_cap` and
