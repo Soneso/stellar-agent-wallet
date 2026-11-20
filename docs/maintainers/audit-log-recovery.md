@@ -618,7 +618,9 @@ A revoked record refuses with `approval.revoked` before that reacquisition.
 A refusal keeps its wire code, such as `approval.evidence_capacity` or `audit.outbox_evidence_unusable`, and exposes no approval block.
 The payment producer binds its recovery entry after the reservation; a retained binding of the same payment refuses with `approval.entry_inconsistent`.
 A crash between the reservation and the inbox insert leaves a reserved record without an entry, and a retry refuses with `approval.not_found`.
-That operation ends at its waiting expiry; prepare again under a new business id.
+The business id ends there.
+No route, MCP or CLI, rebuilds the entry: its absence is indistinguishable from an entry that was rejected and then collected, and a rejection lives only in the unauthenticated inbox.
+That operation ends at its waiting expiry; prepare the operation again under a new business id.
 The readiness proof precedes every admission and every reacquisition.
 
 A crash after the pending open retains its identity even if reservation or insertion fails.

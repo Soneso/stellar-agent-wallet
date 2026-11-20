@@ -545,7 +545,13 @@ async fn toolset_commit_keeps_the_commit_floor_rule() {
 #[serial_test::serial]
 async fn public_commit_is_unattended_or_queues_before_nonce_use() {
     for outer in ["allow", "require_approval", "deny"] {
-        let run = Run::new(outer, "allow", &["propose-transaction", "sign-payment"]).await;
+        let run = Run::with_policy(
+            outer,
+            "allow",
+            &["propose-transaction", "sign-payment"],
+            |raw| outer_lifetime(&raw, 120),
+        )
+        .await;
         let args = Tool::Pay.prepare_args(&run.f);
         let prepared = wire(&Tool::Pay.prepare(&run.f.server, &args).await);
         assert_eq!(prepared["ok"], true, "{prepared}");
@@ -621,8 +627,8 @@ async fn public_commit_is_unattended_or_queues_before_nonce_use() {
             let waiting_end = operation.waiting_expires_at_ms.unwrap();
             assert_eq!(
                 first[0].expires_at_unix_ms,
-                (first[0].created_at_unix_ms + 60_000).min(waiting_end),
-                "the queued end is the earlier of the outer 60 s consent and the operation's \
+                (first[0].created_at_unix_ms + 120_000).min(waiting_end),
+                "the queued end is the earlier of the outer 120 s consent and the operation's \
                  waiting end {waiting_end}"
             );
             let repeated = run.invoke("stellar_pay_commit", commit.clone()).await;
@@ -690,6 +696,22 @@ async fn public_commit_is_unattended_or_queues_before_nonce_use() {
     }
 }
 
+/// The policy `raw` with the lifetime of its outer `stellar_toolset_invoke`
+/// approval rule set to `secs`. A toolset commit of a direct-first payment
+/// signs only while the consent it queues outlasts the stored deadline, so
+/// these runs give that rule the 120-second classic deadline.
+fn outer_lifetime(raw: &str, secs: i64) -> String {
+    let mut doc = raw.parse::<toml_edit::DocumentMut>().unwrap();
+    for rule in doc["rules"].as_array_of_tables_mut().unwrap().iter_mut() {
+        if rule["match"]["tool"].as_str() == Some("stellar_toolset_invoke")
+            && rule.contains_key("ttl_secs")
+        {
+            rule["ttl_secs"] = toml_edit::value(secs);
+        }
+    }
+    doc.to_string()
+}
+
 /// The operation a mainnet payment preparation opened under `args`'s
 /// business id.
 fn prepared_operation(run: &Run, args: &Value) -> stellar_agent_network::policy_state::OperationId {
@@ -721,10 +743,11 @@ async fn public_commit_queue_opens_the_durable_record_proof_delivery_reads() {
         seed_existing_consent_delivery_for_test,
     };
     use stellar_agent_network::policy_state::{ApprovalState, ApprovalStatus};
-    let run = Run::new(
+    let run = Run::with_policy(
         "require_approval",
         "allow",
         &["propose-transaction", "sign-payment"],
+        |raw| outer_lifetime(&raw, 120),
     )
     .await;
     let name = run.f.server.profile_name_for_approval();
@@ -805,7 +828,48 @@ async fn public_commit_queue_opens_the_durable_record_proof_delivery_reads() {
                 .join("operator.toml"),
         )
         .unwrap();
-        stellar_agent_core::approval::witness::verify_approval(
+        // A direct preparation opens a canonical record, so the approval is
+        // the consent to its stored intent (business_entry.rs:509-514), which
+        // the commit verifies with the intent and its decision
+        // (canonical_commit.rs:249-262).
+        let policy = run.f.server.current_mainnet_policy().unwrap();
+        let id = stellar_agent_network::policy_state::BusinessId::parse(
+            args["business_id"].as_str().unwrap(),
+        )
+        .unwrap();
+        let stored = stellar_agent_network::policy_state::OperationStatus::new(
+            &run.f.server.window_store,
+            run.f.server.security_profile(),
+        )
+        .view(&id)
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            stored.slot_kind,
+            stellar_agent_network::policy_state::SlotKind::Canonical
+        );
+        let intent = run
+            .f
+            .server
+            .canonical_commit_target(policy, id, args["source"].as_str().unwrap(), |_| true)
+            .unwrap_or_else(|_| panic!("the canonical record resumes"))
+            .intent;
+        assert_eq!(*intent.digest().as_bytes(), stored.intent_digest);
+        let decision = stellar_agent_core::mainnet::decision::MainnetDecision::for_test(
+            stellar_agent_core::policy::Decision::RequireApproval(
+                stellar_agent_core::policy::ApprovalRequest::new(String::new(), 0),
+            ),
+            None,
+            policy.digest(),
+            0,
+            0,
+            &name,
+            run.f.server.security_profile().chain_id.caip2_str(),
+            now_unix_ms().unwrap(),
+            entries[0].expires_at_unix_ms - entries[0].created_at_unix_ms,
+            stellar_agent_core::mainnet::decision::AuthorityScope::Classic,
+        );
+        stellar_agent_core::approval::witness::verify_intent_approval(
             &inbox,
             run.f.server.security_profile(),
             &name,
@@ -815,12 +879,9 @@ async fn public_commit_queue_opens_the_durable_record_proof_delivery_reads() {
                 .unwrap()
                 .try_into()
                 .unwrap(),
-            &super::common::GatedApprovalKind::Payment.expectation(
-                stellar_agent_core::approval::subject::approval_subject_classic(
-                    commit["envelope_xdr"].as_str().unwrap(),
-                ),
-            ),
-            run.f.server.current_mainnet_policy().unwrap(),
+            &intent,
+            &decision,
+            policy,
             now_unix_ms().unwrap(),
         )
         .unwrap()
@@ -2722,7 +2783,28 @@ async fn public_mainnet_terminal_consent_survives_restart_and_clock_rollback() {
                 _ => {}
             }
             drop(store);
-            let end = entry.expires_at_unix_ms;
+            // An envelope record's waiting window ends with its consent. A
+            // canonical record's granted intent consent keeps it waiting until
+            // the consent's execution end (approvals.rs:1791-1806, swept at
+            // operations.rs:2166-2178), so that row advances to that end.
+            let end = if !first_toolset && mode == "expired" {
+                let consent = stellar_agent_network::policy_state::ApprovalStatus::new(
+                    &run.f.server.window_store,
+                    run.f.server.security_profile(),
+                )
+                .find_by_nonce(&entry.approval_nonce)
+                .unwrap()
+                .unwrap()
+                .record
+                .consent;
+                assert!(
+                    consent.is_some(),
+                    "the attested canonical consent is granted"
+                );
+                consent.unwrap().execution_expires_at_ms
+            } else {
+                entry.expires_at_unix_ms
+            };
             let policy_clock = set_query_time_for_test(end);
             let network_clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(end);
             run.f.server.clock =
@@ -2901,9 +2983,18 @@ async fn public_direct_and_toolset_payment_audit_bodies_match() {
             serde_json::from_slice(&rows[0].canonical_json_body().unwrap()).unwrap();
         // Canonical hash-input bodies exclude chain authentication fields.
         // Only these random identifiers and the wall timestamp are normalized.
-        for key in ["ts", "request_id", "nonce_id"] {
+        for key in ["ts", "request_id"] {
             assert!(body.as_object_mut().unwrap().remove(key).is_some(), "{key}");
         }
+        // The toolset commit takes the envelope route and names its protocol
+        // nonce (pay.rs:2539); the direct commit of the canonical record names
+        // none (canonical_commit.rs:342). Every other field is compared below.
+        let nonce_id = body.as_object_mut().unwrap().remove("nonce_id");
+        assert_eq!(
+            nonce_id.is_some_and(|value| !value.is_null()),
+            toolset,
+            "nonce_id names the toolset commit's protocol nonce only"
+        );
         assert_eq!(body["legs"][0]["destination_sha256"], DESTINATIONS[2].1);
         assert_eq!(body["legs"][0]["amount"], "10");
         assert_eq!(body["policy_decision"], "allow");
@@ -3639,4 +3730,377 @@ async fn public_toolset_tombstone_replay_is_status_only() {
         );
         assert_eq!(run.control.sent().len(), 1);
     }
+}
+
+/// On a canonical record a toolset commit signs only an envelope of the
+/// stored intent: an envelope this server prepared for another intent, under
+/// another id, refuses the conflict with either commit arguments and sends
+/// nothing.
+#[tokio::test]
+#[serial_test::serial(keyring, mainnet_clock)]
+#[serial_test::serial]
+async fn public_toolset_commit_of_another_intent_under_a_canonical_id_refuses() {
+    use stellar_agent_network::policy_state::{BusinessId, OperationStatus, SlotKind};
+    for other in ["memo", "amount", "fee"] {
+        let run = Run::new("allow", "allow", &["propose-transaction", "sign-payment"]).await;
+        run.grant(DESTINATIONS[0].0);
+        let args = Tool::Pay.prepare_args(&run.f);
+        let prepared = run.prepare_route(&args, false).await;
+        assert_eq!(prepared["ok"], true, "{prepared}");
+        let id = BusinessId::parse(args["business_id"].as_str().unwrap()).unwrap();
+        let status =
+            OperationStatus::new(&run.f.server.window_store, run.f.server.security_profile());
+        let stored = status.view(&id).unwrap().unwrap();
+        assert_eq!(stored.slot_kind, SlotKind::Canonical);
+        let mut foreign = Tool::Pay.prepare_args(&run.f);
+        match other {
+            "memo" => foreign["memo_text"] = "another".into(),
+            "amount" => foreign["amount_in_stroops"] = "11".into(),
+            _ => foreign["fee"] = "200".into(),
+        }
+        let envelope = run.prepare_route(&foreign, true).await;
+        assert_eq!(envelope["ok"], true, "{other}: {envelope}");
+        let foreign_id = BusinessId::parse(foreign["business_id"].as_str().unwrap()).unwrap();
+        let foreign_view = status.view(&foreign_id).unwrap().unwrap();
+        let window = std::fs::read(run.f.server.window_store.path()).unwrap();
+        let mut under_canonical = foreign.clone();
+        under_canonical["business_id"] = args["business_id"].clone();
+        for commit in [
+            run.commit_args(under_canonical, &envelope),
+            run.commit_args(args.clone(), &envelope),
+        ] {
+            let refused = run.commit_route(commit, true).await;
+            assert_eq!(
+                refused["error"]["code"], "operation.business_id_conflict",
+                "{other}: {refused}"
+            );
+            assert!(run.control.sent().is_empty(), "{other}");
+            assert!(authorizations(&run.f).is_empty(), "{other}");
+            assert_eq!(status.view(&id).unwrap().unwrap(), stored, "{other}");
+            assert_eq!(
+                status.view(&foreign_id).unwrap().unwrap(),
+                foreign_view,
+                "{other}"
+            );
+            assert_eq!(
+                std::fs::read(run.f.server.window_store.path()).unwrap(),
+                window,
+                "{other}: the refusal writes no record"
+            );
+        }
+    }
+}
+
+/// One payment keeps one open attempt across both routes: after a commit on
+/// either route sends and leaves its outcome unknown, a commit of the same id
+/// on the other route sends nothing and keeps the one attempt.
+#[tokio::test]
+#[serial_test::serial(keyring, mainnet_clock)]
+#[serial_test::serial]
+async fn public_open_attempt_is_one_across_routes() {
+    use stellar_agent_network::policy_state::{BusinessId, OperationStatus};
+    for first_toolset in [false, true] {
+        let run = Run::new("allow", "allow", &["propose-transaction", "sign-payment"]).await;
+        run.grant(DESTINATIONS[0].0);
+        let args = Tool::Pay.prepare_args(&run.f);
+        let prepared = run.prepare_route(&args, first_toolset).await;
+        assert_eq!(prepared["ok"], true, "{prepared}");
+        let commit = run.commit_args(args.clone(), &prepared);
+        let sent = run.commit_route(commit.clone(), first_toolset).await;
+        assert_eq!(sent["ok"], true, "{sent}");
+        let id = BusinessId::parse(args["business_id"].as_str().unwrap()).unwrap();
+        let status =
+            OperationStatus::new(&run.f.server.window_store, run.f.server.security_profile());
+        let open = status.view(&id).unwrap().unwrap();
+        assert_eq!(open.state.wire_name(), "sent_outcome_unknown");
+        assert_eq!(open.attempts, 1);
+        assert_eq!(run.control.sent().len(), 1);
+        let again = run.commit_route(commit, !first_toolset).await;
+        assert_ne!(
+            again["data"]["status"], "submitted",
+            "first_toolset={first_toolset}: {again}"
+        );
+        assert_eq!(
+            run.control.sent().len(),
+            1,
+            "first_toolset={first_toolset}: {again}"
+        );
+        assert_eq!(authorizations(&run.f).len(), 1);
+        let kept = status.view(&id).unwrap().unwrap();
+        assert_eq!(kept.attempts, 1, "first_toolset={first_toolset}: {again}");
+        assert_eq!(kept.state.wire_name(), "sent_outcome_unknown");
+    }
+}
+
+/// Fills the inbox with live copies of its first entry up to the 4,096-entry
+/// capacity, so the next entry write refuses, and returns the bytes before.
+fn fill_inbox(run: &Run) -> (std::path::PathBuf, String) {
+    let path = run
+        .f
+        .server
+        .resolve_approval_dir()
+        .unwrap()
+        .join("operator.toml");
+    let before = std::fs::read_to_string(&path).unwrap();
+    let mut file: toml_edit::DocumentMut = before.parse().unwrap();
+    let template = file["pending"][0].as_table().unwrap().clone();
+    let entries = file["pending"].as_array_of_tables_mut().unwrap();
+    while entries.len() < 4096 {
+        let mut entry = template.clone();
+        entry["approval_nonce"] = toml_edit::value(format!("capacity{:014}", entries.len()));
+        entries.push(entry);
+    }
+    std::fs::write(&path, file.to_string()).unwrap();
+    (path, before)
+}
+
+/// A first preparation whose record opens and whose inbox entry write then
+/// refuses leaves the record without an entry, as a crash between the two
+/// writes does. The retry on either route queues a new entry.
+///
+/// On a canonical record the entry spans the decision's whole lifetime and
+/// ends with the record's waiting window, so the consent to the stored intent
+/// admits the commit. On an envelope record the entry starts at the retry and
+/// ends with the window.
+#[tokio::test]
+#[serial_test::serial(keyring, mainnet_clock)]
+#[serial_test::serial]
+async fn public_retry_after_a_lost_first_entry_completes() {
+    use stellar_agent_network::policy_state::{
+        ApprovalStatus, BusinessId, OperationStatus, SlotKind,
+    };
+    for (first_toolset, retry_toolset) in
+        [(false, false), (false, true), (true, true), (true, false)]
+    {
+        let label = format!("first_toolset={first_toolset} retry_toolset={retry_toolset}");
+        let run = Run::new(
+            "allow",
+            "require_approval",
+            &["propose-transaction", "sign-payment"],
+        )
+        .await;
+        run.grant(DESTINATIONS[0].0);
+        let mut other = Tool::Pay.prepare_args(&run.f);
+        other["amount_in_stroops"] = "9".into();
+        let other = run.prepare_route(&other, false).await;
+        assert_eq!(other["ok"], true, "{label}: {other}");
+        let (path, before) = fill_inbox(&run);
+        let args = Tool::Pay.prepare_args(&run.f);
+        // An envelope record's window ends with its envelope's deadline, about
+        // 120 seconds after a preparation 75 seconds earlier, inside the
+        // retry's 60-second decision and past the commit's 30-second margin.
+        let opened_at = now_unix_ms().unwrap() - if first_toolset { 75_000 } else { 0 };
+        let network = stellar_agent_network::mainnet::clock::set_now_ms_for_test(opened_at);
+        let policy = stellar_agent_core::policy::v1::criteria::state_store::set_query_time_for_test(
+            opened_at,
+        );
+        let lost = if first_toolset {
+            run.f
+                .server
+                .call_stellar_toolset_invoke(StellarToolsetInvokeArgs {
+                    toolset: TOOLSET.into(),
+                    action: "stellar_pay".into(),
+                    chain_id: Some("stellar:mainnet".into()),
+                    args: args.clone(),
+                })
+                .await
+        } else {
+            Tool::Pay.prepare_result(&run.f.server, &args).await
+        };
+        drop((network, policy));
+        assert!(
+            !lost
+                .as_ref()
+                .is_ok_and(|result| result.is_error != Some(true)),
+            "{label}: the first entry write refuses"
+        );
+        let id = BusinessId::parse(args["business_id"].as_str().unwrap()).unwrap();
+        let status =
+            OperationStatus::new(&run.f.server.window_store, run.f.server.security_profile());
+        let opened = status.view(&id).unwrap().unwrap();
+        assert_eq!(
+            opened.slot_kind,
+            if first_toolset {
+                SlotKind::Envelope
+            } else {
+                SlotKind::Canonical
+            },
+            "{label}"
+        );
+        let approvals =
+            ApprovalStatus::new(&run.f.server.window_store, run.f.server.security_profile());
+        assert!(
+            approvals
+                .find_by_operation(opened.operation_id)
+                .unwrap()
+                .is_none(),
+            "{label}: no approval record opened"
+        );
+        std::fs::write(&path, before).unwrap();
+        let retried = if retry_toolset {
+            run.f
+                .server
+                .call_stellar_toolset_invoke(StellarToolsetInvokeArgs {
+                    toolset: TOOLSET.into(),
+                    action: "stellar_pay".into(),
+                    chain_id: Some("stellar:mainnet".into()),
+                    args: args.clone(),
+                })
+                .await
+        } else {
+            Tool::Pay.prepare_result(&run.f.server, &args).await
+        }
+        .map(|result| wire(&result))
+        .map_err(|error| error.message.to_string());
+        assert!(
+            retried.as_ref().is_ok_and(|body| body["ok"] == true),
+            "{label}: the retry queues a new entry: {retried:?}"
+        );
+        let prepared = retried.unwrap();
+        let nonce = prepared["data"]["approval"]["approval_nonce"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let entry = run
+            .pending()
+            .into_iter()
+            .find(|entry| entry.approval_nonce == nonce)
+            .unwrap();
+        let (created, waiting_end) = (
+            opened.created_at_ms.unwrap(),
+            opened.waiting_expires_at_ms.unwrap(),
+        );
+        assert_eq!(entry.expires_at_unix_ms, waiting_end, "{label}");
+        if first_toolset {
+            assert!(
+                entry.created_at_unix_ms > created
+                    && entry.expires_at_unix_ms < entry.created_at_unix_ms + 60_000,
+                "{label}: an envelope record's entry starts at its retry and ends with the window"
+            );
+        } else {
+            assert_eq!(
+                (entry.created_at_unix_ms, waiting_end - created),
+                (created, 60_000),
+                "{label}: a canonical record's entry spans the decision's lifetime"
+            );
+        }
+        let mut commit = run.commit_args(args.clone(), &prepared);
+        commit["approval_nonce"] = nonce.clone().into();
+        commit["approval_attestation"] = run.f.attest(&entry).into();
+        let sent = run.commit_route(commit, retry_toolset).await;
+        assert_eq!(sent["ok"], true, "{label}: {sent}");
+        assert_eq!(run.control.sent().len(), 1, "{label}");
+        assert_eq!(
+            approvals
+                .find_by_operation(opened.operation_id)
+                .unwrap()
+                .unwrap()
+                .record
+                .nonce,
+            nonce,
+            "{label}"
+        );
+    }
+}
+
+/// The on-chain deadline, in Unix seconds, of the unsigned or signed
+/// envelope `xdr`.
+fn envelope_deadline(xdr: &str) -> u64 {
+    use stellar_xdr::{Limits, Preconditions, ReadXdr as _, TransactionEnvelope};
+    let TransactionEnvelope::Tx(envelope) =
+        TransactionEnvelope::from_xdr_base64(xdr, Limits::none()).unwrap()
+    else {
+        panic!("a classic envelope")
+    };
+    let Preconditions::Time(bounds) = envelope.tx.cond else {
+        panic!("a deadline")
+    };
+    bounds.max_time.0
+}
+
+/// A canonical payment prepared under an approval of a 60-second rule
+/// stores a deadline strictly before that decision's end, the last whole
+/// second before it, which every authority its commit resolves outlasts. The
+/// toolset commit of that envelope under the consent signs it unchanged.
+#[tokio::test]
+#[serial_test::serial(keyring, mainnet_clock)]
+#[serial_test::serial]
+async fn public_canonical_preparation_stores_a_deadline_its_toolset_commit_signs() {
+    let run = Run::new(
+        "allow",
+        "require_approval",
+        &["propose-transaction", "sign-payment"],
+    )
+    .await;
+    run.grant(DESTINATIONS[0].0);
+    let args = Tool::Pay.prepare_args(&run.f);
+    let prepared = run.prepare_route(&args, false).await;
+    assert_eq!(prepared["ok"], true, "{prepared}");
+    let entry = run.pending().pop().unwrap();
+    let end_ms = entry.created_at_unix_ms + 60_000;
+    assert_eq!(entry.expires_at_unix_ms, end_ms, "the decision's 60 s end");
+    let deadline = envelope_deadline(prepared["data"]["envelope_xdr"].as_str().unwrap());
+    assert_eq!(
+        deadline,
+        (end_ms - 1) / 1_000,
+        "the stored deadline is the last whole second before the decision's end"
+    );
+    assert!(deadline * 1_000 < end_ms);
+    let mut commit = run.commit_args(args, &prepared);
+    commit["approval_nonce"] = entry.approval_nonce.clone().into();
+    commit["approval_attestation"] = run.f.attest(&entry).into();
+    let sent = run.commit_route(commit, true).await;
+    assert_eq!(sent["ok"], true, "{sent}");
+    let sent = run.control.sent();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        envelope_deadline(&sent[0]),
+        deadline,
+        "the toolset commit signs the stored envelope"
+    );
+}
+
+/// An authority a toolset commit resolves after the preparation, here the
+/// outer consent of a 60-second rule queued at the commit, can end before
+/// the deadline a direct preparation under `Allow` stored. The toolset
+/// commit then refuses before signing with the resolver's code and sends
+/// nothing, and the direct commit of the same record sends.
+#[tokio::test]
+#[serial_test::serial(keyring, mainnet_clock)]
+#[serial_test::serial]
+async fn public_toolset_commit_under_a_shorter_later_authority_refuses_and_direct_sends() {
+    let run = Run::new(
+        "require_approval",
+        "allow",
+        &["propose-transaction", "sign-payment"],
+    )
+    .await;
+    run.grant(DESTINATIONS[0].0);
+    let args = Tool::Pay.prepare_args(&run.f);
+    let prepared = run.prepare_route(&args, false).await;
+    assert_eq!(prepared["ok"], true, "{prepared}");
+    let deadline = envelope_deadline(prepared["data"]["envelope_xdr"].as_str().unwrap());
+    let proofless = run.commit_args(args.clone(), &prepared);
+    let queued = run.commit_route(proofless.clone(), true).await;
+    assert_eq!(
+        queued["error"]["code"], "policy.approval_required",
+        "{queued}"
+    );
+    let entry = run.pending().pop().unwrap();
+    assert!(
+        entry.expires_at_unix_ms <= deadline * 1_000,
+        "the outer consent ends before the stored deadline"
+    );
+    let mut commit = proofless.clone();
+    commit["approval_nonce"] = entry.approval_nonce.clone().into();
+    commit["approval_attestation"] = run.f.attest(&entry).into();
+    let refused = run.commit_route(commit, true).await;
+    assert_eq!(
+        refused["error"]["code"], "network.mainnet_authorization_refused",
+        "{refused}"
+    );
+    assert!(run.control.sent().is_empty());
+    let sent = run.commit_route(proofless, false).await;
+    assert_eq!(sent["ok"], true, "{sent}");
+    assert_eq!(run.control.sent().len(), 1);
 }

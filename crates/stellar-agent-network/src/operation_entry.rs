@@ -584,6 +584,19 @@ pub struct CanonicalRebuild {
     pub cross_check: crate::cross_check::CrossCheckOutcome,
 }
 
+/// The deadline, in Unix seconds, of a canonical envelope built at `now_ms`
+/// under an authority that ends at `authority_end_ms`: the earlier of
+/// [`MAINNET_CLASSIC_DEADLINE_SECONDS`] after `now_ms` and the last whole
+/// second strictly before that end, as the resolver requires.
+///
+/// [`MAINNET_CLASSIC_DEADLINE_SECONDS`]: crate::mainnet::resolve::MAINNET_CLASSIC_DEADLINE_SECONDS
+#[must_use]
+pub fn canonical_max_time_s(now_ms: u64, authority_end_ms: u64) -> u64 {
+    (now_ms / 1000)
+        .saturating_add(crate::mainnet::resolve::MAINNET_CLASSIC_DEADLINE_SECONDS)
+        .min(authority_end_ms.saturating_sub(1) / 1000)
+}
+
 /// Rebuilds the envelope of a canonical intent from reads made now.
 ///
 /// The reads run in order: the readiness check, the source account, the fee
@@ -640,9 +653,8 @@ pub async fn rebuild_canonical(
         }));
     }
     require_sequence_successor(account.sequence_number)?;
-    let max_time_s = (crate::mainnet::clock::now_ms()? / 1000)
-        .saturating_add(crate::mainnet::resolve::MAINNET_CLASSIC_DEADLINE_SECONDS)
-        .min(request.authority_end_ms.saturating_sub(1) / 1000);
+    let max_time_s =
+        canonical_max_time_s(crate::mainnet::clock::now_ms()?, request.authority_end_ms);
     let envelope = intent_envelope(
         intent,
         request.network.network_passphrase(),

@@ -295,7 +295,19 @@ policy's `RequireApproval` requires consent bound to the executed envelope.
 Preparation requires `propose-transaction` without a signing grant. Commit
 checks its own grant, retains its lease through submission, and stops at the
 earliest policy or grant end. Limits from both policies account for one payment.
-Direct and toolset retries retain the same bound consent and original interval.
+On mainnet one payment has one record per business ID, and its first
+preparation decides its kind: `stellar_pay` stores the intent, a toolset
+preparation the exact envelope. Either route resumes that record, with its
+bound consent and original interval. Only a `stellar_pay` payment on mainnet,
+committed directly, commits after the prepared envelope's deadline. A toolset
+commit keeps the 120-second nonce lifetime, and on a `stellar_pay` record it
+signs only an envelope of that record's intent; any other refuses
+`operation.business_id_conflict`. A `stellar_pay` preparation stores an
+envelope whose deadline lies before its decision's end. An outer approval
+rule shorter than the 120-second classic deadline makes the toolset commit
+of a direct-first payment refuse with `network.mainnet_authorization_refused`;
+commit the record directly instead, or give the outer rule at least 120
+seconds.
 Keep the same business ID for recovery; reconcile an uncertain send by its hash.
 
 A gated payment call that meets an install, uninstall, or grant write in

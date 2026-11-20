@@ -335,9 +335,24 @@ limits from both policies. Complete M destinations retain their mux ID in consen
 submitted transactions, results and receipts. Payment audit rows hash the complete
 destination and contain its redaction rather than its raw value.
 
-Direct and toolset routes reuse the same retained payment consent when the
-verified policy, operation and envelope match. Retrying does not renew its
-original interval. A policy-required commit queues before consuming its protocol
+On mainnet one payment has one record per business ID, and its first
+preparation decides the record's kind. A `stellar_pay` preparation stores the
+lasting payment intent; a toolset preparation stores the exact envelope.
+Either route resumes that record and reuses its retained consent. Retrying
+does not renew its original interval. A commit after the prepared envelope's
+deadline applies only to a payment that `stellar_pay` prepared on mainnet,
+committed directly. A toolset commit verifies its protocol nonce, so it keeps
+the 120-second nonce lifetime. A toolset commit of a `stellar_pay` record signs
+only an envelope prepared for that record's intent; any other envelope refuses
+`operation.business_id_conflict` and sends nothing. The envelope a mainnet
+`stellar_pay` preparation stores carries the deadline its commit would
+compute: the earlier of 120 seconds after the preparation and the last whole
+second before the end of the preparation's decision. A toolset commit signs
+that envelope unchanged when the authority it adds outlasts that deadline,
+such as an outer approval rule of at least 120 seconds. An outer approval
+rule shorter than the 120-second classic deadline makes the toolset commit of
+a direct-first payment refuse with `network.mainnet_authorization_refused`
+and send nothing; a direct commit of the record completes it. A policy-required commit queues before consuming its protocol
 nonce; an unknown nonce queues nothing on mainnet. On mainnet the queued consent
 binds the operation that the running server prepared for the nonce. After a
 server restart, a commit without approval proof for an earlier preparation

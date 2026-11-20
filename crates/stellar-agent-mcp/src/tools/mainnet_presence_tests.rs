@@ -1131,13 +1131,9 @@ mod producers {
                 } else {
                     let dropped = case == "dropped";
                     // The consent matches the record the tool prepared: an
-                    // envelope approval for a payment, an intent-digest
-                    // approval for the three canonical tools.
-                    if tool == Tool::Pay {
-                        run.delivery_fixture(dropped, dropped);
-                    } else {
-                        run.canonical_delivery_fixture(dropped, dropped);
-                    }
+                    // intent-digest approval, as each of the four tools
+                    // prepares a canonical record on mainnet.
+                    run.canonical_delivery_fixture(dropped, dropped);
                     let result = run.commit().await;
                     if dropped {
                         assert_eq!(
@@ -1169,6 +1165,44 @@ mod producers {
                 x402_consent_route(&run, authenticated, case).await;
             }
         }
+    }
+
+    /// A published canonical payment builds its inbox entry over the stored
+    /// intent before the record reserves: the entry and the record bind the
+    /// intent digest, and the entry keeps its recovery binding.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn a_published_canonical_payment_binds_the_intent_digest() {
+        use stellar_agent_core::approval::subject::SubjectKind;
+        let run = ClassicRun::unconsented(Tool::Pay).await;
+        let _published = publish_scope(&run.f.server, kind(Tool::Pay), true, MAX_SLOTS - 1);
+        let mut args = Tool::Pay.prepare_args(&run.f);
+        args["business_id"] = serde_json::json!(crate::tools::common::tests::fresh_business_id());
+        let response = wire(&Tool::Pay.prepare(&run.f.server, &args).await);
+        assert_eq!(response["ok"], true, "{response}");
+        let nonce = response["data"]["approval"]["approval_nonce"]
+            .as_str()
+            .unwrap();
+        let entry = stored_approval(&run.f, nonce).unwrap();
+        assert_eq!(entry.subject_kind, SubjectKind::IntentDigest);
+        let record = status(&run).find_by_nonce(nonce).unwrap().unwrap().record;
+        assert_eq!(record.subject_kind, SubjectKind::IntentDigest);
+        let operation =
+            OperationStatus::new(&run.f.server.window_store, run.f.server.security_profile())
+                .view(&BusinessId::parse(args["business_id"].as_str().unwrap()).unwrap())
+                .unwrap()
+                .unwrap();
+        assert_eq!(record.subject, operation.intent_digest);
+        assert!(
+            matches!(
+                PendingApprovalStore::open(store_path(&run.f))
+                    .unwrap()
+                    .check_payment_recovery_at(nonce, entry.expires_at_unix_ms),
+                Err(stellar_agent_core::approval::ApprovalError::Expired)
+            ),
+            "the published payment keeps its recovery binding"
+        );
     }
 
     /// A published open keeps the prepared decision. A published retry
@@ -1941,8 +1975,9 @@ mod producers {
             let record = record.unwrap().record;
             let signed = run.entry.expires_at_unix_ms - run.entry.created_at_unix_ms;
             assert!(
-                signed <= 120_000,
-                "the operation deadline shortens the 300-second request: {signed}"
+                (299_000..=300_000).contains(&signed),
+                "a canonical operation has no envelope deadline, so the \
+                 300-second request holds: {signed}"
             );
             assert_eq!(
                 record.rule_ttl_ms, signed,
@@ -1950,8 +1985,25 @@ mod producers {
             );
             assert_eq!(record.kind, ApprovedKind::Payment);
             assert_eq!(
+                record.subject_kind,
+                stellar_agent_core::approval::subject::SubjectKind::IntentDigest
+            );
+            let id = BusinessId::parse(run.args["business_id"].as_str().unwrap()).unwrap();
+            assert_eq!(
                 record.subject,
-                mainnet_consent_subject(&run.entry, &binding()).unwrap()
+                OperationStatus::new(&run.f.server.window_store, run.f.server.security_profile())
+                    .view(&id)
+                    .unwrap()
+                    .unwrap()
+                    .intent_digest,
+                "the record binds the intent digest"
+            );
+            assert_eq!(
+                stellar_agent_core::approval::subject::approval_subject_classic(
+                    run.args["envelope_xdr"].as_str().unwrap()
+                ),
+                mainnet_consent_subject(&run.entry, &binding()).unwrap(),
+                "the consent challenge is the stored envelope's hash"
             );
             assert_eq!(
                 (record.created_at_ms, record.waiting_expires_at_ms),
@@ -2035,6 +2087,9 @@ mod producers {
             drop(run);
 
             // A handle retained while the record was live observes its expiry.
+            // The payment producer's envelope record waits until the envelope
+            // deadline, after the approval's signed end, so its recovery
+            // binding is retained past that end.
             let mut run = ClassicRun::with(
                 Tool::Pay,
                 |raw| {
@@ -2047,18 +2102,18 @@ mod producers {
                 |_| {},
                 |_| {},
             )
+            .await
+            .pay_envelope_record()
             .await;
             let id = BusinessId::parse(run.args["business_id"].as_str().unwrap()).unwrap();
-            let digest =
-                OperationStatus::new(&run.f.server.window_store, run.f.server.security_profile())
-                    .view(&id)
-                    .unwrap()
-                    .unwrap()
-                    .intent_digest;
-            let ClassicEntry::Resume(handle) = run
+            let Some(stellar_agent_network::policy_state::LookupOutcome::Resumable(handle)) = run
                 .f
                 .server
-                .operation_step(|recorder| operation_entry::lookup_classic(recorder, &id, &digest))
+                .operation_step(|recorder| {
+                    recorder
+                        .lookup(&id)
+                        .map_err(operation_entry::operation_refusal)
+                })
                 .unwrap()
             else {
                 panic!("a live operation resumes")
@@ -3246,7 +3301,9 @@ async fn mainnet_commit_rechecks_consent_after_policy_change() {
         "unsigned edit",
         "absent pin",
     ] {
-        let mut run = ClassicRun::new(Tool::Pay).await;
+        // The proof gate re-checks consent on the envelope route; a stored
+        // canonical intent names the earlier policy and no longer validates.
+        let mut run = ClassicRun::new(Tool::Pay).await.envelope_route();
         let raw = run.f.raw.replace("sequence = 7", "sequence = 8");
         match change {
             "revoked credential" => {
@@ -3310,7 +3367,7 @@ async fn mainnet_commit_rechecks_consent_after_policy_change() {
         assert_classic_unsigned(change, &run, &run.entry.clone());
     }
 
-    let run = ClassicRun::new(Tool::Pay).await;
+    let run = ClassicRun::new(Tool::Pay).await.envelope_route();
     let changed = {
         use stellar_xdr::{Limits, ReadXdr as _, TransactionEnvelope, WriteXdr as _};
         let TransactionEnvelope::Tx(mut envelope) = TransactionEnvelope::from_xdr_base64(
@@ -4075,6 +4132,8 @@ async fn mcp_approve_browser_round_trip_records_before_signing() {
 
 /// The mainnet approval gate decides a proof from the approval's durable
 /// record and the call's admitted operation; the inbox grants nothing.
+/// [`pay_gate`] runs the envelope route's authority wrapper, so a payment
+/// run it decides commits an envelope record.
 mod durable_gate {
     use super::*;
     use crate::tools::common::{SuppliedProof, approval_consumed_error, mainnet_authority};
@@ -4195,7 +4254,7 @@ mod durable_gate {
         }
 
         for case in ["locked", "contradictory"] {
-            let run = ClassicRun::new(Tool::Pay).await;
+            let run = ClassicRun::new(Tool::Pay).await.envelope_route();
             if case == "contradictory" {
                 edit_stored(&run.f, &run.entry.approval_nonce, |entry| {
                     let expires = entry["expires_at_unix_ms"].as_integer().unwrap();
@@ -4212,7 +4271,7 @@ mod durable_gate {
             assert_eq!(result["ok"], true, "{case}: {result}");
         }
 
-        let run = ClassicRun::new(Tool::Pay).await;
+        let run = ClassicRun::new(Tool::Pay).await.envelope_route();
         let operation = Some(run.operation_id());
         let (other_args, _) = run.prepare_again().await;
         let uniform = approval_required_indistinguishable(PROFILE);
@@ -4354,7 +4413,7 @@ mod durable_gate {
     #[serial_test::serial(keyring)]
     #[serial_test::serial]
     async fn mcp_reuse_keeps_receipt_and_operation_boundaries() {
-        let run = ClassicRun::new(Tool::Pay).await;
+        let run = ClassicRun::new(Tool::Pay).await.envelope_route();
         let own = run.operation_id();
         let other_id = run.bind_new_business_id();
         let other =
@@ -4399,7 +4458,7 @@ mod durable_gate {
             "the receipt refuses before the record read"
         );
 
-        let run = ClassicRun::new(Tool::Pay).await;
+        let run = ClassicRun::new(Tool::Pay).await.envelope_route();
         let receipts = stellar_agent_core::profile::receipt::ReceiptStore::open(PROFILE).unwrap();
         std::fs::write(receipts.file_path().unwrap(), "{unparsable").unwrap();
         let reads = facts_reads(&run);
@@ -4491,7 +4550,7 @@ mod durable_gate {
     #[serial_test::serial(keyring)]
     #[serial_test::serial]
     async fn policy_path_reads_no_record() {
-        let run = ClassicRun::allowed(Tool::Pay).await;
+        let run = ClassicRun::allowed(Tool::Pay).await.envelope_route();
         let operation = Some(run.operation_id());
         let reads = facts_reads(&run);
         let gate = pay_gate(&run, SuppliedProof::default(), operation).await;
@@ -4529,7 +4588,7 @@ mod durable_gate {
     async fn mcp_durable_verifier_uses_fresh_floor() {
         use stellar_agent_core::approval::witness::ApprovedKind;
         use stellar_agent_network::policy_state::approvals::ConsentEvidenceEnforcementGuard;
-        let run = ClassicRun::new(Tool::Pay).await;
+        let run = ClassicRun::new(Tool::Pay).await.envelope_route();
         let server = &run.f.server;
         let profile = server.security_profile();
         let nonce = &run.entry.approval_nonce;

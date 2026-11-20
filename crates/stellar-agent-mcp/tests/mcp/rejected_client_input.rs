@@ -369,8 +369,10 @@ async fn a_rejected_argument_stays_out_of_the_tool_result() {
 
 /// Off mainnet every classic commit requires its envelope, protocol nonce
 /// and nonce expiry. A commit that omits one answers the same fixed tool
-/// result on all four tools, the payment commit's deserialization refusal
-/// included; a present empty envelope refuses `simulation.divergence`.
+/// result on all four tools; a present empty envelope refuses
+/// `simulation.divergence`. A payment commit with a present empty nonce or a
+/// zero expiry beside an envelope that does not decode keeps that refusal
+/// too.
 #[tokio::test]
 #[serial_test::serial]
 async fn a_classic_commit_without_its_envelope_fields_answers_the_fixed_refusal() {
@@ -415,15 +417,19 @@ async fn a_classic_commit_without_its_envelope_fields_answers_the_fixed_refusal(
                 "{tool} {field}: {response}"
             );
         }
-        if tool != "stellar_pay_commit" {
+        let mut present = vec![("envelope_xdr", json!(""))];
+        if tool == "stellar_pay_commit" {
+            present.extend([("nonce", json!("")), ("expires_at_unix_ms", json!(0))]);
+        }
+        for (field, value) in present {
             let mut arguments = complete.clone();
-            arguments["envelope_xdr"] = json!("");
+            arguments[field] = value;
             let response = tool_response(tool, arguments).await;
             let text = response["result"]["content"][0]["text"].as_str().unwrap();
             let envelope: Value = serde_json::from_str(text).unwrap();
             assert_eq!(
                 envelope["error"]["code"], "simulation.divergence",
-                "{tool}: {response}"
+                "{tool} {field}: {response}"
             );
         }
     }

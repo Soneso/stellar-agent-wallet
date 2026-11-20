@@ -450,15 +450,29 @@ async fn public_payment_crashes_preserve_recovery_at_every_durable_write() {
         [false, true]
             .into_iter()
             .flat_map(|first| {
+                // Every cut inside the consent write refuses as an unrecorded
+                // consent. A direct-first record is canonical: its
+                // authorization is minted inside its attempt's begin
+                // (submission_record.rs:458-463), so no cut leaves an
+                // unclaimed authorization that consumes the approval.
+                let unclaimed: &[&str] = if first {
+                    &[
+                        "window/5/awaiting_approval policy.approval_consumed",
+                        "window/4/awaiting_approval policy.approval_consumed",
+                    ]
+                } else {
+                    &[]
+                };
                 [
                     "approval/Renamed policy.approval_required",
                     "approval/FileSynced policy.approval_required",
                     "approval/DirectorySynced policy.approval_required",
                     "window/4/awaiting_approval policy.approval_required",
-                    "window/5/awaiting_approval policy.approval_consumed",
-                    "window/4/awaiting_approval policy.approval_consumed",
                 ]
+                .iter()
+                .chain(unclaimed)
                 .map(|cut| format!("toolset_first={first} {cut}"))
+                .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>(),
         "only the unrecorded consent and the unclaimed authorization refuse the retry"
@@ -917,7 +931,7 @@ async fn prove_absence(run: &Run) {
 #[serial_test::serial]
 async fn public_consumed_preparation_refuses_before_queueing() {
     let run = Run::with_recording("require_approval", "allow", &["propose-transaction", "sign-payment"],
-        |raw| raw + "\n[[rules]]\nmatch = { tool = \"stellar_transaction_status\", chain = \"stellar:mainnet\" }\ncriteria = []\ndecision = \"allow\"\n", true).await;
+        |raw| super::outer_lifetime(&raw, 120) +"\n[[rules]]\nmatch = { tool = \"stellar_transaction_status\", chain = \"stellar:mainnet\" }\ncriteria = []\ndecision = \"allow\"\n", true).await;
     let args = Tool::Pay.prepare_args(&run.f);
     run.grant(args["destination"].as_str().unwrap());
     run.control

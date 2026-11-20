@@ -1,11 +1,13 @@
-//! Canonical activation of the MCP create-account, trustline and claim tools.
+//! Canonical activation of the MCP payment, create-account, trustline and
+//! claim tools.
 //!
 //! On mainnet these preparations store the lasting intent under the business
 //! id and open an intent-digest approval only when one is required. Their
 //! commits look the id up, rebuild the envelope from the stored intent and
 //! sign without the preparation's process nonce, envelope or expiry. Payment
-//! keeps its envelope record and its own producer. An envelope record keeps
-//! the envelope route, which requires all three fields.
+//! opens its approval through its own producer, which keeps the recovery
+//! binding of the prepared envelope. An envelope record keeps the envelope
+//! route, which requires all three fields.
 
 #![allow(
     clippy::unwrap_used,
@@ -22,10 +24,9 @@ use stellar_agent_network::policy_state::{
     OperationView, SlotKind,
 };
 
-use super::common::tests::mainnet::{ClassicRun, Fixture, Tool, authorizations, fixture_entries};
-
-/// The three tools whose mainnet preparations store a canonical intent.
-const CANONICAL: [Tool; 3] = [Tool::CreateAccount, Tool::Claim, Tool::Trustline];
+use super::common::tests::mainnet::{
+    ClassicRun, Fixture, Tool, authorizations, fixture_entries, wire,
+};
 
 /// The operation view under the run's business id.
 fn view(run: &ClassicRun) -> OperationView {
@@ -77,7 +78,11 @@ fn expected_payload(tool: Tool, f: &Fixture) -> IntentPayload {
             asset: IntentAsset::Native,
             amount_stroops: 10,
         },
-        Tool::Pay => panic!("payment stores no canonical intent"),
+        Tool::Pay => IntentPayload::Pay {
+            destination: f.envelope.destination().to_owned(),
+            asset: IntentAsset::Native,
+            amount_stroops: 10,
+        },
     }
 }
 
@@ -92,16 +97,20 @@ fn nonce_free(run: &ClassicRun) -> Value {
 }
 
 /// Each canonical preparation stores the full lasting intent and, under an
-/// approval requirement, opens one intent-digest record of that intent; a
-/// retry keeps the one operation and approval. Under `Allow` no approval
-/// record opens. Payment keeps its envelope record and its producer's
-/// envelope-text record.
+/// approval requirement, opens one intent-digest record of that intent over
+/// an intent-digest inbox entry; a retry keeps the one operation and
+/// approval. Under `Allow` no approval record opens.
 #[tokio::test]
 #[serial_test::serial(keyring)]
 #[serial_test::serial]
-async fn mcp_three_classics_prepare_canonical_records() {
-    for tool in CANONICAL {
+async fn mcp_four_classics_prepare_canonical_records() {
+    for tool in Tool::ALL {
         let run = ClassicRun::new(tool).await;
+        assert_eq!(
+            run.entry.subject_kind,
+            SubjectKind::IntentDigest,
+            "{tool:?}"
+        );
         let operation = view(&run);
         assert_eq!(operation.slot_kind, SlotKind::Canonical, "{tool:?}");
         let intent = stored_intent(&run);
@@ -161,16 +170,6 @@ async fn mcp_three_classics_prepare_canonical_records() {
             "{tool:?}: Allow opens no approval record"
         );
     }
-    let pay = ClassicRun::new(Tool::Pay).await;
-    let operation = view(&pay);
-    assert_eq!(operation.slot_kind, SlotKind::Envelope, "payment");
-    let record = ApprovalStatus::new(&pay.f.server.window_store, pay.f.server.security_profile())
-        .find_by_operation(operation.operation_id)
-        .unwrap()
-        .unwrap()
-        .record;
-    assert_eq!(record.subject_kind, SubjectKind::EnvelopeText, "payment");
-    assert_eq!(record.nonce, pay.entry.approval_nonce, "payment");
 }
 
 /// The transaction of the signed envelope `xdr`.
@@ -183,13 +182,13 @@ fn sent_transaction(xdr: &str) -> stellar_xdr::Transaction {
 }
 
 /// A canonical commit pays the fee per operation of the envelope its
-/// preparation stored: create-account and trustline prepared at 200 stroops
-/// send 200.
+/// preparation stored: a payment, create-account and trustline prepared at
+/// 200 stroops send 200.
 #[tokio::test]
 #[serial_test::serial(keyring)]
 #[serial_test::serial]
 async fn a_canonical_commit_pays_the_prepared_fee() {
-    for tool in [Tool::CreateAccount, Tool::Trustline] {
+    for tool in [Tool::Pay, Tool::CreateAccount, Tool::Trustline] {
         let run =
             ClassicRun::with(tool, |raw| raw, |_| {}, |args| args["fee"] = json!("200")).await;
         assert_eq!(
@@ -284,7 +283,7 @@ async fn consecutive_canonical_commits_wait_for_the_sequence_floor() {
 #[serial_test::serial]
 async fn a_late_canonical_commit_takes_a_fresh_sequence_and_deadline() {
     use std::sync::atomic::Ordering;
-    for tool in CANONICAL {
+    for tool in Tool::ALL {
         for required in [true, false] {
             let context = format!("{tool:?} approval required {required}");
             let run = if required {
@@ -356,7 +355,7 @@ async fn transaction_status(run: &ClassicRun, tx_hash: &str) -> Value {
 async fn the_status_call_writes_the_owed_tombstone() {
     use super::common::tests::mainnet::{is_consumed, stored_approval};
     use std::sync::atomic::Ordering;
-    for tool in CANONICAL {
+    for tool in Tool::ALL {
         let run = ClassicRun::with(
             tool,
             |raw| {
@@ -430,13 +429,13 @@ fn stored_record(run: &ClassicRun) -> Value {
 /// non-inclusion from the ledger past the deadline and the source sequence
 /// below the attempt's, and projects it. The nonce-free commit under the
 /// first id then admits a successor attempt under the same approval nonce
-/// and sends it. The row runs for the three tools under both authorities.
+/// and sends it. The row runs for the four tools under both authorities.
 #[tokio::test]
 #[serial_test::serial(keyring, mainnet_clock)]
 #[serial_test::serial]
 async fn a_same_nonce_successor_admits_after_a_checked_non_inclusion() {
     use std::sync::atomic::Ordering;
-    for tool in CANONICAL {
+    for tool in Tool::ALL {
         for required in [true, false] {
             let context = format!("{tool:?} approval required {required}");
             let run = if required {
@@ -516,13 +515,13 @@ async fn a_same_nonce_successor_admits_after_a_checked_non_inclusion() {
 /// the transaction as not found, the recovery pass proves nothing: the
 /// record stays of unknown outcome, the commit answers with its stored state,
 /// sends nothing, and the record keeps one attempt. The row runs for the
-/// three tools under both authorities.
+/// four tools under both authorities.
 #[tokio::test]
 #[serial_test::serial(keyring, mainnet_clock)]
 #[serial_test::serial]
 async fn a_commit_before_the_first_deadline_sends_nothing() {
     use std::sync::atomic::Ordering;
-    for tool in CANONICAL {
+    for tool in Tool::ALL {
         for required in [true, false] {
             let context = format!("{tool:?} approval required {required}");
             let run = if required {
@@ -619,7 +618,7 @@ fn clock_at_millis(millis: u64) -> stellar_agent_core::timefmt::test_clock::Guar
 #[serial_test::serial]
 async fn the_rebuilt_deadline_never_passes_the_approval_authority() {
     let _wallet_clock = clock_at_millis(500);
-    for tool in CANONICAL {
+    for tool in Tool::ALL {
         let run = ClassicRun::new(tool).await;
         let end_ms =
             ApprovalStatus::new(&run.f.server.window_store, run.f.server.security_profile())
@@ -655,7 +654,7 @@ async fn the_rebuilt_deadline_never_passes_the_approval_authority() {
 #[serial_test::serial]
 async fn the_rebuilt_deadline_never_passes_the_policy_authority() {
     let _wallet_clock = clock_at_millis(0);
-    for tool in CANONICAL {
+    for tool in Tool::ALL {
         let run = ClassicRun::allowed(tool).await;
         let rebuild_ms = stellar_agent_core::timefmt::now_unix_ms().unwrap() + 540_000;
         let _clock = move_mainnet_clock(&run, rebuild_ms);
@@ -692,7 +691,7 @@ async fn the_rebuilt_deadline_never_passes_the_policy_authority() {
 #[serial_test::serial(keyring, mainnet_clock)]
 #[serial_test::serial]
 async fn a_first_rebuild_at_the_authority_end_rebuilds_under_it() {
-    for tool in CANONICAL {
+    for tool in Tool::ALL {
         let run = ClassicRun::allowed(tool).await;
         let evaluated_ms = stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1_000 * 1_000;
         let end_ms = evaluated_ms + 600_000;
@@ -793,6 +792,45 @@ async fn a_successor_stays_inside_the_record_execution_window() {
     assert_eq!(view(&run).attempts, 2);
 }
 
+/// A rebuilt deadline is the last whole second before the authority's end
+/// when that end comes first. The policy clock stands 30 seconds behind the
+/// host, on a whole second plus 500 ms, so the commit decision's governing
+/// end, 600 seconds later, ends both authorities: under an approval it comes
+/// before the consent's execution end. A commit 60 seconds before that end
+/// sends the whole second before it.
+#[tokio::test]
+#[serial_test::serial(keyring, mainnet_clock)]
+#[serial_test::serial]
+async fn the_rebuilt_deadline_is_the_last_whole_second_before_the_authority_end() {
+    for tool in Tool::ALL {
+        for required in [true, false] {
+            let context = format!("{tool:?} approval required {required}");
+            let run = if required {
+                ClassicRun::new(tool).await
+            } else {
+                ClassicRun::allowed(tool).await
+            };
+            let host_ms = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+            let policy_ms = (host_ms / 1_000 - 30) * 1_000 + 500;
+            let end_ms = policy_ms + 600_000;
+            let _policy =
+                stellar_agent_core::policy::v1::criteria::state_store::set_query_time_for_test(
+                    policy_ms,
+                );
+            let _clock = move_mainnet_clock(&run, end_ms - 60_000);
+            let result = run.commit_with(nonce_free(&run)).await;
+            assert_eq!(result["ok"], true, "{context}: {result}");
+            let sent = run.control.sent();
+            assert_eq!(sent.len(), 1, "{context}");
+            assert_eq!(
+                sent_deadline(&sent[0]),
+                end_ms / 1_000,
+                "{context}: the last whole second before the authority's end"
+            );
+        }
+    }
+}
+
 /// Each of `changes` applied to the run's nonce-free commit refuses
 /// `operation.business_id_conflict` and sends nothing.
 async fn assert_conflicts(run: &ClassicRun, changes: &[(&str, Value)], stage: &str) {
@@ -817,12 +855,19 @@ async fn assert_conflicts(run: &ClassicRun, changes: &[(&str, Value)], stage: &s
 #[tokio::test]
 #[serial_test::serial(keyring)]
 #[serial_test::serial]
-async fn mcp_three_classics_restart_without_process_nonce() {
-    for tool in CANONICAL {
+async fn mcp_four_classics_restart_without_process_nonce() {
+    for tool in Tool::ALL {
         let mut run = ClassicRun::new(tool).await;
         run.restart().unwrap();
         let other = stellar_agent_test_support::signed_envelope::account_id_for_seed([9; 32]);
+        let issuer = stellar_agent_test_support::signed_envelope::account_id_for_seed([7; 32]);
         let changes = match tool {
+            Tool::Pay => vec![
+                ("destination", json!(other)),
+                ("amount_in_stroops", json!("11")),
+                ("asset", json!(format!("USD:{issuer}"))),
+                ("memo_text", json!("other")),
+            ],
             Tool::CreateAccount => vec![
                 ("destination", json!(other)),
                 ("starting_balance", json!("2 XLM")),
@@ -832,7 +877,6 @@ async fn mcp_three_classics_restart_without_process_nonce() {
                 ("source_account", json!(other)),
                 ("balance_id", json!("cd".repeat(32))),
             ],
-            Tool::Pay => unreachable!(),
         };
         assert_conflicts(&run, &changes, "waiting").await;
 
@@ -861,7 +905,7 @@ async fn mcp_three_classics_restart_without_process_nonce() {
 #[serial_test::serial(keyring)]
 #[serial_test::serial]
 async fn mcp_canonical_full_path_matrix() {
-    for tool in CANONICAL {
+    for tool in Tool::ALL {
         for required in [true, false] {
             let context = format!("{tool:?} approval required {required}");
             let run = if required {
@@ -1117,7 +1161,7 @@ async fn canonical_refusals_reach_the_mcp_result() {
 #[serial_test::serial(keyring)]
 #[serial_test::serial]
 async fn nonce_free_commits_resolve_their_business_id() {
-    for tool in CANONICAL {
+    for tool in Tool::ALL {
         let run = ClassicRun::allowed(tool).await;
         for (id, code) in [
             (None, "validation.business_id_required"),
@@ -1151,6 +1195,92 @@ async fn nonce_free_commits_resolve_their_business_id() {
         );
         assert_eq!(run.control.count("sendTransaction"), 0, "{tool:?}");
     }
+}
+
+/// A G destination and an M address of it with the ID 0 and with
+/// `u64::MAX` are three lasting intents: each preparation stores the
+/// destination as supplied under its own digest, and its commit sends to
+/// that destination, returns it, and records its hash in the audit leg.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn pay_destination_spellings_are_distinct_intents() {
+    let mut digests = Vec::new();
+    for muxed_id in [None, Some(0), Some(u64::MAX)] {
+        let run = ClassicRun::with(
+            Tool::Pay,
+            |raw| raw,
+            |_| {},
+            |args| {
+                if let Some(id) = muxed_id {
+                    let key = stellar_strkey::ed25519::PublicKey::from_string(
+                        args["destination"].as_str().unwrap(),
+                    )
+                    .unwrap()
+                    .0;
+                    args["destination"] = json!(
+                        stellar_strkey::ed25519::MuxedAccount { ed25519: key, id }
+                            .to_string()
+                            .as_str()
+                    );
+                }
+            },
+        )
+        .await;
+        let destination = run.args["destination"].as_str().unwrap().to_owned();
+        let operation = view(&run);
+        assert_eq!(operation.slot_kind, SlotKind::Canonical, "{destination}");
+        let intent = stored_intent(&run);
+        let IntentPayload::Pay {
+            destination: stored,
+            ..
+        } = intent.payload()
+        else {
+            panic!("a payment intent expected")
+        };
+        assert_eq!(*stored, destination);
+        digests.push(operation.intent_digest);
+        let result = run.commit_with(nonce_free(&run)).await;
+        assert_eq!(result["ok"], true, "{destination}: {result}");
+        assert_eq!(
+            result["data"]["destination"], destination,
+            "{destination}: {result}"
+        );
+        let sent = run.control.sent();
+        assert_eq!(sent.len(), 1, "{destination}");
+        let sent = sent_transaction(&sent[0]);
+        let stellar_xdr::OperationBody::Payment(payment) = &sent.operations[0].body else {
+            panic!("a payment expected")
+        };
+        let sent_destination = match &payment.destination {
+            stellar_xdr::MuxedAccount::Ed25519(key) => stellar_strkey::ed25519::PublicKey(key.0)
+                .to_string()
+                .as_str()
+                .to_owned(),
+            stellar_xdr::MuxedAccount::MuxedEd25519(muxed) => {
+                stellar_strkey::ed25519::MuxedAccount {
+                    ed25519: muxed.ed25519.0,
+                    id: muxed.id,
+                }
+                .to_string()
+                .as_str()
+                .to_owned()
+            }
+        };
+        assert_eq!(sent_destination, destination);
+        let hash = {
+            use sha2::Digest as _;
+            stellar_agent_core::hex::encode(&sha2::Sha256::digest(destination.as_bytes()))
+        };
+        let log = std::fs::read_to_string(&run.f.server.profile.audit_log_path).unwrap();
+        assert!(
+            log.contains(&format!("\"destination_sha256\":\"{hash}\"")),
+            "{destination}: the audit leg records the complete destination's hash"
+        );
+    }
+    digests.sort_unstable();
+    digests.dedup();
+    assert_eq!(digests.len(), 3, "one intent per spelling");
 }
 
 /// The response to one `tools/call` of `name` with `arguments` on a session
@@ -1217,7 +1347,7 @@ async fn transport_call(
 #[serial_test::serial(keyring)]
 #[serial_test::serial]
 async fn envelope_records_keep_the_nonce_contract() {
-    for tool in CANONICAL {
+    for tool in Tool::ALL {
         let run = ClassicRun::new(tool).await.envelope_route();
         for field in ["nonce", "envelope_xdr", "expires_at_unix_ms"] {
             let mut args = run.args.clone();
@@ -1257,4 +1387,90 @@ async fn envelope_records_keep_the_nonce_contract() {
         assert_eq!(operation.slot_kind, SlotKind::Envelope, "{tool:?}");
         assert_eq!(operation.attempts, 0, "{tool:?}");
     }
+}
+
+/// A fault after the payment's inbox entry is written and before its
+/// approval record opens leaves the entry and its recovery binding; after a
+/// restart the retried preparation recovers the same approval nonce, opens
+/// one record over the canonical slot and adds no entry.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn pay_prepare_recovers_its_nonce_after_a_fault_before_the_record_opens() {
+    use stellar_agent_network::policy_state::store::commit_faults::{
+        COMMIT_FAULT_AFTER_COUNTER, COMMIT_FAULT_AFTER_PREPARED, arm_accounting_fault,
+        observe_commit,
+    };
+    fn nonces(run: &ClassicRun) -> Vec<String> {
+        stellar_agent_core::approval::PendingApprovalStore::open(
+            run.f
+                .server
+                .resolve_approval_dir()
+                .unwrap()
+                .join(format!("{}.toml", run.f.server.profile_name_for_approval())),
+        )
+        .unwrap()
+        .snapshot(stellar_agent_core::timefmt::now_unix_ms().unwrap())
+        .into_iter()
+        .map(|entry| entry.approval_nonce)
+        .collect()
+    }
+    fn record(
+        run: &ClassicRun,
+        operation: stellar_agent_network::policy_state::OperationId,
+    ) -> Option<stellar_agent_network::policy_state::ApprovalView> {
+        ApprovalStatus::new(&run.f.server.window_store, run.f.server.security_profile())
+            .find_by_operation(operation)
+            .unwrap()
+    }
+    let mut run = ClassicRun::new(Tool::Pay).await;
+    let before = nonces(&run);
+    let mut args = Tool::Pay.prepare_args(&run.f);
+    args["business_id"] = json!(crate::tools::common::tests::fresh_business_id());
+    // The preparation's first commit opens the operation; the fault stops
+    // the next one, the approval record's open, before its counter moves.
+    let observer = observe_commit(|point| {
+        if point == COMMIT_FAULT_AFTER_COUNTER {
+            std::mem::forget(arm_accounting_fault(COMMIT_FAULT_AFTER_PREPARED));
+        }
+    });
+    let faulted = wire(&Tool::Pay.prepare(&run.f.server, &args).await);
+    drop(observer);
+    assert_eq!(
+        faulted["error"]["code"], "submission.record_unavailable",
+        "{faulted}"
+    );
+    let id = BusinessId::parse(args["business_id"].as_str().unwrap()).unwrap();
+    let operation =
+        OperationStatus::new(&run.f.server.window_store, run.f.server.security_profile())
+            .view(&id)
+            .unwrap()
+            .unwrap();
+    assert_eq!(operation.slot_kind, SlotKind::Canonical);
+    assert!(
+        record(&run, operation.operation_id).is_none(),
+        "no record opened"
+    );
+    let after = nonces(&run);
+    let [written] = after
+        .iter()
+        .filter(|nonce| !before.contains(nonce))
+        .collect::<Vec<_>>()[..]
+    else {
+        panic!("one entry outlives the fault: {after:?}")
+    };
+    let written = written.clone();
+
+    run.restart().unwrap();
+    let retried = wire(&Tool::Pay.prepare(&run.f.server, &args).await);
+    assert_eq!(retried["ok"], true, "{retried}");
+    assert_eq!(
+        retried["data"]["approval"]["approval_nonce"], written,
+        "the retry recovers the nonce: {retried}"
+    );
+    let record = record(&run, operation.operation_id).unwrap().record;
+    assert_eq!(record.nonce, written);
+    assert_eq!(record.subject_kind, SubjectKind::IntentDigest);
+    assert_eq!(record.subject, operation.intent_digest);
+    assert_eq!(nonces(&run), after, "the retry adds no entry");
 }

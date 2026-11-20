@@ -2177,15 +2177,29 @@ confirmation ceremony. A claim looks its id up before the balance read and
 the predicate check. A retained record answers with its stored state and a
 waiting envelope record yields its stored envelope. An unknown id of an MCP
 tool opens an `Envelope` slot over the unsigned envelope just built, with the intent
-digest beside its hash. On mainnet the MCP tools `stellar_create_account`,
-`stellar_trustline` and `stellar_claim` look the id up by their canonical
-intent instead. After the policy gate they open a `Canonical` slot of the full
-intent, a claim's asset and amount included, with the governing decision of
-the preparation and its commit. Under an approval requirement that decision's
-lifetime is the record's waiting interval, and the approval binds the intent
-digest. An unknown id of a CLI verb opens a `Canonical` slot with the full
-intent, the policy decision and the unsigned envelope just built; a claim's
-intent takes the asset and amount of the balance it read.
+digest beside its hash. On mainnet the MCP tools `stellar_pay`,
+`stellar_create_account`, `stellar_trustline` and `stellar_claim` look the id
+up by their canonical intent instead. A payment through a toolset looks the
+id up the same way, so either route resumes the record the first preparation
+opened, `Canonical` or `Envelope`. Under a new id it opens the `Envelope`
+slot its commit's protocol nonce and lease verify. After the policy
+gate they open a `Canonical` slot of the full intent, a claim's asset and
+amount included, with the governing decision of the preparation and its
+commit. Under an approval requirement that decision's lifetime is the
+record's waiting interval, and the approval binds the intent digest. A
+payment entry queued after that interval opened, as on a retry after a crash
+before the first approval record opened, keeps the decision's whole lifetime
+and ends with the interval, because consent to the intent must span that
+lifetime. A crash after the approval record's reservation and before its
+inbox insert ends the business id instead, as `audit-log-recovery.md`
+describes. The envelope the payment preparation stores carries a deadline
+before that decision's end, from `canonical_max_time_s`, the bound
+`rebuild_canonical` applies. The
+payment producer keeps its recovery binding keyed by the prepared envelope's
+hash, which the canonical record also stores, and its new inbox entry binds
+the intent digest. An unknown id of a CLI verb opens a `Canonical` slot with
+the full intent, the policy decision and the unsigned envelope just built; a
+claim's intent takes the asset and amount of the balance it read.
 
 A classic commit reads its record before it verifies the approval, rebuilds
 the envelope or consumes the nonce. One window read yields the record under
@@ -2200,27 +2214,40 @@ other tombstone refuses with that conflict. A retained record answers there
 without a lock or a write. A record that continues runs
 the gates and is decided again under the recorder.
 
-A mainnet commit of those three MCP tools first reads the record under its
+A mainnet commit of those four MCP tools first reads the record under its
 id without a lock. A `Canonical` record takes the canonical route; any other
 record, an unknown id and an unreadable window keep the envelope route above
 when the call presents all three fields. A call that omits one answers the
 fixed argument refusal for an envelope record, and for a missing, malformed
-or unknown id or an unreadable window the id's own refusal. After the
-argument checks and the endpoint probe, the canonical route looks the id up
-under the recorder. The commit's lasting arguments must name the stored
-intent of the tool's own kind: the account and the destination and starting
-balance, the trustline account, or the claim's balance and claimant. Any
-other refuses with `operation.business_id_conflict`, also against a record
-that already ran; a matching record that does no further work answers with
-its stored state. The route then rebuilds the envelope with
-`rebuild_canonical` at the fee per operation of the prepared envelope the
-record stores, bounded by the intent's fee bound and the current caps. Its
-deadline is the earlier of 120 seconds after the rebuild and the last whole
-second strictly before the authority's end; for a successor that end is the
-earlier of the current authority's end and the record's execution end. The
+or unknown id or an unreadable window the id's own refusal. A present value,
+empty or zero included, keeps its own refusal. A payment through a toolset
+always takes the envelope route. On a direct preparation's canonical record,
+a toolset commit first looks the id up under the recorder as the canonical
+route does. A retained record answers with its stored state and a tombstone
+answers from one read without a write. Its lasting arguments must name the
+stored intent, and the record must bind the presented envelope; otherwise it
+refuses `operation.business_id_conflict` and sends nothing. It then verifies
+its proof as the consent to the stored intent, and the record's one open
+attempt holds across both routes. After the argument checks and the endpoint
+probe, the canonical route looks the id up under the recorder. The commit's
+lasting arguments must name the stored intent of the tool's own kind: the
+payment's source, destination, asset, amount and memo, the account and the
+destination and starting balance, the trustline account, or the claim's
+balance and claimant. Any other refuses with
+`operation.business_id_conflict`, also against a record that already ran; a
+matching record that does no further work answers with its stored state. A
+payment also reads the destination's base account for the policy's identity
+criteria and the oracle witness, with the memo requirement and the source
+trustline. The route then rebuilds the envelope with `rebuild_canonical` at
+the fee per operation of the prepared envelope the record stores, bounded by
+the intent's fee bound and the current caps. Its deadline is the earlier of
+120 seconds after the rebuild and the last whole second strictly before the
+authority's end; for a successor that end is the earlier of the current
+authority's end and the record's execution end. The
 policy gate evaluates the rebuilt envelope's arguments with a source read
 that requests a trustline intent's trustline, so removing a held trustline
-adds no reserve, and a proof verifies
+adds no reserve; a payment's source read requests none, as on the envelope
+route. A proof verifies
 as the consent to the stored intent under the governing decision. The
 signing runs `resolve_canonical_tx_sign`, which refuses with
 `DeadlineTooFar` a canonical envelope whose deadline does not lie before that
@@ -2499,7 +2526,7 @@ Under a canonical preparation, `lookup_canonical` answers an envelope record of 
 The record stays an envelope record, so a rebuilt envelope with a fresh sequence refuses at its attempt with `operation.business_id_conflict`.
 The x402 parent retains its separate meaning. Malformed canonical content refuses resolution while lifecycle operations remain available.
 The CLI verbs `pay`, `claim`, `trustline` and sponsored `accounts create` create canonical slots.
-On mainnet the MCP create-account, trustline and claim tools create canonical slots; the other MCP tools, and every MCP tool off mainnet, create envelope slots.
+On mainnet the MCP payment, create-account, trustline and claim tools create canonical slots; a payment through a toolset, the other MCP tools, and every MCP tool off mainnet create envelope slots.
 A CLI run of a canonical record shows the stored intent at the confirmation, whose challenge is the stored envelope.
 Before the ceremony, the confirmation requires the durable record's subject to equal the stored intent digest and the entry's challenge subject to equal the stored envelope's subject.
 After the confirmation it rebuilds the envelope with `rebuild_canonical`: the readiness check, the source account's current sequence, the fee the caller's choice gives now, a fresh deadline, and the oracle check bound to the rebuilt envelope.

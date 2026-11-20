@@ -1301,7 +1301,7 @@ async fn toolset_policy_consent_keeps_effects_and_reservation() {
             assert_eq!(h.window().pending, 0);
             entries[0].approval_nonce.clone()
         };
-        let approval = h.attest_nonce(&nonce, &args.envelope_xdr);
+        let approval = h.attest_nonce(&nonce, args.envelope_xdr.as_deref().unwrap());
         for candidate in [nonce.clone(), "A".repeat(22)] {
             let invalid = h.pay_args(&sim["data"], AMOUNT, Some((candidate, "A".repeat(43))));
             let refusal = result_json(
@@ -2228,7 +2228,7 @@ async fn rule_ttl_bounds_toolset_queued_approval_at_commit() {
             // Serialize the old unbound shape; never edit a recovery binding's interval.
             std::fs::write(&path, "").unwrap();
             let entry = stellar_agent_core::approval::PendingApproval::new_payment_pending_until(
-                args.envelope_xdr.clone(),
+                args.envelope_xdr.clone().unwrap(),
                 process_uid_for_attestation().unwrap(),
                 created,
                 created + stellar_agent_core::approval::DEFAULT_TTL_MS,
@@ -2289,7 +2289,7 @@ async fn rule_ttl_bounds_toolset_queued_approval_at_commit() {
             }
             entry.approval_nonce.clone()
         };
-        let approval = h.attest_nonce(&nonce, &args.envelope_xdr);
+        let approval = h.attest_nonce(&nonce, args.envelope_xdr.as_deref().unwrap());
         h.server
             .set_clock_for_test(Arc::new(MockClock::new(move || Ok(now0))));
         for repeated in [false, true] {

@@ -516,6 +516,8 @@ impl WalletServer {
                     attestation: args.approval_attestation.clone(),
                 },
                 witness_inputs: witness_inputs.into(),
+                identity_view: None,
+                payment: false,
             },
         )
         .await

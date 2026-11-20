@@ -226,7 +226,7 @@ percentile, an explicit `classic_base`, or the profile's
 
 ## stellar_pay_commit
 
-Commit step: verifies the nonce, re-builds the Payment envelope for divergence check, signs via the profile keyring, and submits the transaction. Configured mainnet writes require a feature-enabled build and per-action authorization. Before the nonce is burned, the tool establishes which network the RPC endpoint actually serves and refuses a mismatch, so a wrongly-configured endpoint does not consume the nonce. The submit layer then verifies every signature on the envelope against the network the endpoint reported.
+Commit step: verifies the nonce, re-builds the Payment envelope for divergence check, signs via the profile keyring, and submits the transaction. A mainnet commit of an intent stored under `business_id` needs no `nonce`, `expires_at_unix_ms` or `envelope_xdr`: it rebuilds the envelope from that intent with a fresh sequence and deadline at the fee per operation of the prepared envelope, and verifies no nonce. A payment through a toolset keeps the three fields. Configured mainnet writes require a feature-enabled build and per-action authorization. Before the nonce is burned, the tool establishes which network the RPC endpoint actually serves and refuses a mismatch, so a wrongly-configured endpoint does not consume the nonce. The submit layer then verifies every signature on the envelope against the network the endpoint reported.
 
 **Arguments:**
 - `chain_id` (string, required): CAIP-2 chain identifier.
@@ -238,9 +238,9 @@ Commit step: verifies the nonce, re-builds the Payment envelope for divergence c
   simulate). Mutually exclusive with `amount`.
 - `asset` (string, required): Asset descriptor (same as simulate).
 - `memo_text` / `memo_id` / `memo_hash_hex` / `memo_return_hex` (optional, same as simulate).
-- `nonce` (string, required): Base64 nonce from the simulate step.
-- `expires_at_unix_ms` (number, required): Expiry from the simulate step.
-- `envelope_xdr` (string, required): Base64 envelope from the simulate step.
+- `nonce` (string): Base64 nonce from the simulate step. Required except on a mainnet commit of an intent stored under `business_id`.
+- `expires_at_unix_ms` (number): Expiry from the simulate step. Required as `nonce` is.
+- `envelope_xdr` (string): Base64 envelope from the simulate step. Required as `nonce` is.
 - `approval_nonce` (string, optional): Approval nonce from the simulate step's `approval` block. Required, with `approval_attestation`, when the simulate step reported that approval is required.
 - `approval_attestation` (string, optional): URL-safe base64 attestation that `stellar-agent approve` writes after the operator confirms.
 
@@ -449,8 +449,8 @@ Accounting expiry ends a reservation whatever the endpoint reports. The accounti
 On a mainnet profile the primary endpoint's `FAILED` and `NOT_FOUND` are claims the oracle has to confirm. The call asks the oracle named by `oracle_provider_url` about the same transaction. The oracle's `SUCCESS` is recorded as a report, as above, and its `FAILED` keeps the reservation. Its `NOT_FOUND` runs the rule above with the oracle as the endpoint: the retention window, the ledger close time, the account sequence and the second lookup are all the oracle's. The oracle's answers count only once it reports the mainnet passphrase, which the call checks first. An oracle that reports another network, whose identity cannot be read, or that cannot answer, and a mainnet profile without an oracle, preserve the existing receipt status and the reservation. Accounting expiry is checked before any endpoint or oracle lookup, so it ends a time-bounded reservation in each of these cases.
 
 On a mainnet profile the wallet's commit tools build classic envelopes with
-a deadline 120 seconds after the build, so their accounting horizon is
-bounded. On a testnet profile they build classic envelopes without a time
+a deadline at most 120 seconds after the build, so their accounting horizon
+is bounded. On a testnet profile they build classic envelopes without a time
 bound. A presented envelope, such as one the SEP-43 tool submits, can carry a
 time bound, and so can the inner transaction of a fee-bump.
 

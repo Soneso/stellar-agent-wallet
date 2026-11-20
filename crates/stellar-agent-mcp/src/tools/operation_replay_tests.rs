@@ -1044,9 +1044,8 @@ async fn commit_with_another_business_id_refuses_with_mismatch() {
             // another operation.
             let code = match tool {
                 _ if named != other => "operation.business_id_mismatch",
-                Tool::Pay => "operation.business_id_mismatch",
                 Tool::Trustline => "policy.approval_required",
-                Tool::CreateAccount | Tool::Claim => "operation.business_id_conflict",
+                Tool::Pay | Tool::CreateAccount | Tool::Claim => "operation.business_id_conflict",
             };
             assert_eq!(result["error"]["code"], code, "{tool:?} {named}: {result}");
             assert_eq!(run.control.count("sendTransaction"), 0, "{tool:?}");
