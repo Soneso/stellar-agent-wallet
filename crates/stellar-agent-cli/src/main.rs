@@ -263,26 +263,26 @@ enum Commands {
     ///
     /// Verbs:
     /// - `smart-account rules <create | get | set-name | set-valid-until |
-    ///   delete | add-policy | remove-policy | list>` — context-rule lifecycle.
+    ///   delete | add-policy | remove-policy | list>`: context-rule lifecycle.
     /// - `smart-account signers <list | refresh | add | remove |
     ///   set-threshold | batch-add | set-weighted-threshold |
-    ///   set-signer-weight>` — signer-set lifecycle.
-    /// - `smart-account multicall` — submit a batched invocation bundle.
-    /// - `smart-account deploy-webauthn-verifier` — deploy the OZ
+    ///   set-signer-weight>`: signer-set lifecycle.
+    /// - `smart-account multicall`: submit a batched invocation bundle.
+    /// - `smart-account deploy-webauthn-verifier`: deploy the OZ
     ///   WebAuthn-verifier WASM and record its address.
-    /// - `smart-account deploy-ed25519-verifier` — deploy the OZ
+    /// - `smart-account deploy-ed25519-verifier`: deploy the OZ
     ///   Ed25519-verifier WASM and record its address.
-    /// - `smart-account deploy-spending-limit-policy` — deploy the OZ
+    /// - `smart-account deploy-spending-limit-policy`: deploy the OZ
     ///   spending-limit-policy WASM (per-network singleton) and record its
     ///   address.
-    /// - `smart-account migrate-verifier` — plan/execute External-signer
+    /// - `smart-account migrate-verifier`: plan/execute External-signer
     ///   verifier migration.
-    /// - `smart-account list-verifiers` — enumerate the verifier allowlist.
-    /// - `smart-account list-rules` — alias for `smart-account rules list`.
-    /// - `smart-account register-multicall` / `unregister-multicall` — manage
+    /// - `smart-account list-verifiers`: enumerate the verifier allowlist.
+    /// - `smart-account list-rules`: alias for `smart-account rules list`.
+    /// - `smart-account register-multicall` / `unregister-multicall`: manage
     ///   the local multicall-router registry.
-    /// - `smart-account timelock <schedule | cancel | execute | list-pending>`
-    ///   — OZ upgrade-timelock operations.
+    /// - `smart-account timelock <schedule | cancel | execute | list-pending>`:
+    ///   OZ upgrade-timelock operations.
     /// - `smart-account deploy-policy`, `list-intents`, and `execute`.
     ///
     /// Every subcommand that signs refuses mainnet. `signers list`,

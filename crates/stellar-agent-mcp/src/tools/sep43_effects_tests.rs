@@ -1116,6 +1116,30 @@ async fn an_unreadable_text_memo_refuses_a_valued_transaction() {
     assert_eq!(fx.seed_reads(), 0);
 }
 
+/// A text memo that is not UTF-8 refuses a transaction whose only effect is
+/// a pool share `ChangeTrust` with `sep43.invalid_xdr`, as it refuses a
+/// credit `ChangeTrust`, with no account read.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn an_unreadable_text_memo_refuses_a_pool_share_trustline() {
+    let fx = Fixture::new(trustline_reserve_rules()).await;
+    let memo = Memo::Text(vec![0xff].try_into().unwrap());
+    for body in [trustline_on(*b"USDC", 100 * XLM), pool_share_trustline()] {
+        let envelope = source_tx(fx.key, memo.clone(), vec![body]);
+        for result in [fx.sign(envelope.clone()).await, fx.submit(envelope).await] {
+            let (code, message) = refused(&result);
+            assert_eq!(code, "sep43.invalid_xdr");
+            assert!(
+                message.ends_with("the text memo of a valued transaction is not valid UTF-8"),
+                "{message}"
+            );
+        }
+    }
+    assert_eq!(fx.requests().await, 0);
+    assert_eq!(fx.seed_reads(), 0);
+}
+
 /// A merge and an authority change refuse with their fixed texts even under
 /// a rule that opts into unvalued effects.
 #[tokio::test]
@@ -1862,9 +1886,11 @@ async fn a_pool_share_trustline_adds_two_base_reserves() {
 }
 
 /// After a dust payment the trustline rule still judges a pool share
-/// `ChangeTrust`: its `minimum_reserve` refuses one stroop under the
-/// reserve of the two subentries, and without a trustline rule the
-/// transaction refuses `policy.deny.no_matching_rule`.
+/// `ChangeTrust`, at its own position after the payment: the audit record
+/// lists the payment leg first. Its `minimum_reserve` refuses one stroop
+/// under the reserve of the two subentries after the dust debit, and
+/// without a trustline rule the transaction refuses
+/// `policy.deny.no_matching_rule`.
 #[tokio::test]
 #[serial_test::serial(keyring)]
 #[serial_test::serial]
@@ -1884,6 +1910,14 @@ async fn a_pool_share_trustline_after_a_payment_is_judged_by_the_trustline_rule(
     let dust_then_pool = || fx.tx(vec![payment(muxed(A, None), 1), pool_share_trustline()]);
     fx.account(fx.key, RESERVE + 2 * base + 200 + 1, None);
     signed(&fx.sign(dust_then_pool()).await);
+    // The gate records each leg in the order it decides them.
+    let rows = fx.rows("opaque_payload_signed");
+    let legs = rows[0]["legs"].as_array().unwrap();
+    let kinds: Vec<&str> = legs
+        .iter()
+        .map(|leg| leg["action"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["payment", "trustline"], "{legs:?}");
     fx.account(fx.key, RESERVE + 2 * base + 200, None);
     assert_eq!(
         refused(&fx.sign(dust_then_pool()).await).0,
@@ -2033,6 +2067,23 @@ async fn a_pool_share_trustline_alone_is_checked_at_the_reserve() {
     let fx = Fixture::new(trustline_reserve_rules()).await;
     let base = stellar_agent_core::BASE_RESERVE_STROOPS;
     assert_only_operation_boundary(&fx, pool_share_trustline(), RESERVE + 2 * base + 100).await;
+}
+
+/// A transaction whose only operation is a pool share `ChangeTrust` with a
+/// limit of 0 opens nothing: the account's reserve and fee alone sign it,
+/// to the stroop.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn a_pool_share_line_with_a_zero_limit_opens_nothing() {
+    let fx = Fixture::new(trustline_reserve_rules()).await;
+    let removal = OperationBody::ChangeTrust(stellar_xdr::ChangeTrustOp {
+        line: stellar_xdr::ChangeTrustAsset::PoolShare(
+            stellar_xdr::LiquidityPoolParameters::default(),
+        ),
+        limit: 0,
+    });
+    assert_only_operation_boundary(&fx, removal, RESERVE + 100).await;
 }
 
 /// A pool share `ChangeTrust` whose source is another account opens nothing

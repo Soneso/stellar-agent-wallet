@@ -327,7 +327,8 @@ fresh consent.
 
 A matching grant suppresses the first-invoke re-prompt. The payment and outer
 toolset policies still apply. A composed `Allow` submits without another approval;
-`RequireApproval` from either policy requires consent bound to the executed envelope.
+`RequireApproval` from either policy requires consent bound to the executed envelope,
+or on mainnet to the stored intent of a payment that `stellar_pay` prepared.
 The earlier policy or grant end limits signing authority. Preparation needs
 `propose-transaction` and no signing grant; commit resolves its own grant.
 The payment is reserved and debited once per complete accounting key, including
@@ -348,15 +349,20 @@ only an envelope prepared for that record's intent; any other envelope refuses
 `stellar_pay` preparation stores carries the deadline its commit would
 compute: the earlier of 120 seconds after the preparation and the last whole
 second before the end of the preparation's decision. A toolset commit signs
-that envelope unchanged when the authority it adds outlasts that deadline,
-such as an outer approval rule of at least 120 seconds. An outer approval
-rule shorter than the 120-second classic deadline makes the toolset commit of
-a direct-first payment refuse with `network.mainnet_authorization_refused`
-and send nothing; a direct commit of the record completes it. A policy-required commit queues before consuming its protocol
-nonce; an unknown nonce queues nothing on mainnet. On mainnet the queued consent
-binds the operation that the running server prepared for the nonce. After a
-server restart, a commit without approval proof for an earlier preparation
-refuses `nonce.expired` and queues nothing, so the agent prepares again.
+that envelope unchanged when the authority it adds ends after that deadline.
+When that authority ends at or before the stored deadline, the toolset commit
+of a direct-first payment refuses with `network.mainnet_authorization_refused`
+and sends nothing; a direct commit of the record completes it. A payment rule
+shorter than 120 seconds already caps the stored deadline before its
+decision's end, so a short outer consent can still sign. A toolset commit
+whose composed decision has another lifetime than the one the record's
+approval took refuses that approval with `policy.approval_required`; a direct
+commit of the record completes it. A policy-required commit queues before
+consuming its protocol nonce; an unknown nonce queues nothing on mainnet. On
+mainnet the queued consent binds the operation that the running server
+prepared for the nonce. After a server restart, a commit without approval
+proof for an earlier preparation refuses `nonce.expired` and queues nothing,
+so the agent prepares again.
 The pending approval store holds at most 4,096 live entries. A new consent at
 that limit refuses with `approval.store_error`. Run
 `stellar-agent approve gc --profile <profile>` to remove expired entries; add

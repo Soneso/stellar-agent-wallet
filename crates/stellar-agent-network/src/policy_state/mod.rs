@@ -121,7 +121,7 @@
 //! including an empty snapshot with a committed generation. Profile TOML and
 //! receipts cannot establish provenance. Only an absent file and absent
 //! protected generation establish a new authority.
-//! No verb recovers such state in this release; create a profile under a new name.
+//! No verb recovers such state; create a profile under a new name.
 //!
 //! # Integrity
 //!
@@ -434,7 +434,7 @@ pub enum WindowStoreError {
 
     /// Retained state has no complete authenticated network provenance.
     #[error(
-        "spending state has no complete authenticated network provenance. No verb recovers such state in this release; create a profile under a new name."
+        "spending state has no complete authenticated network provenance. No verb recovers such state; create a profile under a new name."
     )]
     ChainUnverifiable,
 
@@ -479,7 +479,7 @@ pub enum WindowStoreError {
     /// `MainnetStateUnverifiable` naming its defect instead.
     #[error(
         "policy window-state store generation mismatch, possible deletion or rollback. \
-         No verb recovers such state in this release; create a profile under a new name."
+         No verb recovers such state; create a profile under a new name."
     )]
     GenerationMismatch,
 
@@ -621,11 +621,11 @@ pub enum WindowStoreError {
     /// spend history nor its authorizations are known.
     ///
     /// Produced in place of the generic integrity errors for a mainnet
-    /// profile in a build with mainnet writes. No verb recovers such state in this release; create a profile under a new name.
+    /// profile in a build with mainnet writes. No verb recovers such state; create a profile under a new name.
     #[cfg(feature = "mainnet-write")]
     #[error(
         "policy.window_state_unverifiable: the policy window-state of this mainnet profile \
-         cannot be verified ({defect}). No verb recovers such state in this release; create a profile under a new name."
+         cannot be verified ({defect}). No verb recovers such state; create a profile under a new name."
     )]
     MainnetStateUnverifiable {
         /// The defect found.
@@ -758,8 +758,7 @@ pub enum WindowStoreError {
 }
 
 /// The sentence that ends a refusal of state no verb recovers.
-const NO_RECOVERY_NOTICE: &str =
-    "No verb recovers such state in this release; create a profile under a new name.";
+const NO_RECOVERY_NOTICE: &str = "No verb recovers such state; create a profile under a new name.";
 
 impl From<StateLockError> for WindowStoreError {
     fn from(error: StateLockError) -> Self {

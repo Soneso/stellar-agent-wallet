@@ -2085,7 +2085,7 @@ pub enum ValidationError {
     /// verified, so neither its spend history nor its authorizations are
     /// known.
     ///
-    /// No verb recovers such state in this release; create a profile under a new name.
+    /// No verb recovers such state; create a profile under a new name.
     ///
     /// # Wire code
     ///
@@ -2093,7 +2093,7 @@ pub enum ValidationError {
     #[cfg(feature = "mainnet-write")]
     #[error(
         "policy.window_state_unverifiable: the policy window-state of mainnet profile \
-         '{profile}' cannot be verified ({defect}). No verb recovers such state in this release; create a profile under a new name."
+         '{profile}' cannot be verified ({defect}). No verb recovers such state; create a profile under a new name."
     )]
     WindowStateUnverifiable {
         /// Selected profile name.
@@ -2110,7 +2110,7 @@ pub enum ValidationError {
 
     /// Retained spending state lacks authenticated network provenance.
     #[error(
-        "spending state has no complete authenticated network provenance. No verb recovers such state in this release; create a profile under a new name."
+        "spending state has no complete authenticated network provenance. No verb recovers such state; create a profile under a new name."
     )]
     WindowChainUnverifiable,
 
@@ -7244,9 +7244,7 @@ mod tests {
         let text = unverifiable.to_string();
         assert!(text.contains("hmac_invalid"), "{text}");
         assert!(
-            text.contains(
-                "No verb recovers such state in this release; create a profile under a new name."
-            ),
+            text.contains("No verb recovers such state; create a profile under a new name."),
             "{text}"
         );
         let open = WalletError::Validation(ValidationError::ResetWindowStateOpenAuthorizations {

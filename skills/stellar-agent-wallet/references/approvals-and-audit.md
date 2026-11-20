@@ -14,7 +14,9 @@ Every gated tool/command invocation is evaluated by the active policy engine
 before any signature. Reads the decision needs, such as the source account, can
 run first. The engine returns Allow, Deny, or RequireApproval.
 Two-phase MCP actions hold approval requests in a per-profile pending store.
-Single-shot signing paths refuse approval decisions; see
+On testnet, single-shot CLI signing paths refuse approval decisions with
+`policy.approval_required`. On mainnet, full-mode CLI payment, claim, sponsored
+creation, and trustline commands run the passkey ceremony for RequireApproval; see
 [CLI signing coverage](cli-reference.md#signing-and-approval-coverage).
 The SEP-43 transaction tools store a pending approval for a single payment,
 path payment, account creation or trustline change. The attested repeat signs.
@@ -267,7 +269,7 @@ same window reads one shared count, whichever rule carries it.
 Each criterion compares that shared count against its own `max_calls`.
 `bundle_rate_limit` counts each inner call of a multicall bundle.
 
-`minimum_reserve` counts the envelope fee with the debit. MCP pay/create-account/trustline/claim commits supply it, as do CLI `pay`, `claim`, sponsored `accounts create`, and `trustline` for the envelope they build. The required reserve is the account's reserve plus margin plus one base reserve for each trustline the call opens, two for a liquidity pool share trustline. A trustline the account read shows as held opens none, so removing it or changing its limit adds nothing; one the read cannot show counts as opened. The trustline commands judge the asset the transaction carries, the resolved `CODE:ISSUER`, whatever spelling the caller used. In SEP-43 signing, the `stellar_trustline_commit` rule judges each wallet-sourced pool share `ChangeTrust` as its own trustline operation, with or without other operations. Its leg carries no asset, so an `asset_allowlist` on that rule refuses it with `policy.deny.asset_not_allowlisted`. A balance after the debit and fee below that requirement refuses with `policy.deny.minimum_reserve_breached`; equality passes. MCP classic preparation selects the fee before the policy gate, so its `minimum_reserve` check counts `total_fee_stroops`. Its paired commit check counts the encoded envelope fee and can refuse preparation on mainnet.
+`minimum_reserve` counts the envelope fee with the debit. MCP pay/create-account/trustline/claim commits supply it, as do CLI `pay`, `claim`, sponsored `accounts create`, and `trustline` for the envelope they build. The required reserve is the account's reserve plus margin plus one base reserve for each trustline the call opens, two for a liquidity pool share trustline. A trustline the account read shows as held opens none, so removing it or changing its limit adds nothing; one the read cannot show counts as opened. The trustline commands judge the asset the transaction carries, the resolved `CODE:ISSUER`, whatever spelling the caller used. In SEP-43 signing, the `stellar_trustline_commit` rule judges each wallet-sourced pool share `ChangeTrust` as its own trustline operation, with or without other operations, and one with a limit of 0 opens nothing. Its leg carries no asset, so an `asset_allowlist` on that rule refuses it with `policy.deny.asset_not_allowlisted`. A balance after the debit and fee below that requirement refuses with `policy.deny.minimum_reserve_breached`; equality passes. MCP classic preparation selects the fee before the policy gate, so its `minimum_reserve` check counts `total_fee_stroops`. Its paired commit check counts the encoded envelope fee and can refuse preparation on mainnet.
 
 ### Version 2 additions
 
@@ -399,6 +401,7 @@ undelivered rows stay queued.
 Queued success exits zero and includes `audit_code: audit.outbox_queued`; Written omits `audit_code`.
 It returns immediately after persistence, without waiting for delivery.
 Legacy queues commit a count and chain head; owner queues authenticate tagged rows and commit delivered batches.
+Every mainnet approval kind enforces delivery: payment, which covers account creation, claim, trustline, and x402 payment.
 An enforced kind additionally requires exact Delivered evidence before use.
 For an enforced kind, recoverable delivery and evidence errors retry the existing grant without another ceremony.
 
@@ -443,8 +446,9 @@ rewrite the terminal. An entry whose envelope does not decode or does not match
 its stored digest, or an MPP charge whose shown terms do not match its
 authorization fingerprint, or a rule proposal whose stored digest is not the digest
 of what it shows, is shown as inconsistent and cannot be approved
-(`approval.entry_inconsistent`). The operator confirms at the
-terminal; the command then records the consent. Recording is one-shot: a nonce
+(`approval.entry_inconsistent`). On testnet the operator confirms at the
+terminal; the command then records the consent. On mainnet no prompt runs, and
+the command records the consent after a verified passkey assertion. Recording is one-shot: a nonce
 that is expired, of the wrong kind, or already attested is rejected. Approval is
 bound to the local user: the process uid recorded at create time is re-derived
 at approve time and must match, so a different local user cannot consent on the
@@ -511,9 +515,16 @@ slot binds the tag to the exact transaction envelope that will be signed. The
 `process_uid` (numeric OS uid on Unix) gives cross-account-on-host non-replay: a
 tag minted by one local user cannot be replayed by another.
 
-The MCP commit-path verifier recomputes the tag and compares it in constant
-time. It reports live rejected and consumed approvals as
-`policy.approval_rejected` and `policy.approval_consumed`. Every other failure,
+Off mainnet, the MCP commit-path verifier recomputes the tag and compares it in
+constant time. On mainnet it verifies the proof against the approval's durable
+record. It reports live rejected and consumed approvals as
+`policy.approval_rejected` and `policy.approval_consumed`. Off mainnet, an
+entry whose stored payment destination is not a canonical G account or M
+address, or whose payment recovery binding is inconsistent, returns
+`approval.entry_inconsistent`. On mainnet a revoked
+approval returns `approval.revoked`, and a verified approval whose queued
+consent row has no exact Delivered evidence returns
+`approval.consent_undelivered`. Every other failure,
 such as an expired, missing, or forged approval, returns
 `policy.approval_required`, so a caller cannot probe which of those states a
 nonce is in. The CLI `approve` path
@@ -535,13 +546,15 @@ a grant in the on-disk store).
 |---|---|---|---|
 | `--id <NONCE>` | yes (this form) | none | The approval nonce from the agent surface's simulate/build response. |
 | `--profile <NAME>` | no | `--profile`, then `STELLAR_AGENT_PROFILE`, then `default` | Profile whose attestation key and store to use. |
-| `--yes` | no | off | Non-interactive auto-approve. Bypasses the stdin prompt; the wallet-controlled summary is still printed for a visible record. For trusted automation and tests, not routine operator use. |
+| `--yes` | no | off | Non-interactive auto-approve on a testnet profile. Bypasses the stdin prompt; the wallet-controlled summary is still printed for a visible record. For trusted automation and tests, not routine operator use. A mainnet profile refuses it with `approve.yes_refused_on_mainnet`. |
+| `--open-by-operator` | no | off | Prints the local mainnet presence URL for the operator to open. A testnet profile or a signed-origin policy refuses it. Conflicts with `--yes`. |
 
-Interactively the command prints the summary and prompts `Approve? [y/N]:`;
+On testnet the command prints the summary and prompts `Approve? [y/N]:`;
 only `y`/`yes` (case-insensitive) consents, everything else (including empty
 input, `n`, EOF) denies. Exits `1` when the nonce is unknown, expired, already
 attested, created by a different local user, denied at the prompt, or on I/O
-error.
+error. On mainnet no prompt runs; the command waits for a verified passkey
+assertion.
 
 ```bash
 stellar-agent approve --id ABCxyzNonce --profile <name>
@@ -647,9 +660,11 @@ Toolset-routed payments use two distinct controls, and only one is suppressible.
   installation, package version and digest, capability, destination, asset,
   amount range, and expiry. The grant suppresses only
   the first-invoke re-prompt.
-- The per-action payment approval (`PaymentSimulated`) fires unconditionally on
-  every toolset-routed payment, and its attestation binds the actual executed
-  envelope.
+- The per-action payment approval (`PaymentSimulated`) fires on a
+  toolset-routed payment when the stricter of the routed and outer policy
+  decisions requires approval. Its attestation binds the actual executed
+  envelope, or on mainnet the stored intent of a payment that `stellar_pay`
+  prepared.
 
 A matching grant requires a version 3 HMAC that verifies under the profile's
 attestation key and profile/chain binding. It must be unexpired, with a lifetime

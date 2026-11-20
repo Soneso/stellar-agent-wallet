@@ -509,7 +509,7 @@ Ledger signing also requires this passkey ceremony.
 
 The length prefixes on the variable fields prevent boundary-collision attacks (two different nonce/uid pairs cannot collide into the same input). The `envelope_sha256` slot binds the attestation to the exact transaction envelope that will be signed. The `process_uid` (numeric OS uid on Unix) gives cross-account-on-host non-replay: a tag minted by one local user cannot be replayed by another.
 
-The MCP commit-path verifier recomputes the tag and compares it in constant time. It collapses the distinct internal outcomes (`Expired`, `NotFound`, `AlreadyAttested`) into the single wire code `policy.approval_required`, so a caller cannot probe which state a nonce is in; the distinction is kept only in internal debug tracing.
+Off mainnet, the MCP commit-path verifier recomputes the tag and compares it in constant time. On mainnet it verifies the proof against the approval's durable record. It reports an absent, malformed, unknown, expired, or mismatched approval with the single wire code `policy.approval_required`, so a caller cannot probe which of these states a nonce is in. Internal debug tracing keeps the distinction. A live rejection returns `policy.approval_rejected`. A live consumed testnet approval, an approval held by a submission receipt, or a mainnet proof of another operation returns `policy.approval_consumed`. A revoked mainnet approval returns `approval.revoked`. A verified mainnet approval whose queued consent row has no exact Delivered evidence returns `approval.consent_undelivered`.
 
 On testnet the attestation proves that **the keyring holder ran `approve`**, not that a human clicked "yes" in some agent-controlled UI. A mainnet attestation also binds a user-verified passkey assertion over the exact consent, so the HMAC key alone records no mainnet consent. The agent's own UI is not a trust input; the wallet-controlled `approve` step is.
 
@@ -535,7 +535,7 @@ Toolset-routed payments use two distinct controls, and only one of them is suppr
 
 A matching grant requires a version 3 HMAC that verifies under the profile's attestation key and profile/chain binding. It must be unexpired, with a lifetime of at most 30 days, and issued no later than the current time and at or after the second following the current installation. An invalid install time honors no grant. Consent issued in the install second re-prompts once. A forged or edited grant suppresses nothing.
 
-The **per-action payment approval** (`PaymentSimulated`) is required when the routed payment or outer toolset policy requires consent, and binds the actual executed envelope. A composed `Allow` uses a current first-invoke grant without another payment approval. See [Toolsets](toolsets.md) for how toolsets route payments.
+The **per-action payment approval** (`PaymentSimulated`) is required when the routed payment or outer toolset policy requires consent, and binds the actual executed envelope. On mainnet, for a payment that `stellar_pay` prepared, it binds that payment's stored intent instead. A composed `Allow` uses a current first-invoke grant without another payment approval. See [Toolsets](toolsets.md) for how toolsets route payments.
 
 ## The hash-chained audit log
 

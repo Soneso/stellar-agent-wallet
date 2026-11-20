@@ -86,7 +86,7 @@ Facts that apply to every crate:
 | `stellar-agent-dex` | 3 | Soroswap swap adapter | excluded from beta |
 | `stellar-agent-toolsets` | 3 | toolset package format (no format-stability promise) | read or local only; toolset packages admit no mainnet signing |
 | `stellar-agent-toolsets-install` | 3 | toolset install and attestation | read or local only; installation admits no mainnet signing |
-| `stellar-agent-toolsets-runtime` | 3 | toolset invocation runtime | read or local only; signing actions refuse mainnet |
+| `stellar-agent-toolsets-runtime` | 3 | toolset invocation runtime | supports admitted beta operations through exact toolset payment actions; other signing actions refuse mainnet |
 | `stellar-agent-mcp-macros` | internal | proc-macros for the MCP registry | supports admitted beta operations through its MCP registry consumers |
 | `stellar-agent-soroban-auth` | internal | Soroban authorization preimages and signature payloads | supports admitted beta operations through its authorized Soroban consumers |
 | `stellar-agent-test-support` | internal | test harness and fixtures | supports tests of admitted beta operations; grants no production authority |

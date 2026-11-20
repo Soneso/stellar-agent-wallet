@@ -187,7 +187,13 @@ An agent limited to MCP cannot mint the attestation; the approval key stays in
 the operator's keyring.
 A commit that reaches the gate without a valid attestation is refused with
 `policy.approval_required` (the same envelope whether the attestation is absent,
-forged, or expired, so a caller learns nothing from the failure). Treat
+forged, or expired, so a caller learns nothing from the failure).
+A live rejection returns `policy.approval_rejected`. A live consumed testnet
+approval, an approval held by a submission receipt, or a mainnet proof of
+another operation returns `policy.approval_consumed`. A revoked mainnet
+approval returns `approval.revoked`. A verified mainnet approval whose queued
+consent row has no exact Delivered evidence returns
+`approval.consent_undelivered`. Treat
 `policy.approval_required` as "ask the operator to approve, then retry the commit"
 and never as a transient error to retry blindly.
 Call `stellar_approval_status` with `approval_id` to read the approval's state.
@@ -253,15 +259,16 @@ operator policy and approvals bound every call. Two tools drive them:
 No signing, key, or policy tool is reachable through an ungated capability, so
 an `action` naming one returns `toolset.unknown_action`. A toolset whose install
 record does not verify returns `toolset.pin_unverifiable`; the operator
-uninstalls and installs it again. `stellar_toolset_invoke` is a destructive tool
-and is refused on a mainnet profile. Two signing-adjacent
+uninstalls and installs it again. `stellar_toolset_invoke` is a destructive tool.
+On an enabled mainnet profile it admits only exact `stellar_pay` and
+`stellar_pay_commit` actions, and other mainnet actions refuse. Two signing-adjacent
 capabilities route through the gated path: `sign-payment` reaches
 `stellar_pay_commit`, and `sign-rule-create` reaches `stellar_rule_create_commit`
 (agent-proposed context rules). Each is guarded by a first-invoke gate. The
 first use with no matching grant returns `toolset.first_invoke_approval_required`
-with a nonce for the operator to approve. And for `sign-payment` an
-unconditional per-action approval additionally fires on every toolset-routed
-payment regardless of policy. To drive a payment, invoke `action: "stellar_pay"`
+with a nonce for the operator to approve. A `sign-payment` commit also needs a
+per-action approval when the routed payment rule or the outer toolset rule
+requires approval. To drive a payment, invoke `action: "stellar_pay"`
 to build the envelope, then `action: "stellar_pay_commit"`. Its `args` carry the
 same `chain_id`, `source`, `destination`, `asset`, and amount as the build. They
 also carry the `envelope_xdr`, `nonce`, and `expires_at_unix_ms` that the build

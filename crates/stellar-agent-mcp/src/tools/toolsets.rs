@@ -352,9 +352,10 @@ impl WalletServer {
                        capabilities, read from its authenticated install record. Signing \
                        actions (sign-payment, sign-rule-create) route to the signing commit \
                        tools behind a first-invoke grant. Payment consent follows the \
-                       composed policies; rule creation requires per-action approval. A toolset \
-                       adds these gates; it does not restrict the native tools this server \
-                       also exposes.",
+                       composed policies; rule creation requires per-action approval. On \
+                       mainnet only the exact stellar_pay and stellar_pay_commit actions run, \
+                       after setup; every other action refuses. A toolset adds these gates; \
+                       it does not restrict the native tools this server also exposes.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn stellar_toolset_invoke(

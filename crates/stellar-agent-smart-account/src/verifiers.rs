@@ -1075,8 +1075,8 @@ fn unix_duration_to_ms(duration: Result<Duration, std::time::SystemTimeError>) -
 /// resolvers honor, or `None` when no override applies.
 ///
 /// A build with `test` or the `test-helpers` feature reads it through
-/// [`sandboxed::read_override`]; every other build reads it through
-/// [`read_override`].
+/// `sandboxed::read_override`, which accepts only a path inside a marked
+/// sandbox. Every other build reads it through [`read_override`].
 pub(crate) fn networks_toml_override() -> Option<PathBuf> {
     #[cfg(any(test, feature = "test-helpers"))]
     use sandboxed::read_override;
@@ -1132,19 +1132,18 @@ pub fn default_networks_toml_path() -> Result<PathBuf, SaError> {
     default_networks_toml_path_with_override(env_override.as_deref())
 }
 
-/// Inner helper for [`default_networks_toml_path`] that takes the env-var
-/// value as a pure parameter.
+/// Inner helper for [`default_networks_toml_path`] that takes the override
+/// as a pure parameter.
 ///
-/// Split out so the env-var override branch is unit-testable without
-/// process-global env-var mutation (which is `unsafe fn` in Rust 2024 and
-/// incompatible with the crate's `#![forbid(unsafe_code)]`).  The outer
-/// function is a thin wrapper that reads `std::env::var` and forwards.
+/// The override branch is unit-testable here without process-global env-var
+/// mutation, which is `unsafe fn` in Rust 2024 and incompatible with the
+/// crate's `#![forbid(unsafe_code)]`. The outer function reads the override
+/// through [`networks_toml_override`], which never returns an empty path,
+/// and forwards it.
 fn default_networks_toml_path_with_override(
     env_override: Option<&str>,
 ) -> Result<PathBuf, SaError> {
-    if let Some(val) = env_override
-        && !val.is_empty()
-    {
+    if let Some(val) = env_override {
         return Ok(PathBuf::from(val));
     }
 
@@ -1691,35 +1690,6 @@ mod tests {
         );
     }
 
-    /// An empty env-var value must NOT be treated as an override to an empty
-    /// path; it falls through to the canonical default, matching
-    /// [`crate::multicall::MulticallRegistry::load`]'s own
-    /// override-emptiness check — the two are now required to agree since
-    /// both resolve `STELLAR_AGENT_NETWORKS_TOML`.
-    #[test]
-    #[serial_test::serial]
-    fn default_networks_toml_path_treats_empty_override_as_unset() {
-        let guard_home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-        assert!(
-            guard_home
-                .path()
-                .join(stellar_agent_test_support::sandbox::MARKER)
-                .is_file(),
-            "owned wallet root is marked before the home guard"
-        );
-        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
-        match default_networks_toml_path_with_override(Some("")) {
-            Ok(path) => assert!(
-                path.ends_with("networks.toml"),
-                "empty override must fall through to the canonical default, got: {path:?}"
-            ),
-            Err(SaError::NetworksTomlIo { .. }) => {
-                // Acceptable on hosts with no resolvable data directory.
-            }
-            Err(e) => panic!("unexpected error: {e:?}"),
-        }
-    }
-
     #[test]
     fn default_networks_toml_path_override_outside_a_sandbox_is_ignored() {
         const EXPECTED: &str = "STELLAR_AGENT_TEST_NETWORKS_EXPECTED";
@@ -1788,8 +1758,9 @@ mod tests {
         );
     }
 
-    /// The reader of builds without `test` and `test-helpers` returns any
-    /// non-empty override, inside or outside a marked sandbox.
+    /// The reader of builds without `test` and `test-helpers` returns a
+    /// non-empty override outside a marked sandbox, and reads an empty one as
+    /// unset. This build's shared reader ignores the same unmarked override.
     #[test]
     #[serial_test::serial]
     fn read_override_returns_a_non_empty_value_without_a_sandbox() {

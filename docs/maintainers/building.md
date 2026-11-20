@@ -248,7 +248,7 @@ Start local verification with `bash .github/scripts/preflight.sh` and run the
 issue-specific acceptance commands. `bash .github/scripts/preflight.sh --full`
 runs the complete local registry, including coverage.
 
-CI runs the offline workspace suite on every pull request to `main` or
+CI runs the offline gates on every pull request to `main` or
 `mainnet-write`. Pull-request
 coverage requires the `coverage` label; live acceptance uses its separate
 workflow. A pull request into `mainnet-write` that changes only documentation,

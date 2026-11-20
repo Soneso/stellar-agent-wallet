@@ -291,7 +291,8 @@ fresh consent.
 
 A matching grant suppresses the first-invoke re-prompt. The routed payment and
 outer invocation policies compose: `Allow` submits unattended, while either
-policy's `RequireApproval` requires consent bound to the executed envelope.
+policy's `RequireApproval` requires consent bound to the executed envelope,
+or on mainnet to the stored intent of a payment that `stellar_pay` prepared.
 Preparation requires `propose-transaction` without a signing grant. Commit
 checks its own grant, retains its lease through submission, and stops at the
 earliest policy or grant end. Limits from both policies account for one payment.
@@ -303,11 +304,14 @@ committed directly, commits after the prepared envelope's deadline. A toolset
 commit keeps the 120-second nonce lifetime, and on a `stellar_pay` record it
 signs only an envelope of that record's intent; any other refuses
 `operation.business_id_conflict`. A `stellar_pay` preparation stores an
-envelope whose deadline lies before its decision's end. An outer approval
-rule shorter than the 120-second classic deadline makes the toolset commit
-of a direct-first payment refuse with `network.mainnet_authorization_refused`;
-commit the record directly instead, or give the outer rule at least 120
-seconds.
+envelope whose deadline lies before its decision's end. When the authority
+a toolset commit adds ends at or before that deadline, the toolset commit of
+a direct-first payment refuses with `network.mainnet_authorization_refused`
+and sends nothing; commit the record directly instead. A payment rule shorter
+than 120 seconds already caps the stored deadline, so a short outer consent
+can still sign. A composed decision whose lifetime differs from the one the
+record's approval took refuses that approval with `policy.approval_required`;
+commit the record directly instead.
 Keep the same business ID for recovery; reconcile an uncertain send by its hash.
 
 A gated payment call that meets an install, uninstall, or grant write in

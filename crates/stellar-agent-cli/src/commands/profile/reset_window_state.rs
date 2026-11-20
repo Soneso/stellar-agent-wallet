@@ -19,7 +19,7 @@
 //! presented on the store clock.
 //! A tampered, unparseable, or rolled-back store refuses before
 //! the reset row, as does missing authenticated network provenance.
-//! No verb recovers such state in this release; create a profile under a new name.
+//! No verb recovers such state; create a profile under a new name.
 //! File I/O failures refuse without changing state; retry after access is restored.
 //!
 //! # Audit-row ordering
@@ -1101,9 +1101,7 @@ mod tests {
         let text = unverifiable.to_string();
         assert!(text.contains("generation_mismatch"), "{text}");
         assert!(
-            text.contains(
-                "No verb recovers such state in this release; create a profile under a new name."
-            ),
+            text.contains("No verb recovers such state; create a profile under a new name."),
             "{text}"
         );
         let open = store_refusal("acme", WindowStoreError::OpenAuthorizations { open: 2 });

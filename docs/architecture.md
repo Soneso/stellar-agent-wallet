@@ -180,8 +180,8 @@ sequenceDiagram
 4. Preparation builds the envelope, mints the commit nonce, checks commit approval requirements, stores any required consent request, and returns the envelope, nonce, expiry, and request.
 5. The operator reviews the summary and approves, writing or queuing an audit consent row before persisting an HMAC attestation, a secret-key integrity tag binding consent to bytes.
 6. The agent calls `stellar_pay_commit` with the prepared artifact and any required approval proof.
-7. The server checks the halt marker again before dispatch; the handler checks mainnet authorization on a mainnet profile, evaluates decoded arguments against fresh reads, verifies required consent, and rejects an envelope that differs from its rebuild.
-8. It obtains any required oracle witness, checks audit readiness, and consumes the verified nonce before loading the signing key.
+7. The server checks the halt marker again before dispatch; the handler checks mainnet authorization on a mainnet profile, evaluates decoded arguments against fresh reads, verifies required consent, and rejects an envelope that differs from its rebuild. On mainnet a direct commit of the intent that `stellar_pay` stored under the business id rebuilds the envelope from that intent with a fresh sequence and deadline instead of comparing a presented one. Its policy evaluation and consent check stay, and its arguments must name that intent. A toolset commit and a commit of an exact-envelope record take the envelope route.
+8. It obtains any required oracle witness, checks audit readiness, and consumes the verified nonce before loading the signing key. A commit that rebuilds the envelope from the stored intent verifies and consumes no protocol nonce.
 9. After signing, the submit layer checks endpoint and signature binding, then records the receipt, pending audit row, and any spending reservation before sending.
 10. Confirmation records success. A definitive failure, like an uncertain outcome, keeps the receipt, the pending row, and the reservation. A bounded reservation stays charged through its accounting horizon, even after an operator clear; an untimed one ends only at an operator clear with both acknowledgement flags. Reconciliation, the process of checking what actually settled, reads the chain meanwhile.
 
@@ -270,7 +270,7 @@ Network checks establish endpoint identity and signature binding and refuse main
 | Check | Enforcement and limit |
 | --- | --- |
 | CLI entry | Payment commands refuse a mainnet profile before signing unless policy authority (Allow) or approval authority (RequireApproval) covers the action; the `--build-only`, `--sign-only` and `--submit-only` stages always refuse it. |
-| MCP entry | The four classic commit tools and the two x402 payment tools admit mainnet only under policy or approval authority for the action; other commit and signing tools refuse mainnet before key access. MPP restricts its flow to testnet. |
+| MCP entry | The four classic commit tools and the two x402 payment tools admit mainnet only under policy or approval authority for the action. `stellar_toolset_invoke` admits its exact `stellar_pay` and `stellar_pay_commit` actions under the same authority. Other commit and signing tools refuse mainnet before key access. MPP restricts its flow to testnet. |
 | Submit layer | Ordinary submission refuses a mainnet passphrase or a known mainnet host before decoding or RPC. Authorized submission binds each action to its endpoint, signer, policy, approval, audit state, and window reservation. |
 | Endpoint identity | `getNetwork` must match the configured passphrase before reads used for signing and again before sending. Unsupported protocol responses refuse on mainnet and warn on other networks. |
 | Signature binding | Local verification checks the envelope's signatures against that network and fetched signer sets before transmission. |
