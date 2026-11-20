@@ -15,6 +15,8 @@
 //! 1. `stellar_pay` (under a `RequireApproval` policy) parks a real payment
 //!    approval against funded testnet accounts — the same production path
 //!    `approve_serve_testnet_acceptance.rs` exercises for the loopback server.
+//!    A signed, verified fixture policy binds the entry for recovery; a
+//!    direct preparation queues a new payment approval only under one.
 //! 2. `start_remote_serve` binds the real TLS listener on loopback with
 //!    `rp_id = "localhost"` and a real `rcgen` self-signed certificate, with
 //!    an EMPTY credential allowlist — enrollment does not require one, and
@@ -593,6 +595,9 @@ async fn remote_approval_browser_drives_real_payment_commit() {
     server.set_policy_engine_for_test(Arc::new(RequireApprovalEngine {
         reason: REQUIRE_APPROVAL_REASON,
     }));
+    // A direct preparation queues a new payment approval only under a
+    // signed, verified policy; the synthetic engine above carries none.
+    server.set_payment_recovery_policy_for_test(common::payment_recovery_policy(&server));
 
     // ── 1. Simulate under RequireApproval: parks a real pending entry ───────
     let sim = server
