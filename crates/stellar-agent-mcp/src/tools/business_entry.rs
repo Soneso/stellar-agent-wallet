@@ -190,7 +190,8 @@ fn linked_entry_in(
 ) -> Result<PendingApproval, WalletError> {
     inbox.get(nonce).cloned().ok_or_else(|| {
         WalletError::Approval(ApprovalFailure::NotFound {
-            detail: "the operation's approval entry is gone; prepare the operation again"
+            detail: "the operation's approval entry is gone; prepare the operation again under \
+                     a new business_id"
                 .to_owned(),
         })
     })

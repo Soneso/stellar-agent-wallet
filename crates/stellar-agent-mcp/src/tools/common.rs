@@ -14002,6 +14002,140 @@ pub(crate) mod tests {
             assert_eq!(control.count("sendTransaction"), 1);
         }
 
+        /// Prepares the trustline change of `limit_stroops` under
+        /// `minimum_reserve` at margin 0 on `stellar_trustline_commit` and no
+        /// balance floor, over a source that holds the trustline when `held`
+        /// and has `prepared_stroops` at the preparation, then commits it
+        /// through the canonical route, under the business id alone, over
+        /// the source at `committed_stroops`. The preparation evaluates the
+        /// commit rule too. Returns the commit's result and the number of
+        /// sends.
+        async fn unfloored_canonical_trustline_commit(
+            prepared_stroops: i64,
+            committed_stroops: i64,
+            held: bool,
+            limit_stroops: &str,
+        ) -> (serde_json::Value, usize) {
+            use stellar_agent_test_support::xdr_fixtures::{
+                account_ledger_key_xdr, trustline_entry_xdr, trustline_ledger_key_xdr,
+            };
+            use stellar_xdr::{LedgerEntryData, Limits, ReadXdr, WriteXdr};
+            let primary = wiremock::MockServer::start().await;
+            let oracle = wiremock::MockServer::start().await;
+            let f = routed_fixture_with(
+                |raw| {
+                    with_criterion(
+                        &classic_policy(&raw),
+                        "stellar_trustline_commit",
+                        "minimum_reserve",
+                        "margin_stroops",
+                        &toml_edit::Value::from(0),
+                    )
+                },
+                |_| {},
+                &primary,
+                &oracle,
+            );
+            let source = f.envelope.source().to_owned();
+            let issuer = stellar_agent_test_support::signed_envelope::account_id_for_seed([7; 32]);
+            let source_key = account_ledger_key_xdr(&source);
+            let entries_at = |balance_stroops: i64| {
+                let mut entries = fixture_entries(&f);
+                for entry in &mut entries {
+                    if entry["key"] == source_key.as_str() {
+                        let mut data = LedgerEntryData::from_xdr_base64(
+                            entry["xdr"].as_str().unwrap(),
+                            Limits::none(),
+                        )
+                        .unwrap();
+                        let LedgerEntryData::Account(account) = &mut data else {
+                            panic!("account expected")
+                        };
+                        account.balance = balance_stroops;
+                        account.num_sub_entries = u32::from(held);
+                        entry["xdr"] = data.to_xdr_base64(Limits::none()).unwrap().into();
+                    }
+                }
+                if held {
+                    entries.push(serde_json::json!({
+                        "key": trustline_ledger_key_xdr(&source, "USD", &issuer),
+                        "xdr": trustline_entry_xdr(&source, "USD", &issuer, 0),
+                        "lastModifiedLedgerSeq": 100,
+                    }));
+                }
+                entries
+            };
+            let control = mount_rpc(&f, &primary).await;
+            let oracle_control = mount_rpc(&f, &oracle).await;
+            *control.entries.lock().unwrap() = Some(entries_at(prepared_stroops));
+            *oracle_control.entries.lock().unwrap() = Some(entries_at(prepared_stroops));
+            let mut args = Tool::Trustline.prepare_args(&f);
+            args["limit_stroops"] = limit_stroops.into();
+            let prepared = wire(&Tool::Trustline.prepare(&f.server, &args).await);
+            assert_eq!(prepared["ok"], true, "{prepared}");
+            *control.entries.lock().unwrap() = Some(entries_at(committed_stroops));
+            *oracle_control.entries.lock().unwrap() = Some(entries_at(committed_stroops));
+            let operation = stellar_agent_network::policy_state::OperationStatus::new(
+                &f.server.window_store,
+                f.server.security_profile(),
+            )
+            .view(
+                &stellar_agent_network::policy_state::BusinessId::parse(
+                    args["business_id"].as_str().unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                operation.slot_kind,
+                stellar_agent_network::policy_state::SlotKind::Canonical,
+                "the preparation stores a canonical record"
+            );
+            let committed = wire(&Tool::Trustline.commit(&f.server, args).await.unwrap());
+            (committed, control.count("sendTransaction"))
+        }
+
+        /// Under `minimum_reserve` at margin 0 on the commit and no balance
+        /// floor, the canonical commit's gate reads the source with the
+        /// intent's trustline. The source holds it: 1.6 XLM against a
+        /// reserve of 1.5 XLM. Its removal adds no reserve, so it commits
+        /// and sends once.
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        #[serial_test::serial]
+        async fn mainnet_unfloored_canonical_removal_of_a_held_trustline_adds_no_reserve() {
+            let (committed, sends) =
+                unfloored_canonical_trustline_commit(16_000_000, 16_000_000, true, "0").await;
+            assert_eq!(committed["ok"], true, "{committed}");
+            assert_eq!(sends, 1);
+        }
+
+        /// Under `minimum_reserve` at margin 0 on the commit and no balance
+        /// floor, opening a trustline adds one base reserve to a source
+        /// without subentries: 1.5 XLM. The source prepares at 1.6 XLM and
+        /// holds 1.2 XLM at the commit, which meets its reserve of 1 XLM but
+        /// not the 1.5 XLM. The canonical commit refuses
+        /// `policy.deny.minimum_reserve_breached` and sends nothing.
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        #[serial_test::serial]
+        async fn mainnet_unfloored_canonical_opening_refuses_a_reserve_the_balance_lacks() {
+            let (committed, sends) =
+                unfloored_canonical_trustline_commit(16_000_000, 12_000_000, false, "10").await;
+            assert_eq!(
+                committed["error"]["code"], "policy.deny.minimum_reserve_breached",
+                "{committed}"
+            );
+            let message = committed["error"]["message"].as_str().unwrap();
+            assert!(
+                message.contains("\"reserve_required_stroops\":\"15000000\"")
+                    && message.contains("\"balance_stroops\":\"12000000\""),
+                "{message}"
+            );
+            assert_eq!(sends, 0);
+        }
+
         /// `stellar_pay` under a floor on either name reads the source
         /// once for its gate and paired check: a low balance refuses
         /// `account.floor_refused`, and a funded one prepares.

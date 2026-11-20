@@ -494,6 +494,13 @@ mod producers {
                 response["error"]["code"], "approval.not_found",
                 "a missing linked entry is not replaced"
             );
+            assert!(
+                response["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("prepare the operation again under a new business_id"),
+                "the refusal names its remedy: {response}"
+            );
             let clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(
                 run.entry.expires_at_unix_ms + 86_400_000,
             );

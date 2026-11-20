@@ -1843,6 +1843,15 @@ impl WalletServer {
     /// `(nonce, expires_at_unix_ms, envelope_xdr)` triple returned by
     /// `stellar_pay`, plus the original call arguments.
     ///
+    /// A mainnet commit under a `business_id` whose record holds a stored
+    /// intent takes none of the three: the arguments must name that intent,
+    /// and after the destination, memo-requirement and trustline reads it
+    /// rebuilds the envelope from that intent with a fresh sequence and
+    /// deadline at the fee per operation of the prepared envelope, takes its
+    /// authority from the stored record, and verifies no nonce. A toolset
+    /// commit takes the envelope route. Invariants 1 to 4 below hold for
+    /// every envelope-route commit.
+    ///
     /// # Security invariants (same as `stellar_create_account_commit`)
     ///
     /// 1. **Policy re-evaluation on authoritative args:** before calling
@@ -1897,10 +1906,10 @@ impl WalletServer {
     ///
     /// # Trustline re-fetch
     ///
-    /// Commit path does NOT re-fetch the trustline.  The HMAC + envelope rebuild
-    /// divergence check covers envelope-bytes drift; a trustline removed between
-    /// simulate and commit will surface as on-chain `op_no_trust`.  Re-fetching
-    /// here would add a round-trip without preventing the race.
+    /// Both commit routes read the source's trustline of the sent asset again,
+    /// on the primary, through `PaymentLedgerFacts::read`, and the oracle
+    /// witness compares that observation. A native payment reads no
+    /// trustline. A failed read refuses with its ledger code.
     ///
     /// # Errors
     ///

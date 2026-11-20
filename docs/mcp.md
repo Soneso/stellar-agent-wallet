@@ -907,7 +907,7 @@ envelope.
 | Tool | Purpose | Gating |
 | --- | --- | --- |
 | `stellar_pay` | Simulate a payment: build the Payment envelope, run the SEP-29 memo-required check, mint a single-use nonce. | No signing; no submission. Not annotated read-only (mints the single-use nonce the commit step consumes). |
-| `stellar_pay_commit` | Verify the nonce, re-check the envelope, sign from the keyring, submit. | Signs and submits. Two-phase verb; approval spine. |
+| `stellar_pay_commit` | Verify the nonce, re-check the envelope, sign from the keyring, submit. A direct mainnet commit of an intent stored under `business_id` rebuilds the envelope from that intent without the nonce. | Signs and submits. Two-phase verb; approval spine. |
 | `stellar_create_account` | Simulate account creation: build the CreateAccount envelope, mint a single-use nonce. | No signing; no submission. Not annotated read-only (mints the single-use nonce the commit step consumes). |
 | `stellar_create_account_commit` | Verify the nonce, re-check the envelope, sign, submit. A mainnet commit of an intent stored under `business_id` rebuilds the envelope from that intent without the nonce. | Signs and submits. Two-phase verb; approval spine. |
 | `stellar_claim` | Simulate claiming a claimable balance by ID: fetch the entry, run the claimant / predicate / trustline guards, render the typed preview, mint a single-use nonce. | No signing; no submission. Not annotated read-only (mints the single-use nonce the commit step consumes). |
