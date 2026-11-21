@@ -768,6 +768,42 @@ async fn absent_pair_refuses_without_provisioning() {
     );
 }
 
+/// A mainnet listener whose authority verifies a signed policy without an
+/// `approval_origin` refuses before bind; the same profile under the signed
+/// origin starts.
+#[tokio::test]
+#[serial_test::serial]
+async fn signed_policy_without_an_approval_origin_refuses_before_bind() {
+    // The configuration is built without a prepared policy, so the listener
+    // loads the current policy at its start.
+    let mut f = Fixture::new();
+    let control = start_remote_serve(unprepared_or_late_config(&f, "unprepared").await).await;
+    assert!(
+        control.is_ok(),
+        "the signed origin starts: {:?}",
+        control.err()
+    );
+    control.unwrap().shutdown().await.unwrap();
+    f.fixture.sign_policy(&[&fixture_authenticator()]);
+    let current = f.fixture.authority().load_current().unwrap();
+    assert!(
+        current
+            .policy()
+            .mainnet()
+            .is_some_and(|body| body.approval_origin.is_none()),
+        "the re-signed policy names no approval origin"
+    );
+    let result = start_remote_serve(unprepared_or_late_config(&f, "unprepared").await).await;
+    assert!(
+        matches!(
+            result,
+            Err(RemoteServeStartError::MainnetPresenceUnsupported)
+        ),
+        "{:?}",
+        result.err()
+    );
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn signed_origin_refuses_cert_pin_mismatch() {

@@ -65,6 +65,12 @@ pub(crate) fn classify(body: &str, name: &str, passphrase: &str) -> Classificati
 }
 
 /// Classifies the installed body for routing; admission still verifies its signature.
+///
+/// The value reads the unverified policy text, so it only selects a mode: the
+/// listener mode of `approve serve` and the consent line a ceremony prints. It
+/// grants no trust and must not be used as authority. The listener's verified
+/// load of the signed policy, before any bind, decides trust and refuses a
+/// policy without `approval_origin`.
 pub(crate) fn has_signed_origin(name: &str, profile: &Profile) -> bool {
     default_policy_dir()
         .ok()

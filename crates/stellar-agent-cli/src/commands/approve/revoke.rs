@@ -80,6 +80,17 @@ trait RevocationCalls {
     fn release(&mut self, record: &WireApproval) -> Result<(), WalletError>;
 }
 
+/// Whether `record`, which reached the inbox gate as a pending record, holds
+/// no consent and is closed at most by the end of its waiting window. The
+/// inspection closes an unconsented record at its waiting expiry, and an
+/// operation closure at the operation's own time.
+fn expired_while_admitted(record: &WireApproval) -> bool {
+    record.consent.is_none()
+        && record
+            .closed_at_ms
+            .is_none_or(|at| at == record.waiting_expires_at_ms)
+}
+
 fn revoke_with(
     calls: &mut impl RevocationCalls,
     nonce: &str,
@@ -88,11 +99,19 @@ fn revoke_with(
 ) -> Result<RevocationView, RevocationFailure> {
     let before = calls.lookup(nonce)?;
     let view = project(&before);
-    if view.is_noop() {
+    // A pending record is revoked at any time: a receipt verified before its
+    // waiting expiry can still commit consent until a revocation.
+    if view.is_noop() && before.record.state != ApprovalState::Pending {
         return Ok(view);
     }
     // Inbox authority covers only live, unconsented pending durable records.
-    if origin != Surface::Cli && !view.permits_inbox_revocation() {
+    // The inbox admitted the request on a live record, so a waiting expiry
+    // that passes before this lookup still revokes; consent or an operation
+    // closure still refuses.
+    if origin != Surface::Cli
+        && !view.permits_inbox_revocation()
+        && !expired_while_admitted(&before.record)
+    {
         return Err(failure(
             "approval.denied",
             "The inbox cannot revoke this approval.",
@@ -1118,15 +1137,51 @@ pub(super) mod tests {
                 "success",
                 "expired",
                 "during-expiry",
+                "consumed-expired",
+                "serve-live",
+                "serve-expired",
+                "serve-closed",
                 "facade-error",
                 "append-error",
             ]
             .map(move |scenario| (consented, scenario))
         }) {
+            if (scenario == "consumed-expired" && !consented)
+                || (scenario == "serve-closed" && consented)
+            {
+                continue;
+            }
             let mut f = Fixture::new();
             if consented {
                 f.consent();
             }
+            if scenario == "consumed-expired" {
+                let mut mint = f.mint();
+                mint.authorization_ttl_ms = 300_000;
+                f.store.mint_authorization(f.core.profile(), &mint).unwrap();
+            }
+            if scenario == "serve-closed" {
+                // The operation closes inside the waiting window.
+                OperationRecorder::new(&f.store, f.core.profile(), &mut Rows::default(), "close")
+                    .transition(
+                        f.handle.id(),
+                        None,
+                        stellar_agent_network::policy_state::operations::OperationState::Expired,
+                        &Default::default(),
+                    )
+                    .unwrap();
+                assert!(f.view().record.closed_at_ms.is_some());
+                assert!(!f.view().expired);
+            }
+            // The inbox admitted the request on a live record; its lookup in
+            // the adapter runs at or after the waiting expiry.
+            let origin = if scenario.starts_with("serve-") {
+                Surface::Serve
+            } else {
+                Surface::Cli
+            };
+            let denied = scenario == "serve-closed"
+                || (matches!(scenario, "serve-live" | "serve-expired") && consented);
             let view = f.view();
             let expiry = view
                 .record
@@ -1138,7 +1193,7 @@ pub(super) mod tests {
             let access = f.access();
             let before = f.bytes();
             let unchanged = f.unchanged_sections();
-            if scenario == "expired" {
+            if matches!(scenario, "expired" | "consumed-expired" | "serve-expired") {
                 f.clock.set(expiry);
             }
             let mut calls = ScriptedClockAndCalls {
@@ -1152,25 +1207,56 @@ pub(super) mod tests {
                 calls: vec![],
                 fail_append: scenario == "append-error",
             };
-            let result = revoke_with(&mut calls, &f.entry.approval_nonce, Surface::Cli, None);
+            let result = revoke_with(&mut calls, &f.entry.approval_nonce, origin, None);
             // Evidence release follows the committed revocation and its row;
-            // a failed revocation or audit append releases nothing.
+            // a failed revocation or audit append releases nothing. A pending
+            // record revokes also at and after its expiry; a consumed record
+            // whose window ended returns its view without a write. The inbox
+            // still refuses a consented record and one whose operation closed.
             let expected: &[&str] = match scenario {
-                "expired" => &["lookup"],
-                "during-expiry" | "facade-error" => &["lookup", "revoke"],
+                _ if denied => &["lookup"],
+                "consumed-expired" => &["lookup"],
+                "facade-error" => &["lookup", "revoke"],
                 "append-error" => &["lookup", "revoke", "append"],
                 _ => &["lookup", "revoke", "append", "release"],
             };
             assert_eq!(calls.calls, expected, "{scenario}");
             assert_eq!(f.unchanged_sections(), unchanged);
             match scenario {
+                _ if denied => {
+                    assert_eq!(result.unwrap_err().code, "approval.denied", "{scenario}");
+                    assert_eq!(f.bytes(), before, "{scenario}");
+                    assert_eq!(f.view().record.state, ApprovalState::Pending);
+                    continue;
+                }
+                "serve-expired" => {
+                    let view = result.unwrap();
+                    assert!(view.expired);
+                    assert_eq!(view.state, "revoked");
+                    assert_eq!(view.revoked_at_ms, Some(expiry));
+                    assert_eq!(f.view().record.state, ApprovalState::Revoked);
+                    let audit = std::fs::read_to_string(f.core.audit_path()).unwrap();
+                    let row: Value = serde_json::from_str(audit.lines().last().unwrap()).unwrap();
+                    assert_eq!(row["kind"], "approval_revoked");
+                    assert_eq!(row["origin"], "serve");
+                }
                 "facade-error" => {
                     assert_eq!(result.unwrap_err().code, "internal.unexpected_state");
                     assert_eq!(f.bytes(), before);
                 }
-                "expired" | "during-expiry" => {
-                    assert!(result.unwrap().expired);
+                "consumed-expired" => {
+                    let view = result.unwrap();
+                    assert!(view.expired);
+                    assert_eq!(view.state, "expired");
+                    assert_eq!(f.view().record.state, ApprovalState::Consumed);
                     assert_eq!(f.bytes(), before);
+                }
+                "expired" | "during-expiry" => {
+                    let view = result.unwrap();
+                    assert!(view.expired, "{scenario}");
+                    assert_eq!(view.state, "revoked", "{scenario}");
+                    assert_eq!(view.revoked_at_ms, Some(expiry), "{scenario}");
+                    assert_eq!(f.view().record.state, ApprovalState::Revoked);
                 }
                 "append-error" => {
                     let error = result.unwrap_err();
@@ -1246,12 +1332,21 @@ pub(super) mod tests {
                 assert_eq!(f.unchanged_sections(), sections);
                 assert_eq!(f.view().record.consumed_at_ms, before.record.consumed_at_ms);
                 assert_eq!(f.view().record.operation_id, before.record.operation_id);
-                if expired {
+                // A pending record revokes inside and after its window; a
+                // consumed record whose window ended writes nothing.
+                if expired && state == "consumed" {
                     assert_eq!(f.bytes(), bytes);
+                    assert_eq!(result.state, "expired");
                 } else {
-                    assert_eq!(f.view().record.consent, before.record.consent);
-                    assert_eq!(result.state, "revoked");
-                    assert_eq!(result.revoked_at_ms, Some(expiry - 1));
+                    if !expired {
+                        assert_eq!(f.view().record.consent, before.record.consent);
+                    }
+                    assert_eq!(result.state, "revoked", "{state} {expired}");
+                    assert_eq!(
+                        result.revoked_at_ms,
+                        Some(if expired { expiry } else { expiry - 1 })
+                    );
+                    assert_eq!(f.view().record.state, ApprovalState::Revoked);
                 }
             }
         }

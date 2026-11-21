@@ -194,7 +194,7 @@ async fn consumed_resolver_refusals_precede_expiry_for_another_operation() {
         let facts = record_facts(&f, &witness);
         let now = super::super::clock::now_ms().unwrap();
         assert_eq!(
-            enabled::check_approval_facts(Some(&facts), &witness, None, None, now),
+            enabled::check_approval_facts(Some(&facts), &witness, None, now),
             Err(MainnetAuthorizationError::Refused(P::ApprovalNonceReused)),
             "consumed nonce reuse precedes expiry: {case}"
         );
@@ -203,7 +203,6 @@ async fn consumed_resolver_refusals_precede_expiry_for_another_operation() {
                 Some(&facts),
                 &witness,
                 Some(link.operation_id),
-                None,
                 now
             ),
             Err(MainnetAuthorizationError::Refused(P::ApprovalExpired)),
@@ -324,7 +323,6 @@ async fn resolver_state_matrix() {
                     Some(&facts),
                     &witness,
                     operation.map(|link| link.operation_id),
-                    None,
                     super::super::clock::now_ms().unwrap()
                 ),
                 expected.map_or(Ok(()), |p| Err(MainnetAuthorizationError::Refused(p))),
@@ -374,7 +372,6 @@ async fn resolver_state_matrix() {
                         Some(&facts),
                         &witness,
                         Some(link.operation_id),
-                        None,
                         at
                     )
                     .is_ok()
@@ -412,7 +409,6 @@ fn facts_comparisons_refuse_alone() {
             Some(&record_facts(&f, &other)),
             &witness,
             Some(other_link.operation_id),
-            None,
             other.consent_at_ms()
         ),
         Err(MainnetAuthorizationError::Refused(P::ApprovalNonce)),
@@ -449,7 +445,6 @@ fn facts_comparisons_refuse_alone() {
                 Some(&changed),
                 &witness,
                 Some(link.operation_id),
-                None,
                 witness.consent_at_ms()
             ),
             Err(MainnetAuthorizationError::Refused(expected)),
@@ -544,8 +539,7 @@ async fn gates_never_fall_back_to_the_inbox() {
             &f.signer,
             witness.consent_at_ms(),
             &f.window,
-            Some(link),
-            None
+            Some(link)
         ),
         Err(MainnetAuthorizationError::Refused(P::StoreUnavailable)),
         "facts read failure refuses before mint"
@@ -593,7 +587,6 @@ async fn released_payload_refuses_as_expired() {
             Some(&facts),
             &witness,
             Some(link.operation_id),
-            None,
             witness.consent_at_ms()
         ),
         Err(MainnetAuthorizationError::Refused(P::ApprovalExpired)),
@@ -620,7 +613,6 @@ async fn released_payload_refuses_as_expired() {
             Some(&record_facts(&f, &witness)),
             &witness,
             Some(link.operation_id),
-            None,
             witness.consent_at_ms()
         ),
         Err(MainnetAuthorizationError::Refused(P::ApprovalRevoked))
@@ -852,7 +844,6 @@ fn intent_restart_seam() {
             Some(&facts),
             &witness,
             Some(link.operation_id),
-            None,
             now
         )
         .is_ok()
@@ -1078,7 +1069,6 @@ async fn missing_record_refuses_with_its_own_precondition() {
                 facts.as_ref(),
                 &recorded,
                 f.link(recorded.nonce()).map(|link| link.operation_id),
-                None,
                 f.now
             ),
             Err(MainnetAuthorizationError::Refused(P::ApprovalNotFound))
@@ -1284,18 +1274,20 @@ fn message_mint_without_identity_refuses() {
     );
 }
 
-/// A used message proof of the same approval, consumed for the request's
-/// operation, exempts the authenticated payment from a later revocation at
-/// the resolver; the mint then caps it at the retained bound.
+/// A revocation after the message proof consumed the record refuses the
+/// authenticated payment at the resolver, as every other revoked case does.
+/// Without a revocation, the payment under the used message proof mints and
+/// the mint caps it at the retained bound.
 #[tokio::test]
 #[serial_test::serial]
-async fn used_parent_exemption_holds_at_both_layers() {
+async fn used_parent_payment_refuses_after_revocation() {
     for case in [
         "used-then-revoked",
         "revoked-before-use",
         "wrong-parent",
         "wrong-operation",
         "plain",
+        "used",
         "at-cap",
         "before-consent",
     ] {
@@ -1328,7 +1320,10 @@ async fn used_parent_exemption_holds_at_both_layers() {
             "the message consumes only its own record"
         );
         // The revocation lands between the message and the payment.
-        revoke_record(&f, &witness);
+        let revoked = !matches!(case, "used" | "at-cap" | "before-consent");
+        if revoked {
+            revoke_record(&f, &witness);
+        }
         let cap = record_facts(&f, &witness)
             .record()
             .consent
@@ -1337,7 +1332,8 @@ async fn used_parent_exemption_holds_at_both_layers() {
             .execution_expires_at_ms
             .min(witness.expires_at_ms());
         let (receipt, operation, expected) = match case {
-            "used-then-revoked" => (Some(&receipt), Some(link), None),
+            "used-then-revoked" => (Some(&receipt), Some(link), Some(P::ApprovalRevoked)),
+            "used" => (Some(&receipt), Some(link), None),
             "wrong-parent" => (Some(&receipt), Some(link), Some(P::ApprovalRevoked)),
             "wrong-operation" => (
                 Some(&receipt),
@@ -1369,14 +1365,14 @@ async fn used_parent_exemption_holds_at_both_layers() {
                 let facts = record_facts(&f, &witness);
                 assert_eq!(
                     facts.record().disposition,
-                    stellar_agent_core::approval::witness::ApprovalDisposition::Revoked
+                    stellar_agent_core::approval::witness::ApprovalDisposition::Consumed
                 );
                 assert_eq!(
                     facts.record().consumed_at_ms,
                     consumed_at,
                     "the record keeps its first consumption"
                 );
-                // At the cap the mint refuses on the same exemption.
+                // At the cap the facts check refuses the used record.
                 f.clock.set(cap);
                 let facts = record_facts(&f, &witness);
                 assert_eq!(
@@ -1384,13 +1380,26 @@ async fn used_parent_exemption_holds_at_both_layers() {
                         Some(&facts),
                         &witness,
                         Some(link.operation_id),
-                        receipt.and_then(super::super::message::MessageUseReceipt::approval_nonce),
                         cap
                     ),
                     Err(MainnetAuthorizationError::Refused(P::ApprovalExpired))
                 );
             }
             Some(expected) => assert_refused(result, expected, &f, &before),
+        }
+        if case == "used-then-revoked" {
+            // The resolver's own facts check refuses the consumed, revoked
+            // record for its operation, before the mint's check.
+            let facts = record_facts(&f, &witness);
+            assert_eq!(
+                enabled::check_approval_facts(
+                    Some(&facts),
+                    &witness,
+                    Some(link.operation_id),
+                    witness.consent_at_ms()
+                ),
+                Err(MainnetAuthorizationError::Refused(P::ApprovalRevoked))
+            );
         }
     }
 }

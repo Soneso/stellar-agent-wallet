@@ -1248,7 +1248,10 @@ fn complete_history_end(
 /// ledger. The complete-history branch needs two covered absences whose
 /// oldest ledgers reach back to the pre-exposure ledger and whose latest
 /// ledgers reach the stored scan end, with intact history. A regressed or
-/// failed account read decides nothing and falls back to nothing.
+/// failed account read decides nothing and falls back to nothing. A read
+/// that succeeds without both sequences below the attempt's, such as one
+/// that shows the sequence used, proves nothing by sequence and falls back
+/// to the complete-history branch.
 ///
 /// # Errors
 ///
@@ -3902,6 +3905,45 @@ mod tests {
         let update = evaluated.input.recovery.unwrap();
         assert_eq!(update.disagreements, 3);
         assert_eq!(update.diagnostic.as_deref(), Some(ACCOUNT_LEDGER_REGRESSED));
+    }
+
+    /// An account read that succeeds and shows the attempt's sequence used
+    /// proves nothing by sequence. The attempt then decides by complete
+    /// history on two covered absences, and stays pending without them.
+    #[test]
+    fn recovery_used_sequence_read_falls_back_to_complete_history() {
+        let released = exposed(true);
+        let covered = [absent(5, 60), absent(5, 61)];
+        let short = [absent(21, 60), absent(5, 61)];
+        for read in [
+            accounts(7, 7, (60, 61)),
+            accounts(6, 7, (60, 61)),
+            accounts(8, 6, (60, 61)),
+        ] {
+            let proof = classify_non_inclusion(&released, &covered, Some(&read), None);
+            assert!(
+                matches!(&proof, Ok(NotIncludedProof::CompleteHistory { primary, witness })
+                    if primary.first_ledger == 20
+                        && primary.oldest_ledger == 5
+                        && primary.latest_ledger == 60
+                        && witness.latest_ledger == 61),
+                "{read:?}: {proof:?}"
+            );
+            assert!(
+                matches!(
+                    observe(&released, Some(&covered), None, Some(&read), None),
+                    Observed::Decided(DecidedTransition::NotIncluded(
+                        NotIncludedProof::CompleteHistory { .. }
+                    ))
+                ),
+                "{read:?}"
+            );
+            assert_eq!(
+                classify_non_inclusion(&released, &short, Some(&read), None),
+                Err("coverage_pending"),
+                "{read:?}"
+            );
+        }
     }
 
     /// Complete-history non-inclusion needs two covered absences reaching

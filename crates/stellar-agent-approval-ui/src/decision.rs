@@ -208,7 +208,10 @@ pub struct RevocationView {
 }
 
 impl RevocationView {
-    /// Whether an eligible inbox entry can change this durable record.
+    /// Whether an eligible inbox entry can change this durable record: a live,
+    /// unconsented, pending record. A record the inbox admitted on this test
+    /// is still revoked when its waiting expiry passes before the adapter
+    /// reads it again.
     #[must_use]
     pub fn permits_inbox_revocation(&self) -> bool {
         self.state == "pending"
@@ -217,7 +220,11 @@ impl RevocationView {
             && self.closed_at_ms.is_none()
     }
 
-    /// Whether revocation returns this view without another write.
+    /// Whether the view shows a revoked, expired or closed record. The inbox
+    /// returns such a view without another write. The owner's revocation
+    /// still revokes a record whose stored state is pending, which the view
+    /// does not show, and returns the view without a write for every other
+    /// stored state.
     #[must_use]
     pub fn is_noop(&self) -> bool {
         self.state == "revoked" || self.expired || self.closed_at_ms.is_some()

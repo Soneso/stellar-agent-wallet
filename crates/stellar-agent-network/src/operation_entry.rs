@@ -1679,7 +1679,9 @@ impl OperationAudit for ConsentOnlyAudit {
 ///
 /// # Errors
 ///
-/// The refusals of [`ApprovalRecorder::record_consent`] and
+/// `approval.revoked` when the store refuses because the record is revoked,
+/// at any time after the revocation; otherwise the refusals of
+/// [`ApprovalRecorder::record_consent`] and
 /// [`ApprovalRecorder::record_consent_with_delivery`], rendered through
 /// [`operation_refusal`].
 pub fn commit_consent(
@@ -1699,7 +1701,23 @@ pub fn commit_consent(
         ),
         None => recorder.record_consent(completion.id, &completion.witness, &completion.payload),
     }
-    .map_err(operation_refusal)
+    .map_err(|error| {
+        // A revocation is final, so the record read after the refusal names it.
+        let revoked = ApprovalStatus::new(store, profile)
+            .view(completion.id)
+            .is_ok_and(|view| {
+                view.is_some_and(|view| {
+                    view.record.state == crate::policy_state::approvals::ApprovalState::Revoked
+                })
+            });
+        if revoked {
+            WalletError::Approval(ApprovalFailure::Revoked {
+                detail: "this approval has been revoked".to_owned(),
+            })
+        } else {
+            operation_refusal(error)
+        }
+    })
 }
 
 /// The stores an integrated approval request is admitted under.

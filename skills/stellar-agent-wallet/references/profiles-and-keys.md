@@ -658,8 +658,10 @@ repair the file or remove the marker path by hand.
 platform sees the old marker, the new one, or none. `profile show` reports `halted`, `halted_at`, and `halt_reason`.
 
 `profile resume` on a halted profile writes its `profile_resumed` audit row
-first and removes the marker only after the row is committed, so a resume that
-took effect is always recorded. A `profile_resumed` row records that the
+first and removes the marker only after the row is written to the log or
+queued in the audit outbox. A row queued in the outbox is reported as
+`queued`, and a dropped tail of queued rows that carry no reference, such as
+halt and resume, is not detected before delivery. A `profile_resumed` row records that the
 command ran; the marker file decides the state. Exit code `1` means the profile
 is still halted. Two failures leave a `profile_resumed` row on a profile that
 stays halted: a marker that cannot be removed after the row, and an append that

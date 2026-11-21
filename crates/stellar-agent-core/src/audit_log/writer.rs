@@ -12348,6 +12348,109 @@ mod tests {
         writer1.write_entry(entry2).unwrap();
     }
 
+    /// The sidecar lock is held from `open` through every write and a
+    /// rotation until the writer drops; a second open refuses at each step
+    /// and succeeds after the drop.
+    #[test]
+    fn the_writer_lock_spans_the_whole_writer_lifetime() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let second = || AuditWriter::open(path.clone(), None).map(drop);
+        let mut writer = open_no_key(path.clone());
+        assert!(
+            matches!(second(), Err(WriterError::FileLocked)),
+            "after open"
+        );
+        writer
+            .write_entry(make_entry(writer.last_entry_hash()))
+            .unwrap();
+        assert!(
+            matches!(second(), Err(WriterError::FileLocked)),
+            "after a write"
+        );
+        let threshold = super::super::rotation::test_seam::set_rotation_threshold(&path, 1);
+        writer
+            .write_entry(make_entry(writer.last_entry_hash()))
+            .unwrap();
+        drop(threshold);
+        assert!(
+            !rotated_archives_newest_first(&path).is_empty(),
+            "the write rotated the log"
+        );
+        assert!(
+            matches!(second(), Err(WriterError::FileLocked)),
+            "after rotation"
+        );
+        drop(writer);
+        let reopened = second();
+        assert!(reopened.is_ok(), "the drop releases the lock: {reopened:?}");
+    }
+
+    /// A second session that opens the log while a rotation has renamed the
+    /// active file and not yet created the next one refuses `FileLocked`,
+    /// and the rotating writer creates the next active file.
+    #[test]
+    fn a_second_session_inside_a_rotation_refuses() {
+        use super::super::verify::verify_log;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut writer = open_no_key(path.clone());
+        let observed: Arc<Mutex<Option<(bool, bool)>>> = Arc::new(Mutex::new(None));
+        let seen = observed.clone();
+        let active = path.clone();
+        writer.after_rotation_rename = Some(Box::new(move |_archive: &Path| {
+            let absent = !active.exists();
+            let refused = matches!(
+                AuditWriter::open(active.clone(), None),
+                Err(WriterError::FileLocked)
+            );
+            *seen.lock().unwrap() = Some((absent, refused));
+        }));
+        writer
+            .write_entry(make_entry(writer.last_entry_hash()))
+            .unwrap();
+        let threshold = super::super::rotation::test_seam::set_rotation_threshold(&path, 1);
+        writer
+            .write_entry(make_entry(writer.last_entry_hash()))
+            .unwrap();
+        drop(threshold);
+        assert_eq!(
+            *observed.lock().unwrap(),
+            Some((true, true)),
+            "the second session ran between the rename and the new file and refused"
+        );
+        writer
+            .write_entry(make_entry(writer.last_entry_hash()))
+            .unwrap();
+        drop(writer);
+        assert!(
+            verify_log(&path, None).is_ok(),
+            "the rotated chain verifies"
+        );
+    }
+
+    /// Readers take no writer lock: a verification reads the log while a
+    /// writer holds the lock, and a writer opens after a verification.
+    #[test]
+    fn readers_take_no_writer_lock() {
+        use super::super::verify::verify_log;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut writer = open_no_key(path.clone());
+        writer
+            .write_entry(make_entry(writer.last_entry_hash()))
+            .unwrap();
+        let held = verify_log(&path, None);
+        assert!(
+            held.is_ok(),
+            "a verification under a held writer lock: {held:?}"
+        );
+        drop(writer);
+        verify_log(&path, None).unwrap();
+        let _lock = super::super::lock::AuditWriterLock::acquire(&lock_sidecar_path(&path))
+            .expect("a verification holds no lock after it returns");
+    }
+
     /// A path with no parent directory component must be rejected.
     ///
     /// On all POSIX + Windows platforms `PathBuf::from("/").parent()` returns
