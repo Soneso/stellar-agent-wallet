@@ -126,8 +126,7 @@ cross-check witness guards against a lying primary. Enablement refuses a
 profile whose stored or merged RPC or oracle URL names another host, and a
 mainnet signature accepts a witness only from the signed oracle host. A
 mainnet write builds its post-send oracle client only for the signed oracle
-host. On
-mainnet, a step that reconciles, recovers, releases or clears a submission
+host. On mainnet, a step that reconciles, recovers, releases or clears a submission
 runs only after the enablement verifies in the same process, with clients
 built from the verified profile. That covers the value verbs' reconcile
 pass, `tx status`, `tx receipt clear`, and an MCP server's status tool and
@@ -138,8 +137,9 @@ cannot redirect either endpoint of a signature or a settlement without the
 owner's signature. Of the witness inputs, the
 owner signs the oracle host and the per-asset cross-check thresholds. For an
 asset the signed thresholds name, a profile threshold can only lower the
-amount that requires a witness; for any other asset the profile threshold
-alone applies. The
+amount that requires a witness. On mainnet, for an asset the signed thresholds
+do not name, XLM and its SAC use at most 1000 XLM, and a token has no
+threshold and refuses. The
 oracle URL's scheme, path, and credentials and the oracle provider record are
 unsigned profile fields.
 
@@ -264,11 +264,17 @@ properties:
   the RPC re-simulation, and withhold it when that row cannot be written. An approval or
   rejection takes effect only after its audit row is durable, in the log or in the
   log's outbox. A queued row reaches the log before the consumer of the approval loads
-  a signing key. Queued rows are committed by count and SHA-256 chain head in the
-  platform keyring, and only committed operator rows drain. A removed, changed, or
-  reordered committed row, a line past the commitment, or a committed row of
-  another kind refuses keyed acquisition until `audit acknowledge-outbox-loss`
-  records the loss and revokes decided approvals and toolset grants. An absent outbox state reads as zero;
+  a signing key. A queue without owner state commits its rows by count and
+  SHA-256 chain head in the platform keyring, and only committed operator rows
+  drain. A removed, changed, or reordered committed row, a line past the
+  commitment, or a committed row of another kind refuses keyed acquisition until
+  `audit acknowledge-outbox-loss` records the loss. The command first removes
+  decided, unexpired approvals from the approval inbox and revokes toolset
+  grants. A queue under owner state authenticates each row by its tag and
+  commits delivered batches. A dropped tail of queued rows that carry no
+  reference, such as halt and resume rows, is not detected before delivery.
+  A queued mainnet consent row carries a reference, and a commit whose consent
+  row was not delivered refuses with `approval.consent_undelivered`. An absent outbox state reads as zero;
   raw deletion or restore of that keyring entry shares the boundary below.
   Every append, drain and keyed writer locks the lock files whose identities the
   keyring records for the log, and refuses a lock file that is not the recorded
@@ -294,7 +300,10 @@ properties:
   `audit verify --profile` (`audit.entry_tag_invalid`), and readers stop at the
   writer's verified tip. Still open: code that can read the audit key can compute
   valid tags, rows before the boundary row rest on the anchor alone, `audit verify`
-  without `--profile` checks no tag, and zero-config logs carry no tags. Raw
+  without `--profile` checks no tag, and zero-config logs carry no tags. Under
+  owner state, a same-user process with file access and no audit key can drop
+  a tail of queued rows that carry no reference, such as halt and resume rows,
+  and the next drain and `audit verify --profile` do not detect it. Raw
   deletion or restore of platform keyring items outside the wallet, together with a
   matching log, rests on the platform keyring's own access control. A headless keyring
   backend keeps those items in a file that same-user code can restore, so mainnet

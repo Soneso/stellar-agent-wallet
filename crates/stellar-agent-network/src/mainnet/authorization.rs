@@ -1680,6 +1680,9 @@ mod tests {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
             let _storage_home =
                 stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            // The expiry check reads the approval decision time from the
+            // keyring, so the test installs its own store.
+            keyring_mock::install().unwrap();
             let f = Fixture::new();
             let a = f.tx();
             a.check_profile("mainnet-profile").unwrap();

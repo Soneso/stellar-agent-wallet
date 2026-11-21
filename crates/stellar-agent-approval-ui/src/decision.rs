@@ -222,9 +222,10 @@ impl RevocationView {
 
     /// Whether the view shows a revoked, expired or closed record. The inbox
     /// returns such a view without another write. The owner's revocation
-    /// still revokes a record whose stored state is pending, which the view
-    /// does not show, and returns the view without a write for every other
-    /// stored state.
+    /// decides on the stored record instead: it revokes a pending record at
+    /// any time and a consumed record inside its window, and returns the view
+    /// without a write for a revoked record and a consumed one whose window
+    /// ended.
     #[must_use]
     pub fn is_noop(&self) -> bool {
         self.state == "revoked" || self.expired || self.closed_at_ms.is_some()

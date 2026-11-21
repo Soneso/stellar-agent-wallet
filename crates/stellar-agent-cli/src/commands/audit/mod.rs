@@ -6,8 +6,9 @@
 //!   integrity from the oldest rotated file to the current active file.
 //! - [`reanchor`] — move the log's keyring-held tip anchor to its current tip
 //!   after an operator-acknowledged rollback or audit binding change.
-//! - `acknowledge-outbox-loss`: revoke the profile's permissions, then record
-//!   the loss of queued operator rows.
+//! - `acknowledge-outbox-loss`: remove the profile's decided approvals from
+//!   its approval inbox and revoke its toolset grants, then record the loss
+//!   of queued operator rows.
 //! - `bind-carriers`: record the identities of the audit lock files and start
 //!   a new outbox generation, with every wallet process stopped.
 //!
@@ -162,7 +163,7 @@ pub enum AuditSubcommand {
     /// Exits 0 on success; exits 1 without a required acknowledgement and on
     /// any failure.
     Reanchor(reanchor::ReanchorArgs),
-    /// Acknowledge lost queued operator rows and revoke the profile's permissions.
+    /// Acknowledge lost queued rows after removing decided inbox approvals and toolset grants.
     AcknowledgeOutboxLoss(acknowledge_outbox_loss::AcknowledgeOutboxLossArgs),
     /// Record the carrier identities with every wallet process stopped.
     BindCarriers(bind_carriers::BindCarriersArgs),

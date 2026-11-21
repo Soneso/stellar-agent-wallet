@@ -949,14 +949,20 @@ fn publication_refuses_revoked_retry() {
     .unwrap();
     drop(inbox);
     let committed = fx.bytes();
-    assert!(
-        commit_consent(&fx.store, fx.fixture.profile(), &completion).is_err(),
-        "integrated publication accepts only live retries"
-    );
-    assert_eq!(
-        commit_consent(&fx.store, fx.fixture.profile(), &compatibility).unwrap(),
-        revoked
-    );
+    // Both paths refuse a revoked record, also the compatibility repeat of
+    // the receipt the record already holds.
+    for (path, completion) in [
+        ("integrated", &completion),
+        ("compatibility", &compatibility),
+    ] {
+        assert_eq!(
+            commit_consent(&fx.store, fx.fixture.profile(), completion)
+                .unwrap_err()
+                .code(),
+            "approval.revoked",
+            "{path}"
+        );
+    }
     assert_eq!(fx.bytes(), committed);
 }
 

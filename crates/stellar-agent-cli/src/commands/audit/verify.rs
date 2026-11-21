@@ -176,10 +176,13 @@ pub struct AuditVerifyResult {
     /// not yet drained into it: the newline-terminated lines of
     /// `<log>.outbox`, counted after the commitment check and apart from it.
     ///
-    /// Queued rows are committed in the keyring until a draining writer
-    /// appends them. With `--profile` on the profile's own log, verification
-    /// checks that commitment under the outbox lock and fails when committed
-    /// rows are missing or changed. A torn or unparseable outbox adds a
+    /// A queue without owner state commits its rows by count and chain head
+    /// in the keyring until a draining writer appends them; a queue under
+    /// owner state authenticates each row by its tag and commits delivered
+    /// batches. With `--profile` on the profile's own log, verification checks
+    /// the commitment under the outbox lock and fails when committed rows are
+    /// missing or changed. Under owner state, a dropped tail of queued rows
+    /// that carry no reference, such as halt and resume rows, passes. A torn or unparseable outbox adds a
     /// warning and leaves the chain verdict unchanged. An outbox that cannot
     /// be read has no count: the field is omitted, an `outbox_unreadable`
     /// warning names the condition, and the chain verdict is unchanged.

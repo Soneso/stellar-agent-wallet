@@ -450,8 +450,9 @@ enable-mainnet` stages the host of `oracle_provider_url` as
 only from the signed `oracle_host`, never from the host the profile names
 alone. Of the witness inputs, the owner signs the oracle host and the
 `[mainnet.cross_check_thresholds]`. For an asset the signed table names, a
-profile threshold can only lower the amount that requires a witness; for any
-other asset the profile threshold alone applies. The scheme, path, and credentials of
+profile threshold can only lower the amount that requires a witness. For an
+asset the signed table does not name, XLM and its SAC use at most 1000 XLM, and
+a token has no threshold and refuses. The scheme, path, and credentials of
 `oracle_provider_url` and the `providers.oracle` record are unsigned profile
 fields.
 For the x402 payment tools, the oracle simulates the same unsigned transfer the
