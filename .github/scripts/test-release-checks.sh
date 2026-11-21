@@ -442,11 +442,21 @@ exit 2
 STUB
 chmod +x "$tmp/bin/curl"
 touch "$tmp/github-env"
+stub_digest=$(printf 'fixed download bytes\n' |
+  python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')
+pinned_digest=$(sed -n 's/^SODIUM_MSVC_SHA256=//p' .github/scripts/release/sodium.sh)
+if ! [[ "$pinned_digest" =~ ^[0-9a-f]{64}$ ]]; then
+  echo 'FAIL sodium-digest: sodium.sh holds no single SHA-256 pin' >&2
+  exit 1
+fi
 # The split literal keeps the environment-file scanner of
 # check-feature-discipline.py from reading this fixture line as a write.
 expect sodium-digest 1 env PATH="$tmp/bin:$PATH" "GITHUB""_ENV=$tmp/github-env" \
   bash .github/scripts/release/sodium.sh
 expect_output sodium-digest 'sodium: MSVC archive SHA-256 differs from the pinned digest'
+# The mismatch message names the pinned and the downloaded digest.
+expect_output sodium-digest "sodium: expected $pinned_digest"
+expect_output sodium-digest "sodium: actual   $stub_digest"
 if [ -s "$tmp/github-env" ]; then
   echo 'FAIL sodium-digest: exports an unverified install root' >&2
   exit 1
@@ -455,8 +465,6 @@ for name in libsodium-1.0.22-stable-msvc.zip libsodium-1.0.22-stable-msvc.zip.mi
   [ -s "$RUNNER_TEMP/sodium-dist/$name" ] || { echo "FAIL sodium-digest: missing $name" >&2; exit 1; }
 done
 # A copy pinned to the digest of the stub bytes exports the directory once.
-stub_digest=$(printf 'fixed download bytes\n' |
-  python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')
 sed "s/^SODIUM_MSVC_SHA256=.*\$/SODIUM_MSVC_SHA256=$stub_digest/" .github/scripts/release/sodium.sh > "$tmp/sodium-pinned.sh"
 if [ "$(grep -c -x "SODIUM_MSVC_SHA256=$stub_digest" "$tmp/sodium-pinned.sh")" != 1 ]; then
   echo 'FAIL sodium-match: the pinned copy does not set the stub digest' >&2
