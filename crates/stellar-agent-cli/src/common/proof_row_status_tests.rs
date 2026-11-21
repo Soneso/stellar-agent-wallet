@@ -580,17 +580,253 @@ async fn every_cli_row_writes_one_value_row_on_mainnet() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// sizing.accounting_inputs_mainnet
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// On mainnet an unlisted payment beyond a budget bound escalates to a
+// per-payment approval: the verb starts a consent ceremony, and a presence
+// answer without user verification parks the approval and refuses
+// `approval.presence_invalid`. A debit beyond the total budget of the policy's epoch refuses
+// `policy.deny.total_budget_exhausted`, and a balance the observed account,
+// the retained native obligations and the call's debit and fee take below the
+// floor refuses `account.floor_refused`.
+
+/// The balance of the agent's account on the fixture ledgers.
+const AGENT_BALANCE: i64 = 100_000_000_000;
+
+/// One accounting input of `sizing.accounting_inputs_mainnet`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Input {
+    Unlisted,
+    Total,
+    Floor,
+}
+
+impl Input {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Unlisted => "unlisted",
+            Self::Total => "total",
+            Self::Floor => "floor",
+        }
+    }
+
+    /// The refusal of a call over the input on mainnet.
+    fn refusal(self) -> &'static str {
+        match self {
+            Self::Unlisted => "approval.presence_invalid",
+            Self::Total => "policy.deny.total_budget_exhausted",
+            Self::Floor => "account.floor_refused",
+        }
+    }
+
+    /// The inputs that can refuse a call of `verb`. A claim and a trustline
+    /// debit nothing, so neither budget can be exceeded by them; the floor
+    /// counts their fee.
+    fn of(verb: Verb) -> &'static [Self] {
+        match verb {
+            Verb::Claim | Verb::Trustline => &[Self::Floor],
+            Verb::Pay | Verb::Create => &[Self::Unlisted, Self::Total, Self::Floor],
+        }
+    }
+}
+
+impl Verb {
+    /// The profile name of the verb's run under `input`.
+    fn accounting_name(self, input: Input) -> &'static str {
+        match (self, input) {
+            (Self::Pay, Input::Unlisted) => "row-accounting-unlisted-pay",
+            (Self::Pay, Input::Total) => "row-accounting-total-pay",
+            (Self::Pay, Input::Floor) => "row-accounting-floor-pay",
+            (Self::Create, Input::Unlisted) => "row-accounting-unlisted-create",
+            (Self::Create, Input::Total) => "row-accounting-total-create",
+            (Self::Create, Input::Floor) => "row-accounting-floor-create",
+            (Self::Claim, _) => "row-accounting-floor-claim",
+            (Self::Trustline, _) => "row-accounting-floor-trustline",
+        }
+    }
+
+    /// The native debit of one call: the 1 XLM payment and the 2 XLM
+    /// creation of the verbs' mainnet arguments.
+    fn debit(self) -> i64 {
+        match self {
+            Self::Pay => 10_000_000,
+            Self::Create => 20_000_000,
+            Self::Claim | Self::Trustline => 0,
+        }
+    }
+
+    /// The verb's allowing rule with `input` sized for one call. The floor
+    /// admits one call and refuses a second while the first call's debit and
+    /// fee stay retained: the balance less one and a half calls at a fee of
+    /// 100 stroops.
+    fn accounting_rule(self, input: Input) -> String {
+        use crate::common::mainnet_write_fixture::{
+            NEW_ACCOUNT, balance_floor, claim_rule, create_rule, pay_rule, trustline_rule,
+        };
+        let debit = self.debit();
+        let extra = match input {
+            Input::Unlisted => String::new(),
+            Input::Total => format!(
+                "{{ kind = \"total_budget\", asset = \"native\", max_stroops = {debit} }},\n"
+            ),
+            Input::Floor => balance_floor(AGENT_BALANCE - (debit + 100) * 3 / 2),
+        };
+        let rule = match self {
+            Self::Pay => pay_rule("allow", &extra),
+            Self::Create => create_rule("allow", &extra),
+            Self::Claim => claim_rule("allow", &extra),
+            Self::Trustline => trustline_rule("allow", &extra),
+        };
+        if input != Input::Unlisted {
+            return rule;
+        }
+        let listed = if matches!(self, Self::Pay) {
+            DESTINATION
+        } else {
+            NEW_ACCOUNT
+        };
+        let unlisted = rule.replace(
+            &format!("allowlist = [\"{listed}\"] }}"),
+            &format!(
+                "allowlist = [], unlisted = {{ mode = \"budget\", asset = \"native\", \
+                 per_tx_stroops = {debit}, per_period_stroops = {debit}, window = \"1d\" }} }}"
+            ),
+        );
+        assert_ne!(unlisted, rule, "the rule lists the verb's destination");
+        unlisted
+    }
+
+    /// The fixture of the verb under `input`. The primary and the oracle
+    /// share one ledger, so both report the sequence the first run's send
+    /// advanced; the primary reports its entries at the readiness ledger for
+    /// the floor's account read.
+    fn accounting_spec(self, input: Input) -> Spec {
+        let ledger = self.ledger();
+        let primary = if input == Input::Floor {
+            ledger.clone().entries_at_readiness_ledger()
+        } else {
+            ledger.clone()
+        };
+        Spec::new(self.accounting_name(input))
+            .primary(primary)
+            .oracle(ledger)
+            .rules(vec![self.accounting_rule(input)])
+    }
+}
+
+/// The number of records of each bucket of `fixture`'s window.
+fn bucket_rows(fixture: &MainnetFixture) -> std::collections::BTreeMap<String, usize> {
+    fixture.window_body()["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|bucket| {
+            (
+                bucket["bucket"].as_str().unwrap().to_owned(),
+                bucket["records"].as_array().unwrap().len(),
+            )
+        })
+        .collect()
+}
+
+/// For each verb on mainnet, the unlisted counter, the budget epoch and the
+/// balance floor size the call from persisted accounting.
+///
+/// Each verb runs under each input that can refuse it, on its own fixture
+/// whose allowing rule carries that input sized for one call. The first run
+/// sends without a consent ceremony; the second run, a new command over the
+/// same files, refuses with the input's refusal and sends nothing. Over the
+/// unlisted budget the second run starts the one consent ceremony and parks
+/// its approval, which a presence answer without user verification leaves
+/// pending. Under the floor the second call's
+/// own debit and fee fit the floor, and the first call's retained
+/// obligation, read from the window, crosses it. Every bucket of the window
+/// keeps the one record of the sent call, and the refusal adds none.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn every_cli_row_sizes_its_second_call_from_persisted_accounting() {
+    let mut checks = Checks::default();
+    for verb in Verb::ALL {
+        for &input in Input::of(verb) {
+            let what = |step: &str| format!("{} {step}", input.name());
+            let mut fixture = verb.accounting_spec(input).build().await;
+            if input == Input::Floor {
+                fixture.cover_native_history();
+            }
+            let business_id = crate::common::business_entry::fresh_business_id();
+            let (code, first) = verb.run(&fixture, &business_id).await;
+            let first_sent = fixture.sent_envelopes().await.len();
+            checks.eq(verb, &what("first run"), &json!(code), &json!(0));
+            checks.eq(
+                verb,
+                &what("first run sends"),
+                &json!(first_sent),
+                &json!(1),
+            );
+            checks.eq(
+                verb,
+                &what("first run ceremonies"),
+                &json!(fixture.ceremonies().len()),
+                &json!(0),
+            );
+            let sent = bucket_rows(&fixture);
+            if input == Input::Unlisted {
+                present(&mut fixture, 1);
+            }
+            let business_id = crate::common::business_entry::fresh_business_id();
+            let (code, second) = verb.run(&fixture, &business_id).await;
+            if input == Input::Unlisted {
+                checks.eq(
+                    verb,
+                    &what("second run ceremonies and parked approvals"),
+                    &json!([fixture.ceremonies().len(), fixture.pending_entries().len()]),
+                    &json!([1, 1]),
+                );
+            }
+            checks.eq(
+                verb,
+                &what("second run"),
+                &json!([code, second["error"]["code"]]),
+                &json!([1, input.refusal()]),
+            );
+            checks.eq(
+                verb,
+                &what("second run sends"),
+                &json!(fixture.sent_envelopes().await.len()),
+                &json!(first_sent),
+            );
+            checks.holds(
+                verb,
+                &format!(
+                    "{}: one record in each bucket: {sent:?}: {first}",
+                    what("window")
+                ),
+                !sent.is_empty() && sent.values().all(|records| *records == 1),
+            );
+            checks.holds(
+                verb,
+                &what("the refusal adds no record"),
+                bucket_rows(&fixture) == sent,
+            );
+        }
+    }
+    checks.assert_none();
+}
+
 /// Every matrix cell that names a test of this module lists exactly the
 /// verbs of the verb table, and every row test of this module is named by a
 /// cell.
 #[test]
 fn the_verb_table_matches_its_matrix_cells() {
     const MODULE: &str = "common::proof_row_status_tests::";
-    const TESTS: [&str; 4] = [
+    const TESTS: [&str; 5] = [
         "every_cli_row_reports_its_approval_without_consuming_it",
         "every_cli_row_reports_its_operation_and_next_step",
         "every_cli_row_keeps_its_queued_consent_row_until_the_holder_drains",
         "every_cli_row_writes_one_value_row_on_mainnet",
+        "every_cli_row_sizes_its_second_call_from_persisted_accounting",
     ];
     let matrix: toml::Table = toml::from_str(include_str!(
         "../../../../.github/scripts/proof-matrix.toml"

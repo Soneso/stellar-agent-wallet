@@ -6,8 +6,9 @@
 #
 # The cell rule: a cell names a test only when the test asserts the claim
 # for every row the cell lists. A test that iterates every tool counts for
-# each row it reaches. Existing behavior without such a test for a row stays
-# pending on "row-test". Rows that share a test set share one cell, and each
+# each row it reaches. A cell whose behavior exists and whose test is still
+# to come stays pending on a delivery key that states what the test waits
+# for. Rows that share a test set share one cell, and each
 # (claim, row) pair a claim applies to has exactly one cell. A cell holds
 # not_applicable only when its rows cannot exhibit the claim, and its reason
 # says why that is safe.
@@ -318,6 +319,14 @@ id = "sizing.accounting_inputs"
 family = "sizing"
 statement = "the unlisted counter, the budget epoch and the balance floor size the call from persisted accounting"
 applies = ["commit", "single", "verb"]
+builds = "feature-off"
+
+[[claim]]
+id = "sizing.accounting_inputs_mainnet"
+family = "sizing"
+statement = "the unlisted counter, the budget epoch and the balance floor size the call from persisted accounting"
+applies = ["commit", "single", "verb"]
+builds = "feature-on"
 
 [[claim]]
 id = "sizing.hold_follows_evidence"
@@ -443,12 +452,12 @@ key = "operation-notification"
 change = "operation-state notifications on MCP"
 
 [[delivery]]
-key = "row-test"
-change = "the behavior exists; a test for this row follows"
-
-[[delivery]]
 key = "x402-testnet-no-payer-view"
 change = "on testnet and in a build without mainnet writes, the x402 tools pass no account view, so a minimum_reserve rule refuses with policy.engine_required before sizing; on mainnet the payer read sizes the call, and the claim's mainnet-write scope names its tests"
+
+[[delivery]]
+key = "testnet-floor-no-account-view"
+change = "in a build without mainnet writes, the balance floor reads no account and refuses account.unread before any send (crates/stellar-agent-core/src/policy/v1/criteria/balance_floor.rs:97-98), so no floor input is stored to survive a restart, and a claim or trustline row runs no other input; on mainnet the floor reads the first call's retained obligation, and the claim's mainnet-write scope names its tests"
 
 [[delivery]]
 key = "cli-trustline-mainnet-reserve"
@@ -894,10 +903,42 @@ tests = [
   { package = "stellar-agent-mcp", target = "lib", name = "tools::common::tests::mainnet::classic_public_pairs_acquire_one_frame_per_handler", builds = "feature-on" },
 ]
 
+# Cells: sizing.accounting_inputs. Off mainnet the floor reads no observed
+# account, so it refuses every call account.unread and stores nothing to
+# survive a restart. A claim and a trustline debit nothing, so only the
+# floor can refuse them. Partial ref, feature-off, which the checker does
+# not resolve: stellar-agent-cli test:cli
+# proof_row_claims::every_row_sizes_its_second_call_from_persisted_accounting
+# pins the unlisted counter and the total budget across a restart for the
+# pay, create-account and x402 rows; an unlisted excess and a total-budget
+# excess deny there.
 [[cell]]
 claim = "sizing.accounting_inputs"
-rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
-pending = "row-test"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment"]
+pending = "testnet-floor-no-account-view"
+
+[[cell]]
+claim = "sizing.accounting_inputs"
+rows = ["cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+pending = "testnet-floor-no-account-view"
+
+# Cells: sizing.accounting_inputs_mainnet. An unlisted excess escalates to
+# an approval on mainnet, and the floor reads the first call's retained
+# obligation. A claim and a trustline debit nothing, so only the floor can
+# refuse them.
+[[cell]]
+claim = "sizing.accounting_inputs_mainnet"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::proof_row_status_tests::every_mcp_row_sizes_its_second_call_from_persisted_accounting", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "sizing.accounting_inputs_mainnet"
+rows = ["cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+tests = [
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "common::proof_row_status_tests::every_cli_row_sizes_its_second_call_from_persisted_accounting", builds = "feature-on" },
+]
 
 [[cell]]
 claim = "sizing.hold_follows_evidence"
@@ -1372,7 +1413,7 @@ tests = [
 [[cell]]
 claim = "approval.binds_intent"
 rows = ["mcp.toolset_pay_commit"]
-not_applicable = "a toolset-first record binds the exact envelope its consent signed, which fixes every operation of the intent: the toolset preparation opens an envelope record (crates/stellar-agent-mcp/src/tools/pay.rs:1290-1294), its approval binds the envelope text (crates/stellar-agent-mcp/src/tools/business_entry.rs:524-528), and the commit verifies the consent against that envelope (crates/stellar-agent-mcp/src/tools/pay.rs:2303-2305); a direct-first canonical record it continues binds the intent digest (pay.rs:2298-2302). tools::toolsets_mainnet_tests::proof_rows::a_toolset_first_record_binds_the_exact_envelope_text pins the envelope binding."
+not_applicable = "a toolset-first record binds the exact envelope its consent signed, which fixes every operation of the intent: the toolset preparation opens an envelope record (crates/stellar-agent-mcp/src/tools/pay.rs:1290-1294), its approval binds the envelope text (crates/stellar-agent-mcp/src/tools/business_entry.rs:524-528), and the commit verifies the consent against that envelope (crates/stellar-agent-mcp/src/tools/pay.rs:2303-2305); a direct-first canonical record it continues binds the intent digest (pay.rs:2298-2302). tools::toolsets_mainnet_tests::proof_rows::a_toolset_first_record_binds_the_exact_envelope_text pins the envelope binding, and tools::toolsets_mainnet_tests::public_commit_queue_opens_the_durable_record_proof_delivery_reads pins the direct-first half."
 
 [[cell]]
 claim = "approval.rebuild_from_intent"
@@ -1409,10 +1450,30 @@ tests = [
   { package = "stellar-agent-mcp", target = "test:mcp", name = "toolset_sign_payment_gated_integration::payment_outer_gate_defers_reserve_check" },
 ]
 
+# Off mainnet the floor reads no observed account, so the toolset commit
+# refuses account.unread before and after a restart and stores nothing.
+# Partial ref, feature-off, which the checker does not resolve:
+# stellar-agent-mcp test:mcp
+# approval_cap_integration::toolset_rows::the_toolset_commit_sizes_its_second_payment_from_persisted_accounting
+# pins the unlisted counter and the total budget across a restart.
 [[cell]]
 claim = "sizing.accounting_inputs"
 rows = ["mcp.toolset_pay_commit"]
-pending = "row-test"
+pending = "testnet-floor-no-account-view"
+
+# The three partial mainnet tests prove the unlisted classification, the
+# total epoch across a restart at the toolset preparation, and the commit
+# floor rule; the fourth proves each input refusing the toolset commit
+# after a restart.
+[[cell]]
+claim = "sizing.accounting_inputs_mainnet"
+rows = ["mcp.toolset_pay_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_outer_unlisted_classification_controls_threshold_and_holds", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_composed_total_epoch_survives_aging_reset_and_restart", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::toolset_commit_keeps_the_commit_floor_rule", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::proof_rows::the_toolset_commit_sizes_its_second_payment_from_persisted_accounting", builds = "feature-on" },
+]
 
 [[cell]]
 claim = "sizing.hold_follows_evidence"
