@@ -9,8 +9,10 @@
 //! its record from the profile file, and `pay` refuses. A fresh profile, with
 //! no enablement, keyring entry, or policy, shows that every write verb takes
 //! the refusal at its first step. With the oracle in place, each setup passes
-//! that step and stops at the endpoint identity probe, which the loopback
-//! counter accepts and cannot answer, so the refusal belongs to the oracle.
+//! that step. The enabled installation stops at the endpoint identity probe,
+//! which the loopback counter accepts and cannot answer, so the refusal
+//! belongs to the oracle. The fresh profile stops at the enablement check,
+//! which precedes every client.
 //!
 //! `STELLAR_AGENT_HOME` is set on the child only, and the headless keyring
 //! backend is forced so no run reaches the login keychain. The enabled
@@ -165,7 +167,8 @@ fn run(home: &Path, args: &[&str]) -> (i32, Value) {
 /// Every mainnet write verb refuses a fresh profile, with no enablement,
 /// that sets no oracle with `profile.mainnet_oracle_required` and the
 /// missing-URL detail, before any endpoint contact; the same fresh profile
-/// with its oracle passes the oracle step and refuses at the endpoint probe.
+/// with its oracle passes the oracle step and refuses at the enablement
+/// check, also before any endpoint contact.
 #[test]
 fn mainnet_oracle_required_refuses_every_write_verb_of_a_fresh_profile_without_an_oracle() {
     for (verb, args) in WRITE_VERBS {
@@ -174,13 +177,21 @@ fn mainnet_oracle_required_refuses_every_write_verb_of_a_fresh_profile_without_a
         write_profile(home.path(), &endpoint.https_uri(), true);
         let (code, complete) = run(home.path(), args);
         assert_eq!(code, 1, "`{verb}` with its oracle: {complete}");
+        // The fresh profile holds no owner key, so the enablement check that
+        // precedes every client refuses it.
+        let engine_code = if *verb == "trustline" {
+            "trustline.policy_engine_unavailable"
+        } else {
+            "policy.engine_unavailable"
+        };
         assert_eq!(
-            complete["error"]["code"], "network.endpoint_identity_unavailable",
+            complete["error"]["code"], engine_code,
             "`{verb}` with its oracle: {complete}"
         );
-        assert!(
-            endpoint.accepted().expect("connection count") > 0,
-            "`{verb}` with its oracle probes the primary endpoint"
+        assert_eq!(
+            endpoint.accepted().expect("connection count"),
+            0,
+            "`{verb}` with its oracle refuses before any endpoint contact"
         );
 
         let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();

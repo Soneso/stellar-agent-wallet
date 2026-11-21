@@ -358,9 +358,16 @@ mainnet profile that loads without `oracle_provider_url` is refused with
 reads a keyring entry and writes no enablement state, and every mainnet
 write, in the CLI and in the MCP server, refuses before any signature. An
 enabled profile whose oracle is removed refuses every CLI mainnet write until
-the oracle is set again. A running MCP server checks the profile it loaded at
-startup; its next start refuses the enablement with
-`profile.mainnet_enablement_invalid: on_disk_oracle_host`. On testnet the oracle is
+the oracle is set again, and `tx status` and `tx receipt clear` refuse it with
+`profile.mainnet_enablement_invalid: on_disk_oracle_host`. A running MCP
+server keeps the profile it loaded at startup, and its per-call freshness
+check verifies the enablement against the stored profile again, so a removed
+or moved oracle refuses its value tools, status tool and gate pass with
+`network.mainnet_write_forbidden`. Its next start refuses the enablement with
+`profile.mainnet_enablement_invalid: on_disk_oracle_host`. On mainnet,
+reconciliation, recovery and release run only after the enablement verifies,
+with the primary and oracle the signed policy binds; a profile without an
+enablement record runs none of them. On testnet the oracle is
 optional, and a required witness without one warns.
 
 On mainnet the owner-signed policy binds the oracle host. `profile

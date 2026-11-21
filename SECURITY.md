@@ -126,11 +126,16 @@ cross-check witness guards against a lying primary. Enablement refuses a
 profile whose stored or merged RPC or oracle URL names another host, and a
 mainnet signature accepts a witness only from the signed oracle host. A
 mainnet write builds its post-send oracle client only for the signed oracle
-host. A same-user process that edits the profile file therefore cannot move
-the endpoint or the witness of a mainnet signature without the owner's
-signature. The reconciliation pass, `tx status`, and `tx receipt` build their
-primary and oracle clients from the profile, without an enablement check. Of
-the witness inputs, the
+host. On
+mainnet, a step that reconciles, recovers, releases or clears a submission
+runs only after the enablement verifies in the same process, with clients
+built from the verified profile. That covers the value verbs' reconcile
+pass, `tx status`, `tx receipt clear`, and an MCP server's status tool and
+gate pass, which add the per-call freshness check. A mainnet profile without
+an enablement record runs none of these steps, and `tx receipt clear`
+refuses on it. A same-user process that edits the profile file therefore
+cannot redirect either endpoint of a signature or a settlement without the
+owner's signature. Of the witness inputs, the
 owner signs the oracle host and the per-asset cross-check thresholds. For an
 asset the signed thresholds name, a profile threshold can only lower the
 amount that requires a witness; for any other asset the profile threshold

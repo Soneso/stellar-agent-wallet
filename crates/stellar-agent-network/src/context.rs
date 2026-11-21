@@ -315,7 +315,9 @@ impl MainnetWriteContext {
             P::DerivedNameMismatch,
         )?;
         require(
-            merged.chain_id == snapshot.chain_id && merged.rpc_url == snapshot.rpc_url,
+            merged.chain_id == snapshot.chain_id
+                && merged.rpc_url == snapshot.rpc_url
+                && merged.oracle_provider_url == snapshot.oracle_provider_url,
             P::DiskViewMismatch,
         )?;
         Ok(Self {
@@ -874,6 +876,70 @@ mod tests {
                 MainnetEndpointFlags::default()
             ),
             crate::mainnet::MainnetPrecondition::DiskViewMismatch
+        );
+    }
+
+    #[cfg(feature = "mainnet-write")]
+    #[test]
+    #[serial_test::serial]
+    fn context_refuses_merged_oracle_differing_from_disk() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let (dir, _, resolved) = stored_context_profile();
+        let mut profile = Profile::builder_mainnet_named(
+            "context",
+            "https://rpc.example.invalid",
+            "signer",
+            "key",
+            "nonce",
+            "key",
+        )
+        .primary_provider(
+            stellar_agent_core::profile::schema::PrimaryProviderRecord::new(
+                "Primary operator",
+                "rpc.example.invalid",
+            ),
+        )
+        .oracle_provider_url(url::Url::parse("https://oracle.example.invalid").unwrap())
+        .oracle_provider(stellar_agent_core::profile::schema::ProviderRecord::new(
+            "Oracle operator",
+            "oracle.example.invalid",
+            true,
+        ))
+        .build();
+        profile.audit_log_path = dir.path().join("audit.jsonl");
+        stellar_agent_core::profile::loader::save_to_dir("context", &profile, dir.path()).unwrap();
+        let mut merged = profile.clone();
+        merged.oracle_provider_url = Some("https://other-oracle.example.invalid".parse().unwrap());
+        assert_eq!(
+            refusal(
+                &merged,
+                &resolved,
+                dir.path(),
+                MainnetEndpointFlags::default()
+            ),
+            crate::mainnet::MainnetPrecondition::DiskViewMismatch
+        );
+        merged.oracle_provider_url = None;
+        assert_eq!(
+            refusal(
+                &merged,
+                &resolved,
+                dir.path(),
+                MainnetEndpointFlags::default()
+            ),
+            crate::mainnet::MainnetPrecondition::DiskViewMismatch
+        );
+        assert!(
+            MainnetWriteContext::build(
+                &profile,
+                &resolved,
+                dir.path(),
+                MainnetEndpointFlags::default()
+            )
+            .is_ok(),
+            "the stored oracle URL as merged builds the context"
         );
     }
 

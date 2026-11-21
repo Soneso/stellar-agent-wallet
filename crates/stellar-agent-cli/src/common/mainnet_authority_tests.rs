@@ -1260,6 +1260,100 @@ async fn every_value_verb_refuses_without_the_signed_policy_or_enablement() {
     }
 }
 
+/// Whether the stored window still holds the reservation `id`.
+fn holds(fixture: &MainnetFixture, id: &str) -> bool {
+    stellar_agent_network::policy_state::PersistedWindowStore::for_profile(fixture.name)
+        .pending_reservations(&fixture.profile())
+        .unwrap()
+        .iter()
+        .any(|hold| hold.id == id)
+}
+
+/// Every mainnet value verb verifies the enablement before its reconcile
+/// pass. A stored `oracle_provider_url` moved to another host after the
+/// ceremony, and separately a moved `rpc_url`, refuse with the enablement
+/// refusal before any client is built: neither endpoint receives a request,
+/// the expired hold stays, and no outcome row is written. With the URL put
+/// back, the same verb's pass ends that hold.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn every_value_verb_verifies_the_enablement_before_its_reconcile_pass() {
+    use crate::common::mainnet_write_fixture::{ORACLE_HOST, PRIMARY_HOST};
+    const HOLD: &str = "e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3";
+    const TX: &str = "f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4";
+    let names = [
+        ["moved-pay-oracle", "moved-pay-primary"],
+        ["moved-claim-oracle", "moved-claim-primary"],
+        ["moved-create-oracle", "moved-create-primary"],
+        ["moved-trustline-oracle", "moved-trustline-primary"],
+    ];
+    for (verb, [oracle_name, primary_name]) in Verb::ALL.into_iter().zip(names) {
+        for (name, binding) in [
+            (oracle_name, "on_disk_oracle_host"),
+            (primary_name, "on_disk_host"),
+        ] {
+            let context = format!("{} with a moved {binding}", verb.name());
+            let mut fixture = verb.spec(name).build().await;
+            fixture.seed_expired_hold(HOLD, TX);
+            let restore = |fixture: &MainnetFixture| {
+                if binding == "on_disk_host" {
+                    fixture.set_stored_rpc_url(&format!("https://{PRIMARY_HOST}"));
+                } else {
+                    fixture.set_stored_oracle_url(&format!("https://{ORACLE_HOST}"));
+                }
+            };
+            if binding == "on_disk_host" {
+                fixture.set_stored_rpc_url("https://moved-primary.example.invalid");
+            } else {
+                fixture.set_stored_oracle_url("https://moved-oracle.example.invalid");
+            }
+            let primary_before = fixture.primary_methods().await.len();
+            let oracle_before = fixture.oracle_methods().await.len();
+            let audit_before = fixture.audit_row_count();
+            let before = signer_resolutions_on_this_thread();
+
+            let (exit, envelope) = verb.run(&fixture).await;
+
+            assert_refused_before_confirmation(
+                &context,
+                &fixture,
+                exit,
+                &envelope,
+                "profile.mainnet_enablement_invalid",
+                before,
+            )
+            .await;
+            let message = envelope["error"]["message"].as_str().unwrap();
+            assert!(message.ends_with(binding), "{context}: {message}");
+            assert_eq!(
+                fixture.primary_methods().await.len(),
+                primary_before,
+                "{context}: the primary receives no request"
+            );
+            assert_eq!(
+                fixture.oracle_methods().await.len(),
+                oracle_before,
+                "{context}: the oracle receives no request"
+            );
+            assert!(holds(&fixture, HOLD), "{context}: the hold stays");
+            assert_eq!(
+                fixture.audit_row_count(),
+                audit_before,
+                "{context}: no outcome row"
+            );
+
+            restore(&fixture);
+            fixture.present_with(crate::common::mainnet_presence::driver::fixture_credential());
+            let (exit, envelope) = verb.run(&fixture).await;
+            assert_eq!(exit, 0, "{context} restored: {envelope}");
+            assert!(
+                !holds(&fixture, HOLD),
+                "{context} restored: the pass ends the expired hold"
+            );
+        }
+    }
+}
+
 /// A browser at the signed HTTPS origin, talking to the listener a value
 /// verb binds.
 struct SignedBrowser {
@@ -2381,6 +2475,174 @@ async fn every_mcp_commit_refuses_a_revoked_approval() {
     for authenticated in [false, true] {
         x402_refuses_a_revoked_approval(authenticated).await;
     }
+}
+
+/// The dispatch-gate pass of every MCP classic tool runs only on the startup
+/// enablement record and a fresh check of it. With the server running, a
+/// stored `oracle_provider_url` moved to another host, and separately a
+/// moved `rpc_url`, refuse the tool with the freshness refusal the value
+/// tools give: the primary receives no settlement request, the oracle none
+/// at all, the expired hold stays, and no outcome row is written. With the
+/// URL put back, the gate's pass ends that hold.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn every_mcp_gate_pass_needs_a_fresh_enablement() {
+    use crate::common::mainnet_write_fixture::{ORACLE_HOST, PRIMARY_HOST};
+    const HOLD: &str = "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5";
+    const TX: &str = "f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6";
+    let names = [
+        ["gate-pay-oracle", "gate-pay-primary"],
+        ["gate-claim-oracle", "gate-claim-primary"],
+        ["gate-create-oracle", "gate-create-primary"],
+        ["gate-trustline-oracle", "gate-trustline-primary"],
+    ];
+    for (tool, [oracle_name, primary_name]) in McpTool::ALL.into_iter().zip(names) {
+        for (name, primary_moved) in [(oracle_name, false), (primary_name, true)] {
+            let context = format!(
+                "{tool:?} with a moved {}",
+                if primary_moved { "primary" } else { "oracle" }
+            );
+            let fixture = tool.verb().spec(name).rules(tool.rules()).build().await;
+            let server = mcp_server(&fixture);
+            fixture.seed_expired_hold(HOLD, TX);
+            if primary_moved {
+                fixture.set_stored_rpc_url("https://moved-primary.example.invalid");
+            } else {
+                fixture.set_stored_oracle_url("https://moved-oracle.example.invalid");
+            }
+            let primary_before = fixture.primary_methods().await.len();
+            let oracle_before = fixture.oracle_methods().await.len();
+            let audit_before = fixture.audit_row_count();
+
+            let refused = tool.prepare(&server, &tool.prepare_args(&fixture)).await;
+
+            assert_eq!(refused["ok"], false, "{context}: {refused}");
+            assert_eq!(
+                refused["error"]["code"], "network.mainnet_write_forbidden",
+                "{context}: {refused}"
+            );
+            // The tool's account and fee reads precede its gate; the pass
+            // would ask the primary for the hold's transaction.
+            let asked = fixture.primary_methods().await[primary_before..].to_vec();
+            assert!(
+                !asked.iter().any(|method| method == "getTransaction"),
+                "{context}: the primary receives no settlement request: {asked:?}"
+            );
+            assert_eq!(
+                fixture.oracle_methods().await.len(),
+                oracle_before,
+                "{context}: the oracle receives no request"
+            );
+            assert!(holds(&fixture, HOLD), "{context}: the hold stays");
+            assert_eq!(
+                fixture.audit_row_count(),
+                audit_before,
+                "{context}: no outcome row"
+            );
+
+            if primary_moved {
+                fixture.set_stored_rpc_url(&format!("https://{PRIMARY_HOST}"));
+            } else {
+                fixture.set_stored_oracle_url(&format!("https://{ORACLE_HOST}"));
+            }
+            let prepared = tool.prepare(&server, &tool.prepare_args(&fixture)).await;
+            assert_eq!(prepared["ok"], true, "{context} restored: {prepared}");
+            assert!(
+                !holds(&fixture, HOLD),
+                "{context} restored: the gate's pass ends the expired hold"
+            );
+        }
+    }
+}
+
+/// A server on a mainnet profile without an enablement record refuses a
+/// classic value tool structurally, before its gate: the expired hold stays,
+/// the oracle receives no request, and no outcome row is written.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn an_mcp_value_tool_without_an_enablement_record_settles_nothing() {
+    const HOLD: &str = "e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7";
+    const TX: &str = "f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8";
+    let tool = McpTool::Pay;
+    let fixture = tool
+        .verb()
+        .spec("gate-pay-no-record")
+        .rules(tool.rules())
+        .pre_enable()
+        .build()
+        .await;
+    let server = mcp_server(&fixture);
+    fixture.seed_expired_hold(HOLD, TX);
+    let oracle_before = fixture.oracle_methods().await.len();
+    let audit_before = fixture.audit_row_count();
+
+    let answered = tool.prepare(&server, &tool.prepare_args(&fixture)).await;
+
+    assert_eq!(
+        answered["error"]["code"], "network.mainnet_write_forbidden",
+        "no mainnet write: {answered}"
+    );
+    assert!(holds(&fixture, HOLD), "the hold stays: {answered}");
+    assert_eq!(
+        fixture.oracle_methods().await.len(),
+        oracle_before,
+        "the oracle receives no request"
+    );
+    assert_eq!(
+        fixture.audit_row_count(),
+        audit_before,
+        "no outcome row: {answered}"
+    );
+}
+
+/// The dispatch gate of a value tool on a server without an enablement
+/// record runs no settlement step. Every mainnet value tool refuses before
+/// its gate on such a server, so the test drives the gate itself: the
+/// expired hold stays, no outcome row is written, and neither endpoint
+/// receives a request.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn an_mcp_gate_without_an_enablement_record_runs_no_settlement_step() {
+    const HOLD: &str = "e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9";
+    const TX: &str = "fafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafa";
+    let tool = McpTool::Pay;
+    let fixture = tool
+        .verb()
+        .spec("gate-direct-no-record")
+        .rules(tool.rules())
+        .pre_enable()
+        .build()
+        .await;
+    let server = mcp_server(&fixture);
+    fixture.seed_expired_hold(HOLD, TX);
+    let primary_before = fixture.primary_methods().await.len();
+    let oracle_before = fixture.oracle_methods().await.len();
+    let audit_before = fixture.audit_row_count();
+
+    let refusal = server
+        .dispatch_gate_for_test(
+            "stellar_pay",
+            &tool.prepare_args(&fixture),
+            "stellar:mainnet",
+        )
+        .await;
+
+    assert!(holds(&fixture, HOLD), "the hold stays: {refusal:?}");
+    assert_eq!(
+        fixture.audit_row_count(),
+        audit_before,
+        "no outcome row: {refusal:?}"
+    );
+    let asked = fixture.primary_methods().await[primary_before..].to_vec();
+    assert!(
+        asked.is_empty(),
+        "the primary receives no request: {asked:?}"
+    );
+    assert_eq!(
+        fixture.oracle_methods().await.len(),
+        oracle_before,
+        "the oracle receives no request"
+    );
 }
 
 /// One x402 MCP row on its own fixture: the plain payment, or with

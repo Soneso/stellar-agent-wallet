@@ -50,6 +50,21 @@
 //!
 //! No step sends the transaction again.
 //!
+//! # Mainnet enablement
+//!
+//! On mainnet the steps above run only after the enablement verifies, with
+//! clients built from the profile whose primary and oracle hosts the signed
+//! policy binds. When the signed policy has a `[mainnet]` table and the
+//! enablement does not verify, the verb refuses with
+//! `profile.mainnet_enablement_invalid` before any client is built. When the
+//! owner key or the signed policy does not load and the installation holds an
+//! enablement nonce, or its nonce entry is unreadable, the verb refuses with
+//! that load's code before any client is built. A profile without an
+//! enablement record, because its verified policy has no `[mainnet]` table
+//! or its installation holds no enablement nonce, runs no reconciliation,
+//! recovery or release, and `--retry-recovery` has no effect. Its answer
+//! comes from the stored state and the primary endpoint's lookup.
+//!
 //! # Recovery results
 //!
 //! For a managed mainnet attempt, `recovery` carries each attempt's typed
@@ -268,6 +283,25 @@ pub async fn run(args: &StatusArgs) -> i32 {
     }
 
     let window = PersistedWindowStore::for_profile(&resolved.name);
+    // On mainnet only a verified enablement settles: the record binds the
+    // primary and oracle hosts the clients below are built from. A profile
+    // without a record answers from the stored state and the primary.
+    let settle = if profile.chain_id.is_mainnet() {
+        match crate::commands::policy_engine::settlement_enablement(
+            "tx status",
+            &resolved,
+            &profile,
+            window.path(),
+        ) {
+            Ok(record) => record.is_some(),
+            Err(refusal) => {
+                render_json(&refusal);
+                return 1;
+            }
+        }
+    } else {
+        true
+    };
     let target = match submission_flow::select_status(&profile, &window, &selectors) {
         Ok(target) => target,
         Err(error) => {
@@ -277,7 +311,17 @@ pub async fn run(args: &StatusArgs) -> i32 {
     };
     let data = match target.tx_hash.as_deref() {
         Some(tx_hash) => {
-            match hash_status(args, tx_hash, &profile, &resolved.name, origin, &window).await {
+            match hash_status(
+                args,
+                tx_hash,
+                &profile,
+                &resolved.name,
+                origin,
+                &window,
+                settle,
+            )
+            .await
+            {
                 Ok(data) => data,
                 Err(code) => return code,
             }
@@ -301,7 +345,8 @@ pub async fn run(args: &StatusArgs) -> i32 {
 }
 
 /// Reconciles `tx_hash` into its hash view, or renders the refusal and
-/// returns its exit code.
+/// returns its exit code. Without `settle` the lookup runs no
+/// reconciliation, recovery stage, or release.
 async fn hash_status(
     args: &StatusArgs,
     tx_hash: &str,
@@ -309,6 +354,7 @@ async fn hash_status(
     profile_name: &str,
     origin: stellar_agent_core::profile::loader::ProfileOrigin,
     window: &PersistedWindowStore,
+    settle: bool,
 ) -> Result<StatusData, i32> {
     let context = crate::common::network::profile_network_context(profile);
     let client = match context.primary_client() {
@@ -327,9 +373,13 @@ async fn hash_status(
         }
     };
 
-    let oracle = crate::commands::submission_record::settlement_oracle_in(profile, &context);
-    let outcome = submission_flow::transaction_status(
-        status_request(
+    let writer = || {
+        crate::commands::submission_record::accounting_audit_writer(profile, profile_name, origin)
+    };
+    let approval_dir = stellar_agent_core::profile::schema::default_approval_dir;
+    let outcome = if settle {
+        let oracle = crate::commands::submission_record::settlement_oracle_in(profile, &context);
+        let request = status_request(
             args,
             tx_hash,
             profile,
@@ -337,17 +387,12 @@ async fn hash_status(
             window,
             &client,
             oracle.as_ref(),
-        ),
-        stellar_agent_core::profile::schema::default_approval_dir,
-        || {
-            crate::commands::submission_record::accounting_audit_writer(
-                profile,
-                profile_name,
-                origin,
-            )
-        },
-    )
-    .await
+        );
+        submission_flow::transaction_status(request, approval_dir, writer).await
+    } else {
+        let request = status_request(args, tx_hash, profile, profile_name, window, &client, None);
+        submission_flow::transaction_status_unsettled(request, approval_dir, writer).await
+    }
     .map_err(|error| {
         render_json(&status_error_envelope(error));
         1
@@ -979,6 +1024,422 @@ mod tests {
             2,
             "an unrecorded hash keeps one lookup per surface: {sent:?}"
         );
+    }
+
+    /// The envelope hash of the hold the settlement tests seed.
+    #[cfg(feature = "mainnet-write")]
+    const SEEDED_HOLD: &str = "a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7";
+    /// The transaction hash of the hold the settlement tests seed.
+    #[cfg(feature = "mainnet-write")]
+    const SEEDED_TX: &str = "b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8";
+
+    /// A mainnet fixture whose policy allows the status tool, with an
+    /// expired hold seeded, and `pre_enable` applied when `enabled` is false.
+    #[cfg(feature = "mainnet-write")]
+    async fn settlement_fixture(
+        name: &'static str,
+        enabled: bool,
+    ) -> crate::common::mainnet_write_fixture::MainnetFixture {
+        use crate::common::mainnet_write_fixture::{
+            AGENT_SEED, DESTINATION, ISSUER, Spec, pay_rule,
+        };
+        use crate::test_rpc::ClassicRpc;
+        let agent = stellar_agent_test_support::signed_envelope::account_id_for_seed(AGENT_SEED);
+        let status_rule = "[[rules]]\nmatch = { tool = \"stellar_transaction_status\", \
+                           chain = \"stellar:mainnet\" }\ncriteria = []\ndecision = \"allow\"\n";
+        let mut spec = Spec::new(name)
+            .rules(vec![
+                pay_rule("require_approval", ""),
+                status_rule.to_owned(),
+            ])
+            .primary(ClassicRpc::mainnet(&[&agent, DESTINATION, ISSUER]))
+            .oracle(ClassicRpc::mainnet(&[&agent, DESTINATION, ISSUER]));
+        if !enabled {
+            spec = spec.pre_enable();
+        }
+        let fixture = spec.build().await;
+        fixture.seed_expired_hold(SEEDED_HOLD, SEEDED_TX);
+        fixture
+    }
+
+    /// The envelope hash of the second hold the restored half seeds.
+    #[cfg(feature = "mainnet-write")]
+    const SECOND_HOLD: &str = "c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9";
+    /// The transaction hash of the second hold.
+    #[cfg(feature = "mainnet-write")]
+    const SECOND_TX: &str = "d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0";
+
+    /// Whether the stored window still holds the seeded reservation.
+    #[cfg(feature = "mainnet-write")]
+    fn holds_seeded(fixture: &crate::common::mainnet_write_fixture::MainnetFixture) -> bool {
+        holds(fixture, SEEDED_HOLD)
+    }
+
+    /// Whether the stored window still holds the reservation `id`.
+    #[cfg(feature = "mainnet-write")]
+    fn holds(fixture: &crate::common::mainnet_write_fixture::MainnetFixture, id: &str) -> bool {
+        super::PersistedWindowStore::for_profile(fixture.name)
+            .pending_reservations(&fixture.profile())
+            .expect("window")
+            .iter()
+            .any(|hold| hold.id == id)
+    }
+
+    /// The startup MCP server of `fixture`, routed to its endpoints.
+    #[cfg(feature = "mainnet-write")]
+    fn status_server(
+        fixture: &crate::common::mainnet_write_fixture::MainnetFixture,
+    ) -> stellar_agent_mcp::server::WalletServer {
+        use crate::common::mainnet_write_fixture::{ORACLE_HOST, PRIMARY_HOST};
+        stellar_agent_mcp::server::WalletServer::new_with_selection_and_routes_for_test(
+            fixture.profile(),
+            stellar_agent_core::profile::name::ProfileNameSource::Flag,
+            &stellar_agent_core::profile::schema::default_profile_dir().expect("profile dir"),
+            &[
+                (PRIMARY_HOST, &fixture.primary.uri()),
+                (ORACLE_HOST, &fixture.oracle.uri()),
+            ],
+        )
+        .expect("server")
+    }
+
+    /// Runs `tx status` on the seeded hold.
+    #[cfg(feature = "mainnet-write")]
+    async fn cli_status(
+        fixture: &crate::common::mainnet_write_fixture::MainnetFixture,
+    ) -> (i32, serde_json::Value) {
+        crate::common::render::take_rendered_for_test();
+        let code = super::run(&super::StatusArgs {
+            tx_hash: Some(SEEDED_TX.to_owned()),
+            business_id: None,
+            profile: Some(fixture.name.to_owned()),
+            output: stellar_agent_core::envelope::OutputFormat::Json,
+            retry_recovery: false,
+        })
+        .await;
+        (code, crate::test_rpc::last_rendered())
+    }
+
+    /// Calls `stellar_transaction_status` on `tx_hash` and returns the error
+    /// flag with the envelope.
+    #[cfg(feature = "mainnet-write")]
+    async fn mcp_status(
+        server: &stellar_agent_mcp::server::WalletServer,
+        tx_hash: &str,
+    ) -> (bool, serde_json::Value) {
+        let result = server
+            .call_stellar_transaction_status(
+                stellar_agent_mcp::server::StellarTransactionStatusArgs {
+                    chain_id: "stellar:mainnet".to_owned(),
+                    tx_hash: Some(tx_hash.to_owned()),
+                    business_id: None,
+                    retry_recovery: false,
+                },
+            )
+            .await
+            .expect("tool result");
+        let text = &result.content[0].as_text().expect("text").text;
+        (
+            result.is_error == Some(true),
+            serde_json::from_str(text).expect("envelope"),
+        )
+    }
+
+    /// After the enablement, a stored `oracle_provider_url` moved to another
+    /// host, and separately a moved `rpc_url`, refuse `tx status` with the
+    /// enablement refusal and the running server's status tool with the
+    /// freshness refusal. Neither endpoint receives a request, the expired
+    /// hold stays, and no outcome row is written. With the URL put back,
+    /// both surfaces settle the hold.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn status_refuses_a_moved_endpoint_before_any_settlement() {
+        use crate::common::mainnet_write_fixture::{ORACLE_HOST, PRIMARY_HOST};
+        for (name, binding) in [
+            ("status-moved-oracle", "on_disk_oracle_host"),
+            ("status-moved-primary", "on_disk_host"),
+        ] {
+            let fixture = settlement_fixture(name, true).await;
+            let server = status_server(&fixture);
+            let moved = |fixture: &crate::common::mainnet_write_fixture::MainnetFixture,
+                         moved: bool| {
+                match (binding, moved) {
+                    ("on_disk_host", true) => {
+                        fixture.set_stored_rpc_url("https://moved-primary.example.invalid");
+                    }
+                    ("on_disk_host", false) => {
+                        fixture.set_stored_rpc_url(&format!("https://{PRIMARY_HOST}"));
+                    }
+                    (_, true) => {
+                        fixture.set_stored_oracle_url("https://moved-oracle.example.invalid");
+                    }
+                    (_, false) => fixture.set_stored_oracle_url(&format!("https://{ORACLE_HOST}")),
+                }
+            };
+            moved(&fixture, true);
+            let primary = fixture.primary_methods().await.len();
+            let oracle = fixture.oracle_methods().await.len();
+            let audit = fixture.audit_row_count();
+
+            let (code, cli) = cli_status(&fixture).await;
+            assert_eq!(code, 1, "{binding}: {cli}");
+            assert_eq!(
+                cli["error"]["code"], "profile.mainnet_enablement_invalid",
+                "{binding}: {cli}"
+            );
+            let message = cli["error"]["message"].as_str().expect("message");
+            assert!(message.ends_with(binding), "{message}");
+            let (failed, mcp) = mcp_status(&server, SEEDED_TX).await;
+            assert!(failed, "{binding}: {mcp}");
+            assert_eq!(
+                mcp["error"]["code"], "network.mainnet_write_forbidden",
+                "{binding}: {mcp}"
+            );
+
+            assert_eq!(fixture.primary_methods().await.len(), primary, "{binding}");
+            assert_eq!(fixture.oracle_methods().await.len(), oracle, "{binding}");
+            assert!(holds_seeded(&fixture), "{binding}: the hold stays");
+            assert_eq!(
+                fixture.audit_row_count(),
+                audit,
+                "{binding}: no outcome row"
+            );
+
+            moved(&fixture, false);
+            let (code, cli) = cli_status(&fixture).await;
+            assert_eq!(code, 0, "{binding} restored: {cli}");
+            assert!(
+                !holds_seeded(&fixture),
+                "{binding} restored: the CLI lookup settles"
+            );
+            fixture.seed_expired_hold(SECOND_HOLD, SECOND_TX);
+            let (failed, mcp) = mcp_status(&server, SECOND_TX).await;
+            assert!(!failed, "{binding} restored: {mcp}");
+            assert!(
+                !holds(&fixture, SECOND_HOLD),
+                "{binding} restored: the MCP lookup settles"
+            );
+        }
+    }
+
+    /// A mainnet profile whose signed policy has no `[mainnet]` table holds
+    /// no enablement record: `tx status` and the status tool run no
+    /// settlement step. The expired hold stays pending, the oracle is not
+    /// asked, no outcome row is written, and both answers still come back
+    /// from the stored state and the primary's lookup.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn status_without_an_enablement_record_settles_nothing() {
+        let fixture = settlement_fixture("status-no-record", false).await;
+        let server = status_server(&fixture);
+        let oracle = fixture.oracle_methods().await.len();
+        let audit = fixture.audit_row_count();
+
+        let (code, cli) = cli_status(&fixture).await;
+        let (failed, mcp) = mcp_status(&server, SEEDED_TX).await;
+
+        assert_eq!(code, 0, "{cli}");
+        assert!(!failed, "{mcp}");
+        for view in [&cli["data"], &mcp["data"]] {
+            assert_eq!(view["tx_hash"], SEEDED_TX, "{view}");
+            assert_eq!(view["record"]["status"], "pending", "{view}");
+            assert_eq!(view["record"]["reservation_open"], true, "{view}");
+            assert!(view["chain_status"].is_string(), "{view}");
+        }
+        assert!(holds_seeded(&fixture), "the hold stays pending");
+        assert_eq!(
+            fixture.oracle_methods().await.len(),
+            oracle,
+            "no oracle request"
+        );
+        assert_eq!(fixture.audit_row_count(), audit, "no outcome row");
+        let asked = fixture.primary_methods().await;
+        assert!(
+            asked.iter().any(|method| method == "getTransaction"),
+            "the answer comes from the primary's lookup: {asked:?}"
+        );
+    }
+
+    /// Breaks the owner key of `fixture` when `owner_removed` is set, and
+    /// otherwise flips one digit of its policy signature.
+    #[cfg(feature = "mainnet-write")]
+    fn break_policy_load(
+        fixture: &crate::common::mainnet_write_fixture::MainnetFixture,
+        owner_removed: bool,
+    ) {
+        if owner_removed {
+            fixture.delete_keyring_entry(&fixture.profile().policy_owner_key_id);
+        } else {
+            fixture.tamper_policy_signature();
+        }
+    }
+
+    /// On an enabled profile, a signed policy that no longer verifies, and
+    /// separately a missing owner key, refuse `tx status` with that load's
+    /// own code before any client is built. Neither endpoint receives a
+    /// request, the expired hold stays, and no outcome row is written.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn status_refuses_an_unloadable_policy_or_owner_key_with_its_load_code() {
+        for (name, owner_removed, load_code) in [
+            (
+                "status-tampered-policy",
+                false,
+                "policy.owner_signature_invalid",
+            ),
+            ("status-no-owner", true, "policy.engine_unavailable"),
+        ] {
+            let fixture = settlement_fixture(name, true).await;
+            break_policy_load(&fixture, owner_removed);
+            let primary = fixture.primary_methods().await.len();
+            let oracle = fixture.oracle_methods().await.len();
+            let audit = fixture.audit_row_count();
+
+            let (code, cli) = cli_status(&fixture).await;
+
+            assert_eq!(code, 1, "{name}: {cli}");
+            assert_eq!(cli["error"]["code"], load_code, "{name}: {cli}");
+            assert_eq!(fixture.primary_methods().await.len(), primary, "{name}");
+            assert_eq!(fixture.oracle_methods().await.len(), oracle, "{name}");
+            assert!(holds_seeded(&fixture), "{name}: the hold stays");
+            assert_eq!(fixture.audit_row_count(), audit, "{name}: no outcome row");
+        }
+    }
+
+    /// On an installation that holds no enablement nonce, a signed policy
+    /// that no longer verifies, and separately a missing owner key, leave the
+    /// profile without an enablement record: `tx status` answers from the
+    /// stored state and the primary's lookup and settles nothing.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn status_of_an_unloadable_policy_without_an_enablement_nonce_settles_nothing() {
+        for (name, owner_removed) in [
+            ("status-no-nonce-tampered", false),
+            ("status-no-nonce-no-owner", true),
+        ] {
+            let fixture = settlement_fixture(name, false).await;
+            break_policy_load(&fixture, owner_removed);
+            let oracle = fixture.oracle_methods().await.len();
+            let audit = fixture.audit_row_count();
+
+            let (code, cli) = cli_status(&fixture).await;
+
+            assert_eq!(code, 0, "{name}: {cli}");
+            assert_eq!(cli["data"]["record"]["status"], "pending", "{name}: {cli}");
+            assert!(holds_seeded(&fixture), "{name}: the hold stays pending");
+            assert_eq!(fixture.oracle_methods().await.len(), oracle, "{name}");
+            assert_eq!(fixture.audit_row_count(), audit, "{name}: no outcome row");
+            let asked = fixture.primary_methods().await;
+            assert!(
+                asked.iter().any(|method| method == "getTransaction"),
+                "{name}: the answer comes from the primary's lookup: {asked:?}"
+            );
+        }
+    }
+
+    /// An unreadable enablement nonce entry does not show that the
+    /// installation was never enabled: a signed policy that no longer
+    /// verifies refuses `tx status` with that load's code before any client
+    /// is built, and the expired hold stays.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn status_of_an_unloadable_policy_with_an_unreadable_nonce_refuses() {
+        let fixture = settlement_fixture("status-unreadable-nonce", false).await;
+        break_policy_load(&fixture, false);
+        let nonce = stellar_agent_core::profile::schema::mainnet_enablement_entry_ref(
+            &fixture.profile().policy_window_state_key_id,
+        );
+        stellar_agent_test_support::keyring_mock::inject_error(
+            &nonce.service,
+            &nonce.account,
+            keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::other("locked"))),
+        )
+        .expect("inject");
+        let primary = fixture.primary_methods().await.len();
+        let oracle = fixture.oracle_methods().await.len();
+        let audit = fixture.audit_row_count();
+
+        let (code, cli) = cli_status(&fixture).await;
+
+        assert_eq!(code, 1, "{cli}");
+        assert_eq!(
+            cli["error"]["code"], "policy.owner_signature_invalid",
+            "{cli}"
+        );
+        assert_eq!(fixture.primary_methods().await.len(), primary);
+        assert_eq!(fixture.oracle_methods().await.len(), oracle);
+        assert!(holds_seeded(&fixture), "the hold stays");
+        assert_eq!(fixture.audit_row_count(), audit, "no outcome row");
+    }
+
+    /// A testnet fixture whose policy allows the status tool, with an expired
+    /// hold seeded under `SEEDED_HOLD`.
+    #[cfg(feature = "mainnet-write")]
+    async fn testnet_settlement_fixture(
+        name: &'static str,
+    ) -> crate::common::mainnet_write_fixture::MainnetFixture {
+        use crate::common::mainnet_write_fixture::{
+            AGENT_SEED, DESTINATION, ISSUER, Spec, pay_rule,
+        };
+        use crate::test_rpc::ClassicRpc;
+        let agent = stellar_agent_test_support::signed_envelope::account_id_for_seed(AGENT_SEED);
+        let status_rule = "[[rules]]\nmatch = { tool = \"stellar_transaction_status\", \
+                           chain = \"stellar:mainnet\" }\ncriteria = []\ndecision = \"allow\"\n";
+        let fixture = Spec::new(name)
+            .testnet()
+            .rules(vec![
+                pay_rule("require_approval", ""),
+                status_rule.to_owned(),
+            ])
+            .primary(ClassicRpc::testnet(&[&agent, DESTINATION, ISSUER]))
+            .build()
+            .await;
+        fixture.seed_expired_hold(SEEDED_HOLD, SEEDED_TX);
+        fixture
+    }
+
+    /// On testnet `tx status` needs no enablement: its reconciliation ends
+    /// the expired hold.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn testnet_status_settles_without_an_enablement() {
+        let fixture = testnet_settlement_fixture("status-testnet-cli").await;
+
+        let (code, cli) = cli_status(&fixture).await;
+
+        assert_eq!(code, 0, "{cli}");
+        assert!(!holds_seeded(&fixture), "the reconciliation ends the hold");
+    }
+
+    /// On testnet the status tool needs no enablement: its reconciliation
+    /// ends the expired hold.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn testnet_status_tool_settles_without_an_enablement() {
+        let fixture = testnet_settlement_fixture("status-testnet-mcp").await;
+        let server = status_server(&fixture);
+
+        let result = server
+            .call_stellar_transaction_status(
+                stellar_agent_mcp::server::StellarTransactionStatusArgs {
+                    chain_id: "stellar:testnet".to_owned(),
+                    tx_hash: Some(SEEDED_TX.to_owned()),
+                    business_id: None,
+                    retry_recovery: false,
+                },
+            )
+            .await
+            .expect("tool result");
+
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        assert!(!holds_seeded(&fixture), "the reconciliation ends the hold");
     }
 
     #[test]

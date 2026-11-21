@@ -334,13 +334,30 @@ fn each_mainnet_pipeline_reconciles_after_its_probe_and_before_its_policy() {
         } else {
             "check_endpoint_identity("
         };
+        // The engine the evaluation reads is the one rebuilt after the pass.
         assert_called_between(
             file,
             source,
             MAINNET_PIPELINE,
             after,
             "reconcile_open_reservations(",
+            "reload_mainnet_policy_engine(",
+        );
+    }
+}
+
+#[test]
+fn each_mainnet_pipeline_verifies_its_enablement_before_any_client() {
+    for (file, source) in MAINNET_VERBS {
+        // The pass settles, so the enablement verifies the snapshot's hosts
+        // before the client that serves the probe and the pass is built.
+        assert_called_between(
+            file,
+            source,
+            MAINNET_PIPELINE,
+            "mainnet_profiles_dir()",
             "load_mainnet_policy_engine(",
+            "context.primary_client()",
         );
     }
 }

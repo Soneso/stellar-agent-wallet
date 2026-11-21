@@ -297,8 +297,14 @@ signed `[mainnet].oracle_host` fails enablement, so startup aborts with
 `profile.mainnet_enablement_invalid` naming `on_disk_oracle_host` or
 `merged_oracle_host`. Admission also refuses a context profile without
 `oracle_provider_url` with `profile.mainnet_oracle_required`, before signing.
-The server reads the profile at startup, so it applies an oracle change from
-its next start.
+The server builds its clients from the profile it read at startup, so it
+applies an oracle change from its next start. Each value tool, the status
+tool and the dispatch-gate pass verify the enablement against the stored
+profile again first, so a stored `rpc_url` or `oracle_provider_url` changed
+to another host refuses them with `network.mainnet_write_forbidden` before
+any settlement step. A mainnet server without an enablement record runs no
+reconciliation, recovery or release: the gate skips its pass, and the status
+tool answers from the stored state and the primary's lookup.
 
 After `profile enable-mainnet` or `profile sign-policy`, restart the MCP server.
 Startup refuses a mainnet policy without approval credentials, read-only use
@@ -470,7 +476,7 @@ their own `x402.*` code before the `chain_id` check.
 | `stellar_create_account_commit` | Verify the nonce, re-check the envelope, sign, submit. | Signs and submits. Two-phase; approval spine. |
 | `stellar_balances` | Fetch native XLM balance and optional trustline balances. | Read-only. |
 | `stellar_friendbot` | Fund a testnet account via Friendbot. | Mutating, testnet-only; gated. |
-| `stellar_transaction_status` | Reconcile one submitted transaction against the chain and record a reported success, by its receipt or, when the receipt is missing, by its reservation. Returns `record` (with `release_code`, `settlement_evidence: "unavailable"` and an optional `settlement_decision_id`) and `reservation`. `record` is display data and authenticates no settlement. On a mainnet profile the call also consults the oracle about the primary's `FAILED` and `NOT_FOUND`, and a negative answer from either retains the reservation. | Reads the chain, writes the wallet's record; moves no value and never sends. The way out of `submission.tx_timeout`. |
+| `stellar_transaction_status` | Reconcile one submitted transaction against the chain and record a reported success, by its receipt or, when the receipt is missing, by its reservation. Returns `record` (with `release_code`, `settlement_evidence: "unavailable"` and an optional `settlement_decision_id`) and `reservation`. `record` is display data and authenticates no settlement. On a mainnet profile the call also consults the oracle the enablement binds about the primary's `FAILED` and `NOT_FOUND`, and a negative answer from either retains the reservation. On mainnet it reconciles only with the startup enablement record and a fresh check of it, which refuses with `network.mainnet_write_forbidden`; without a record it answers from the stored state and the primary's lookup. | Reads the chain, writes the wallet's record; moves no value and never sends. The way out of `submission.tx_timeout`. |
 
 `stellar_transaction_status` refuses with `submission.record_unavailable` when the spending-window file cannot be read.
 

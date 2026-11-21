@@ -296,6 +296,9 @@ struct OwnerKeyPrelude {
     policy_dir: std::path::PathBuf,
     /// The signed policy file of the profile's owner-key namespace.
     policy_path: std::path::PathBuf,
+    /// The owner-key namespace the policy file and the owner key resolve
+    /// through.
+    profile_name: String,
 }
 
 /// Derives the owner-key namespace of `profile`, reads and decodes the owner
@@ -362,6 +365,7 @@ fn resolve_owner_key(
         source,
         policy_dir,
         policy_path,
+        profile_name,
     })
 }
 
@@ -428,16 +432,72 @@ pub(crate) fn load_mainnet_policy_engine(
     source: ProfileNameSource,
     profile_dir: &std::path::Path,
 ) -> Result<MainnetPolicy, Envelope<()>> {
-    let profile = context.profile();
-    let owner = resolve_owner_key(verb, profile)
-        .map_err(|msg| Envelope::<()>::err_raw(engine_code, msg))?;
-    let built = build_policy_engine(
-        profile,
+    let built = build_mainnet_engine(
+        verb,
+        engine_code,
+        context,
         Some(ProfileSelection {
             name: context.profile_name(),
             source,
             profile_dir,
         }),
+    )?;
+    mainnet_policy_from(built, verb)
+}
+
+/// Rebuilds the engine of `enabled` over the window state as it stands now,
+/// for a verb whose reconcile pass ran after [`load_mainnet_policy_engine`]
+/// verified the enablement.
+///
+/// The verb verifies the enablement before its pass and evaluates after it,
+/// so the evaluation reads the window state the pass left. The rebuild runs no
+/// second enablement verification and keeps `enabled`'s record.
+///
+/// # Errors
+///
+/// - The build errors of [`load_mainnet_policy_engine`].
+/// - `network.mainnet_write_forbidden` when the signed policy's facts differ
+///   from the ones `enabled` verified.
+pub(crate) fn reload_mainnet_policy_engine(
+    verb: &'static str,
+    engine_code: &'static str,
+    context: &MainnetWriteContext,
+    enabled: MainnetPolicy,
+) -> Result<MainnetPolicy, Envelope<()>> {
+    let built = build_mainnet_engine(verb, engine_code, context, None)?;
+    match built.verified {
+        Some(verified) if verified.fact_digest() == enabled.verified.fact_digest() => {
+            Ok(MainnetPolicy {
+                verified,
+                body: enabled.body,
+                enablement: enabled.enablement,
+            })
+        }
+        _ => Err(Envelope::<()>::err_raw(
+            MAINNET_WRITE_FORBIDDEN,
+            format!(
+                "the signed policy changed after {verb} verified the mainnet enablement; run \
+                 {verb} again"
+            ),
+        )),
+    }
+}
+
+/// Builds the engine of the context's stored profile, verifying the
+/// enablement when `selection` is given, and maps a build failure to the
+/// verb's envelope.
+fn build_mainnet_engine(
+    verb: &'static str,
+    engine_code: &'static str,
+    context: &MainnetWriteContext,
+    selection: Option<ProfileSelection<'_>>,
+) -> Result<BuiltPolicyEngine, Envelope<()>> {
+    let profile = context.profile();
+    let owner = resolve_owner_key(verb, profile)
+        .map_err(|msg| Envelope::<()>::err_raw(engine_code, msg))?;
+    build_policy_engine(
+        profile,
+        selection,
         context.profile_name(),
         Some(&owner.policy_dir),
         owner.public_key,
@@ -460,8 +520,98 @@ pub(crate) fn load_mainnet_policy_engine(
             engine_code,
             build_error_message(other, verb, &owner.policy_path),
         ),
-    })?;
-    mainnet_policy_from(built, verb)
+    })
+}
+
+/// Verifies the enablement of a selected mainnet profile for a verb that
+/// runs settlement steps outside a value write: `tx status` and
+/// `tx receipt clear`.
+///
+/// The signed policy loads compare-only over an empty window image, so the
+/// check writes no pin and hydrates no state. A verb runs settlement steps on
+/// `Ok(Some(_))` only, with clients built from `profile`, whose primary and
+/// oracle hosts the record binds.
+///
+/// Returns `Ok(None)` when the profile holds no enablement record: the
+/// verified policy has no `[mainnet]` table, or the owner key or the signed
+/// policy does not load and the installation holds no enablement nonce.
+///
+/// # Errors
+///
+/// - `policy.engine_unavailable` when the owner key does not load on an
+///   installation that holds or cannot read its enablement nonce.
+/// - The load's own `policy.*` code, such as
+///   `policy.owner_signature_invalid`, when the signed policy does not load on
+///   such an installation.
+/// - `profile.mainnet_enablement_invalid` when the policy has a `[mainnet]`
+///   table and [`verify_enablement`] refuses.
+/// - `internal.unexpected_state` when the profiles directory is unavailable.
+///
+/// [`verify_enablement`]: stellar_agent_core::mainnet::enablement::verify_enablement
+pub(crate) fn settlement_enablement(
+    verb: &str,
+    resolved: &stellar_agent_core::profile::name::ResolvedProfileName,
+    profile: &Profile,
+    window_path: &std::path::Path,
+) -> Result<Option<EnablementRecord>, Envelope<()>> {
+    use stellar_agent_core::mainnet::enablement::{
+        has_enablement_nonce, read_enablement_nonce, verify_enablement,
+    };
+    use stellar_agent_core::policy::v1::PolicyStateStore;
+    use stellar_agent_core::policy::v1::verified::{PinMode, PolicyLoad, load_verified_policy};
+    let loaded = resolve_owner_key(verb, profile)
+        .map_err(|message| {
+            let error = EngineLoadError::from(message);
+            Envelope::<()>::err_raw(error.code(), error.to_string())
+        })
+        .and_then(|owner| {
+            load_verified_policy(
+                &PolicyLoad {
+                    path: &owner.policy_path,
+                    profile,
+                    profile_name: &owner.profile_name,
+                    owner_pubkey: &owner.public_key,
+                    owner_source: owner.source,
+                    window_path,
+                },
+                PolicyStateStore::new(),
+                PinMode::CompareOnly,
+            )
+            .map_err(|error| {
+                let code = error.wire_code();
+                Envelope::<()>::err_raw(
+                    code,
+                    build_error_message(
+                        PolicyEngineBuildError::Policy(error),
+                        verb,
+                        &owner.policy_path,
+                    ),
+                )
+            })
+        });
+    let verified = match loaded {
+        Ok(verified) => verified,
+        // An installation without an enablement nonce was never enabled, so
+        // its load failure leaves it without a record. Every other load
+        // failure refuses with its own code.
+        Err(_) if matches!(has_enablement_nonce(profile), Ok(false)) => return Ok(None),
+        Err(refusal) => return Err(refusal),
+    };
+    if verified.mainnet().is_none() {
+        return Ok(None);
+    }
+    let profiles_dir = crate::common::mainnet_write::mainnet_profiles_dir()
+        .map_err(|error| Envelope::<()>::err(&error))?;
+    verify_enablement(
+        &verified,
+        &resolved.name,
+        resolved.source,
+        profile,
+        &profiles_dir,
+        &read_enablement_nonce,
+    )
+    .map(Some)
+    .map_err(|error| Envelope::<()>::err(&WalletError::Validation(error)))
 }
 
 /// Requires a built engine to carry a verified policy with a `[mainnet]`
@@ -4028,6 +4178,83 @@ decision = "allow"
             error.message,
             "pay on mainnet requires the profile's mainnet enablement; run profile \
              enable-mainnet, then profile sign-policy"
+        );
+    }
+
+    /// The reload after a verb's reconcile pass keeps the enablement the
+    /// verb verified and takes a freshly hydrated engine of the same signed
+    /// policy; a policy whose facts differ from the verified one refuses.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn the_reload_after_the_pass_requires_the_verified_policy() {
+        let fixture = crate::common::mainnet_write_fixture::Spec::new("mainnet-policy-reload")
+            .build()
+            .await;
+        let context = crate::common::mainnet_write::mainnet_context(
+            &fixture.profile(),
+            &stellar_agent_core::profile::name::ResolvedProfileName::from_flag(fixture.name),
+            stellar_agent_network::MainnetEndpointFlags::default(),
+        )
+        .unwrap();
+        let profiles = crate::common::mainnet_write::mainnet_profiles_dir().unwrap();
+        let load = || {
+            load_mainnet_policy_engine(
+                "pay",
+                "policy.engine_unavailable",
+                &context,
+                ProfileNameSource::Flag,
+                &profiles,
+            )
+            .unwrap()
+        };
+        let enabled = load();
+        let (digest, record) = (
+            enabled.verified.fact_digest(),
+            enabled.enablement.fact_digest(),
+        );
+        // A hold the window gains after the verification, as a reconcile
+        // pass changes it, reaches the reloaded engine only.
+        let now_ms = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+        fixture.seed_hold_since(&"a1".repeat(32), &"b2".repeat(32), now_ms);
+        let key = stellar_agent_core::policy::v1::criteria::state_store::StateKey::new(
+            fixture.name,
+            1,
+            "native",
+            86_400,
+        );
+        let used = |policy: &MainnetPolicy| {
+            policy
+                .verified
+                .engine()
+                .state_store()
+                .query_window(&key, now_ms)
+                .unwrap()
+                .0
+        };
+        assert_eq!(used(&enabled), 0, "the verified image predates the hold");
+        let reloaded =
+            reload_mainnet_policy_engine("pay", "policy.engine_unavailable", &context, enabled)
+                .unwrap();
+        assert_eq!(reloaded.verified.fact_digest(), digest);
+        assert_eq!(reloaded.enablement.fact_digest(), record);
+        assert_eq!(
+            used(&reloaded),
+            75,
+            "the reload hydrates the current window"
+        );
+
+        let mut other = load();
+        other.verified = VerifiedPolicy::for_test([9; 32], other.verified.engine());
+        let result =
+            reload_mainnet_policy_engine("pay", "policy.engine_unavailable", &context, other);
+        assert!(result.is_err(), "a changed policy refuses the reload");
+        let envelope = result.err().unwrap();
+        let error = envelope.error.unwrap();
+        assert_eq!(error.code, "network.mainnet_write_forbidden");
+        assert_eq!(
+            error.message,
+            "the signed policy changed after pay verified the mainnet enablement; run pay again"
         );
     }
 }

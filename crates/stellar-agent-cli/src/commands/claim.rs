@@ -167,7 +167,7 @@ use stellar_agent_network::{
 use crate::commands::policy_engine::{
     build_v1_policy_engine, claim_policy_args, effective_classic_fee_cap, envelope_total_fee,
     evaluate_mainnet_policy, evaluate_opaque_signing_policy, evaluate_value_moving_policy,
-    load_mainnet_policy_engine, mainnet_floor_source, with_total_fee,
+    load_mainnet_policy_engine, mainnet_floor_source, reload_mainnet_policy_engine, with_total_fee,
 };
 use crate::common::business_entry::{
     Bound, ClassicStart, Staging, bind_signing, classic_start, entry_business_id,
@@ -2076,6 +2076,20 @@ where
         Ok(id) => id,
         Err(error) => return ClaimOutcome::failed(claim_error_envelope(&error)),
     };
+    // The reconcile pass below can settle, so the enablement verifies the
+    // snapshot's primary and oracle hosts before any client is built; the
+    // engine reloads after the pass, so the evaluation reads the window
+    // state the pass left.
+    let enabled = match load_mainnet_policy_engine(
+        "claim",
+        "policy.engine_unavailable",
+        &context,
+        resolved.source,
+        &profiles_dir,
+    ) {
+        Ok(policy) => policy,
+        Err(envelope) => return ClaimOutcome::failed(envelope),
+    };
     // One client serves every read, the resolver and the send.
     let client = match context.primary_client() {
         Ok(client) => client,
@@ -2108,16 +2122,12 @@ where
     // The claim's identity is its balance and claimant, which the arguments
     // name. A retained operation thus answers before the balance read and the
     // claim guards, whose answers change once the claim ran.
-    let policy = match load_mainnet_policy_engine(
-        "claim",
-        "policy.engine_unavailable",
-        &context,
-        resolved.source,
-        &profiles_dir,
-    ) {
-        Ok(policy) => policy,
-        Err(envelope) => return ClaimOutcome::failed(envelope),
-    };
+    let policy =
+        match reload_mainnet_policy_engine("claim", "policy.engine_unavailable", &context, enabled)
+        {
+            Ok(policy) => policy,
+            Err(envelope) => return ClaimOutcome::failed(envelope),
+        };
     let fee_choice = match parse_classic_fee_choice(args.fee.as_deref()) {
         Ok(fee_choice) => fee_choice,
         Err(e) => return ClaimOutcome::failed(claim_error_envelope(&ClaimError::from(e))),

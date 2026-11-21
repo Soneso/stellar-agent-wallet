@@ -120,7 +120,7 @@ use stellar_agent_network::{ClassicFeeChoice, MainnetEndpointFlags};
 use crate::commands::policy_engine::{
     build_v1_policy_engine, effective_classic_fee_cap, envelope_total_fee, evaluate_mainnet_policy,
     evaluate_value_moving_policy, load_mainnet_policy_engine, mainnet_floor_source_requesting,
-    trustline_policy_args, with_total_fee,
+    reload_mainnet_policy_engine, trustline_policy_args, with_total_fee,
 };
 
 use stellar_agent_network::{
@@ -1295,6 +1295,20 @@ where
             );
         }
     };
+    // The reconcile pass below can settle, so the enablement verifies the
+    // snapshot's primary and oracle hosts before any client is built; the
+    // engine reloads after the pass, so the evaluation reads the window
+    // state the pass left.
+    let enabled = match load_mainnet_policy_engine(
+        "trustline",
+        "trustline.policy_engine_unavailable",
+        &context,
+        resolved.source,
+        &profiles_dir,
+    ) {
+        Ok(policy) => policy,
+        Err(envelope) => return write_envelope(out, &envelope, 1),
+    };
 
     // One client serves every read, the resolver and the send.
     let client = match context.primary_client() {
@@ -1373,12 +1387,11 @@ where
     // The intent the business id binds needs the verified policy and the
     // request facts only, so a retained operation answers before the
     // envelope is built.
-    let policy = match load_mainnet_policy_engine(
+    let policy = match reload_mainnet_policy_engine(
         "trustline",
         "trustline.policy_engine_unavailable",
         &context,
-        resolved.source,
-        &profiles_dir,
+        enabled,
     ) {
         Ok(policy) => policy,
         Err(envelope) => return write_envelope(out, &envelope, 1),

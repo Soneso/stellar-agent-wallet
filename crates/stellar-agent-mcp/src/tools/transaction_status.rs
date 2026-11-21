@@ -33,6 +33,13 @@
 //! new bounded evidence run for a stopped attempt and resets its run count
 //! to one. It never resubmits and authorizes no successor.
 //!
+//! On mainnet the lookup reconciles, recovers and releases only when the
+//! startup enablement record exists and the per-call freshness check of it
+//! succeeds, with the startup snapshot clients whose hosts that record binds.
+//! A failed check answers `network.mainnet_write_forbidden`, as the value
+//! tools do. Without a record the lookup runs none of those steps and answers
+//! from the stored state and the primary endpoint's lookup.
+//!
 //! `business_id` selects a mainnet operation by its business id, alone or
 //! with a `tx_hash` of one of its attempts. The selectors are resolved from
 //! the authenticated window before any recovery, and `operation` projects the
@@ -189,6 +196,12 @@ impl WalletServer {
                 },
             );
         };
+        // On mainnet the lookup settles only on the startup enablement record
+        // and a fresh check of it, with the startup snapshot clients.
+        let settle = match self.settlement_allowed() {
+            Ok(settle) => settle,
+            Err(refusal) => return Ok(refusal),
+        };
         let client = match self.context.primary_client() {
             Ok(client) => client,
             Err(err) => {
@@ -201,9 +214,16 @@ impl WalletServer {
             }
         };
 
-        let oracle = self.settlement_oracle();
-        let outcome = match submission_flow::transaction_status(
-            status_request(
+        let writer = || {
+            crate::tools::value_audit::require_value_audit_writer(
+                &self.profile,
+                &profile_name,
+                self.audit_binding,
+            )
+        };
+        let looked_up = if settle {
+            let oracle = self.settlement_oracle();
+            let request = status_request(
                 &args,
                 tx_hash,
                 &self.profile,
@@ -211,18 +231,27 @@ impl WalletServer {
                 &window,
                 &client,
                 oracle.as_ref(),
-            ),
-            || self.resolve_approval_dir(),
-            || {
-                crate::tools::value_audit::require_value_audit_writer(
-                    &self.profile,
-                    &profile_name,
-                    self.audit_binding,
-                )
-            },
-        )
-        .await
-        {
+            );
+            submission_flow::transaction_status(request, || self.resolve_approval_dir(), writer)
+                .await
+        } else {
+            let request = status_request(
+                &args,
+                tx_hash,
+                &self.profile,
+                &profile_name,
+                &window,
+                &client,
+                None,
+            );
+            submission_flow::transaction_status_unsettled(
+                request,
+                || self.resolve_approval_dir(),
+                writer,
+            )
+            .await
+        };
+        let outcome = match looked_up {
             Ok(outcome) => outcome,
             Err(error) => return Ok(status_error_result(error)),
         };
