@@ -451,3 +451,148 @@ async fn the_toolset_commit_queued_approval_row_drains_or_persists_at_shutdown()
         "the next draining writer delivers the persisted row"
     );
 }
+
+/// The number of records of each bucket of `h`'s window store, read as
+/// [`hold_statuses`] reads it; empty before the store's first write.
+fn bucket_rows(h: &Harness) -> std::collections::BTreeMap<String, usize> {
+    let Ok(bytes) = std::fs::read(PersistedWindowStore::for_profile(&h.name).path()) else {
+        return std::collections::BTreeMap::new();
+    };
+    let body: Value = (0..bytes.len())
+        .filter(|&at| bytes[at] == b'{')
+        .find_map(|at| serde_json::from_slice(&bytes[at..]).ok())
+        .unwrap();
+    body["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|bucket| {
+            (
+                bucket["bucket"].as_str().unwrap().to_owned(),
+                bucket["records"].as_array().unwrap().len(),
+            )
+        })
+        .collect()
+}
+
+/// The error code of a preparation or commit answer.
+fn code(answer: &Value) -> &str {
+    answer["error"]["code"].as_str().unwrap_or("")
+}
+
+/// The unlisted counter, the budget epoch and the balance floor size the
+/// toolset commit from persisted accounting on testnet.
+///
+/// Each input runs on its own harness, whose signed version 2 policy allows
+/// every testnet tool, the toolset invocation included, under that input
+/// sized for one payment of [`AMOUNT`]. Two payments are prepared through
+/// the toolset. The first toolset commit sends; the server restarts; the
+/// second toolset commit refuses with the input's code and sends nothing,
+/// and the window keeps the one record of the sent commit in each bucket.
+/// Off mainnet an unlisted payment beyond its budget is denied
+/// `policy.deny.unlisted_budget_exceeded`, and a debit beyond the total
+/// budget `policy.deny.total_budget_exhausted`. The floor reads no observed
+/// account off mainnet, so under it every toolset call refuses
+/// `account.unread` before any send.
+#[tokio::test]
+#[serial]
+async fn the_toolset_commit_sizes_its_second_payment_from_persisted_accounting() {
+    let mut failures = Vec::new();
+    for (input, criterion, refusal) in [
+        (
+            "unlisted",
+            format!(
+                "{{ kind = \"counterparty_allowlist\", kinds = [\"G_ACCOUNT\"], allowlist = [], \
+                 unlisted = {{ mode = \"budget\", asset = \"native\", per_tx_stroops = {AMOUNT}, \
+                 per_period_stroops = {AMOUNT}, window = \"1d\" }} }}"
+            ),
+            "policy.deny.unlisted_budget_exceeded",
+        ),
+        (
+            "total",
+            format!("{{ kind = \"total_budget\", asset = \"native\", max_stroops = {AMOUNT} }}"),
+            "policy.deny.total_budget_exhausted",
+        ),
+        (
+            "floor",
+            "{ kind = \"balance_floor\", min_stroops = \"1\" }".to_owned(),
+            "account.unread",
+        ),
+    ] {
+        let rules = format!(
+            r#"[[rules]]
+match = {{ tool = "stellar_transaction_status", chain = "*" }}
+criteria = []
+decision = "allow"
+[[rules]]
+match = {{ tool = "*", chain = "stellar:testnet" }}
+criteria = [{criterion}]
+decision = "allow"
+"#
+        );
+        let mut h = Harness::with_versioned_rules(
+            &format!("cell-accounting-toolset-{input}"),
+            Outcome::Success,
+            2,
+            &rules,
+        )
+        .await;
+        h.install_payment_toolset();
+        let first = h.simulate_pay_route(AMOUNT, true).await;
+        let second = h.simulate_pay_route(AMOUNT, true).await;
+        if input == "floor" {
+            // Each call refuses before any send, before and after a restart.
+            let before = [code(&first).to_owned(), code(&second).to_owned()];
+            restart_toolset(&mut h);
+            let after = code(&h.simulate_pay_route(AMOUNT, true).await).to_owned();
+            if before != [refusal, refusal]
+                || after != refusal
+                || !h.sends.lock().unwrap().is_empty()
+                || !bucket_rows(&h).is_empty()
+            {
+                failures.push(format!(
+                    "floor: {before:?} then {after}, {} sent, window {:?}",
+                    h.sends.lock().unwrap().len(),
+                    bucket_rows(&h)
+                ));
+            }
+            continue;
+        }
+        if first["ok"] != true || second["ok"] != true {
+            failures.push(format!("{input}: preparations: {first} and {second}"));
+            continue;
+        }
+        let sent = h
+            .commit_pay_driven(h.pay_args(&first["data"], AMOUNT, None), false, true)
+            .await;
+        let sends = h.sends.lock().unwrap().len();
+        let window = bucket_rows(&h);
+        restart_toolset(&mut h);
+        let refused = h
+            .commit_pay_driven(h.pay_args(&second["data"], AMOUNT, None), false, true)
+            .await;
+        if sent["ok"] != true || sends != 1 {
+            failures.push(format!(
+                "{input}: first toolset commit, {sends} sent: {sent}"
+            ));
+        }
+        if code(&refused) != refusal || h.sends.lock().unwrap().len() != sends {
+            failures.push(format!(
+                "{input}: second toolset commit after the restart: {refused}"
+            ));
+        }
+        let counted = window
+            .keys()
+            .any(|bucket| bucket.starts_with(&format!("{input}:")));
+        if !counted || window.values().any(|records| *records != 1) {
+            failures.push(format!("{input}: window after the sent commit {window:?}"));
+        }
+        if bucket_rows(&h) != window {
+            failures.push(format!(
+                "{input}: the refusal changed the window {window:?} to {:?}",
+                bucket_rows(&h)
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

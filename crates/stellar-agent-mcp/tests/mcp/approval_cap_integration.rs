@@ -216,6 +216,12 @@ decision = "allow"
     }
 
     async fn with_rules(name: &str, outcome: Outcome, rules: &str) -> Self {
+        Self::with_versioned_rules(name, outcome, 1, rules).await
+    }
+
+    /// [`Self::with_rules`] in a policy document of `version`; version 2
+    /// admits the accounting criteria and carries a policy sequence of 1.
+    async fn with_versioned_rules(name: &str, outcome: Outcome, version: u32, rules: &str) -> Self {
         let root = crate::common::isolated_data_root();
         let signer_reads = Arc::new(AtomicI64::new(0));
         let observed_reads = Arc::clone(&signer_reads);
@@ -275,7 +281,8 @@ decision = "allow"
         )
         .unwrap();
 
-        let body = format!("version = 1\nscope = \"profile:{name}\"\n{rules}");
+        let sequence = if version >= 2 { "sequence = 1\n" } else { "" };
+        let body = format!("version = {version}\nscope = \"profile:{name}\"\n{sequence}{rules}");
         let signature = hex::encode(
             signer
                 .sign(&digest(&canonical_bytes(&body).unwrap()))

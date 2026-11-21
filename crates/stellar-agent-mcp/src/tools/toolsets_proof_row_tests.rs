@@ -771,3 +771,186 @@ async fn the_toolset_commit_takes_its_locks_across_processes_in_order() {
         );
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// sizing.accounting_inputs_mainnet
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `raw` with one accounting input sized for one 10-stroop payment of the
+/// fixture on the rules of `names`: the unlisted budget of the rule's
+/// counterparty list, which then lists no destination, a total budget, or a
+/// balance floor at the fixture balance less one and a half payments of
+/// 10 stroops and a 100-stroop fee.
+fn accounting_input(raw: &str, input: &str, names: &[&str]) -> String {
+    const BALANCE: i64 = 100_000_000_000;
+    let mut doc = raw.parse::<toml_edit::DocumentMut>().unwrap();
+    for rule in doc["rules"].as_array_of_tables_mut().unwrap().iter_mut() {
+        if !rule["match"]["tool"]
+            .as_str()
+            .is_some_and(|tool| names.contains(&tool))
+        {
+            continue;
+        }
+        let criteria = rule["criteria"].as_array_mut().unwrap();
+        let added = match input {
+            "unlisted" => {
+                for criterion in criteria.iter_mut() {
+                    let criterion = criterion.as_inline_table_mut().unwrap();
+                    if criterion["kind"].as_str() == Some("counterparty_allowlist") {
+                        criterion.insert(
+                            "allowlist",
+                            toml_edit::Value::Array(toml_edit::Array::new()),
+                        );
+                        let mut budget = toml_edit::InlineTable::new();
+                        for (key, value) in
+                            [("mode", "budget"), ("asset", "native"), ("window", "1d")]
+                        {
+                            budget.insert(key, value.into());
+                        }
+                        budget.insert("per_tx_stroops", 10_i64.into());
+                        budget.insert("per_period_stroops", 10_i64.into());
+                        criterion.insert("unlisted", budget.into());
+                    }
+                }
+                continue;
+            }
+            "total" => {
+                "{ kind = \"total_budget\", asset = \"native\", max_stroops = 10 }".to_owned()
+            }
+            _ => format!(
+                "{{ kind = \"balance_floor\", min_stroops = \"{}\" }}",
+                BALANCE - 165
+            ),
+        };
+        criteria.push(added.parse::<toml_edit::Value>().unwrap());
+    }
+    doc.to_string()
+}
+
+/// The number of records of each bucket of `run`'s window.
+fn bucket_rows(run: &Run) -> std::collections::BTreeMap<String, usize> {
+    super::super::common::tests::mainnet::ledger(&run.f).map_or_else(Default::default, |state| {
+        state["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|bucket| {
+                (
+                    bucket["bucket"].as_str().unwrap().to_owned(),
+                    bucket["records"].as_array().unwrap().len(),
+                )
+            })
+            .collect()
+    })
+}
+
+/// The unlisted counter, the budget epoch and the balance floor size the
+/// toolset commit from persisted accounting after a restart.
+///
+/// Each input runs on its own fixture whose allowing rules carry it sized
+/// for one 10-stroop payment: the unlisted budget and the total budget on
+/// the outer toolset rule and the routed commit rule, and the floor on both
+/// routed payment rules over a covered window. The first toolset commit
+/// sends; the server restarts; the second toolset commit refuses with the
+/// input's refusal and sends nothing. The second payment is prepared through
+/// the toolset before the first commit, except over the unlisted budget:
+/// there a mainnet payment escalates to a per-payment approval, which the
+/// commit queues for the operation its own process prepared, so that payment
+/// is prepared after the restart, and its commit without a proof refuses
+/// `policy.approval_required`. Over the total budget it refuses
+/// `policy.deny.total_budget_exhausted`, and under the floor the first
+/// payment's retained debit and fee cross the floor the second fits alone,
+/// `account.floor_refused`. Every bucket keeps the one record of the sent
+/// commit, and the refusal adds none.
+#[tokio::test]
+#[serial_test::serial(keyring, mainnet_clock)]
+#[serial_test::serial]
+async fn the_toolset_commit_sizes_its_second_payment_from_persisted_accounting() {
+    let mut failures = Vec::new();
+    for (input, names, refusal) in [
+        (
+            "unlisted",
+            &["stellar_pay_commit", "stellar_toolset_invoke"][..],
+            "policy.approval_required",
+        ),
+        (
+            "total",
+            &["stellar_pay_commit", "stellar_toolset_invoke"][..],
+            "policy.deny.total_budget_exhausted",
+        ),
+        (
+            "floor",
+            &["stellar_pay", "stellar_pay_commit"][..],
+            "account.floor_refused",
+        ),
+    ] {
+        let mut run = Run::with_policy(
+            "allow",
+            "allow",
+            &["propose-transaction", "sign-payment"],
+            |raw| accounting_input(&raw, input, names),
+        )
+        .await;
+        if input == "floor" {
+            super::super::common::tests::mainnet::cover_native_history(&run.f);
+        }
+        // A toolset commit that requires approval binds the operation its
+        // own process prepared, so the unlisted case prepares its second
+        // payment after the restart.
+        let after_restart = input == "unlisted";
+        let first = Tool::Pay.prepare_args(&run.f);
+        run.grant(first["destination"].as_str().unwrap());
+        let second = Tool::Pay.prepare_args(&run.f);
+        let first_prepared = run.prepare_route(&first, true).await;
+        let mut second_prepared = if after_restart {
+            Value::Null
+        } else {
+            run.prepare_route(&second, true).await
+        };
+        if first_prepared["ok"] != true || (!after_restart && second_prepared["ok"] != true) {
+            failures.push(format!(
+                "{input}: preparations: {first_prepared} and {second_prepared}"
+            ));
+            continue;
+        }
+        let sent = run
+            .commit_route(run.commit_args(first, &first_prepared), true)
+            .await;
+        let sends = run.control.sent().len();
+        let window = bucket_rows(&run);
+        run.restart();
+        if after_restart {
+            second_prepared = run.prepare_route(&second, true).await;
+            if second_prepared["ok"] != true {
+                failures.push(format!(
+                    "{input}: preparation after the restart: {second_prepared}"
+                ));
+                continue;
+            }
+        }
+        let refused = run
+            .commit_route(run.commit_args(second, &second_prepared), true)
+            .await;
+        if sent["ok"] != true || sends != 1 {
+            failures.push(format!(
+                "{input}: first toolset commit, {sends} sent: {sent}"
+            ));
+        }
+        if refused["error"]["code"] != refusal || run.control.sent().len() != sends {
+            failures.push(format!(
+                "{input}: second toolset commit after the restart, {} sent: {refused}",
+                run.control.sent().len()
+            ));
+        }
+        if window.is_empty() || window.values().any(|records| *records != 1) {
+            failures.push(format!("{input}: window after the sent commit {window:?}"));
+        }
+        if bucket_rows(&run) != window {
+            failures.push(format!(
+                "{input}: the refusal changed the window {window:?} to {:?}",
+                bucket_rows(&run)
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

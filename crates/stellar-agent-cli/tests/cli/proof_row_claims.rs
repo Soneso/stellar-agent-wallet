@@ -2177,9 +2177,427 @@ async fn the_create_account_row_refuses_below_reserve_and_admits_the_boundary() 
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// sizing.accounting_inputs
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Off mainnet the three inputs refuse as follows. An unlisted payment beyond
+// a budget bound is denied `policy.deny.unlisted_budget_exceeded`, since only
+// a mainnet profile escalates the excess to an approval. A debit beyond the
+// total budget of the policy's epoch is denied
+// `policy.deny.total_budget_exhausted`. The balance floor reads no observed
+// account off mainnet, so it refuses every call `account.unread` before any
+// send.
+
+/// One accounting input of `sizing.accounting_inputs`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccountingInput {
+    /// The unlisted-recipient budget of `counterparty_allowlist`.
+    Unlisted,
+    /// The `total_budget` of the policy's epoch.
+    Total,
+    /// The `balance_floor`.
+    Floor,
+}
+
+impl AccountingInput {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Unlisted => "unlisted",
+            Self::Total => "total",
+            Self::Floor => "floor",
+        }
+    }
+
+    /// The criteria array of the input for a call that debits `amount`
+    /// stroops of `asset`: each bound admits one such call and refuses a
+    /// second.
+    fn criteria(self, asset: &str, amount: i64) -> String {
+        match self {
+            Self::Unlisted => format!(
+                "[{{ kind = \"counterparty_allowlist\", kinds = [\"G_ACCOUNT\"], allowlist = [], \
+                 unlisted = {{ mode = \"budget\", asset = \"{asset}\", per_tx_stroops = {amount}, \
+                 per_period_stroops = {amount}, window = \"1d\" }} }}]"
+            ),
+            Self::Total => {
+                format!(
+                    "[{{ kind = \"total_budget\", asset = \"{asset}\", max_stroops = {amount} }}]"
+                )
+            }
+            Self::Floor => "[{ kind = \"balance_floor\", min_stroops = \"1\" }]".to_owned(),
+        }
+    }
+
+    /// The refusal of a call over the input off mainnet.
+    fn refusal(self) -> &'static str {
+        match self {
+            Self::Unlisted => "policy.deny.unlisted_budget_exceeded",
+            Self::Total => "policy.deny.total_budget_exhausted",
+            Self::Floor => "account.unread",
+        }
+    }
+
+    /// The prefix of the window bucket the input counts in.
+    fn bucket(self) -> &'static str {
+        match self {
+            Self::Unlisted => "unlisted:",
+            Self::Total => "total:",
+            Self::Floor => "",
+        }
+    }
+
+    /// The inputs that can refuse a call of `row`. A claim and a trustline
+    /// debit nothing, so neither the unlisted budget nor the total budget
+    /// can be exceeded by them; the floor counts their fee.
+    fn of(row: Row) -> &'static [Self] {
+        match row {
+            Row::McpClaimCommit | Row::McpTrustlineCommit | Row::CliClaim | Row::CliTrustline => {
+                &[Self::Floor]
+            }
+            _ => &[Self::Unlisted, Self::Total, Self::Floor],
+        }
+    }
+}
+
+/// The rows of `sizing.accounting_inputs`.
+const ACCOUNTING_ROWS: &[Row] = &[
+    Row::McpPayCommit,
+    Row::McpCreateAccountCommit,
+    Row::McpClaimCommit,
+    Row::McpTrustlineCommit,
+    Row::McpX402CreatePayment,
+    Row::McpX402AuthenticatedPayment,
+    Row::CliPay,
+    Row::CliClaim,
+    Row::CliTrustline,
+    Row::CliAccountsCreate,
+];
+
+/// The 1 XLM a classic accounting row debits, and the 1 unit of
+/// [`X402_ASSET`] an x402 row pays.
+const ACCOUNTING_AMOUNT: i64 = 10_000_000;
+
+/// `rules` in a version 2 policy document scoped to `profile`, the version
+/// the three accounting criteria require.
+fn accounting_document(profile: &str, rules: &[String]) -> String {
+    policy_document(profile, rules).replacen("version = 1", "version = 2", 1)
+}
+
+/// The number of records of each bucket of the window store at `path`,
+/// read as [`Rows::hold_statuses`] reads the store; empty without a file.
+fn bucket_rows(path: &std::path::Path) -> std::collections::BTreeMap<String, usize> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return std::collections::BTreeMap::new();
+    };
+    let body: Value = (0..bytes.len())
+        .filter(|&at| bytes[at] == b'{')
+        .find_map(|at| serde_json::from_slice(&bytes[at..]).ok())
+        .unwrap();
+    body["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|bucket| {
+            (
+                bucket["bucket"].as_str().unwrap().to_owned(),
+                bucket["records"].as_array().unwrap().len(),
+            )
+        })
+        .collect()
+}
+
+/// The refusal code of a call's envelope, or of the preparation that
+/// refused in its place.
+fn refusal_code(envelope: &Value) -> &str {
+    envelope["error"]["code"]
+        .as_str()
+        .or_else(|| envelope["preparation_refused"]["error"]["code"].as_str())
+        .unwrap_or("")
+}
+
+/// Checks the window of a row after its first call was sent and after its
+/// second call over `input` refused: every bucket holds the one record of
+/// the sent call, the input's own bucket among them, and the refusal added
+/// none.
+fn one_row_per_bucket(
+    input: AccountingInput,
+    sent: &std::collections::BTreeMap<String, usize>,
+    refused: &std::collections::BTreeMap<String, usize>,
+) -> Result<(), String> {
+    let counted = sent.keys().any(|bucket| bucket.starts_with(input.bucket()));
+    if !counted || sent.values().any(|rows| *rows != 1) || refused != sent {
+        Err(format!(
+            "window after the sent call {sent:?}, after the refused call {refused:?}"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// The window store path of `profile` under the data root installed now.
+fn window_path(profile: &str) -> std::path::PathBuf {
+    stellar_agent_core::profile::schema::default_policy_window_state_path_for(profile)
+}
+
+/// Prepares the classic MCP `tool` on `server` with `args` and returns the
+/// commit arguments of the prepared envelope, or the refused preparation.
+async fn prepare_commit_args(
+    server: &WalletServer,
+    tool: &str,
+    args: Value,
+) -> Result<Value, Value> {
+    fn from<T: serde::de::DeserializeOwned>(value: &Value) -> T {
+        serde_json::from_value(value.clone()).unwrap()
+    }
+    let prepared = result_json(
+        &match tool {
+            "stellar_pay" => server.call_stellar_pay(from(&args)).await,
+            "stellar_create_account" => server.call_stellar_create_account(from(&args)).await,
+            "stellar_claim" => server.call_stellar_claim(from(&args)).await,
+            "stellar_trustline" => server.call_stellar_trustline(from(&args)).await,
+            other => panic!("{other} has no commit handler"),
+        }
+        .unwrap(),
+    );
+    if prepared["ok"] != true {
+        return Err(json!({ "preparation_refused": prepared }));
+    }
+    let mut commit = args;
+    for field in ["nonce", "expires_at_unix_ms", "envelope_xdr"] {
+        commit[field] = prepared["data"][field].clone();
+    }
+    Ok(commit)
+}
+
+/// Commits the prepared classic MCP `tool` on `server`.
+async fn commit_prepared(server: &WalletServer, tool: &str, commit: Value) -> Value {
+    fn from<T: serde::de::DeserializeOwned>(value: &Value) -> T {
+        serde_json::from_value(value.clone()).unwrap()
+    }
+    result_json(
+        &match tool {
+            "stellar_pay" => server.call_stellar_pay_commit(from(&commit)).await,
+            "stellar_create_account" => {
+                server
+                    .call_stellar_create_account_commit(from(&commit))
+                    .await
+            }
+            "stellar_claim" => server.call_stellar_claim_commit(from(&commit)).await,
+            _ => server.call_stellar_trustline_commit(from(&commit)).await,
+        }
+        .unwrap(),
+    )
+}
+
+/// Runs a classic row of `rows` under `input` on its own profile and
+/// returns the failures. An MCP row prepares both calls on one server,
+/// commits the first, and commits the second on a server started in its
+/// place; a CLI row runs its verb twice, each run a new process. Under the
+/// unlisted and total budgets the first call sends and the second refuses
+/// with the input's code and sends nothing, with one window record in each
+/// bucket. Under the floor both calls refuse `account.unread`, nothing is
+/// sent, and the window holds no record.
+async fn classic_accounting_case(rows: &Rows, row: Row, input: AccountingInput) -> Vec<String> {
+    let id = row.id();
+    let profile = format!(
+        "accounting-{}-{}",
+        input.name(),
+        id.replace(['.', '_'], "-")
+    );
+    let rules = Rows::rules_for(id, &input.criteria("native", ACCOUNTING_AMOUNT));
+    rows.home.provision_v1_profile(
+        &profile,
+        &["--rpc-url", &rows.rpc.uri()],
+        &rows.signer,
+        &owner(),
+        &accounting_document(&profile, &rules),
+    );
+    rows.open_keyring();
+    let mcp = MCP_COMMIT_ROWS
+        .iter()
+        .find(|(row, _)| *row == id)
+        .map(|(_, tool)| *tool);
+    let before = rows.ledger.sends();
+    let (first, second) = match mcp {
+        Some(tool) => {
+            let server = WalletServer::new(rows.home.load_profile(&profile)).unwrap();
+            let first = prepare_commit_args(&server, tool, rows.mcp_args(tool)).await;
+            let second = prepare_commit_args(&server, tool, rows.mcp_args(tool)).await;
+            match (first, second) {
+                (Ok(first), Ok(second)) => {
+                    let first = commit_prepared(&server, tool, first).await;
+                    drop(server);
+                    let restarted = WalletServer::new(rows.home.load_profile(&profile)).unwrap();
+                    let sent = bucket_rows(&window_path(&profile));
+                    let second = commit_prepared(&restarted, tool, second).await;
+                    return finish(rows, id, input, before, &first, &second, &sent, &profile);
+                }
+                (first, second) => (
+                    first.unwrap_or_else(|refused| refused),
+                    second.unwrap_or_else(|refused| refused),
+                ),
+            }
+        }
+        None => {
+            let row = CLI_PROOF_ROWS.iter().find(|row| row.id == id).unwrap();
+            let first = rows.run(row, &profile, true).envelope;
+            let sent = bucket_rows(&window_path(&profile));
+            let second = rows.run(row, &profile, true).envelope;
+            return finish(rows, id, input, before, &first, &second, &sent, &profile);
+        }
+    };
+    // Both preparations refused: only the floor refuses before a send.
+    finish(
+        rows,
+        id,
+        input,
+        before,
+        &first,
+        &second,
+        &Default::default(),
+        &profile,
+    )
+}
+
+/// Checks the two calls of a classic accounting case.
+#[allow(clippy::too_many_arguments, reason = "the two calls and their facts")]
+fn finish(
+    rows: &Rows,
+    id: &str,
+    input: AccountingInput,
+    before: usize,
+    first: &Value,
+    second: &Value,
+    sent: &std::collections::BTreeMap<String, usize>,
+    profile: &str,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    let sends = rows.ledger.sends() - before;
+    let refused = bucket_rows(&window_path(profile));
+    if input == AccountingInput::Floor {
+        if refusal_code(first) != "account.unread"
+            || refusal_code(second) != "account.unread"
+            || sends != 0
+            || !refused.values().all(|rows| *rows == 0)
+        {
+            failures.push(format!(
+                "{id} floor: {sends} sent, window {refused:?}: {first} then {second}"
+            ));
+        }
+        return failures;
+    }
+    if first["ok"] != true || sends != 1 {
+        failures.push(format!(
+            "{id} {}: first call, {sends} sent: {first}",
+            input.name()
+        ));
+    }
+    if refusal_code(second) != input.refusal() {
+        failures.push(format!(
+            "{id} {}: second call after the restart: {second}",
+            input.name()
+        ));
+    }
+    if let Err(failure) = one_row_per_bucket(input, sent, &refused) {
+        failures.push(format!("{id} {}: {failure}", input.name()));
+    }
+    failures
+}
+
+/// Runs an x402 row under `input` in its own home and returns the
+/// failures. The first payment is authorized on one server and the second
+/// is called on a server started in its place. Under the unlisted and total
+/// budgets the first is paid and the second refuses with the input's code,
+/// with one window record in each bucket. Under the floor both refuse
+/// `account.unread` and the window holds no record.
+async fn x402_accounting_case(row: Row, input: AccountingInput) -> Vec<String> {
+    let id = row.id();
+    let endpoint = X402Endpoint::new(signer().public(), false);
+    let rpc = endpoint.serve().await;
+    let tool = match row {
+        Row::McpX402CreatePayment => "stellar_x402_create_payment",
+        _ => "stellar_x402_authenticated_payment",
+    };
+    let name = row.profile(&format!("accounting-{}", input.name()));
+    let rules = [policy_rule(
+        tool,
+        "stellar:testnet",
+        &input.criteria(X402_ASSET, ACCOUNTING_AMOUNT),
+        "allow",
+    )];
+    let home = IsolatedHome::new();
+    home.provision_v1_profile(
+        &name,
+        &["--rpc-url", &rpc.uri()],
+        &signer(),
+        &owner(),
+        &accounting_document(&name, &rules),
+    );
+    let home = RowHome { home, name };
+    let _in_process = home.enter();
+    let first = mcp_x402(&home.server(), row).await;
+    let sent = bucket_rows(&window_path(&home.name));
+    let second = mcp_x402(&home.server(), row).await;
+    let refused = bucket_rows(&window_path(&home.name));
+    let mut failures = Vec::new();
+    if input == AccountingInput::Floor {
+        if refusal_code(&first) != "account.unread"
+            || refusal_code(&second) != "account.unread"
+            || !refused.values().all(|rows| *rows == 0)
+        {
+            failures.push(format!(
+                "{id} floor: window {refused:?}: {first} then {second}"
+            ));
+        }
+        return failures;
+    }
+    if first["ok"] != true {
+        failures.push(format!("{id} {}: first call: {first}", input.name()));
+    }
+    if refusal_code(&second) != input.refusal() {
+        failures.push(format!(
+            "{id} {}: second call after the restart: {second}",
+            input.name()
+        ));
+    }
+    if let Err(failure) = one_row_per_bucket(input, &sent, &refused) {
+        failures.push(format!("{id} {}: {failure}", input.name()));
+    }
+    failures
+}
+
+/// The unlisted counter, the budget epoch and the balance floor size every
+/// value row's call from persisted accounting, on testnet.
+///
+/// Each row runs under each input that can refuse it, on its own profile
+/// whose signed version 2 policy holds that input alone. After one call is
+/// sent and the wallet restarts, a second call over the unlisted budget or
+/// the total budget refuses with that input's code and sends nothing, and
+/// the window keeps the one record of the sent call in each bucket. The
+/// floor reads no observed account off mainnet, so under it every call
+/// refuses `account.unread` before any send and the window holds no record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn every_row_sizes_its_second_call_from_persisted_accounting() {
+    let mut failures = Vec::new();
+    for &row in ACCOUNTING_ROWS.iter().filter(|row| !row.is_classic()) {
+        for &input in AccountingInput::of(row) {
+            failures.extend(x402_accounting_case(row, input).await);
+        }
+    }
+    let rows = Rows::new().await;
+    let _home = StellarAgentHomeGuard::new(rows.home.path());
+    for &row in ACCOUNTING_ROWS.iter().filter(|row| row.is_classic()) {
+        for &input in AccountingInput::of(row) {
+            failures.extend(classic_accounting_case(&rows, row, input).await);
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 /// For every test of this file that a matrix cell names, the rows of all the
-/// cells that name it are exactly the rows of the test's table, and every row
-/// test of this file is named by a cell.
+/// cells that name it are exactly the rows of the test's table, and the table
+/// lists exactly the tests of this file that a cell names.
 #[test]
 fn the_row_tables_match_their_matrix_cells() {
     const MODULE: &str = "proof_row_claims::";

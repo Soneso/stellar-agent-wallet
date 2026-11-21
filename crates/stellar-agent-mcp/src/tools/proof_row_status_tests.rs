@@ -588,6 +588,431 @@ async fn every_mcp_row_writes_one_value_row_on_mainnet() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// sizing.accounting_inputs_mainnet
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// On mainnet an unlisted payment beyond a budget bound escalates to a
+// per-payment approval, so an allowing rule answers `policy.approval_required`.
+// A debit beyond the total budget of the policy's epoch refuses
+// `policy.deny.total_budget_exhausted`, and a balance the observed account,
+// the retained native obligations and the call's debit and fee take below the
+// floor refuses `account.floor_refused`.
+
+/// The balance of every account of the mainnet fixture's ledger.
+const FIXTURE_BALANCE: i64 = 100_000_000_000;
+
+/// One accounting input of `sizing.accounting_inputs_mainnet`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Input {
+    Unlisted,
+    Total,
+    Floor,
+}
+
+impl Input {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Unlisted => "unlisted",
+            Self::Total => "total",
+            Self::Floor => "floor",
+        }
+    }
+
+    /// The refusal of a call of `row` over the input on mainnet. An x402
+    /// payment that requires approval queues it and answers its pending
+    /// approval without a payment payload, as its preparation call does.
+    fn refusal(self, row: Row) -> &'static str {
+        match self {
+            Self::Unlisted if matches!(row, Row::Classic(_)) => "policy.approval_required",
+            Self::Unlisted => "approval queued",
+            Self::Total => "policy.deny.total_budget_exhausted",
+            Self::Floor => "account.floor_refused",
+        }
+    }
+}
+
+/// What a call answered: its error code, `approval queued` for an x402
+/// answer that names a pending approval and carries no payment payload, the
+/// error code of a refused preparation, or `paid`.
+fn answered(envelope: &Value) -> String {
+    let data = &envelope["data"];
+    if let Some(code) = envelope["error"]["code"]
+        .as_str()
+        .or_else(|| envelope["preparation_refused"]["error"]["code"].as_str())
+    {
+        code.to_owned()
+    } else if data["approval"]["approval_nonce"].is_string()
+        && data.get("paymentSignature").is_none()
+    {
+        "approval queued".to_owned()
+    } else {
+        "paid".to_owned()
+    }
+}
+
+impl Input {
+    /// The inputs that can refuse a call of `row`. A claim and a trustline
+    /// debit nothing, so neither budget can be exceeded by them; the floor
+    /// counts their fee.
+    fn of(row: Row) -> &'static [Self] {
+        match row {
+            Row::Classic(Tool::Claim | Tool::Trustline) => &[Self::Floor],
+            _ => &[Self::Unlisted, Self::Total, Self::Floor],
+        }
+    }
+}
+
+impl Row {
+    /// The rules that carry the row's accounting criteria: the commit rule
+    /// of a classic row, and the floor also on its preparation rule, whose
+    /// paired evaluation reads the same floor; the payment rule of an x402
+    /// row.
+    fn accounting_rules(self, input: Input) -> Vec<&'static str> {
+        match self {
+            Self::Classic(tool) if input == Input::Floor => {
+                vec![tool.prepare_name(), tool.commit_name()]
+            }
+            Self::Classic(tool) => vec![tool.commit_name()],
+            _ => vec![self.tool()],
+        }
+    }
+
+    /// The asset the row debits and the amount of one call: the fixture's
+    /// 10-stroop payment, its 1 XLM creation, and its 10-unit x402 payment
+    /// in the fixture's token.
+    fn debit(self) -> (String, i64) {
+        match self {
+            Self::Classic(Tool::CreateAccount) => ("native".to_owned(), 10_000_000),
+            Self::Classic(_) => ("native".to_owned(), 10),
+            Self::X402 | Self::Authenticated => (
+                stellar_strkey::Contract([3; 32]).to_string().to_string(),
+                10,
+            ),
+        }
+    }
+
+    /// The floor that admits one call of the row and refuses a second whose
+    /// first call's native debit and fee stay retained: the balance less one
+    /// and a half calls. An x402 payment debits no native stroops and pays no
+    /// fee, so its floor is the balance itself, which the native obligation
+    /// of a sent payment of the same account crosses.
+    fn floor(self) -> i64 {
+        match self {
+            Self::Classic(Tool::CreateAccount) => FIXTURE_BALANCE - 15_000_150,
+            Self::Classic(Tool::Pay) => FIXTURE_BALANCE - 165,
+            Self::Classic(_) => FIXTURE_BALANCE - 150,
+            Self::X402 | Self::Authenticated => FIXTURE_BALANCE,
+        }
+    }
+}
+
+/// `raw` with `input` sized for one call of `row` on each of the row's
+/// accounting rules.
+fn accounting_policy(raw: &str, row: Row, input: Input) -> String {
+    let (asset, amount) = row.debit();
+    let mut doc = raw.parse::<toml_edit::DocumentMut>().unwrap();
+    let names = row.accounting_rules(input);
+    for rule in doc["rules"].as_array_of_tables_mut().unwrap().iter_mut() {
+        if !rule["match"]["tool"]
+            .as_str()
+            .is_some_and(|tool| names.contains(&tool))
+        {
+            continue;
+        }
+        let criteria = rule["criteria"].as_array_mut().unwrap();
+        let mut added = toml_edit::InlineTable::new();
+        match input {
+            Input::Unlisted => {
+                for criterion in criteria.iter_mut() {
+                    let criterion = criterion.as_inline_table_mut().unwrap();
+                    if criterion["kind"].as_str() == Some("counterparty_allowlist") {
+                        criterion.insert(
+                            "allowlist",
+                            toml_edit::Value::Array(toml_edit::Array::new()),
+                        );
+                        let mut budget = toml_edit::InlineTable::new();
+                        budget.insert("mode", "budget".into());
+                        budget.insert("asset", asset.as_str().into());
+                        budget.insert("window", "1d".into());
+                        budget.insert("per_tx_stroops", amount.into());
+                        budget.insert("per_period_stroops", amount.into());
+                        criterion.insert("unlisted", budget.into());
+                    }
+                }
+                continue;
+            }
+            Input::Total => {
+                added.insert("kind", "total_budget".into());
+                added.insert("asset", asset.as_str().into());
+                added.insert("max_stroops", amount.into());
+            }
+            Input::Floor => {
+                added.insert("kind", "balance_floor".into());
+                added.insert("min_stroops", row.floor().to_string().into());
+            }
+        }
+        criteria.push(added);
+    }
+    doc.to_string()
+}
+
+/// The number of records of each bucket of `f`'s window.
+fn bucket_rows(f: &Fixture) -> std::collections::BTreeMap<String, usize> {
+    ledger(f).map_or_else(Default::default, |state| {
+        state["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|bucket| {
+                (
+                    bucket["bucket"].as_str().unwrap().to_owned(),
+                    bucket["records"].as_array().unwrap().len(),
+                )
+            })
+            .collect()
+    })
+}
+
+/// One MCP row on a routed mainnet fixture whose rules allow its calls under
+/// one accounting input.
+enum Accounting {
+    Classic(Box<ClassicRun>),
+    X402 {
+        f: Box<Fixture>,
+        rpc: wiremock::MockServer,
+        control: std::sync::Arc<super::common::tests::mainnet::RpcControl>,
+        _unenforced:
+            Vec<stellar_agent_network::policy_state::approvals::ConsentEvidenceDisableGuard>,
+    },
+    Authenticated(Box<AuthenticatedRun>),
+}
+
+impl Accounting {
+    /// The fixture of `row` under `input`. A classic row's first call is
+    /// prepared; a floor run's window covers the endpoint's balance reads.
+    async fn new(row: Row, input: Input) -> Self {
+        use super::common::tests::mainnet::{cover_native_history, mount_rpc, routed_fixture};
+        let policy = move |raw: String| accounting_policy(&raw, row, input);
+        let accounting = match row {
+            Row::Classic(tool) => Self::Classic(Box::new(
+                ClassicRun::build(
+                    tool,
+                    None,
+                    policy,
+                    |_| {},
+                    |args| {
+                        if input == Input::Floor {
+                            args["cover_native_history"] = json!(true);
+                        }
+                    },
+                )
+                .await,
+            )),
+            Row::X402 => {
+                let rpc = wiremock::MockServer::start().await;
+                let f = routed_fixture(policy, &rpc);
+                let control = mount_rpc(&f, &rpc).await;
+                Self::X402 {
+                    _unenforced: super::common::tests::mainnet::unenforced(&f),
+                    f: Box::new(f),
+                    rpc,
+                    control,
+                }
+            }
+            Row::Authenticated => Self::Authenticated(Box::new(
+                AuthenticatedRun::build(move |raw| {
+                    accounting_policy(&authenticated_policy(&raw), row, input)
+                })
+                .await,
+            )),
+        };
+        if input == Input::Floor && !matches!(accounting, Self::Classic(_)) {
+            cover_native_history(accounting.fixture());
+        }
+        accounting
+    }
+
+    fn fixture(&self) -> &Fixture {
+        match self {
+            Self::Classic(run) => &run.f,
+            Self::X402 { f, .. } => f,
+            Self::Authenticated(run) => &run.f,
+        }
+    }
+
+    /// The primary endpoint's sent transactions since the last clear.
+    fn sent(&self) -> usize {
+        match self {
+            Self::Classic(run) => run.control.sent().len(),
+            Self::X402 { control, .. } => control.sent().len(),
+            Self::Authenticated(run) => run.control.sent().len(),
+        }
+    }
+
+    /// A second preparation of a classic row, before its first commit,
+    /// with the commit arguments of its envelope.
+    async fn prepare_second(&self) -> Option<Value> {
+        let Self::Classic(run) = self else {
+            return None;
+        };
+        let args = run.tool.prepare_args(&run.f);
+        let prepared = wire(&run.tool.prepare(&run.f.server, &args).await);
+        let mut commit = args;
+        for field in ["envelope_xdr", "nonce", "expires_at_unix_ms"] {
+            commit[field] = prepared["data"][field].clone();
+        }
+        Some(if prepared["ok"] == true {
+            commit
+        } else {
+            json!({ "preparation_refused": prepared })
+        })
+    }
+
+    /// The row's call: the commit of `commit`, or the run's own first
+    /// commit, for a classic row; the payment without a proof for an x402
+    /// row.
+    async fn call(&self, commit: Option<Value>) -> Value {
+        match self {
+            Self::Classic(run) => match commit {
+                Some(commit) if commit.get("preparation_refused").is_some() => {
+                    run.control.clear();
+                    commit
+                }
+                Some(commit) => run.commit_with(commit).await,
+                None => run.commit().await,
+            },
+            Self::X402 { f, control, .. } => {
+                control.clear();
+                wire(
+                    &f.server
+                        .call_stellar_x402_create_payment(x402_args(f, None))
+                        .await
+                        .unwrap(),
+                )
+            }
+            Self::Authenticated(run) => {
+                run.control.clear();
+                run.call(run.args(HOME, None)).await
+            }
+        }
+    }
+
+    /// Sends a native payment of the fixture's account, whose debit and fee
+    /// the floor counts as a retained obligation.
+    async fn pay(&self) -> Value {
+        let f = self.fixture();
+        let args = Tool::Pay.prepare_args(f);
+        let prepared = wire(&Tool::Pay.prepare(&f.server, &args).await);
+        let mut commit = args;
+        for field in ["envelope_xdr", "nonce", "expires_at_unix_ms"] {
+            commit[field] = prepared["data"][field].clone();
+        }
+        wire(&Tool::Pay.commit(&f.server, commit).await.unwrap())
+    }
+
+    /// Starts a new server on the current files and keyring in place of the
+    /// running one, as a restart of the wallet process does.
+    fn restart(&mut self) {
+        match self {
+            Self::Classic(run) => run.restart().unwrap(),
+            Self::X402 { f, rpc, .. } => {
+                f.server = WalletServer::new_with_selection_and_routes_for_test(
+                    (*f.server.profile).clone(),
+                    stellar_agent_core::profile::name::ProfileNameSource::Flag,
+                    &stellar_agent_core::profile::schema::default_profile_dir().unwrap(),
+                    &[
+                        ("rpc.example.invalid", rpc.uri().as_str()),
+                        ("oracle.example.invalid", rpc.uri().as_str()),
+                    ],
+                )
+                .unwrap();
+            }
+            Self::Authenticated(run) => run.restart().unwrap(),
+        }
+    }
+}
+
+/// For each MCP value row on mainnet, the unlisted counter, the budget epoch
+/// and the balance floor size the call from persisted accounting.
+///
+/// Each row runs under each input that can refuse it, on its own fixture
+/// whose allowing rules carry that input sized for one call. A classic row
+/// prepares both calls first; its first call commits and sends, the server
+/// restarts, and the second commit refuses with the input's refusal and
+/// sends nothing. An x402 row pays once, restarts, and its second payment
+/// refuses. Under the floor the second call's own debit and fee fit the
+/// floor, and the first call's retained obligation, read from the window
+/// after the restart, crosses it; an x402 payment carries no native
+/// obligation, so a native payment of the same account sends between its
+/// two calls. Every bucket of the window keeps the one record of each sent
+/// call, and the refusal adds none.
+#[tokio::test]
+#[serial_test::serial(keyring, mainnet_clock)]
+#[serial_test::serial]
+async fn every_mcp_row_sizes_its_second_call_from_persisted_accounting() {
+    let mut checks = Checks::default();
+    for row in Row::ALL {
+        for &input in Input::of(row) {
+            let what = |step: &str| format!("{} {step}", input.name());
+            let mut accounting = Accounting::new(row, input).await;
+            let second = accounting.prepare_second().await;
+            let first = accounting.call(None).await;
+            let first_sent = accounting.sent();
+            checks.eq(row, &what("first call"), &first["ok"], &json!(true));
+            if matches!(row, Row::Classic(_)) {
+                checks.eq(
+                    row,
+                    &what("first call sends"),
+                    &json!(first_sent),
+                    &json!(1),
+                );
+            }
+            if input == Input::Floor && !matches!(row, Row::Classic(_)) {
+                let paid = accounting.pay().await;
+                checks.eq(row, &what("native payment"), &paid["ok"], &json!(true));
+            }
+            let sent = bucket_rows(accounting.fixture());
+            accounting.restart();
+            let refused = accounting.call(second).await;
+            checks.eq(
+                row,
+                &what("second call after the restart"),
+                &json!(answered(&refused)),
+                &json!(input.refusal(row)),
+            );
+            checks.eq(
+                row,
+                &what("second call sends"),
+                &json!(accounting.sent()),
+                &json!(0),
+            );
+            // The x402 floor run's two sent calls share the call-count
+            // bucket of the profile; every other bucket counts one of them.
+            let shared = |bucket: &str| {
+                input == Input::Floor && !matches!(row, Row::Classic(_)) && bucket == "rate_limit"
+            };
+            checks.holds(
+                row,
+                &format!(
+                    "{}: one record per sent call in each bucket: {sent:?}",
+                    what("window")
+                ),
+                !sent.is_empty()
+                    && sent
+                        .iter()
+                        .all(|(bucket, records)| *records == if shared(bucket) { 2 } else { 1 }),
+            );
+            checks.holds(
+                row,
+                &what("the refusal adds no record"),
+                bucket_rows(accounting.fixture()) == sent,
+            );
+        }
+    }
+    checks.assert_none();
+}
+
 /// Every matrix cell that names a test of this module lists exactly the rows
 /// that test iterates, and every row test of this module is named by a cell.
 #[test]
@@ -608,7 +1033,7 @@ fn the_row_tables_match_their_matrix_cells() {
             .map(|tool| Row::Classic(*tool).id().to_owned())
             .collect(),
     );
-    let tables: [(&str, &Vec<String>); 4] = [
+    let tables: [(&str, &Vec<String>); 5] = [
         (
             "every_mcp_row_reports_its_approval_without_consuming_it",
             &all,
@@ -622,6 +1047,10 @@ fn the_row_tables_match_their_matrix_cells() {
             &all,
         ),
         ("every_mcp_row_writes_one_value_row_on_mainnet", &all),
+        (
+            "every_mcp_row_sizes_its_second_call_from_persisted_accounting",
+            &all,
+        ),
     ];
     let mut named = std::collections::BTreeSet::new();
     for cell in matrix["cell"].as_array_of_tables().unwrap() {
