@@ -974,6 +974,18 @@ impl ResolverFixture {
             "stellar-agent-nonce-operator",
             "default",
         )
+        .primary_provider(
+            stellar_agent_core::profile::schema::PrimaryProviderRecord::new(
+                "Fixture primary operator",
+                "rpc.example.invalid",
+            ),
+        )
+        .oracle_provider_url(url::Url::parse("https://oracle.example.invalid").unwrap())
+        .oracle_provider(stellar_agent_core::profile::schema::ProviderRecord::new(
+            "Fixture oracle operator",
+            "oracle.example.invalid",
+            true,
+        ))
         .build();
         profile.audit_log_path = dir.path().join("audit.jsonl");
         profile_edit(&mut profile);

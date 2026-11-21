@@ -83,6 +83,7 @@ fn policy_at(
         Some(MainnetBody {
             profile: PROFILE.to_owned(),
             endpoint_host: "rpc.example.invalid".to_owned(),
+            oracle_host: "oracle.example.invalid".to_owned(),
             installation_nonce_sha256: [3; 32],
             classic_max_fee_per_op_stroops: 500,
             authorization_ttl_seconds: Some(60),
@@ -3478,6 +3479,7 @@ fn signed_policy_at(
         Some(MainnetBody {
             profile: PROFILE.to_owned(),
             endpoint_host: "rpc.example.invalid".to_owned(),
+            oracle_host: "oracle.example.invalid".to_owned(),
             installation_nonce_sha256: [3; 32],
             classic_max_fee_per_op_stroops: 500,
             authorization_ttl_seconds: Some(60),
@@ -3851,6 +3853,7 @@ fn policy_with_site(origin: Option<ApprovalOrigin>, pin: Option<[u8; 32]>) -> Ve
         Some(MainnetBody {
             profile: PROFILE.to_owned(),
             endpoint_host: "rpc.example.invalid".to_owned(),
+            oracle_host: "oracle.example.invalid".to_owned(),
             installation_nonce_sha256: [3; 32],
             classic_max_fee_per_op_stroops: 500,
             authorization_ttl_seconds: Some(60),

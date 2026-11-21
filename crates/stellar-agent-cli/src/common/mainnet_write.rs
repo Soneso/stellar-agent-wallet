@@ -554,10 +554,11 @@ pub(crate) async fn authorize_and_submit(
     let profile = context.profile();
 
     // The oracle confirms a negative answer of the primary endpoint after the
-    // send. A profile whose oracle client cannot be built is refused here,
-    // before anything is confirmed, recorded or signed.
+    // send. A stored oracle URL off the signed oracle host, or one whose
+    // client cannot be built, is refused here, before anything is confirmed,
+    // recorded or signed.
     let oracle = context
-        .oracle_client()
+        .oracle_client(&policy.enablement)
         .map_err(|e| Envelope::<()>::err(&e))?;
 
     // The enrolled proof reads the identity record, never the seed, and
@@ -1102,6 +1103,124 @@ mod tests {
             );
             assert!(fixture.sent_envelopes().await.is_empty());
         }
+    }
+
+    /// The post-send oracle client is built only for the signed oracle host:
+    /// a write context whose stored profile names another oracle than the
+    /// verified enablement refuses with `network.mainnet_authorization_refused`
+    /// before any consent, signer read, authorization or send.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn a_stored_oracle_off_the_signed_host_refuses_the_write() {
+        use crate::commands::policy_engine::load_mainnet_policy_engine;
+        use crate::common::mainnet_write_fixture::{AGENT_SEED, Spec};
+        use crate::common::signer_ceremony::signer_resolutions_on_this_thread;
+        use stellar_agent_core::mainnet::decision::{AuthorityScope, MainnetDecision};
+        use stellar_agent_core::policy::Decision;
+        use stellar_agent_core::profile::name::ProfileNameSource;
+        let name = "oracle-moved";
+        let fixture = Spec::new(name).build().await;
+        let profiles = mainnet_profiles_dir().unwrap();
+        let signed = mainnet_context(
+            &fixture.profile(),
+            &ResolvedProfileName::from_flag(name),
+            MainnetEndpointFlags::default(),
+        )
+        .unwrap();
+        let policy = load_mainnet_policy_engine(
+            "pay",
+            "policy.engine_unavailable",
+            &signed,
+            ProfileNameSource::Flag,
+            &profiles,
+        )
+        .unwrap();
+        let mut moved = fixture.profile();
+        moved.oracle_provider_url =
+            Some(url::Url::parse("https://moved-oracle.example.invalid").unwrap());
+        moved.providers.as_mut().unwrap().oracle =
+            Some(stellar_agent_core::profile::schema::ProviderRecord::new(
+                "Moved oracle operator",
+                "moved-oracle.example.invalid",
+                true,
+            ));
+        stellar_agent_core::profile::loader::save_to_dir(name, &moved, &profiles).unwrap();
+        let context = mainnet_context(
+            &moved,
+            &ResolvedProfileName::from_flag(name),
+            MainnetEndpointFlags::default(),
+        )
+        .unwrap();
+        let envelope = stellar_agent_test_support::SignedTestEnvelope::builder(AGENT_SEED)
+            .unsigned()
+            .build();
+        let evaluation = MainnetEvaluation {
+            verdict: MainnetVerdict::Allow,
+            decision: MainnetDecision::for_test(
+                Decision::Allow,
+                None,
+                policy.verified.digest(),
+                policy.verified.sequence(),
+                3,
+                name,
+                context.chain().caip2_str(),
+                stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+                600_000,
+                AuthorityScope::Classic,
+            ),
+        };
+        let before = signer_resolutions_on_this_thread();
+        let client = context.primary_client().unwrap();
+        let (capture, _guard) = WarningCapture::capture(Some("stellar_agent"));
+        let result = authorize_and_submit(MainnetWriteRequest {
+            context: &context,
+            profiles_dir: &profiles,
+            verb: "pay",
+            tool: "stellar_pay",
+            consumer: MainnetConsumer::CliPay,
+            unsigned_xdr: envelope.envelope_xdr(),
+            client: &client,
+            probe_deadline: std::time::Duration::from_secs(2),
+            submit_timeout: std::time::Duration::from_secs(2),
+            source: &fixture.agent.g,
+            source_flag: "--source",
+            signer: MainnetSignerChoice::Keyring,
+            policy: &policy,
+            evaluation: &evaluation,
+            effective_cap: 500,
+            witness: None,
+            ledger: OperationalReport {
+                latest_ledger: 2000,
+                close_time_unix: 1_900_000_000,
+                close_lag_seconds: 0,
+            },
+            operation: None,
+            rebuild: None,
+        })
+        .await;
+        let Err(refusal) = result else {
+            panic!("a stored oracle off the signed host must refuse")
+        };
+        assert_eq!(
+            refusal.error.unwrap().code,
+            "network.mainnet_authorization_refused"
+        );
+        assert_eq!(
+            crate::common::mainnet_write_fixture::refusal_warnings(
+                &capture,
+                "mainnet_oracle_client"
+            ),
+            vec!["\"witness_oracle_unbound\"".to_owned()]
+        );
+        fixture.assert_no_consent_ceremony();
+        assert_eq!(signer_resolutions_on_this_thread(), before);
+        assert!(
+            fixture
+                .open_authorizations(stellar_agent_core::timefmt::now_unix_ms().unwrap())
+                .is_empty()
+        );
+        assert!(fixture.sent_envelopes().await.is_empty());
     }
 
     /// Every pipeline step selects the render stage and the invalidation

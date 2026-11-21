@@ -176,9 +176,14 @@ fn parse_mainnet_fields(
             .ok_or_else(|| parse_error(format!("mainnet.{key} must be a u32")))
     };
     let unbound = allow_unbound
-        && ["profile", "endpoint_host", "installation_nonce_sha256"]
-            .iter()
-            .all(|key| table.get(key).is_none());
+        && [
+            "profile",
+            "endpoint_host",
+            "oracle_host",
+            "installation_nonce_sha256",
+        ]
+        .iter()
+        .all(|key| table.get(key).is_none());
     let bindings = if unbound {
         None
     } else {
@@ -194,7 +199,12 @@ fn parse_mainnet_fields(
         }
         let digest =
             crate::hex::decode_hex32(&nonce).map_err(|_| parse_error("invalid nonce digest"))?;
-        Some((text("profile")?, text("endpoint_host")?, digest))
+        Some((
+            text("profile")?,
+            text("endpoint_host")?,
+            text("oracle_host")?,
+            digest,
+        ))
     };
     let classic_max_fee_per_op_stroops = integer("classic_max_fee_per_op_stroops")?;
     let authorization_ttl_seconds = table
@@ -208,11 +218,12 @@ fn parse_mainnet_fields(
     let approval_credentials =
         super::approval_credentials::parse_approval_credentials(table.get("approval_credentials"))?;
     Ok(bindings.map(
-        |(profile, endpoint_host, installation_nonce_sha256)| MainnetBody {
+        |(profile, endpoint_host, oracle_host, installation_nonce_sha256)| MainnetBody {
             approval_origin,
             approval_cert_spki_sha256,
             profile,
             endpoint_host,
+            oracle_host,
             installation_nonce_sha256,
             classic_max_fee_per_op_stroops,
             authorization_ttl_seconds,
@@ -1067,6 +1078,16 @@ mod tests {
             "n",
             "a",
         )
+        .primary_provider(crate::profile::schema::PrimaryProviderRecord::new(
+            "Primary operator",
+            "rpc.example.invalid",
+        ))
+        .oracle_provider_url(url::Url::parse("https://oracle.example.invalid").unwrap())
+        .oracle_provider(crate::profile::schema::ProviderRecord::new(
+            "Oracle operator",
+            "oracle.example.invalid",
+            true,
+        ))
         .build();
         let profiles = f.dir.path().join("profiles");
         loader::save_to_dir("operator", &f.profile, &profiles).unwrap();

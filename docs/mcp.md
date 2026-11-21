@@ -545,9 +545,13 @@ Feature-on startup loads the mainnet write context for a verified enabled
 profile. Failed enablement or policy checks abort startup. Admission refusals
 use `network.mainnet_write_forbidden` for unsupported tools or missing V1 engine,
 verified policy, enablement, enabled context, or profiles directory. A stored
-profile without `oracle_provider_url` refuses at admission with
-`profile.mainnet_oracle_required`, before signing. The server reads the
-profile at startup, so it applies an oracle change from its next start.
+or merged `oracle_provider_url` that is absent or names another host than the
+signed `[mainnet].oracle_host` fails enablement, so startup aborts with
+`profile.mainnet_enablement_invalid` naming `on_disk_oracle_host` or
+`merged_oracle_host`. Admission also refuses a context profile without
+`oracle_provider_url` with `profile.mainnet_oracle_required`, before signing.
+The server reads the profile at startup, so it applies an oracle change from
+its next start.
 
 After `profile enable-mainnet` or `profile sign-policy`, restart the MCP server.
 Startup refuses a mainnet policy without approval credentials, read-only use

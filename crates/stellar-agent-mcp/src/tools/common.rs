@@ -8337,23 +8337,45 @@ pub(crate) mod tests {
             assert_eq!(f.seed_reads.load(Ordering::SeqCst), 0);
         }
 
-        /// A stored mainnet profile whose oracle URL and record were removed
-        /// after enablement still starts, and its admission refuses every
-        /// mainnet write consumer with `profile.mainnet_oracle_required`
-        /// before any seed read.
+        /// A server start on an enabled profile whose stored oracle URL and
+        /// record are absent refuses the enablement with
+        /// `on_disk_oracle_host`. A write context read
+        /// from that stored profile refuses every mainnet write consumer at
+        /// admission with `profile.mainnet_oracle_required` before any seed
+        /// read.
         #[test]
         #[serial_test::serial(keyring)]
         #[serial_test::serial]
         fn mainnet_oracle_required_admission_refuses_each_write_consumer() {
             use stellar_agent_network::mainnet::MainnetConsumer;
-            let f = Fixture::with_profile(
-                |raw| raw,
-                |profile| {
-                    profile.oracle_provider_url = None;
-                    profile.providers.as_mut().unwrap().oracle = None;
-                },
-            );
-            assert!(f.server.mainnet_context.is_some());
+            let mut f = Fixture::new(|raw| raw);
+            let mut stored = (*f.server.profile).clone();
+            stored.oracle_provider_url = None;
+            stored.providers.as_mut().unwrap().oracle = None;
+            let profiles = default_profile_dir().unwrap();
+            loader::save_to_dir("operator", &stored, &profiles).unwrap();
+            match WalletServer::new_with_selection(
+                stored.clone(),
+                ProfileNameSource::Flag,
+                &profiles,
+            ) {
+                Ok(_) => panic!("started mainnet writes without the signed oracle"),
+                Err(error) => assert!(
+                    error
+                        .to_string()
+                        .contains("profile.mainnet_enablement_invalid: on_disk_oracle_host"),
+                    "{error}"
+                ),
+            }
+            f.server.mainnet_context = Some(Arc::new(
+                stellar_agent_network::NetworkContext::mainnet_write(
+                    &stored,
+                    &stellar_agent_core::profile::name::ResolvedProfileName::from_flag("operator"),
+                    &profiles,
+                    stellar_agent_network::MainnetEndpointFlags::default(),
+                )
+                .unwrap(),
+            ));
             for consumer in [
                 MainnetConsumer::McpPay,
                 MainnetConsumer::McpClaim,

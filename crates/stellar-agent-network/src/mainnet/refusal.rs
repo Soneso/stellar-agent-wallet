@@ -70,7 +70,7 @@ pub enum MainnetPrecondition {
     WitnessRequired,
     /// The witness shares the primary endpoint host.
     WitnessSameHost,
-    /// The witness does not name the stored oracle host.
+    /// The witness does not name the owner-signed oracle host.
     WitnessOracleUnbound,
     /// The approval names another profile.
     ApprovalProfileMismatch,

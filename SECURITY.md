@@ -120,6 +120,24 @@ refused.
 Raw deletion or replacement of the pin, enablement, and owner entry outside
 the wallet rests on the platform keyring.
 
+The owner-signed policy of an enabled mainnet profile names both endpoints a
+mainnet signature trusts: the primary RPC host and the oracle host whose
+cross-check witness guards against a lying primary. Enablement refuses a
+profile whose stored or merged RPC or oracle URL names another host, and a
+mainnet signature accepts a witness only from the signed oracle host. A
+mainnet write builds its post-send oracle client only for the signed oracle
+host. A same-user process that edits the profile file therefore cannot move
+the endpoint or the witness of a mainnet signature without the owner's
+signature. The reconciliation pass, `tx status`, and `tx receipt` build their
+primary and oracle clients from the profile, without an enablement check. Of
+the witness inputs, the
+owner signs the oracle host and the per-asset cross-check thresholds. For an
+asset the signed thresholds name, a profile threshold can only lower the
+amount that requires a witness; for any other asset the profile threshold
+alone applies. The
+oracle URL's scheme, path, and credentials and the oracle provider record are
+unsigned profile fields.
+
 The identity record beside an enrolled signer's seed names the profile, chain
 and owner it serves, signed by that owner. On mainnet the wallet signs only
 for that profile under that owner, and message signing on any chain refuses

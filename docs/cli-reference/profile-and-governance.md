@@ -482,7 +482,7 @@ never advances it. It creates no window-state directory or lock file; when
 the lock file is absent, it reads no pin. Loading a verified v2 policy
 advances it.
 
-A `[mainnet]` table may omit `profile`, `endpoint_host`, and
+A `[mainnet]` table may omit `profile`, `endpoint_host`, `oracle_host`, and
 `installation_nonce_sha256` together only while the installation nonce is absent.
 Signing probes nonce presence before reading either owner seed, regardless of
 whether a policy pin exists. A partial binding refuses with the strict
@@ -647,15 +647,16 @@ and the loader's message.
 An enabled profile whose oracle is removed refuses every CLI mainnet write
 with `profile.mainnet_oracle_required` before any signature, until the oracle
 is set again. A running MCP server checks the profile it loaded at startup,
-and its freshness check does not read the oracle fields. It refuses mainnet
-writes for a removed oracle from its next start. A process on a headless keyring backend
+and its freshness check does not read the oracle fields. Its next start
+refuses the enablement with `profile.mainnet_enablement_invalid:
+on_disk_oracle_host`. A process on a headless keyring backend
 (`STELLAR_AGENT_KEYRING_BACKEND` set to `headless-env` or `headless-dpapi`)
 is refused in every mode with `network.mainnet_keyring_backend_unsupported`
 before any keyring entry is read: mainnet needs the platform keyring.
 Before the first nonce is written, a signed v2 policy
 establishes the pin with its verified sequence, digest, and owner.
 Create and sign that policy before running the ceremony.
-It may omit `[mainnet]`, or omit all three installation binding fields together.
+It may omit `[mainnet]`, or omit all four installation binding fields together.
 Initial pinning verifies the enrolled owner's signature, positive sequence,
 scope, owner source, and applicable content restrictions. It creates no runtime
 authority; strict loading still requires the binding fields.
@@ -667,7 +668,15 @@ A v1 policy refuses with `profile.enable_mainnet_precondition` and
 An existing pin stays in place, including during nonce rotation.
 The ceremony records `mainnet_enablement_minted` through the
 strict audit writer, stores an installation nonce, then atomically rewrites
-the policy with the profile, normalized endpoint host, and nonce digest.
+the policy with the profile, the normalized endpoint host, the oracle host,
+and the nonce digest. The oracle host is the host of `oracle_provider_url`,
+normalized as the endpoint host is: lowercase, with a nondefault port. The
+`--rotate` of a bound policy keeps both signed hosts. The result reports
+`endpoint_host` and `oracle_host` as the written policy carries them, so a
+rotation of a bound table reports its signed hosts, and a field the table
+lacks reads `null`. A stored `oracle_provider_url` without a host does not
+load, and the ceremony refuses it with `profile.enable_mainnet_precondition`
+and the loader's message.
 A full binding writes `classic_max_fee_per_op_stroops = 10000` into
 `[mainnet]` when the policy states no fee cap, and keeps an authored one.
 Every enablement or rotation also inserts root
@@ -721,8 +730,25 @@ required signed fields and rules. After enablement, complete and sign the
 policy, run `--check`, and restart the MCP server.
 
 Binding failures name `mainnet_table`, `profile`, `source`, `default`, `on_disk`,
-`chain_id`, `on_disk_host`, `merged_host`, or `nonce_digest`. The signed policy
-field remains `endpoint_host`. Unreadable stored `chain_id` or `rpc_url`
+`chain_id`, `on_disk_host`, `merged_host`, `on_disk_oracle_host`,
+`merged_oracle_host`, or `nonce_digest`. The signed policy fields remain
+`endpoint_host` and `oracle_host`. The oracle bindings fail when the stored or
+the merged `oracle_provider_url` is absent or names another host than the
+signed `oracle_host`.
+
+The signed policy binds both endpoints a mainnet signature trusts. A
+cross-check witness passes only when its host equals the signed
+`oracle_host` and differs from the primary host. Of the witness inputs, the
+owner signs the oracle host and the per-asset `cross_check_thresholds`. For
+an asset the signed table names, a profile threshold can only lower the
+amount that requires a witness; for any other asset the profile threshold
+alone applies. The scheme, path, and credentials of `oracle_provider_url` and
+the `providers.oracle` record are profile fields that the owner does not sign.
+A mainnet write builds its post-send oracle client only when the stored
+`oracle_provider_url` names the signed `oracle_host`, and refuses another
+with `network.mainnet_authorization_refused` before any signature.
+
+Unreadable stored `chain_id` or `rpc_url`
 reports `profile chain and endpoint unreadable` with the path and cause.
 
 `--rotate` replaces the nonce and changes only the policy's nonce digest.
@@ -783,7 +809,8 @@ document the verified load read. Without a `[mainnet]` table the fee cap and
 every table restriction fail. When the policy does not verify, the
 restrictions and `enablement` are `not_evaluated`. The `enablement` check
 fails with `profile.mainnet_enablement_invalid` and the name of the binding
-that does not match, such as `on_disk_host` or `nonce_digest`. The `pin`
+that does not match, such as `on_disk_host`, `merged_oracle_host`, or
+`nonce_digest`. The `pin`
 check passes with the pinned sequence, or with `absent (first use)` when
 neither a pin entry nor an enablement nonce exists. A pin entry without its
 policy-state lock file fails with `policy.pin_absent` and names the lock file;

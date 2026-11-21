@@ -47,6 +47,7 @@ sequence = 7
 [mainnet]
 profile = "operator"
 endpoint_host = "rpc.example.invalid"
+oracle_host = "oracle.example.invalid"
 installation_nonce_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 classic_max_fee_per_op_stroops = 500
 authorization_ttl_seconds = 60
@@ -67,7 +68,15 @@ allow_opaque_signing = false
 
 /// The BLAKE3 digest of [`FIXTURE_CANONICAL`], in lowercase hex.
 pub(crate) const FIXTURE_DIGEST_HEX: &str =
+    "84ad2014ecac26c363bfa4d13a5a05560c82fb5f6a11683cd271528ce102518c";
+
+/// The BLAKE3 digest of [`FIXTURE_CANONICAL`] without its `oracle_host`
+/// line, in lowercase hex: a document without the field keeps this digest.
+const FIXTURE_WITHOUT_ORACLE_HOST_DIGEST_HEX: &str =
     "27215114bd1abcb23ed88923946dead88dde5de7251c571e2ee4adc451b3bc74";
+
+/// The `[mainnet]` line that names the fixture's oracle host.
+pub(crate) const ORACLE_HOST_LINE: &str = "oracle_host = \"oracle.example.invalid\"\n";
 
 /// A well-formed account outside the fixture's counterparty allowlist.
 const UNLISTED: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
@@ -1048,6 +1057,26 @@ fn existing_v2_canonical_bytes_and_digest_match_literals() {
     );
 }
 
+/// `oracle_host` enters the canonical form as its own line after
+/// `endpoint_host` and changes nothing else: the fixture without the line has
+/// the canonical bytes and digest of a document that names no oracle host.
+#[test]
+fn oracle_host_adds_only_its_own_canonical_bytes() {
+    assert_eq!(FIXTURE.matches(ORACLE_HOST_LINE).count(), 1);
+    let without = canonical_bytes(&FIXTURE.replace(ORACLE_HOST_LINE, "")).unwrap();
+    assert_eq!(
+        String::from_utf8(without.clone()).unwrap(),
+        FIXTURE_CANONICAL.replace(ORACLE_HOST_LINE, "")
+    );
+    assert_eq!(
+        stellar_agent_core::hex::encode(blake3::hash(&without).as_bytes()),
+        FIXTURE_WITHOUT_ORACLE_HOST_DIGEST_HEX
+    );
+    assert!(FIXTURE_CANONICAL.contains(&format!(
+        "endpoint_host = \"rpc.example.invalid\"\n{ORACLE_HOST_LINE}installation_nonce_sha256"
+    )));
+}
+
 #[test]
 #[serial_test::serial]
 fn counterparty_deny_mode_is_byte_identical() {
@@ -1125,8 +1154,8 @@ fn absent_origin_keys_keep_canonical_bytes() {
         ),
         (
             FIXTURE_CANONICAL,
-            "27215114bd1abcb23ed88923946dead88dde5de7251c571e2ee4adc451b3bc74",
-            "2405f4764555bdb0c2a4dee21c4f213c2b74df40759eaf2f432fde5e2c45df7fba196e0684c1b71337a25965e7ea75335830090d49438c3a22aecbc2b103f205",
+            FIXTURE_DIGEST_HEX,
+            "fca3937244956bf7d7064a7d80a482a9006b92fdf61b5bc38cacb85037edb32fd6af0dbc868d79c486eb07c83b7b97a9006ab02f62eae92d881ae59957725e09",
         ),
     ];
     for (raw, (expected_bytes, expected_digest, expected_sig)) in

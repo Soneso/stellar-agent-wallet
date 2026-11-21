@@ -1483,7 +1483,30 @@ Checks that need no request keep their place ahead of the endpoint check: argume
 Every refusal that follows a read comes after the endpoint check. Those are account and claim-entry errors, policy denial, approval refusal, rebuild divergence, the audit pre-flight, a malformed nonce, and the chain, fee, asset, and amount checks. The reservation reconcile and its settlement come after it too. A CLI `claim` or `trustline` refused at the early check carries no preview.
 
 The cross-check witness uses `oracle_provider_url` and checks its endpoint identity
-before reading. The oracle must serve the primary's chain. Identity and reads
+before reading. The oracle must serve the primary's chain.
+On mainnet the owner-signed `[mainnet]` section binds both endpoints:
+`endpoint_host` the primary and `oracle_host` the oracle. `profile
+enable-mainnet` stages each as `normalize_endpoint_host` returns it.
+`verify_enablement_bindings` refuses a stored or merged `oracle_provider_url`
+that is absent or names another host, with `on_disk_oracle_host` or
+`merged_oracle_host`, as it refuses the endpoint host with `on_disk_host` or
+`merged_host`. The resolver accepts a witness only when the normalized host
+of its authority equals the signed `oracle_host` and differs from the
+primary host; the profile's oracle URL alone never admits a witness. Of the
+witness inputs, the owner signs the oracle host and the per-asset
+`cross_check_thresholds`. For an asset the signed table names, the profile
+threshold can only lower the amount that requires a witness; for any other
+asset the profile threshold alone applies. The oracle URL's scheme, path, and credentials and
+the `providers.oracle` record stay unsigned profile fields. The oracle host
+enters the policy fact through the document digest, as the approval origin
+does, so neither the enablement nor the policy fact layout lists it.
+`MainnetWriteContext::oracle_client` takes the `EnablementRecord` and builds
+the post-send oracle client of a CLI or MCP mainnet write only when the
+snapshot's oracle URL normalizes to `EnablementRecord::oracle_host()`; another
+URL refuses with `network.mainnet_authorization_refused` and the precondition
+`witness_oracle_unbound`. The reconcile pass, `tx status`, `tx receipt`, and
+the recovery endpoint pair build their clients from the profile without an
+enablement check. Identity and reads
 share a 15-second attempt deadline. Transport read failures retry up to three
 attempts, seven seconds apart. Disagreements, identity or credential refusals,
 invalid answers, and elapsed deadlines never retry.

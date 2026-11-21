@@ -171,7 +171,8 @@ After merging, the loader resolves derived fields and validates:
   engine.
 
 Mainnet selection requires `--profile <NAME>`. Writes require a dedicated
-nondefault profile with matching stored chain and endpoint host. Mainnet `pay`,
+nondefault profile with matching stored chain, endpoint host, and oracle
+host. Mainnet `pay`,
 `claim` and `accounts create` refuse `--secret-env` and, without a signer flag,
 sign with the enrolled seed in the keyring; a Ledger signer must match the
 enrolled identity. `profile enroll-signer` accepts `--secret-env` only, so it
@@ -358,9 +359,21 @@ reads a keyring entry and writes no enablement state, and every mainnet
 write, in the CLI and in the MCP server, refuses before any signature. An
 enabled profile whose oracle is removed refuses every CLI mainnet write until
 the oracle is set again. A running MCP server checks the profile it loaded at
-startup, so it refuses mainnet writes for a removed oracle from its next
-start. On testnet the oracle is
+startup; its next start refuses the enablement with
+`profile.mainnet_enablement_invalid: on_disk_oracle_host`. On testnet the oracle is
 optional, and a required witness without one warns.
+
+On mainnet the owner-signed policy binds the oracle host. `profile
+enable-mainnet` stages the host of `oracle_provider_url` as
+`[mainnet].oracle_host`, and enablement refuses a stored or merged
+`oracle_provider_url` on another host. A mainnet signature accepts a witness
+only from the signed `oracle_host`, never from the host the profile names
+alone. Of the witness inputs, the owner signs the oracle host and the
+`[mainnet.cross_check_thresholds]`. For an asset the signed table names, a
+profile threshold can only lower the amount that requires a witness; for any
+other asset the profile threshold alone applies. The scheme, path, and
+credentials of `oracle_provider_url` and the `providers.oracle` record are
+unsigned profile fields.
 For the x402 payment tools, the oracle simulates the same unsigned transfer the
 primary simulated, and the answers are compared before the payer signs.
 Both admitted mainnet x402 tools obtain the required witness before the payer signs.
@@ -911,8 +924,8 @@ requirement holds in either build for every policy with a `[mainnet]` table.
 
 The profile file and policy file are separate documents. This policy example
 contains complete payment rules for CLI and MCP. Replace the destination with
-the intended account. The zero nonce digest and example endpoint are placeholders.
-Use the profile, endpoint host, and nonce digest written by
+the intended account. The zero nonce digest and example hosts are placeholders.
+Use the profile, endpoint host, oracle host, and nonce digest written by
 [the enablement ceremony](cli-reference.md#profile-enable-mainnet).
 These installation bindings cannot be reused from another installation.
 
@@ -923,6 +936,7 @@ sequence = 1
 
 [mainnet]
 endpoint_host = "rpc.example.invalid"
+oracle_host = "oracle.example.invalid"
 profile = "operator"
 installation_nonce_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 classic_max_fee_per_op_stroops = 500
@@ -970,6 +984,7 @@ reason = "review"
 | Pin comparison | A pin refuses v1 or a lower sequence. Equal sequence with another digest or owner is a fork. |
 | `[mainnet].profile` | Dedicated profile name. |
 | `[mainnet].endpoint_host` | Ceremony-normalized endpoint host. This policy field remains named `endpoint_host`. |
+| `[mainnet].oracle_host` | Required. Ceremony-normalized host of `oracle_provider_url`: lowercase, with a nondefault port. The only host whose cross-check witness a mainnet signature accepts. |
 | `[mainnet].installation_nonce_sha256` | Installation nonce digest as 64 lowercase hexadecimal characters. |
 | `[mainnet].classic_max_fee_per_op_stroops` | Required signed `u32` classic per-operation cap. |
 | `[mainnet].authorization_ttl_seconds` | Optional lifetime from 1 through 120 seconds, distinct from approval lifetime. |

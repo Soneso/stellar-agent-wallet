@@ -64,6 +64,9 @@ const SOURCE_G: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5
 /// The oracle endpoint of the complete profile. No run reaches it.
 const ORACLE_URL: &str = "https://oracle.example.invalid";
 
+/// The host of [`ORACLE_URL`], which the signed policy names.
+const ORACLE_HOST: &str = "oracle.example.invalid";
+
 /// The mainnet write verbs, with arguments that pass the parser.
 const WRITE_VERBS: &[(&str, &[&str])] = &[
     ("pay", &["pay", SOURCE_G, "1 XLM", "--source", SOURCE_G]),
@@ -209,14 +212,15 @@ const NONCE: &str = "oracle-removed-installation-nonce";
 const DESTINATION: &str = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
 
 /// The signed version 2 policy the enablement ceremony leaves for
-/// [`PROFILE`]: bound to `endpoint_host` and the digest of [`NONCE`], with the
+/// [`PROFILE`]: bound to `endpoint_host`, [`ORACLE_HOST`], and the digest of
+/// [`NONCE`], with the
 /// mainnet restrictions, one approval credential and one allowing native
 /// payment rule.
 fn bound_policy(endpoint_host: &str) -> String {
     let digest = stellar_agent_core::hex::encode(&sha2::Sha256::digest(NONCE.as_bytes()));
     format!(
         "version = 2\nscope = \"profile:{PROFILE}\"\n\n[mainnet]\nprofile = \"{PROFILE}\"\n\
-         endpoint_host = \"{endpoint_host}\"\ninstallation_nonce_sha256 = \"{digest}\"\n\
+         endpoint_host = \"{endpoint_host}\"\noracle_host = \"{ORACLE_HOST}\"\ninstallation_nonce_sha256 = \"{digest}\"\n\
          classic_max_fee_per_op_stroops = 500\nauthorization_ttl_seconds = 60\n\
          approval_credentials = [\n\
          {{ credential_id_b64url = \"WlpaWlpaWlpaWlpaWlpaWg\", \

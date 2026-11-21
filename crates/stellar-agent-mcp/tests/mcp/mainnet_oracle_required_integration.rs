@@ -1,21 +1,19 @@
-//! An enabled mainnet server whose stored profile lost its oracle refuses
-//! every mainnet write tool at admission with
-//! `profile.mainnet_oracle_required`.
+//! A server start on an enabled mainnet profile whose stored profile names
+//! no oracle refuses the enablement with `on_disk_oracle_host`: the stored
+//! profile names no oracle host the signed policy binds.
 //!
 //! The fixture enables a mainnet profile with a complete oracle the way the
 //! ceremony leaves it: the owner key, the agent signer and its identity
 //! record, the minted profile keys, a signed version 2 policy bound to the
-//! installation nonce and to the primary endpoint, the pin from a first
-//! startup, and the nonce. A server started on that profile admits each of
-//! the six mainnet write tools. The operator then removes the oracle URL and
-//! its record from the profile file and restarts the server: startup still
-//! verifies the enablement, and every write tool refuses at admission, its
-//! first step. The server reads the profile at startup, so the restart is
-//! what applies the edit.
+//! installation nonce, the primary endpoint, and the oracle host, the pin
+//! from a first startup, and the nonce. A server started on that profile
+//! admits each of the six mainnet write tools. The operator then removes the
+//! oracle URL and its record from the profile file and restarts the server:
+//! startup refuses the enablement. The server reads the profile at startup,
+//! so the restart is what applies the edit.
 //!
-//! The primary endpoint is a loopback connection counter and the keyring
-//! store records every secret read at a coordinate the profile names, so the
-//! refusals are shown to precede any endpoint contact and any keyring read.
+//! The primary endpoint is a loopback connection counter, so the refusal is
+//! shown to precede any endpoint contact.
 //!
 //! The mock keyring and the data root are process-global, so the test is
 //! `#[serial]`.
@@ -28,12 +26,9 @@
     reason = "test-only; a failed setup step fails the test loudly"
 )]
 
-use std::sync::{Arc, Mutex};
-
 use serial_test::serial;
 use sha2::Digest as _;
 use stellar_agent_core::audit_log::BindingCheck;
-use stellar_agent_core::error::MainnetOracleGap;
 use stellar_agent_core::mainnet::enablement::normalize_endpoint_host;
 use stellar_agent_core::policy::v1::{
     canonical::canonical_bytes,
@@ -43,8 +38,7 @@ use stellar_agent_core::profile::loader::save_to_dir;
 use stellar_agent_core::profile::name::ProfileNameSource;
 use stellar_agent_core::profile::schema::{
     KeyringEntryRef, PrimaryProviderRecord, Profile, ProviderRecord, default_policy_dir,
-    default_profile_dir, mainnet_enablement_entry_ref, policy_pin_entry_ref,
-    signer_identity_entry_ref,
+    default_profile_dir, mainnet_enablement_entry_ref, signer_identity_entry_ref,
 };
 use stellar_agent_core::profile::signer_identity::SignerIdentityRecord;
 use stellar_agent_mcp::server::{
@@ -101,43 +95,6 @@ fn complete_profile(home: &std::path::Path, rpc_url: &str) -> Profile {
     .build();
     profile.audit_log_path = home.join("audit.jsonl");
     profile
-}
-
-/// Every keyring coordinate `profile` names or derives, each with a hook
-/// that records its secret reads in `reads`.
-fn recording_hooks(
-    profile: &Profile,
-    reads: &Arc<Mutex<Vec<String>>>,
-) -> Vec<keyring_mock::ReadHook> {
-    let window = &profile.policy_window_state_key_id;
-    let mut coordinates = vec![
-        profile.mcp_signer_default.clone(),
-        profile.mcp_nonce_key_alias.clone(),
-        profile.audit_log_hash_chain_key_id.clone(),
-        profile.policy_owner_key_id.clone(),
-        profile.attestation_key_id.clone(),
-        profile.counterparty_cache_key_id.clone(),
-        window.clone(),
-        policy_pin_entry_ref(window),
-        mainnet_enablement_entry_ref(window),
-        signer_identity_entry_ref(&profile.mcp_signer_default),
-        KeyringEntryRef::default_owner_key("operator"),
-        KeyringEntryRef::default_audit_binding("operator"),
-        KeyringEntryRef::default_mpp_state_key("operator"),
-    ];
-    coordinates.extend(profile.pool_master_key_id.clone());
-    coordinates
-        .into_iter()
-        .map(|coordinate| {
-            let reads = Arc::clone(reads);
-            let label = format!("{}/{}", coordinate.service, coordinate.account);
-            keyring_mock::ReadHook::new(
-                &coordinate.service,
-                &coordinate.account,
-                Arc::new(move || reads.lock().unwrap().push(label.clone())),
-            )
-        })
-        .collect()
 }
 
 /// Enrolls the keys of `profile`, saves it, installs its signed policy bound
@@ -327,10 +284,8 @@ async fn call(server: &WalletServer, tool: &str) -> (String, String) {
 
 /// With its oracle the enabled server admits each write tool, which then
 /// refuses its malformed input with its own code. After the oracle URL and
-/// its record leave the profile file, a restarted server refuses every write
-/// tool at admission with `profile.mainnet_oracle_required` and the
-/// missing-URL detail, before any endpoint contact or keyring read. The
-/// recording store observes the startup's own keyring reads.
+/// its record leave the profile file, a restart refuses the enablement with
+/// `on_disk_oracle_host` before any endpoint contact.
 #[tokio::test]
 #[serial]
 async fn mainnet_oracle_required_refuses_write_tools_after_the_oracle_is_removed() {
@@ -344,10 +299,7 @@ async fn mainnet_oracle_required_refuses_write_tools_after_the_oracle_is_removed
     let _home = StellarAgentHomeGuard::new(home.path());
     let endpoint = ConnectionCounter::start().expect("loopback connection counter");
     let complete = complete_profile(home.path(), &endpoint.https_uri());
-    let reads = Arc::new(Mutex::new(Vec::new()));
-    let take = || std::mem::take(&mut *reads.lock().unwrap());
-    keyring_mock::install_with_read_hooks(recording_hooks(&complete, &reads))
-        .expect("mock keyring store init");
+    keyring_mock::install().expect("mock keyring store init");
     enable(&complete);
 
     let server = start(&complete);
@@ -361,19 +313,23 @@ async fn mainnet_oracle_required_refuses_write_tools_after_the_oracle_is_removed
     removed.oracle_provider_url = None;
     removed.providers.as_mut().unwrap().oracle = None;
     save_to_dir("operator", &removed, &default_profile_dir().unwrap()).unwrap();
-    take();
-    let server = start(&removed);
-    assert!(!take().is_empty(), "startup reads the profile's keys");
     let connections = endpoint.accepted().expect("connection count");
-    for (tool, _) in TOOLS {
-        let (code, message) = call(&server, tool).await;
-        assert_eq!(code, "profile.mainnet_oracle_required", "{tool}: {message}");
-        assert_eq!(message, MainnetOracleGap::UrlMissing.text(), "{tool}");
-        assert_eq!(take(), Vec::<String>::new(), "{tool}: keyring reads");
-        assert_eq!(
-            endpoint.accepted().expect("connection count"),
-            connections,
-            "{tool}: no connection reaches the primary endpoint"
-        );
+    match build_selected_server(removed, ProfileNameSource::Flag, BindingCheck::Enforce) {
+        Ok(_) => panic!("a profile without its signed oracle started with mainnet writes"),
+        Err(error) => assert_eq!(
+            error.to_string(),
+            stellar_agent_core::policy::BuildRegistryError::PolicyEngineError {
+                detail: stellar_agent_core::error::ValidationError::MainnetEnablementInvalid {
+                    binding: "on_disk_oracle_host",
+                }
+                .to_string(),
+            }
+            .to_string()
+        ),
     }
+    assert_eq!(
+        endpoint.accepted().expect("connection count"),
+        connections,
+        "no connection reaches the primary endpoint"
+    );
 }

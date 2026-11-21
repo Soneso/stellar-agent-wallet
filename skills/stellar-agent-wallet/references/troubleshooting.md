@@ -345,12 +345,12 @@ Other build failures use `policy.engine_unavailable` or `trustline.policy_engine
 | `policy.state_lock_io` | The lock cannot be opened. The detail identifies the I/O failure. |
 | `policy.mainnet_minimum_unmet` | The enabled policy fails a named minimum requirement. |
 | `policy.pin_unusable` | The installation pin cannot be read or is malformed. |
-| `profile.mainnet_enablement_invalid` | The message names the failed binding: `mainnet_table`, `profile`, `source`, `default`, `on_disk`, `chain_id`, `on_disk_host`, `merged_host`, or `nonce_digest`. |
+| `profile.mainnet_enablement_invalid` | The message names the failed binding: `mainnet_table`, `profile`, `source`, `default`, `on_disk`, `chain_id`, `on_disk_host`, `merged_host`, `on_disk_oracle_host`, `merged_oracle_host`, or `nonce_digest`. |
 | `profile.enable_mainnet_profile_flag_required` | Supply an explicit `--profile`. |
 | `profile.enable_mainnet_default_refused` | Select a dedicated profile whose name is not `default`. |
 | `profile.enable_mainnet_not_mainnet` | Select a mainnet profile. |
 | `profile.enable_mainnet_precondition` | A named ceremony prerequisite or effect failed. |
-| `profile.mainnet_oracle_required` | The mainnet profile sets no `oracle_provider_url`. Enablement refuses before any keyring read, and every mainnet write before any signature; the MCP server applies an oracle change from its next start. Set `oracle_provider_url` and its `providers.oracle` record in the profile file. |
+| `profile.mainnet_oracle_required` | The mainnet profile sets no `oracle_provider_url`. Enablement refuses before any keyring read, and every mainnet write before any signature; the MCP server applies an oracle change from its next start, where a removed oracle fails the enablement with `on_disk_oracle_host`. Set `oracle_provider_url` and its `providers.oracle` record in the profile file. |
 | `profile.enable_mainnet_nonce_exists` | Use `--rotate` to replace the installation nonce. |
 | `sign_policy.sequence_exhausted` | The maximum of body and pinned sequence is `i64::MAX`. |
 | `profile.enroll_signer_identity_incomplete` | Follow the reported repair or enrollment remedy. |

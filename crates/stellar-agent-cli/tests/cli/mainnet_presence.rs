@@ -195,6 +195,7 @@ fn mainnet_home_with(home: &std::path::Path, scope: fn(&Profile, &str)) -> (Prof
     )
     .audit_log_path(home.join("audit").join("presence.jsonl"))
     .build();
+    stellar_agent_core::approval::mainnet_fixtures::set_fixture_oracle(&mut profile);
     profile.attestation_key_id = KeyringEntryRef::default_attestation_key(NAME);
     save_new_to_dir(NAME, &profile, &home.join("profiles")).unwrap();
     let store: Arc<keyring_core::CredentialStore> =

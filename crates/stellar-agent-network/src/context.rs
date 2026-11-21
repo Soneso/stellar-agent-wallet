@@ -428,18 +428,44 @@ impl MainnetWriteContext {
     /// confirmation of the primary endpoint. The reservation stands whatever
     /// the oracle answers.
     ///
-    /// `Ok(None)` when the stored profile sets no `oracle_provider_url`.
+    /// The stored oracle URL must name the owner-signed oracle host of
+    /// `enablement`, normalized as the enablement normalizes it, so the
+    /// result is a client whenever it is `Ok`.
     ///
     /// # Errors
     ///
-    /// The errors of [`NetworkContext::oracle_client`].
-    pub fn oracle_client(&self) -> Result<Option<StellarRpcClient>, WalletError> {
+    /// `network.mainnet_authorization_refused`, logged with the precondition
+    /// `witness_oracle_unbound`, when the stored oracle URL is absent or names
+    /// another host; otherwise the errors of [`NetworkContext::oracle_client`].
+    pub fn oracle_client(
+        &self,
+        enablement: &stellar_agent_core::mainnet::enablement::EnablementRecord,
+    ) -> Result<Option<StellarRpcClient>, WalletError> {
         #[cfg(feature = "mainnet-write")]
         {
+            use crate::mainnet::refusal::{MainnetAuthorizationError, MainnetPrecondition as P};
+            let signed = self
+                .snapshot
+                .oracle_provider_url
+                .as_ref()
+                .and_then(|url| {
+                    stellar_agent_core::mainnet::enablement::normalize_endpoint_host(url.as_str())
+                        .ok()
+                })
+                .is_some_and(|host| host == enablement.oracle_host());
+            if !signed {
+                tracing::warn!(
+                    path = "mainnet_oracle_client",
+                    precondition = P::WitnessOracleUnbound.label(),
+                    "mainnet authorization refused"
+                );
+                return Err(MainnetAuthorizationError::Refused(P::WitnessOracleUnbound).into());
+            }
             self.network_context().oracle_client(&self.snapshot)
         }
         #[cfg(not(feature = "mainnet-write"))]
         {
+            let _ = enablement;
             self.absurd()
         }
     }

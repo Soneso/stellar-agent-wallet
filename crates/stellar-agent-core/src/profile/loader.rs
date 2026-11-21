@@ -1436,9 +1436,13 @@ pub struct OnDiskMainnetView {
     pub chain_id: super::caip2::Caip2,
     /// The stored RPC endpoint.
     pub rpc_url: String,
+    /// The stored oracle endpoint, when the file sets a string one.
+    pub oracle_provider_url: Option<String>,
 }
 
-/// Reads the stored chain and endpoint without applying environment overlays.
+/// Reads the stored chain, endpoint, and oracle endpoint without applying
+/// environment overlays. A missing or non-string oracle endpoint reads as
+/// `None`.
 ///
 /// # Errors
 ///
@@ -1473,7 +1477,15 @@ pub fn read_mainnet_view_on_disk(
         .parse()
         .map_err(|_| failure("chain_id must be stellar:testnet or stellar:mainnet".to_owned()))?;
     let rpc_url = field("rpc_url")?.to_owned();
-    Ok(OnDiskMainnetView { chain_id, rpc_url })
+    let oracle_provider_url = doc
+        .get("oracle_provider_url")
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned);
+    Ok(OnDiskMainnetView {
+        chain_id,
+        rpc_url,
+        oracle_provider_url,
+    })
 }
 
 /// The stored chain and endpoints, without environment or programmatic overlays.

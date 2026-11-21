@@ -2803,7 +2803,12 @@ pub(super) mod tests {
             .unwrap();
         if !bound {
             let table = doc["mainnet"].as_table_like_mut().unwrap();
-            for field in ["profile", "endpoint_host", "installation_nonce_sha256"] {
+            for field in [
+                "profile",
+                "endpoint_host",
+                "oracle_host",
+                "installation_nonce_sha256",
+            ] {
                 table.remove(field);
             }
         }
@@ -2884,7 +2889,12 @@ pub(super) mod tests {
                         doc["sequence"].as_integer(),
                         Some(if present_pin { 11 } else { 8 })
                     );
-                    for field in ["profile", "endpoint_host", "installation_nonce_sha256"] {
+                    for field in [
+                        "profile",
+                        "endpoint_host",
+                        "oracle_host",
+                        "installation_nonce_sha256",
+                    ] {
                         assert!(doc["mainnet"].get(field).is_none(), "{field}");
                     }
                     load_signed_policy(&path, "operator", &owner, &profile.network_passphrase)
