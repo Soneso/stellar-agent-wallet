@@ -561,10 +561,12 @@ pub struct AuditWriter {
     settlement_index: SettlementIndex,
 }
 
-/// Counts of permissions revoked before acknowledging an outbox loss.
+/// Counts of permissions removed before acknowledging an outbox loss.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RevokedCounts {
-    /// Decided, unexpired, unconsumed approvals removed.
+    /// Unexpired approval inbox entries that hold an attestation or a
+    /// recorded passkey assertion and are neither consumed nor rejected,
+    /// removed from the inbox. No durable approval record changes.
     pub approvals: usize,
     /// Toolset grants removed.
     pub grants: usize,
@@ -582,7 +584,7 @@ pub struct OutboxLossReport {
     pub drained: usize,
     /// Complete lines the acknowledgement discarded without appending them.
     pub discarded: usize,
-    /// Approvals revoked by the caller.
+    /// Decided approvals the caller removed from the approval inbox.
     pub revoked_approvals: usize,
     /// Grants revoked by the caller.
     pub revoked_grants: usize,
@@ -1952,8 +1954,12 @@ impl AuditWriter {
     ///
     /// Delivery is at least once. A refusal leaves the outbox unchanged, and
     /// the entries appended before the refusal are appended again by the next
-    /// drain, with the same `request_id`. Queued rows are committed in the
-    /// keyring until they are drained.
+    /// drain, with the same `request_id`. A legacy queue commits its rows by
+    /// count and chain head in the keyring until they are drained. A queue
+    /// under owner state authenticates each row by its tag and commits
+    /// delivered batches, so a dropped tail of queued rows that carry no
+    /// reference, such as halt and resume rows, is not detected before
+    /// delivery.
     ///
     /// Returns the number of rows appended.
     ///
@@ -2619,13 +2625,14 @@ impl AuditWriter {
     /// The retired watch supplies its expected and observed row counts.
     /// An intact committed prefix is parsed as operator rows even when the
     /// remaining queue is damaged. A refusal occurs here, before the caller
-    /// revokes permissions.
+    /// removes inbox approvals and revokes toolset grants.
     ///
     /// Owner selection reports a loss when the next drain refuses the queue.
     /// It selects the authenticated prefix and excludes delivered
     /// closed-prefix rows from delivery.
     /// Recoverable publication and a lone fence show no active loss.
-    /// Hard owner refusals apply before the caller revokes permissions.
+    /// Hard owner refusals apply before the caller removes inbox approvals
+    /// and revokes toolset grants.
     /// An evidence-dependent query authenticates the owner's evidence image
     /// first and can commit a newer authenticated image to the owner.
     ///
@@ -2676,8 +2683,10 @@ impl AuditWriter {
     ///
     /// Only a writer from [`AuditWriter::open_for_outbox_acknowledgement`]
     /// acknowledges, because only that open checks the tip anchor and defers
-    /// the drain the loss refuses. The caller revokes the profile's decided
-    /// approvals and grants first and passes their counts in `revoked`.
+    /// the drain the loss refuses. The caller first removes the decided
+    /// approvals from the profile's approval inbox and revokes its toolset
+    /// grants, and passes their counts in `revoked`. It writes no `revoked`
+    /// state to a durable approval record.
     ///
     /// An intact committed prefix is parsed as operator rows before the
     /// `audit_outbox_loss_acknowledged` row is appended, so an unusable line

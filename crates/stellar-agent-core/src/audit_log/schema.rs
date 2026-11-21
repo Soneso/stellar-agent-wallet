@@ -3976,8 +3976,9 @@ pub enum EventKind {
         /// had no outbox file.
         retired_file: Option<String>,
     },
-    /// The operator acknowledges lost queued operator rows and revokes
-    /// permissions.
+    /// The operator acknowledges lost queued operator rows after the decided
+    /// approvals are removed from the approval inbox and the toolset grants
+    /// are revoked.
     AuditOutboxLossAcknowledged {
         /// Number of rows committed in the keyring.
         expected_rows: u64,
@@ -3985,7 +3986,7 @@ pub enum EventKind {
         found_rows: u64,
         /// Bounded operator-supplied reason.
         reason: String,
-        /// Decided approvals revoked before this row.
+        /// Decided approvals removed from the approval inbox before this row.
         revoked_approvals: usize,
         /// Toolset grants revoked before this row.
         revoked_grants: usize,

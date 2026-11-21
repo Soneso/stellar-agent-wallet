@@ -568,8 +568,9 @@ The profile owner can revoke a pending record at any time, also after its waitin
 The inbox's "Revoke approval" action accepts eligible pending entries and unconsented durable records only.
 Local actions require a session, per-entry CSRF, session proof and matching entry identity.
 Signed-origin actions also require a fresh assertion from a current-policy credential.
-Revoked records, and consumed records whose window ended or whose operation is closed, return their view without writes or rows.
-Revocation preserves consent, both clocks, operation history and accounting.
+A consumed record is revoked inside its window whatever the state of its operation.
+Revoked records, and consumed records whose window ended, return their view without writes or rows.
+Revocation sets the record's closure time to the revocation time and preserves consent, every other clock, operation history and accounting.
 A consent commit under a revoked record refuses with `approval.revoked`.
 It prevents every later mint at the durable check: first mints, unused-carrier remints, the payment mint under a used SEP-10 message authorization, and the x402 payload-release mint under a used Soroban intent authorization.
 It does not affect an authorization minted before it, which keeps its lifetime, or submissions already sent.
@@ -1060,7 +1061,7 @@ A `pruned_prefix` warning reports `first_file`, the oldest file walked, and
 entry and is authenticated when an audit key is supplied. Verification checks
 every retained entry and bridge, and the warning leaves the verdict successful.
 
-`outbox_pending` counts complete queued consent, halt, and resume lines. With `--profile` and the profile's log path, verification checks the keyring commitment under the outbox lock after the chain walk. A missing or changed committed prefix, or a complete line past it, fails with `audit.outbox_rows_missing`; a held lock fails with `audit.outbox_busy`. Verification authenticates tagged rows, owner state, and both evidence files under the stored key. An unusable row fails with `audit.outbox_unusable`. Unusable evidence fails with `audit.outbox_evidence_unusable`. The outbox lock is taken through the carrier record, so the check also fails with `audit.carrier_replaced`, `audit.carriers_unbound` or `audit.carrier_identity_unavailable` at the head of the detail, and with `audit.outbox_rows_missing` when the retired generation's commitment changed. Without a profile, no commitment is checked. The separate count inspection can report `outbox_torn_tail`, `outbox_unparseable`, or `outbox_unreadable` warnings.
+`outbox_pending` counts complete queued consent, halt, and resume lines. With `--profile` and the profile's log path, verification checks the keyring commitment under the outbox lock after the chain walk. A missing or changed committed prefix, or a complete line past it, fails with `audit.outbox_rows_missing`; a held lock fails with `audit.outbox_busy`. Verification authenticates tagged rows, owner state, and both evidence files under the stored key. An unusable row fails with `audit.outbox_unusable`. Unusable evidence fails with `audit.outbox_evidence_unusable`. The outbox lock is taken through the carrier record, so the check also fails with `audit.carrier_replaced`, `audit.carriers_unbound` or `audit.carrier_identity_unavailable` at the head of the detail, and with `audit.outbox_rows_missing` when the retired generation's commitment changed. Under owner state, a dropped tail of queued rows that carry no reference, such as halt and resume rows, passes this check. Without a profile, no commitment is checked. The separate count inspection can report `outbox_torn_tail`, `outbox_unparseable`, or `outbox_unreadable` warnings.
 
 An `outbox_loss_acknowledged` warning names each loss acknowledgement's file, line, `expected_rows`, and `found_rows`. It leaves the chain verdict unchanged.
 
@@ -1134,8 +1135,10 @@ Operator-only recovery for `audit.outbox_rows_missing`; an agent must not run it
 Stop the process holding the profile's writer and inspect the queued rows first.
 `--reason` is required, non-empty, and recorded with the audit string bound.
 
-The command checks the tip anchor, checks that the loss holds and, when the committed prefix is intact, that every committed row parses and is an operator row, and then revokes every decided, unexpired, unconsumed approval and every toolset grant.
-Mainnet confirmations and recorded passkey assertions count as decided approvals.
+The command checks the tip anchor, checks that the loss holds and, when the committed prefix is intact, that every committed row parses and is an operator row.
+It then removes from the approval inbox every unexpired entry that holds an attestation or a recorded passkey assertion and is neither consumed nor rejected, and revokes every toolset grant.
+It writes no `revoked` state to a durable mainnet approval record.
+A mainnet consent whose queued audit row was lost still cannot authorize: before a signing key loads, the commit requires the row's exact Delivered evidence and refuses with `approval.consent_undelivered`.
 It records `audit_outbox_loss_acknowledged`, appends the committed prefix when it is intact and nothing otherwise, resets the commitment, and empties the outbox, discarding every other line.
 Under owner state, it appends the authenticated prefix, stores the owner item, and publishes the next generation line.
 A watch-only loss leaves the active queue unchanged.

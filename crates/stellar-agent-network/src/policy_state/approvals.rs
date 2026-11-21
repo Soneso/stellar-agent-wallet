@@ -758,7 +758,9 @@ impl<'a> ApprovalRecorder<'a> {
     ///
     /// # Errors
     ///
-    /// Refuses a mismatched witness, receipt or attestation, a second consent, invalid clocks and store errors.
+    /// Refuses a revoked record, also for a repeat of the receipt it holds,
+    /// a mismatched witness, receipt or attestation, a second consent,
+    /// invalid clocks and store errors.
     pub fn record_consent(
         &mut self,
         id: [u8; 32],
@@ -864,7 +866,9 @@ impl<'a> ApprovalRecorder<'a> {
                 .as_mut()
                 .and_then(|s| s.records.iter_mut().find(|r| r.id == id))
                 .ok_or_else(|| unexpected("the approval record is absent"))?;
-            if integrated && record.state == ApprovalState::Revoked {
+            // A revoked record refuses every commit, also a repeat of the
+            // receipt it already holds.
+            if record.state == ApprovalState::Revoked {
                 return Err(unexpected("the approval record is revoked"));
             }
             let digest = payload
@@ -1048,8 +1052,9 @@ pub fn seed_existing_consent_delivery_for_test(
 
 /// Revokes the record `id` in `session`. A pending record is revoked at any
 /// time, also after its waiting expiry, because a receipt verified before
-/// that expiry can still commit consent until a revocation. A revoked
-/// record, and a consumed one whose window ended, return their view
+/// that expiry can still commit consent until a revocation. A consumed
+/// record is revoked inside its window whatever the state of its operation.
+/// A revoked record, and a consumed one whose window ended, return their view
 /// without a write.
 fn revoke_step(session: &mut Session<'_>, id: [u8; 32]) -> Result<ApprovalView, WindowStoreError> {
     let record = session

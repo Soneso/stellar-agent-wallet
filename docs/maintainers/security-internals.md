@@ -1495,8 +1495,9 @@ of its authority equals the signed `oracle_host` and differs from the
 primary host; the profile's oracle URL alone never admits a witness. Of the
 witness inputs, the owner signs the oracle host and the per-asset
 `cross_check_thresholds`. For an asset the signed table names, the profile
-threshold can only lower the amount that requires a witness; for any other
-asset the profile threshold alone applies. The oracle URL's scheme, path, and credentials and
+threshold can only lower the amount that requires a witness. For an asset the
+signed table does not name, XLM and its SAC use at most 1000 XLM, and a token
+has no threshold and refuses. The oracle URL's scheme, path, and credentials and
 the `providers.oracle` record stay unsigned profile fields. The oracle host
 enters the policy fact through the document digest, as the approval origin
 does, so neither the enablement nor the policy fact layout lists it.
@@ -2663,11 +2664,14 @@ opens a record or selects a preparation. The store wire version is unchanged.
 Only `ApprovalRecorder::revoke` changes the durable record.
 The profile owner can revoke a pending record at any time, also after its waiting expiry or the closure of its operation, and consumed records inside execution, including after inbox collection.
 Inbox actions require an authenticated, eligible pending entry and a live unconsented durable record.
-An inbox revocation admitted on such a record still revokes it, and appends its row, when the waiting expiry passes before the adapter reads the record again; consent or an operation closure still refuses with `approval.denied`.
+An inbox revocation admitted on such a record still revokes it, and appends its row, when the waiting expiry passes before the adapter reads the record again; consent, a consumption, or an operation closure still refuses with `approval.denied`.
+When the waiting expiry passes between the inbox entry check and the inbox's first durable lookup, the inbox returns the `expired` view and writes nothing.
+No consent can follow: the entry is unattested, and attestation refuses an expired entry.
 Signed-origin actions reuse current-policy assertion verification, counter updates and listener identity checks.
-Revoked records, and consumed records whose window ended or whose operation is closed, return secret-free views without a facade call or audit row.
+The owner revokes a consumed record inside its window whatever the state of its operation, so every later mint under it refuses, a child mint without an operation link included.
+Revoked records, and consumed records whose window ended, return secret-free views without a facade call or audit row.
 A pending record revokes and appends its row also when its expiry passes between lookup and revoke; a consumed record whose window ends there returns its view without an audit row.
-Consent, both clocks, consumption identity, holds and operation history remain intact.
+The record's closure time takes the revocation time. Consent, both window clocks, consumption identity, holds and operation history remain intact.
 
 The surface appends `approval_revoked` through tool `approval.revoked` after the state commit.
 The row carries the durable record's approval kind, nonce prefix and origin, plus a credential pseudonym for signed-origin requests only.

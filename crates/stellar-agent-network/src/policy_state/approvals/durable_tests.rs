@@ -1265,6 +1265,49 @@ fn a_revocation_after_the_waiting_expiry_stops_a_late_consent() {
     );
 }
 
+/// A record that holds consent and is revoked inside its window refuses a
+/// repeated commit of the same receipt with `approval.revoked` and keeps its
+/// file unchanged.
+#[test]
+#[serial(mainnet_clock)]
+#[serial]
+fn a_revoked_record_refuses_a_repeat_of_its_consent() {
+    let (fx, mut parts) = IntentFx::unconsented(300_000);
+    let profile = fx.fixture.profile();
+    let [first, repeat] = parts.spare;
+    let completion = |witness| {
+        crate::operation_entry::witnessed_completion(
+            &parts.store,
+            profile,
+            witness,
+            parts.payload.clone(),
+        )
+        .unwrap()
+        .unwrap()
+    };
+    let first = completion(first);
+    let repeat = completion(repeat);
+    let committed = crate::operation_entry::commit_consent(&parts.store, profile, &first).unwrap();
+    assert!(committed.record.consent.is_some());
+    let view = ApprovalRecorder::new(&parts.store, profile, &mut parts.rows, "revoke")
+        .revoke(parts.id)
+        .unwrap();
+    assert_eq!(view.record.state, ApprovalState::Revoked);
+    assert!(!view.expired, "inside the window");
+    assert_eq!(view.record.consent, committed.record.consent);
+    let before = std::fs::read(parts.store.path()).unwrap();
+    let refused = crate::operation_entry::commit_consent(&parts.store, profile, &repeat);
+    assert_eq!(
+        refused.as_ref().map(|_| ()).map_err(|error| error.code()),
+        Err("approval.revoked"),
+        "{refused:?}"
+    );
+    let direct = ApprovalRecorder::new(&parts.store, profile, &mut parts.rows, "consent")
+        .record_consent(parts.id, &parts.witness, &parts.payload);
+    assert!(direct.is_err(), "{direct:?}");
+    assert_eq!(std::fs::read(parts.store.path()).unwrap(), before);
+}
+
 /// A re-sign at a higher sequence with an unchanged body invalidates an
 /// intent consent under the earlier and under the reloaded current policy.
 /// Under the current policy the intent, bound to the earlier digest, no

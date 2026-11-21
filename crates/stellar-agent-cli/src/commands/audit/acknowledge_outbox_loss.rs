@@ -1,5 +1,8 @@
-//! Acknowledges lost queued operator rows after revoking the profile's
-//! permissions.
+//! Acknowledges lost queued operator rows after removing the profile's
+//! decided approvals from its approval inbox and revoking its toolset grants.
+//! It writes no `revoked` state to a durable approval record; a mainnet
+//! consent whose queued row was lost refuses with
+//! `approval.consent_undelivered` at its delivery check.
 
 use std::path::Path;
 
@@ -118,7 +121,7 @@ fn acknowledge(
     // outbox lock. Recovery holds all three audit carriers and uses nonblocking
     // acquisition of the permission stores. The approval lock stays held
     // through the acknowledgement, so concurrent approval persistence cannot
-    // escape revocation.
+    // escape the removal.
     let mut approvals = PendingApprovalStore::open(approvals_path.to_path_buf())
         .map_err(|e| approval_store_open_error(&e))?;
     // Load without expiry pruning so every recorded grant is removed.
@@ -361,7 +364,7 @@ mod tests {
     }
 
     /// A decided approval whose stored summary destination fails its checksum
-    /// is still a decided record: the acknowledged loss revokes it, and a
+    /// is still a decided record: the acknowledged loss removes it, and a
     /// later repair of the summary text brings no consent back.
     #[test]
     #[serial_test::serial]
@@ -451,8 +454,8 @@ mod tests {
     /// An outbox commitment the keyring holds in a form that does not parse
     /// refuses the acknowledgement. With that entry removed, the queued line
     /// is past the absent commitment: no acquisition drains it, and the
-    /// acknowledgement records the loss, revokes the decided approvals,
-    /// appends no queued row and empties the outbox.
+    /// acknowledgement records the loss, removes the decided approvals from
+    /// the approval inbox, appends no queued row and empties the outbox.
     #[test]
     #[serial_test::serial]
     fn a_removed_unusable_commitment_is_recovered_by_the_acknowledgement() {

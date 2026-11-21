@@ -343,7 +343,7 @@ When the first line of `<log>.outbox` is a generation line, follow section 8.6 i
 1. Stop the processes that use the profile: the MCP server, `approve serve`, and any CLI verb.
 2. Inspect the file: `cat -n <log>.outbox`. Each intact line is one operator row, with its `kind`, `ts`, and `request_id`; a consent row also carries `nonce_prefix`.
 3. Move the file out of the audit directory: `mv <log>.outbox <somewhere-else>/outbox.saved`. The keyring still records the committed rows, so the next acquisition reports `audit.outbox_rows_missing`.
-4. Follow section 8.3. The acknowledgement records the loss, revokes every decided approval and toolset grant, appends no queued row, and resets the commitment. Approve the affected actions again.
+4. Follow section 8.3. The acknowledgement records the loss, removes every decided approval from the approval inbox, revokes every toolset grant, appends no queued row, and resets the commitment. Approve the affected actions again.
 
 The saved file can hold consent rows whose approvals may already have taken effect. Keep it with the incident record.
 
@@ -376,7 +376,9 @@ stellar-agent audit acknowledge-outbox-loss --profile default --reason "Queue in
 
 The command checks the log's tip anchor and takes its writer and drain locks.
 It checks that the loss holds. When the committed prefix is intact, every committed line must parse and be an operator row.
-It then revokes every decided, unexpired, unconsumed approval, including mainnet confirmations and recorded passkey assertions, and every toolset grant.
+It then removes from the approval inbox every unexpired entry that holds an attestation or a recorded passkey assertion and is neither consumed nor rejected, and revokes every toolset grant.
+It writes no `revoked` state to a durable mainnet approval record.
+A mainnet consent whose queued row was lost still cannot authorize: the commit requires the row's exact Delivered evidence and refuses with `approval.consent_undelivered`.
 Undecided requests remain.
 It appends `audit_outbox_loss_acknowledged`, appends the committed prefix when it is intact and nothing otherwise, stores zero state, and truncates the outbox, discarding every other line.
 The operator approves affected actions again, creating new consent rows.
@@ -809,8 +811,9 @@ read as "nothing queued".
    lines, every one of them now lies past the commitment: keyed acquisitions and drains refuse with
    `audit.outbox_rows_missing`, and nothing is drained. Run
    `stellar-agent audit acknowledge-outbox-loss --profile <name> --reason
-   <text>` (section 8.3). It records the loss, revokes every decided approval
-   and toolset grant, appends no queued row, and empties the outbox. Approve
+   <text>` (section 8.3). It records the loss, removes every decided approval
+   from the approval inbox, revokes every toolset grant, appends no queued row,
+   and empties the outbox. Approve
    the affected actions again.
 5. When the outbox is empty or absent, the zero commitment matches it and no
    loss is detectable: `audit acknowledge-outbox-loss` refuses with

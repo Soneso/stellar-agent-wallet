@@ -100,14 +100,19 @@ fn revoke_with(
     let before = calls.lookup(nonce)?;
     let view = project(&before);
     // A pending record is revoked at any time: a receipt verified before its
-    // waiting expiry can still commit consent until a revocation.
-    if view.is_noop() && before.record.state != ApprovalState::Pending {
+    // waiting expiry can still commit consent until a revocation. A consumed
+    // record is revoked inside its window whatever the state of its
+    // operation, so every later mint under it refuses. A revoked record, and
+    // a consumed one whose window ended, return their view without a write.
+    if before.record.state == ApprovalState::Revoked
+        || (before.record.state != ApprovalState::Pending && before.expired)
+    {
         return Ok(view);
     }
     // Inbox authority covers only live, unconsented pending durable records.
     // The inbox admitted the request on a live record, so a waiting expiry
-    // that passes before this lookup still revokes; consent or an operation
-    // closure still refuses.
+    // that passes before this lookup still revokes; consent, a consumption,
+    // or an operation closure still refuses.
     if origin != Surface::Cli
         && !view.permits_inbox_revocation()
         && !expired_while_admitted(&before.record)
@@ -1728,17 +1733,20 @@ pub(super) mod tests {
             .expire_due(f.entry.created_at_unix_ms)
             .unwrap();
         let view = f.view();
+        assert_eq!(view.record.state, ApprovalState::Consumed);
         assert!(view.record.closed_at_ms.is_some());
         assert!(!view.expired);
-        let bytes = f.bytes();
-        let audit = std::fs::read(f.core.audit_path()).unwrap();
-        assert_eq!(
+        // The owner revokes a consumed record inside its window whatever the
+        // state of its operation.
+        let revoked =
             RevocationAccess::revoke(&f.access(), &f.entry.approval_nonce, Surface::Cli, None)
-                .unwrap(),
-            project(&view)
-        );
-        assert_eq!(f.bytes(), bytes);
-        assert_eq!(std::fs::read(f.core.audit_path()).unwrap(), audit);
+                .unwrap();
+        assert_eq!(revoked.state, "revoked");
+        assert!(revoked.revoked_at_ms.is_some());
+        assert_eq!(f.view().record.state, ApprovalState::Revoked);
+        let audit = std::fs::read_to_string(f.core.audit_path()).unwrap();
+        let row: Value = serde_json::from_str(audit.lines().last().unwrap()).unwrap();
+        assert_eq!(row["kind"], "approval_revoked");
         // An attested entry refuses before the adapter, even where the
         // durable record would answer with a no-op view.
         for durable in ["expired", "revoked"] {
@@ -1787,6 +1795,107 @@ pub(super) mod tests {
             drop(context);
             assert_eq!(f.bytes(), bytes);
             assert_eq!(std::fs::read(f.core.audit_path()).unwrap(), audit);
+        }
+    }
+
+    /// The SEP-10 message leg consumes the record and the operation closes
+    /// inside both windows. The owner's revocation writes `revoked`, and the
+    /// payment mint under the used message, which carries no operation link,
+    /// refuses as revoked. The inbox refuses the same record.
+    #[cfg(feature = "mainnet-write")]
+    #[test]
+    #[serial_test::serial(mainnet_clock)]
+    #[serial_test::serial]
+    fn a_closed_consumed_record_is_revoked_and_its_child_mint_refuses() {
+        use stellar_agent_network::mainnet::{MainnetConsumer, MessageDomain};
+        use stellar_agent_network::policy_state::{ConsumptionBinding, DomainBinding};
+        for origin in [Surface::Cli, Surface::Serve] {
+            let mut f = Fixture::new();
+            f.consent();
+            let domain = MessageDomain {
+                home_domain: "example.invalid".to_owned(),
+                web_auth_domain: "auth.example.invalid".to_owned(),
+                server_key: [3; 32],
+            };
+            let mut message = f.mint();
+            message.consumer = MainnetConsumer::X402Authenticated;
+            message.binding = DomainBinding::Message {
+                domain: domain.clone(),
+                content_digest: [4; 32],
+                ephemeral_public_key: [5; 32],
+            };
+            message.holds = vec![];
+            message.authorization_ttl_ms = 300_000;
+            let minted = f
+                .store
+                .mint_authorization(f.core.profile(), &message)
+                .unwrap();
+            stellar_agent_network::mainnet::test_support::consume_minted(
+                &f.store,
+                f.core.profile(),
+                &message,
+                &minted,
+                &ConsumptionBinding::Message {
+                    domain,
+                    content_digest: [4; 32],
+                    ephemeral_public_key: [5; 32],
+                },
+            )
+            .unwrap();
+            OperationRecorder::new(&f.store, f.core.profile(), &mut Rows::default(), "close")
+                .transition(
+                    f.handle.id(),
+                    None,
+                    stellar_agent_network::policy_state::operations::OperationState::Expired,
+                    &Default::default(),
+                )
+                .unwrap();
+            let closed = f.view();
+            assert_eq!(closed.record.state, ApprovalState::Consumed);
+            assert!(closed.record.closed_at_ms.is_some());
+            assert!(!closed.expired, "inside the execution window");
+            let access = f.access();
+            let mut calls = ScriptedClockAndCalls {
+                real: &access,
+                clock: &f.clock,
+                during_revoke: None,
+                calls: vec![],
+                fail_append: false,
+            };
+            let bytes = f.bytes();
+            let result = revoke_with(&mut calls, &f.entry.approval_nonce, origin, None);
+            if origin == Surface::Serve {
+                assert_eq!(result.unwrap_err().code, "approval.denied");
+                assert_eq!(calls.calls, ["lookup"]);
+                assert_eq!(f.bytes(), bytes, "the inbox wrote the record");
+                continue;
+            }
+            let view = result.unwrap();
+            assert_eq!(view.state, "revoked");
+            assert_eq!(
+                view.revoked_at_ms,
+                Some(stellar_agent_network::mainnet::clock::now_ms().unwrap())
+            );
+            assert_eq!(calls.calls, ["lookup", "revoke", "append", "release"]);
+            let stored = f.view();
+            assert_eq!(stored.record.state, ApprovalState::Revoked);
+            assert_eq!(stored.record.revoked_at_ms, view.revoked_at_ms);
+            let mut payment = message.clone();
+            payment.binding = DomainBinding::Soroban {
+                intent_digest: [6; 32],
+            };
+            payment.parent = Some(minted.id);
+            payment.operation = None;
+            let result = f.store.mint_authorization(f.core.profile(), &payment);
+            assert!(
+                matches!(
+                    result,
+                    Err(WindowStoreError::AuthorizationRefused {
+                        precondition: MainnetPrecondition::ApprovalRevoked
+                    })
+                ),
+                "{result:?}"
+            );
         }
     }
 

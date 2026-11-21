@@ -23,8 +23,9 @@
 //! halt in effect and reports `audit_row: "not_written"`.
 //!
 //! `profile resume` on a halted profile reads the marker, appends the
-//! `profile_resumed` row, and only then removes the marker, so a resume that
-//! took effect is always recorded:
+//! `profile_resumed` row, and removes the marker only after the row is
+//! written or queued in the audit outbox. A row that cannot be appended
+//! keeps the halt:
 //!
 //! - a marker that cannot be read, such as a directory at its path, refuses
 //!   with `profile.halt_unreadable` and writes no row;
