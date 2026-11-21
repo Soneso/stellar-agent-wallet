@@ -176,6 +176,10 @@ fn read_failure(error: &crate::client::RecoveryReadError) -> RecoveryReason {
 }
 
 /// The primary endpoint and independent recovery oracle.
+///
+/// The pair checks network and protocol identity, not hosts. On mainnet the
+/// caller passes clients whose hosts `verify_enablement` verified for the
+/// selected profile in the same process.
 pub struct EndpointPair<'a> {
     primary: &'a StellarRpcClient,
     oracle: Option<&'a StellarRpcClient>,
@@ -2584,6 +2588,9 @@ fn not_found_covers(observed: &crate::ObservedTransaction, target: Option<u32>) 
 /// The shared prefix writes nothing. Production dispatch and targeted status
 /// recovery each call this driver once. Receipt replacement and
 /// acknowledgement remain separate.
+///
+/// The driver binds no host. On mainnet the caller passes a `pair` whose
+/// hosts the enablement verified in the same process.
 ///
 /// # Errors
 /// Returns snapshot, audit and commit errors. An endpoint on another network
@@ -6384,6 +6391,68 @@ mod tests {
                 "the targeted pass ends with one release sweep"
             )
         });
+    }
+
+    /// The unsettled lookup on the attempt the targeted test recovers runs no
+    /// recovery stage: neither endpoint is asked for the transaction or its
+    /// ledgers, the attempt's recovery state is unchanged, no release sweep
+    /// runs, and the cached result still answers.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
+    #[serial_test::serial]
+    async fn unsettled_status_runs_no_recovery_stage() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let mut fx = Fx::new();
+        unknown_with(&mut fx, 1, NOW / 1_000 - 10, vec![]);
+        bind_source(&mut fx);
+        let snapshots = OperationStatus::new(&fx.store, &fx.profile)
+            .outcome_snapshot(None)
+            .unwrap();
+        let before = fx.record(snapshots[0].operation_id);
+        let ExposureIdentity::Classic { tx_hash, .. } = snapshots[0].exposure else {
+            panic!("classic attempt required")
+        };
+        let primary = endpoint(7, NOW / 1_000).await;
+        let oracle = endpoint(8, NOW / 1_000).await;
+        serve_absence(&primary, 7).await;
+        serve_absence(&oracle, 8).await;
+        let primary_client = StellarRpcClient::new(&primary.uri()).unwrap();
+        let oracle_client = StellarRpcClient::new(&oracle.uri()).unwrap();
+        let (writer, _) = crate::mainnet::fixtures::keyed_writer(&fx.profile.audit_log_path);
+        let receipt_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let home = receipt_sandbox.path();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home);
+        crate::submission_flow::RECOVERY_STAGE_TRACE.with_borrow_mut(Vec::clear);
+        let result = crate::submission_flow::transaction_status_unsettled(
+            crate::submission_flow::StatusRequest {
+                profile: &fx.profile,
+                profile_name: "ops",
+                tx_hash: &stellar_agent_core::hex::encode(&tx_hash),
+                window: &fx.store,
+                client: &primary_client,
+                oracle: Some(&oracle_client),
+                retry_recovery: false,
+            },
+            || Ok(home.join("approvals")),
+            || Ok(Arc::clone(&writer)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.recovery.attempts[0].tx_hash, tx_hash);
+        for server in [&primary, &oracle] {
+            assert_eq!(rpc_request_count(server, "getLedgers").await, 0);
+        }
+        assert_eq!(rpc_request_count(&oracle, "getTransaction").await, 0);
+        assert_eq!(
+            serde_json::to_value(fx.record(snapshots[0].operation_id)).unwrap(),
+            serde_json::to_value(before).unwrap(),
+            "the attempt's recovery state is unchanged"
+        );
+        crate::submission_flow::RECOVERY_STAGE_TRACE
+            .with_borrow(|trace| assert!(trace.is_empty(), "no release sweep runs: {trace:?}"));
     }
 
     /// Records one owed accounting expiry, so the drain needs the audit

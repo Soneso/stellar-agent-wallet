@@ -903,6 +903,17 @@ pub(crate) fn set_test_routes(routes: &[(&str, &str)]) -> TestRoutesGuard {
     TestRoutesGuard(())
 }
 
+/// Adds a route for `host` to the routes of this thread, which a guard of
+/// [`set_test_routes`] keeps until it drops.
+#[cfg(all(test, feature = "mainnet-write"))]
+pub(crate) fn add_test_route(host: &str, url: &str) {
+    TEST_ROUTES.with(|slot| {
+        slot.borrow_mut()
+            .get_or_insert_with(Vec::new)
+            .push((host.to_owned(), url.to_owned()));
+    });
+}
+
 /// The invalidations recorded on this thread, oldest first.
 #[cfg(all(test, feature = "mainnet-write"))]
 pub(crate) fn invalidations_on_this_thread()

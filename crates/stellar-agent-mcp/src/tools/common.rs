@@ -1661,6 +1661,26 @@ impl WalletServer {
         .await
     }
 
+    /// Runs [`Self::dispatch_gate`] for `tool_name` and returns the refusal's
+    /// code, or `None` when the gate admits the dispatch.
+    ///
+    /// A test drives the gate's settlement pass with it on a server whose
+    /// tools refuse before their gate. Gated on the `test-helpers` feature or
+    /// `#[cfg(test)]`, so no shipped binary carries it.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[doc(hidden)]
+    pub async fn dispatch_gate_for_test(
+        &self,
+        tool_name: &'static str,
+        args_value: &Value,
+        chain_id: &str,
+    ) -> Option<String> {
+        self.dispatch_gate(tool_name, args_value, chain_id)
+            .await
+            .err()
+            .map(|error| error.code())
+    }
+
     /// Evaluates approval status using the same verified image as its view,
     /// at `now_ms`, the instant the facade read that image.
     pub(crate) async fn dispatch_approval_status(
@@ -1789,9 +1809,11 @@ impl WalletServer {
     /// pass runs accounting expiry for each selected reservation before that
     /// reservation's endpoint reads.
     ///
-    /// On a mainnet profile the pass consults the oracle about a negative
-    /// answer of the primary endpoint, and a negative answer from either keeps
-    /// the reservation. An oracle client that
+    /// On a mainnet profile the gate calls the pass only when
+    /// [`WalletServer::settlement_allowed`] holds, so its clients are the
+    /// startup snapshot's, whose hosts the enablement binds. The pass consults
+    /// the oracle about a negative answer of the primary endpoint, and a
+    /// negative answer from either keeps the reservation. An oracle client that
     /// cannot be built is logged, and the pass then keeps every reservation
     /// the primary reports as failed or unknown.
     ///
@@ -2581,16 +2603,22 @@ impl WalletServer {
         // A read-only tool spends none, so settling before it would buy two
         // keyring reads, an HMAC verify and a receipt-store read per call for
         // an answer nothing in that call uses.
+        //
+        // On mainnet the pass runs only on the startup enablement record and
+        // a fresh per-call check of it; a failed check refuses the dispatch as
+        // the value tools refuse it.
         if !matches!(mode, GateMode::Preparation)
             && descriptor.value_kind != stellar_agent_core::policy::ToolValueKind::ReadOnly
             && self.policy_engine.window_state_store().is_some()
         {
-            self.reconcile_open_reservations(
-                args_value
-                    .get("business_id")
-                    .and_then(serde_json::Value::as_str),
-            )
-            .await;
+            if self.settlement_allowed().map_err(ToolError::Business)? {
+                self.reconcile_open_reservations(
+                    args_value
+                        .get("business_id")
+                        .and_then(serde_json::Value::as_str),
+                )
+                .await;
+            }
             self.window_store
                 .observe_before_policy(self.security_profile())
                 .await;

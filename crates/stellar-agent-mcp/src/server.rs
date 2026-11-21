@@ -1003,7 +1003,12 @@ impl WalletServer {
             })?;
         }
         let context = mainnet_context.as_ref().map_or_else(
-            || stellar_agent_network::NetworkContext::from_profile(&profile),
+            || {
+                let context = stellar_agent_network::NetworkContext::from_profile(&profile);
+                #[cfg(any(test, feature = "test-helpers"))]
+                let context = context.with_test_transport_routes(routes);
+                context
+            },
             |context| context.network_context(),
         );
         let security_profile = mainnet_context
@@ -1813,6 +1818,39 @@ impl WalletServer {
             self.security_profile(),
             &self.context,
         )
+    }
+
+    /// Whether this call may run settlement steps: the reconcile pass, the
+    /// recovery stage and its release.
+    ///
+    /// Off mainnet the answer is `true`. On mainnet it is `true` only when
+    /// the startup enablement record exists and
+    /// [`Self::verify_mainnet_freshness`] succeeds; the steps then use the
+    /// startup snapshot clients, whose hosts that record binds. Without a
+    /// record it is `false`.
+    ///
+    /// # Errors
+    /// The freshness refusal the value tools give,
+    /// `network.mainnet_write_forbidden`.
+    pub(crate) fn settlement_allowed(&self) -> Result<bool, rmcp::model::CallToolResult> {
+        if !self.security_profile().chain_id.is_mainnet() {
+            return Ok(true);
+        }
+        let (Some(context), Some(policy), Some(enablement), Some(profiles_dir)) = (
+            self.mainnet_context.as_deref(),
+            self.verified_policy.as_deref(),
+            self.enablement.as_deref(),
+            self.profiles_dir.as_deref(),
+        ) else {
+            return Ok(false);
+        };
+        self.verify_mainnet_freshness(&MainnetWriteGuard {
+            context,
+            policy,
+            enablement,
+            profiles_dir,
+        })?;
+        Ok(true)
     }
 
     pub(crate) fn mainnet_write_admission(

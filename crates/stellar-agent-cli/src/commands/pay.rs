@@ -165,7 +165,7 @@ use stellar_agent_network::{
 use crate::commands::policy_engine::{
     build_v1_policy_engine, effective_classic_fee_cap, envelope_total_fee, evaluate_mainnet_policy,
     evaluate_opaque_signing_policy, evaluate_value_moving_policy, load_mainnet_policy_engine,
-    mainnet_floor_source, pay_policy_args, with_total_fee,
+    mainnet_floor_source, pay_policy_args, reload_mainnet_policy_engine, with_total_fee,
 };
 use crate::common::business_entry::{
     Bound, ClassicStart, Staging, bind_signing, classic_start, entry_business_id,
@@ -2411,6 +2411,20 @@ where
         Ok(dir) => dir,
         Err(e) => return fail(&Envelope::<()>::err(&e)),
     };
+    // The reconcile pass below can settle, so the enablement verifies the
+    // snapshot's primary and oracle hosts before any client is built; the
+    // engine reloads after the pass, so the evaluation reads the window
+    // state the pass left.
+    let enabled = match load_mainnet_policy_engine(
+        "pay",
+        "policy.engine_unavailable",
+        &context,
+        resolved.source,
+        &profiles_dir,
+    ) {
+        Ok(policy) => policy,
+        Err(envelope) => return fail(&envelope),
+    };
 
     // One client serves every read, the resolver and the send.
     let client = match context.primary_client() {
@@ -2457,16 +2471,11 @@ where
         Ok(inputs) => inputs,
         Err(e) => return fail(&Envelope::<()>::err(&e)),
     };
-    let policy = match load_mainnet_policy_engine(
-        "pay",
-        "policy.engine_unavailable",
-        &context,
-        resolved.source,
-        &profiles_dir,
-    ) {
-        Ok(policy) => policy,
-        Err(envelope) => return fail(&envelope),
-    };
+    let policy =
+        match reload_mainnet_policy_engine("pay", "policy.engine_unavailable", &context, enabled) {
+            Ok(policy) => policy,
+            Err(envelope) => return fail(&envelope),
+        };
     let memo = match parse_memo(args) {
         Ok((memo, _)) => memo,
         Err(e) => return fail(&Envelope::<()>::err(&e)),

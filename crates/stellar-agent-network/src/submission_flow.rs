@@ -512,6 +512,9 @@ const SEQUENCES_MISSING_EVIDENCE: &str = "sequence recovery evidence missing; ";
 /// recovery driver of [`crate::policy_state::recover_outcomes`] once, then repairs the receipt of
 /// every retained committed recovery decision when `receipts` and the writer are available.
 /// Idle passes repair too. Accounting obligations drain in [`finish_reconciliation`].
+///
+/// The pass binds no host. On mainnet the caller passes clients whose hosts
+/// the enablement verified in the same process.
 pub async fn reconcile_pass(
     profile: &Profile,
     window: &PersistedWindowStore,
@@ -1074,6 +1077,9 @@ pub async fn transaction_status(
 /// [`transaction_status`], appending the transitions its recovery driver
 /// commits to `committed`, also when a later step refuses the lookup.
 ///
+/// On mainnet the caller passes clients whose hosts the enablement verified
+/// in the same process.
+///
 /// # Errors
 /// The errors of [`transaction_status`].
 pub async fn transaction_status_committed(
@@ -1081,6 +1087,44 @@ pub async fn transaction_status_committed(
     approval_dir: impl FnOnce() -> Result<PathBuf, StateDirError>,
     writer: impl Fn() -> Result<Arc<Mutex<AuditWriter>>, WalletError>,
     committed: &mut CommittedBatch,
+) -> Result<StatusOutcome, StatusFailure> {
+    status_lookup(request, approval_dir, writer, committed, true).await
+}
+
+/// [`transaction_status`] without its settlement steps, for a mainnet
+/// profile with no verified enablement.
+///
+/// It runs no reconciliation, no recovery stage, and no release, so no
+/// reservation, hold, or outcome changes. It reads the cached recovery
+/// results, delivers owed accounting obligations, repairs the receipts of
+/// committed decisions, and asks the primary endpoint for a hash with no
+/// cached result.
+///
+/// # Errors
+/// The errors of [`transaction_status`], except a reconciliation refusal.
+pub async fn transaction_status_unsettled(
+    request: StatusRequest<'_>,
+    approval_dir: impl FnOnce() -> Result<PathBuf, StateDirError>,
+    writer: impl Fn() -> Result<Arc<Mutex<AuditWriter>>, WalletError>,
+) -> Result<StatusOutcome, StatusFailure> {
+    status_lookup(
+        request,
+        approval_dir,
+        writer,
+        &mut CommittedBatch::default(),
+        false,
+    )
+    .await
+}
+
+/// The status lookup; `settle` runs reconciliation, the recovery stage and
+/// its release.
+async fn status_lookup(
+    request: StatusRequest<'_>,
+    approval_dir: impl FnOnce() -> Result<PathBuf, StateDirError>,
+    writer: impl Fn() -> Result<Arc<Mutex<AuditWriter>>, WalletError>,
+    committed: &mut CommittedBatch,
+    settle: bool,
 ) -> Result<StatusOutcome, StatusFailure> {
     let StatusRequest {
         profile,
@@ -1109,7 +1153,7 @@ pub async fn transaction_status_committed(
     // the receipt reconcile together with no budget. A submission whose
     // receipt is missing reconciles from its authenticated reservation. On a
     // mainnet profile the oracle witnesses the primary's negative answers.
-    if let Some(envelope_hash) = envelope_hash {
+    if settle && let Some(envelope_hash) = envelope_hash {
         let now_ms =
             stellar_agent_core::timefmt::now_unix_ms().map_err(StatusFailure::ClockUnavailable)?;
         match window
@@ -1160,7 +1204,7 @@ pub async fn transaction_status_committed(
             stellar_agent_core::timefmt::now_unix_ms().map_err(StatusFailure::ClockUnavailable)?,
         )
         .map_err(StatusFailure::WindowUnreadable)?;
-        if let Some(handle) = writer.handle() {
+        if settle && let Some(handle) = writer.handle() {
             let recovered = crate::policy_state::recovery::recover_outcomes_committed(
                 window,
                 profile,

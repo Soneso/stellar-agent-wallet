@@ -646,8 +646,12 @@ load, and the ceremony refuses it with `profile.enable_mainnet_precondition`
 and the loader's message.
 An enabled profile whose oracle is removed refuses every CLI mainnet write
 with `profile.mainnet_oracle_required` before any signature, until the oracle
-is set again. A running MCP server checks the profile it loaded at startup,
-and its freshness check does not read the oracle fields. Its next start
+is set again. `tx status` and `tx receipt clear` refuse it with
+`profile.mainnet_enablement_invalid: on_disk_oracle_host` before any endpoint
+is asked. A running MCP server keeps the profile it loaded at startup, and its
+per-call freshness check verifies the enablement against the stored profile
+again. A removed or moved oracle therefore refuses its value tools, its status
+tool and its gate pass with `network.mainnet_write_forbidden`. Its next start
 refuses the enablement with `profile.mainnet_enablement_invalid:
 on_disk_oracle_host`. A process on a headless keyring backend
 (`STELLAR_AGENT_KEYRING_BACKEND` set to `headless-env` or `headless-dpapi`)

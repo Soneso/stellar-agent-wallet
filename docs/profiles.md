@@ -434,8 +434,12 @@ mainnet profile that loads without `oracle_provider_url` is refused with
 reads a keyring entry and writes no enablement state, and every mainnet
 write, in the CLI and in the MCP server, refuses before any signature. An
 enabled profile whose oracle is removed refuses every CLI mainnet write until
-the oracle is set again. A running MCP server checks the profile it loaded at
-startup; its next start refuses the enablement with
+the oracle is set again, and `tx status` and `tx receipt clear` refuse it with
+`profile.mainnet_enablement_invalid: on_disk_oracle_host`. A running MCP
+server keeps the profile it loaded at startup, and its per-call freshness
+check verifies the enablement against the stored profile again, so a removed
+or moved oracle refuses its value tools, status tool and gate pass with
+`network.mainnet_write_forbidden`. Its next start refuses the enablement with
 `profile.mainnet_enablement_invalid: on_disk_oracle_host`. On testnet the oracle is
 optional, and a required witness without one warns.
 
@@ -463,12 +467,19 @@ mainnet passphrase. A submission the primary endpoint reports failed, refused,
 or unknown is checked against the oracle's answers: its transaction status, and
 for an unknown transaction its retention window, ledger close time and account
 sequence. The oracle's success is recorded as a report, and its failure or
-absence keeps the spending-window reservation. When the profile names no
-oracle at reconciliation, as after the operator removes it, such a submission
-preserves the existing receipt status and its reservation. Accounting expiry
-runs before any endpoint or oracle lookup, so a time-bounded reservation still
-ends once its accounting horizon passes. An untimed one stays until the operator clears it
-with `stellar-agent tx receipt clear`.
+absence keeps the spending-window reservation. Mainnet reconciliation runs
+only after the enablement verifies, with the primary and oracle the signed
+policy binds. A profile whose `rpc_url` or `oracle_provider_url` was removed
+or moved to another host runs no reconciliation. `tx status`, `tx receipt
+clear` and the value verbs refuse with `profile.mainnet_enablement_invalid`,
+or with `profile.mainnet_oracle_required` for a value verb whose oracle was
+removed, and the reservation stays until the URL is restored. A mainnet profile whose
+signed policy has no `[mainnet]` table runs no reconciliation either; `tx
+status` answers from the stored state and the primary's lookup. Accounting
+expiry runs before any endpoint or oracle lookup of a reconciliation, so a
+time-bounded reservation ends at the first reconciliation after its
+accounting horizon. An untimed one stays until the operator clears it with
+`stellar-agent tx receipt clear`.
 
 ### Provider attestations
 

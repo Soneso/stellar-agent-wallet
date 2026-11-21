@@ -49,8 +49,12 @@
 //! and a `failed` one goes on to the endpoint. Then the chain: an endpoint
 //! that reports `SUCCESS`, or `FAILED` for a held reservation, is refused the
 //! same way and left for `tx status`, and so is an endpoint that cannot
-//! answer. On a mainnet profile that names an oracle, the oracle is asked as
-//! well and refuses the clear the same way. Its `SUCCESS` refuses, and so does
+//! answer. On a mainnet profile the clear first requires a verified
+//! enablement: without one it refuses with
+//! `profile.mainnet_enablement_invalid` before any client is built, and
+//! nothing is reconciled, released or written. The enablement binds the
+//! primary and oracle hosts, so the oracle it binds is asked as well and
+//! refuses the clear the same way. Its `SUCCESS` refuses, and so does
 //! its `FAILED` for a held reservation. So do an oracle that cannot answer
 //! and one that does not report the mainnet passphrase or whose identity
 //! cannot be read. An oracle client that cannot be built refuses with its own
@@ -58,11 +62,7 @@
 //! `network.rpc_credential_refused`, and any other construction failure is
 //! `network.witness_unavailable`. Every oracle read
 //! of the command, these and reconciliation's below, ends by one deadline: the
-//! profile's submit timeout, counted from the oracle's identity read. A mainnet
-//! profile without an oracle has no second answer to ask for: the primary's
-//! `FAILED` is a claim nothing confirms, so it is not refused here and the
-//! clear proceeds on the acknowledgement; the primary's `SUCCESS` is still
-//! refused.
+//! profile's submit timeout, counted from the oracle's identity read.
 //!
 //! Without `--acknowledge` nothing is reconciled or written: the verb exits 1
 //! with `submission.acknowledgement_required`, and the message names the next
@@ -305,6 +305,31 @@ async fn run_clear(args: &ClearArgs) -> i32 {
     }
 
     let window = PersistedWindowStore::for_profile(&resolved.name);
+    // A mainnet clear is an operator decision the endpoints' answers gate, so
+    // it runs only on a verified enablement, whose record binds the primary
+    // and oracle hosts the clients below are built from.
+    if profile.chain_id.is_mainnet() {
+        let refusal = match crate::commands::policy_engine::settlement_enablement(
+            "tx receipt clear",
+            &resolved,
+            &profile,
+            window.path(),
+        ) {
+            Ok(Some(_)) => None,
+            Ok(None) => Some(Envelope::<()>::err(
+                &stellar_agent_core::error::WalletError::Validation(
+                    stellar_agent_core::error::ValidationError::MainnetEnablementInvalid {
+                        binding: "mainnet_table",
+                    },
+                ),
+            )),
+            Err(refusal) => Some(refusal),
+        };
+        if let Some(refusal) = refusal {
+            render_json(&refusal);
+            return 1;
+        }
+    }
     let scope = stellar_agent_network::policy_state::ChainScope::for_chain(profile.chain_id);
     if let Err(error) = window.require_chain_scope(&profile, &scope) {
         render_json(&Envelope::<()>::err_raw(
@@ -460,8 +485,8 @@ async fn run_clear(args: &ClearArgs) -> i32 {
         }
     };
     // On a mainnet profile the primary endpoint's answer is not the only one
-    // that counts: the oracle the profile names is asked the same question
-    // below. Without an oracle there is no second answer.
+    // that counts: the oracle the verified enablement binds is asked the same
+    // question below.
     let oracle = if scope.chain().is_mainnet() {
         match context.oracle_client(&profile) {
             Ok(oracle) => oracle,
@@ -486,14 +511,11 @@ async fn run_clear(args: &ClearArgs) -> i32 {
             return 1;
         }
     };
-    // A mainnet primary's FAILED without an oracle is a claim nothing can
-    // confirm: reconciliation keeps the reservation on it, and `tx status`
-    // cannot settle it either. A FAILED for a submission without a held
-    // reservation is an unauthenticated report reconciliation records
-    // nothing on. Both go on to the acknowledged unknown outcome and its
-    // time-bound guard rather than being refused here.
-    let unconfirmable_failure = chain.status == "FAILED"
-        && ((profile.chain_id.is_mainnet() && oracle.is_none()) || held.is_none());
+    // A FAILED for a submission without a held reservation is an
+    // unauthenticated report reconciliation records nothing on. It goes on to
+    // the acknowledged unknown outcome and its time-bound guard rather than
+    // being refused here.
+    let unconfirmable_failure = chain.status == "FAILED" && held.is_none();
     if !unbounded_hold
         && (chain.status == "SUCCESS" || (chain.status == "FAILED" && !unconfirmable_failure))
     {
@@ -3079,12 +3101,69 @@ mod tests {
             assert!(fixture.audit_rows("submission_receipt_cleared").is_empty());
         }
 
-        /// Without an oracle, a primary `FAILED` is a claim nothing confirms:
-        /// the clear is not refused on it, and a timed submission waits for
-        /// its bound on the host clock.
+        /// Runs the clear, with `--acknowledge-unbounded` when
+        /// `acknowledge_unbounded` is set, on a profile whose stored
+        /// endpoints no longer match the hosts its enablement binds, and
+        /// asserts the enablement refusal naming `binding`. No endpoint
+        /// receives a request, the hold stays, and the receipt, the window
+        /// file and the audit log stay as they were.
+        async fn assert_enablement_refused(
+            fixture: &MainnetFixture,
+            acknowledge_unbounded: bool,
+            binding: &str,
+        ) {
+            let envelope = assert_refused_before_any_request(
+                fixture,
+                acknowledge_unbounded,
+                "profile.mainnet_enablement_invalid",
+            )
+            .await;
+            let message = envelope["error"]["message"].as_str().expect("message");
+            assert!(message.ends_with(binding), "{message}");
+        }
+
+        /// Runs the clear as [`assert_enablement_refused`] does and asserts
+        /// the refusal `code` with the same untouched state, returning the
+        /// rendered envelope.
+        async fn assert_refused_before_any_request(
+            fixture: &MainnetFixture,
+            acknowledge_unbounded: bool,
+            refusal_code: &str,
+        ) -> Value {
+            let status = receipt_status(fixture);
+            let window = window_bytes(fixture);
+            let log_before = audit_log(fixture);
+            let primary_before = fixture.primary_methods().await.len();
+            let oracle_before = fixture.oracle_methods().await.len();
+
+            let (code, envelope) = clear(fixture, acknowledge_unbounded).await;
+
+            assert_eq!(code, 1, "{envelope}");
+            assert_eq!(envelope["error"]["code"], refusal_code, "{envelope}");
+            assert_eq!(fixture.pending_reservations(), 1, "the hold stays");
+            assert_eq!(receipt_status(fixture), status);
+            assert_eq!(window_bytes(fixture), window, "the window is untouched");
+            assert_eq!(audit_log(fixture), log_before, "the audit log is untouched");
+            assert_eq!(
+                fixture.primary_methods().await.len(),
+                primary_before,
+                "the primary receives no request"
+            );
+            assert_eq!(
+                fixture.oracle_methods().await.len(),
+                oracle_before,
+                "the oracle receives no request"
+            );
+            envelope
+        }
+
+        /// A profile whose oracle URL was removed after the enablement
+        /// ceremony no longer verifies: a timed submission the primary would
+        /// report `FAILED` refuses with the enablement refusal before any
+        /// endpoint is asked, and nothing is released.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
-        async fn an_unconfirmed_failure_waits_for_the_time_bound_without_an_oracle() {
+        async fn a_removed_oracle_refuses_an_open_bound_clear_with_the_enablement_refusal() {
             let fixture = Spec::new("clear-mainnet-failed-open-bound")
                 .without_oracle()
                 .primary(answering("FAILED"))
@@ -3092,21 +3171,15 @@ mod tests {
                 .await;
             seed_submission(&fixture, now_secs() + 600);
 
-            let run = clear(&fixture, false).await;
-
-            assert_refused_untouched(&fixture, &run, "submission.still_pending");
-            let message = run.1["error"]["message"].as_str().expect("message");
-            assert!(message.contains("host's clock"), "{message}");
-            assert!(fixture.oracle_methods().await.is_empty());
+            assert_enablement_refused(&fixture, false, "on_disk_oracle_host").await;
         }
 
-        /// Without an oracle, a primary `FAILED` whose time bound has passed
-        /// on the host clock clears as an unknown outcome under the
-        /// acknowledgement. The bounded reservation keeps counting until its
-        /// accounting horizon, so the clear releases nothing.
+        /// A removed oracle URL refuses the clear of a timed submission whose
+        /// bound has passed with the enablement refusal; the bounded
+        /// reservation stays and no clear row is written.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
-        async fn an_unconfirmed_failure_clears_after_the_time_bound_without_an_oracle() {
+        async fn a_removed_oracle_refuses_a_passed_bound_clear_with_the_enablement_refusal() {
             let fixture = Spec::new("clear-mainnet-failed-passed-bound")
                 .without_oracle()
                 .primary(answering("FAILED"))
@@ -3114,29 +3187,14 @@ mod tests {
                 .await;
             seed_submission(&fixture, now_secs() - 10);
 
-            let (code, envelope) = clear(&fixture, false).await;
-
-            assert_eq!(code, 0, "{envelope}");
-            assert_eq!(envelope["data"]["cleared_from"], "pending", "{envelope}");
-            assert_eq!(envelope["data"]["reservation_released"], false);
-            assert_eq!(
-                fixture.pending_reservations(),
-                1,
-                "the bounded reservation counts until its horizon"
-            );
-            assert_eq!(receipt_status(&fixture), ReceiptStatus::ClearedByOperator);
-            let rows = fixture.audit_rows("submission_receipt_cleared");
-            assert_eq!(rows.len(), 1, "{rows:?}");
-            assert_eq!(rows[0]["reservation_released"], false, "{}", rows[0]);
-            assert!(fixture.oracle_methods().await.is_empty());
+            assert_enablement_refused(&fixture, false, "on_disk_oracle_host").await;
         }
 
-        /// Without an oracle, a primary `SUCCESS` still refuses the clear:
-        /// a debit the endpoint reports applied is not the operator's to
-        /// erase.
+        /// A removed oracle URL refuses the clear with the enablement refusal
+        /// before the primary's `SUCCESS` is read.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
-        async fn a_success_refuses_the_clear_without_an_oracle() {
+        async fn a_removed_oracle_refuses_before_a_success_is_read() {
             let fixture = Spec::new("clear-mainnet-success-no-oracle")
                 .without_oracle()
                 .primary(answering("SUCCESS"))
@@ -3144,9 +3202,117 @@ mod tests {
                 .await;
             seed_submission(&fixture, now_secs() - 10);
 
-            let run = clear(&fixture, false).await;
+            assert_enablement_refused(&fixture, false, "on_disk_oracle_host").await;
+        }
 
-            assert_refused_untouched(&fixture, &run, "submission.not_clearable");
+        /// A mainnet profile whose signed policy has no `[mainnet]` table
+        /// holds no enablement record, so the clear refuses with the
+        /// enablement refusal before any endpoint is asked.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_profile_without_an_enablement_record_refuses_the_clear() {
+            let fixture = Spec::new("clear-mainnet-no-record")
+                .pre_enable()
+                .primary(answering("NOT_FOUND"))
+                .oracle(answering("NOT_FOUND"))
+                .build()
+                .await;
+            seed_submission(&fixture, 0);
+
+            assert_enablement_refused(&fixture, true, "mainnet_table").await;
+        }
+
+        /// On an enabled profile, a signed policy that no longer verifies, and
+        /// separately a missing owner key, refuse the clear with that load's
+        /// own code before any client is built: no endpoint is asked and the
+        /// hold stays.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn an_unloadable_policy_or_owner_key_refuses_the_clear_with_its_load_code() {
+            for (name, owner_removed, load_code) in [
+                (
+                    "clear-mainnet-tampered-policy",
+                    false,
+                    "policy.owner_signature_invalid",
+                ),
+                ("clear-mainnet-no-owner", true, "policy.engine_unavailable"),
+            ] {
+                let fixture = Spec::new(name)
+                    .primary(answering("NOT_FOUND"))
+                    .oracle(answering("NOT_FOUND"))
+                    .build()
+                    .await;
+                seed_submission(&fixture, 0);
+                if owner_removed {
+                    fixture.delete_keyring_entry(&fixture.profile().policy_owner_key_id);
+                } else {
+                    fixture.tamper_policy_signature();
+                }
+
+                assert_refused_before_any_request(&fixture, true, load_code).await;
+            }
+        }
+
+        /// On an installation that holds no enablement nonce, a signed policy
+        /// that no longer verifies, and separately a missing owner key, leave
+        /// the profile without an enablement record: the clear refuses with
+        /// `mainnet_table` before any endpoint is asked.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn an_unloadable_policy_without_an_enablement_nonce_refuses_as_no_record() {
+            for (name, owner_removed) in [
+                ("clear-mainnet-no-nonce-tampered", false),
+                ("clear-mainnet-no-nonce-no-owner", true),
+            ] {
+                let fixture = Spec::new(name)
+                    .pre_enable()
+                    .primary(answering("NOT_FOUND"))
+                    .oracle(answering("NOT_FOUND"))
+                    .build()
+                    .await;
+                seed_submission(&fixture, 0);
+                if owner_removed {
+                    fixture.delete_keyring_entry(&fixture.profile().policy_owner_key_id);
+                } else {
+                    fixture.tamper_policy_signature();
+                }
+
+                assert_enablement_refused(&fixture, true, "mainnet_table").await;
+            }
+        }
+
+        /// A primary URL moved to another host after the enablement ceremony
+        /// refuses the clear with the enablement refusal; neither the moved
+        /// primary nor the oracle is asked, and the hold stays.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_moved_primary_refuses_the_clear_with_the_enablement_refusal() {
+            let fixture = Spec::new("clear-mainnet-moved-primary")
+                .primary(answering("NOT_FOUND"))
+                .oracle(answering("NOT_FOUND"))
+                .build()
+                .await;
+            seed_submission(&fixture, now_secs() - 10);
+            fixture.set_stored_rpc_url("https://moved-primary.example.invalid");
+
+            assert_enablement_refused(&fixture, true, "on_disk_host").await;
+        }
+
+        /// An oracle URL moved to another host after the enablement ceremony
+        /// refuses the clear of an untimed hold, which both acknowledgements
+        /// would otherwise release, with the enablement refusal.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_moved_oracle_refuses_the_clear_with_the_enablement_refusal() {
+            let fixture = Spec::new("clear-mainnet-moved-oracle")
+                .primary(answering("FAILED"))
+                .oracle(answering("FAILED"))
+                .build()
+                .await;
+            seed_submission(&fixture, 0);
+            fixture.set_stored_oracle_url("https://moved-oracle.example.invalid");
+
+            assert_enablement_refused(&fixture, true, "on_disk_oracle_host").await;
         }
 
         /// With an oracle, a primary `FAILED` refuses the clear at the
@@ -3358,12 +3524,12 @@ mod tests {
             assert!(writer.try_lock().is_ok(), "the audit writer is free");
         }
 
-        /// Without an oracle, a sent untimed submission the primary reports
-        /// `FAILED` stays pending, and its clear needs the unbounded
-        /// acknowledgement.
+        /// A removed oracle URL refuses the clear of a sent untimed
+        /// submission with the enablement refusal, with and without the
+        /// unbounded acknowledgement; the hold is not released.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
-        async fn an_untimed_pending_submission_needs_the_unbounded_acknowledgement() {
+        async fn a_removed_oracle_refuses_an_untimed_clear_with_the_enablement_refusal() {
             let fixture = Spec::new("clear-mainnet-untimed-pending")
                 .without_oracle()
                 .primary(answering("FAILED"))
@@ -3371,13 +3537,8 @@ mod tests {
                 .await;
             seed_submission(&fixture, 0);
 
-            assert_clear_needs_the_unbounded_acknowledgement(
-                &fixture,
-                ReceiptStatus::Pending,
-                None,
-            )
-            .await;
-            assert!(fixture.oracle_methods().await.is_empty());
+            assert_enablement_refused(&fixture, false, "on_disk_oracle_host").await;
+            assert_enablement_refused(&fixture, true, "on_disk_oracle_host").await;
         }
 
         /// An untimed hold whose primary and oracle both keep reporting
@@ -3409,8 +3570,8 @@ mod tests {
         #[serial_test::serial]
         async fn an_edited_receipt_bound_does_not_hide_the_exposure_in_the_clear_row() {
             let fixture = Spec::new("clear-mainnet-edited-receipt")
-                .without_oracle()
                 .primary(answering("FAILED"))
+                .oracle(answering("FAILED"))
                 .build()
                 .await;
             seed_submission(&fixture, 0);
@@ -3491,13 +3652,12 @@ mod tests {
             .await;
         }
 
-        /// An untimed hold whose receipt records a failure that the endpoint
-        /// now reports as a success keeps the recorded failure, because the
-        /// mainnet pass settles no chain answer, and clears the same way
-        /// with no evidence on its row.
+        /// A removed oracle URL refuses the clear of an untimed hold whose
+        /// receipt records a failure with the enablement refusal; the
+        /// recorded failure and the hold stay.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
-        async fn an_untimed_failure_the_endpoint_now_reports_successful_is_cleared() {
+        async fn a_removed_oracle_refuses_an_untimed_failure_clear_with_the_enablement_refusal() {
             let fixture = Spec::new("clear-untimed-failed-success")
                 .without_oracle()
                 .primary(answering("SUCCESS"))
@@ -3509,7 +3669,8 @@ mod tests {
             };
             record_receipt_status(&fixture, failed.clone());
 
-            assert_clear_needs_the_unbounded_acknowledgement(&fixture, failed, None).await;
+            assert_enablement_refused(&fixture, true, "on_disk_oracle_host").await;
+            assert_eq!(receipt_status(&fixture), failed);
         }
 
         /// A clear of an untimed hold interrupted after its row, before the
@@ -3621,8 +3782,8 @@ mod tests {
             status: Option<ReceiptStatus>,
         ) {
             let fixture = Spec::new(name)
-                .without_oracle()
                 .primary(answering("FAILED"))
+                .oracle(answering("FAILED"))
                 .build()
                 .await;
             seed_submission(&fixture, 0);

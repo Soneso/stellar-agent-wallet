@@ -23,7 +23,7 @@ pub enum MainnetPrecondition {
     EndpointFlagRefused,
     /// The stored owner coordinate derives another profile name.
     DerivedNameMismatch,
-    /// The merged chain or endpoint differs from disk.
+    /// The merged chain, primary endpoint, or oracle URL differs from disk.
     DiskViewMismatch,
     /// The authorization clock is unavailable.
     ClockUnavailable,

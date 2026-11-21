@@ -771,6 +771,22 @@ This path sends no additional transaction lookup. A record without a managed
 attempt keeps the primary lookup. Only a checked recovery decision settles
 the chain outcome.
 
+On mainnet the verb reconciles, recovers and releases only after the
+profile's enablement verifies, with the primary and oracle clients built from
+the profile whose hosts the signed policy binds. When the signed policy has a
+`[mainnet]` table and the enablement does not verify, for example because the
+stored `rpc_url` or `oracle_provider_url` names another host, the verb refuses
+with `profile.mainnet_enablement_invalid` before any endpoint is asked. When
+the owner key or the signed policy does not load and the installation holds
+an enablement nonce, the verb refuses with that load's code, for example
+`policy.engine_unavailable` or `policy.owner_signature_invalid`, before any
+endpoint is asked. A mainnet profile without an enablement record, because
+its verified policy has no `[mainnet]` table or its installation holds no
+enablement nonce, runs none of these steps: the reservation stays as stored,
+and the answer comes from the stored state and the primary's lookup. Without
+an enablement record the verb runs no recovery stage, so `--retry-recovery`
+has no effect.
+
 A managed attempt also returns `recovery`: each attempt's typed `result`
 (`Included`, `NeverApplicable` or `NeedsEvidence`), `reason`, `class`,
 `earliest_retry_ms`, `next_action` and spent `reservations`, plus any
@@ -914,16 +930,19 @@ to the endpoint check. Then the verb asks the endpoint what became of the transa
 A `FAILED` answer without a held reservation is an unauthenticated report, so
 the clear proceeds on the acknowledgement. An endpoint that cannot answer is
 refused under the same code: a transaction still in flight is exactly the case
-in which an operator's decision can be wrong. On mainnet, the verb also asks
-its configured oracle, first for its network identity and then about the
+in which an operator's decision can be wrong. On mainnet, the verb first
+requires the profile's enablement to verify. Without it, for example when the
+signed policy has no `[mainnet]` table or the stored `rpc_url` or
+`oracle_provider_url` names a host the policy does not bind, the verb refuses
+with `profile.mainnet_enablement_invalid` before any endpoint is asked, and
+nothing is reconciled, released or written. The verb then asks the oracle the
+enablement binds, first for its network identity and then about the
 transaction. An oracle that cannot be reached, or does not answer by the
 verb's deadline, refuses with `network.rpc_unreachable`, and the message names
 the cause. An oracle that answers with another network or an unsupported
 protocol refuses with `submission.not_clearable`. The verb also refuses an
 oracle's `SUCCESS`, and its `FAILED` for a held reservation, with
-`submission.not_clearable`. On a mainnet profile without an
-oracle nothing confirms the endpoint's `FAILED`, so the clear proceeds on the
-acknowledgement; the endpoint's `SUCCESS` is still refused. A reservation with
+`submission.not_clearable`. A reservation with
 a time bound whose receipt is missing is cleared only when the endpoint reports
 `NOT_FOUND` and its submission ledger is below the endpoint's retention floor.
 

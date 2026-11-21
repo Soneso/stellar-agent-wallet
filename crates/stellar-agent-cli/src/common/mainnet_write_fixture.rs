@@ -964,6 +964,93 @@ impl MainnetFixture {
         loader::save_to_dir(self.name, &profile, &default_profile_dir().unwrap()).unwrap();
     }
 
+    /// Records a sent submission of the agent under `envelope_hash` and
+    /// `tx_hash`: its receipt and its authenticated reservation of 75
+    /// stroops in a one-day native window. Its time bound and its pending
+    /// start lie three days back, so its accounting horizon has passed and
+    /// any reconciliation that runs ends it.
+    pub(crate) fn seed_expired_hold(&self, envelope_hash: &str, tx_hash: &str) {
+        const THREE_DAYS_MS: u64 = 3 * 86_400_000;
+        let now_ms = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+        self.seed_hold_since(envelope_hash, tx_hash, now_ms - THREE_DAYS_MS);
+    }
+
+    /// Records the sent submission [`Self::seed_expired_hold`] records, with
+    /// its time bound and its pending start at `since_ms`.
+    pub(crate) fn seed_hold_since(&self, envelope_hash: &str, tx_hash: &str, since_ms: u64) {
+        use stellar_agent_core::policy::v1::criteria::state_store::{
+            StateKey, WindowEntry, WindowLimit,
+        };
+        let profile = self.profile();
+        let source = self.agent.g.clone();
+        let receipts = stellar_agent_core::profile::receipt::ReceiptStore::open(self.name).unwrap();
+        receipts
+            .try_begin(envelope_hash, tx_hash, &source, 7, since_ms / 1_000, 1_000)
+            .unwrap();
+        receipts.mark_submitted(envelope_hash).unwrap();
+        PersistedWindowStore::for_profile(self.name)
+            .record_pending(
+                &profile,
+                &[WindowEntry::new(
+                    StateKey::new(self.name, 1, "native", 86_400),
+                    since_ms,
+                    75,
+                    WindowLimit::Amount {
+                        asset: "native".to_owned(),
+                        window: "1d".to_owned(),
+                        max_stroops: 1_000_000,
+                    },
+                )],
+                &stellar_agent_network::policy_state::SubmissionHold {
+                    destinations: Default::default(),
+                    chain_scope: stellar_agent_network::policy_state::ChainScope::for_chain(
+                        profile.chain_id,
+                    ),
+                    id: envelope_hash.to_owned(),
+                    tx_hash: tx_hash.to_owned(),
+                    source,
+                    sequence: 7,
+                    max_time: since_ms / 1_000,
+                    pending_since_ms: since_ms,
+                    submission_ledger: 1_000,
+                    submission_anchor: None,
+                    operator_required: false,
+                },
+            )
+            .unwrap();
+    }
+
+    /// Moves the stored profile's `rpc_url`, and its primary provider
+    /// record's host, to `url`, as a same-user edit after the ceremony. The
+    /// moved host routes to the fixture's primary endpoint, so a request to
+    /// it is recorded there.
+    pub(crate) fn set_stored_rpc_url(&self, url: &str) {
+        let mut profile = self.profile();
+        let host = url::Url::parse(url).unwrap().host_str().unwrap().to_owned();
+        crate::common::mainnet_write::add_test_route(&host, &self.primary.uri());
+        profile.rpc_url = url.to_owned();
+        if let Some(primary) = profile.providers.as_mut().and_then(|p| p.primary.as_mut()) {
+            primary.host = host;
+        }
+        loader::save_to_dir(self.name, &profile, &default_profile_dir().unwrap()).unwrap();
+    }
+
+    /// Moves the stored profile's `oracle_provider_url`, and its oracle
+    /// provider record's host, to `url`, as a same-user edit after the
+    /// ceremony. The moved host routes to the fixture's oracle endpoint, so
+    /// a request to it is recorded there.
+    pub(crate) fn set_stored_oracle_url(&self, url: &str) {
+        let mut profile = self.profile();
+        let parsed = url::Url::parse(url).unwrap();
+        let host = parsed.host_str().unwrap().to_owned();
+        crate::common::mainnet_write::add_test_route(&host, &self.oracle.uri());
+        if let Some(oracle) = profile.providers.as_mut().and_then(|p| p.oracle.as_mut()) {
+            oracle.host = host;
+        }
+        profile.oracle_provider_url = Some(parsed);
+        loader::save_to_dir(self.name, &profile, &default_profile_dir().unwrap()).unwrap();
+    }
+
     /// Flips one hex digit of the policy signature.
     pub(crate) fn tamper_policy_signature(&self) {
         let raw = std::fs::read_to_string(self.policy_path()).unwrap();

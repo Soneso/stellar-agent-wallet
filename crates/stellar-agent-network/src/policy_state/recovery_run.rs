@@ -352,6 +352,10 @@ pub fn classify_recovery_stop(reason: RecoveryStopReason, stage: RecoveryStage) 
 }
 
 /// Hashes only normalized provider hosts and declared operators, in role order.
+///
+/// The digest reads the `profile` its caller passes and binds no host: a
+/// mismatch reopens a stopped run and restarts its history scan. On mainnet
+/// the caller passes the profile whose hosts the enablement verified.
 pub(super) fn recovery_configuration_digest(
     profile: &stellar_agent_core::profile::schema::Profile,
 ) -> String {

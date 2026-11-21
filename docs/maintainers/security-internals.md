@@ -1504,14 +1504,40 @@ does, so neither the enablement nor the policy fact layout lists it.
 the post-send oracle client of a CLI or MCP mainnet write only when the
 snapshot's oracle URL normalizes to `EnablementRecord::oracle_host()`; another
 URL refuses with `network.mainnet_authorization_refused` and the precondition
-`witness_oracle_unbound`. The reconcile pass, `tx status`, `tx receipt`, and
-the recovery endpoint pair build their clients from the profile without an
-enablement check. Identity and reads
+`witness_oracle_unbound`. On mainnet the reconcile pass, `tx status`,
+`tx receipt clear`, and the recovery endpoint pair get their clients only
+after the enablement verifies, as the settlement paragraph below states.
+Identity and reads
 share a 15-second attempt deadline. Transport read failures retry up to three
 attempts, seven seconds apart. Disagreements, identity or credential refusals,
 invalid answers, and elapsed deadlines never retry.
 The MCP dispatch gate reconciles reservations on a client of its own.
 On the CLI, reconciliation uses the primary client.
+
+On mainnet a settlement step, meaning the reconcile pass, the recovery stage,
+a release, an operator clear or any terminal decision, runs only after
+`verify_enablement` succeeded for the selected profile in the same process.
+Its clients are built from the profile whose hosts that record binds. The
+recovery driver, `EndpointPair` and `recovery_configuration_digest` bind no
+host themselves. The CLI value verbs verify in `load_mainnet_policy_engine`
+before their primary client and their reconcile pass. After the pass,
+`reload_mainnet_policy_engine` rehydrates the engine without a second
+verification and refuses a signed policy whose fact digest changed. `tx status`
+and `tx receipt clear` verify through `settlement_enablement`, which loads the
+signed policy compare-only over an empty window image. It answers "no record"
+only for a verified policy without a `[mainnet]` table, or for an owner-key
+or policy load failure on an installation that holds no enablement nonce.
+Every other load failure refuses with the load's own code before any client
+is built. The MCP status tool and
+the dispatch-gate pass call `settlement_allowed`, which needs the startup
+enablement record and `verify_mainnet_freshness`, and use the startup
+snapshot clients. A mainnet profile without an enablement record runs no
+settlement step: `tx status` and the status tool call
+`transaction_status_unsettled`, the gate skips its pass, and `tx receipt
+clear` refuses with `profile.mainnet_enablement_invalid`.
+`MainnetWriteContext::build` refuses a merged `oracle_provider_url` that
+differs from the snapshot's with `disk_view_mismatch`, as it refuses a
+differing chain or `rpc_url`.
 
 An MCP commit's early check refuses without consuming the nonce. The commit reads the clock for the nonce's expiry after the check, so the check's time counts toward that expiry. A refusal by the submit layer's own check comes after the nonce is consumed.
 
@@ -2317,7 +2343,7 @@ names the intent authorization, the signed entries' digest and their
 expiration ledger. The exposure commits after the intent consumption and
 before the signed re-simulation. A returned payload ends it as `payload_released`. The
 dispatch-time reconciliation pass of the CLI and the MCP server applies the expiry edges
-once on a mainnet profile, before any work reads a record.
+once on a mainnet profile whose enablement verified, before any work reads a record.
 
 The operator clear moves `sent_outcome_unknown` to `cancelled` and writes the
 last exposed attempt's release row of class `unknown` in the same commit: an
