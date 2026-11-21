@@ -124,6 +124,8 @@ enum Outcome {
     Success,
     Timeout,
     Failed,
+    /// `sendTransaction` answers `ERROR` with a `txBAD_SEQ` result.
+    Refused,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -305,11 +307,27 @@ decision = "allow"
             let body: Value = serde_json::from_slice(&request.body).unwrap();
             if body["method"] == "sendTransaction" {
                 observations.lock().unwrap().push(snapshot(&response_profile, &response_name));
+                if matches!(*response_outcome.lock().unwrap(), Outcome::Refused) {
+                    use stellar_xdr::WriteXdr as _;
+                    let refused = stellar_xdr::TransactionResult {
+                        fee_charged: 100,
+                        result: stellar_xdr::TransactionResultResult::TxBadSeq,
+                        ext: stellar_xdr::TransactionResultExt::V0,
+                    }
+                    .to_xdr_base64(stellar_xdr::Limits::none())
+                    .unwrap();
+                    return ResponseTemplate::new(200).set_body_json(json!({
+                        "jsonrpc": "2.0", "id": body["id"],
+                        "result": { "status": "ERROR", "hash": "00".repeat(32),
+                            "latestLedger": 1002, "latestLedgerCloseTime": "0",
+                            "errorResultXdr": refused }
+                    }));
+                }
             }
             if body["method"] == "getTransaction" {
                 observed_polls.fetch_add(1, Ordering::SeqCst);
                 let status = match *response_outcome.lock().unwrap() {
-                    Outcome::Success => { sequence.store(43, Ordering::SeqCst); "SUCCESS" }, Outcome::Timeout | Outcome::Held => "NOT_FOUND", Outcome::Failed => { sequence.store(43, Ordering::SeqCst); "FAILED" },
+                    Outcome::Success => { sequence.store(43, Ordering::SeqCst); "SUCCESS" }, Outcome::Timeout | Outcome::Held | Outcome::Refused => "NOT_FOUND", Outcome::Failed => { sequence.store(43, Ordering::SeqCst); "FAILED" },
                 };
                 let response = ResponseTemplate::new(200).set_body_json(json!({
                     "jsonrpc": "2.0", "id": body["id"],
@@ -538,6 +556,32 @@ decision = "allow"
     }
 
     async fn commit_pay_with_late_answer(&self, args: StellarPayCommitArgs, late: bool) -> Value {
+        self.commit_pay_driven(args, late, false).await
+    }
+
+    /// [`Self::commit_pay_with_late_answer`] on the toolset route of the
+    /// installed payment toolset when `toolset` is set.
+    async fn commit_pay_driven(
+        &self,
+        args: StellarPayCommitArgs,
+        late: bool,
+        toolset: bool,
+    ) -> Value {
+        let call: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<CallToolResult, rmcp::ErrorData>> + '_>,
+        > = if toolset {
+            Box::pin(
+                self.server
+                    .call_stellar_toolset_invoke(StellarToolsetInvokeArgs {
+                        toolset: "payment-toolset".to_owned(),
+                        action: "stellar_pay_commit".to_owned(),
+                        chain_id: Some("stellar:testnet".to_owned()),
+                        args: pay_json(&args),
+                    }),
+            )
+        } else {
+            Box::pin(self.server.call_stellar_pay_commit(args))
+        };
         let outcome = *self.outcomes.lock().unwrap();
         let expires = late || matches!(outcome, Outcome::Timeout | Outcome::Held);
         let polls_before = self.polls.load(Ordering::SeqCst);
@@ -547,54 +591,50 @@ decision = "allow"
         let deadline = t0 + self.profile.submit_timeout();
         let at = deadline + Duration::from_nanos(999_999);
         let result = result_json(
-            &drive_call(
-                self.server.call_stellar_pay_commit(args),
-                |probe| async move {
-                    if expires {
-                        wait_until("the confirmation deadline is armed", || {
-                            confirmation_trace::snapshot().armed.is_some()
-                        })
-                        .await;
-                        assert_eq!(
-                            confirmation_trace::snapshot().armed,
-                            Some(deadline),
-                            "the configured submission deadline is armed"
-                        );
-                        wait_until("the confirmation phase barrier", || {
-                            let trace = confirmation_trace::snapshot();
-                            if late {
-                                trace.answer_held
-                            } else if matches!(outcome, Outcome::Held) {
-                                trace.requests == 1
-                                    && self.polls.load(Ordering::SeqCst) == polls_before + 1
-                            } else {
-                                trace
-                                    .sleeps
-                                    .last()
-                                    .is_some_and(|(_, until)| *until == deadline)
-                            }
-                        })
-                        .await;
-                        tokio::time::advance(
-                            (deadline - Duration::from_millis(1))
-                                .duration_since(tokio::time::Instant::now()),
-                        )
-                        .await;
-                        let_io_run(Duration::from_millis(20)).await;
-                        assert!(
-                            !probe.finished(),
-                            "the commit is pending one tick before the deadline"
-                        );
-                        assert_eq!(confirmation_trace::snapshot().decided, None);
-                        if let Some(release) = release {
-                            release.release();
+            &drive_call(call, |probe| async move {
+                if expires {
+                    wait_until("the confirmation deadline is armed", || {
+                        confirmation_trace::snapshot().armed.is_some()
+                    })
+                    .await;
+                    assert_eq!(
+                        confirmation_trace::snapshot().armed,
+                        Some(deadline),
+                        "the configured submission deadline is armed"
+                    );
+                    wait_until("the confirmation phase barrier", || {
+                        let trace = confirmation_trace::snapshot();
+                        if late {
+                            trace.answer_held
+                        } else if matches!(outcome, Outcome::Held) {
+                            trace.requests == 1
+                                && self.polls.load(Ordering::SeqCst) == polls_before + 1
+                        } else {
+                            trace
+                                .sleeps
+                                .last()
+                                .is_some_and(|(_, until)| *until == deadline)
                         }
-                        tokio::time::advance(at.duration_since(tokio::time::Instant::now())).await;
-                        wait_until("the commit ends at the deadline tick", || probe.finished())
-                            .await;
+                    })
+                    .await;
+                    tokio::time::advance(
+                        (deadline - Duration::from_millis(1))
+                            .duration_since(tokio::time::Instant::now()),
+                    )
+                    .await;
+                    let_io_run(Duration::from_millis(20)).await;
+                    assert!(
+                        !probe.finished(),
+                        "the commit is pending one tick before the deadline"
+                    );
+                    assert_eq!(confirmation_trace::snapshot().decided, None);
+                    if let Some(release) = release {
+                        release.release();
                     }
-                },
-            )
+                    tokio::time::advance(at.duration_since(tokio::time::Instant::now())).await;
+                    wait_until("the commit ends at the deadline tick", || probe.finished()).await;
+                }
+            })
             .await
             .unwrap(),
         );
@@ -3674,3 +3714,7 @@ async fn every_commit_row_keeps_its_approval_state_and_window_across_restart() {
         assert_eq!(transmitted(&approved), 1, "{tool:?}: one transmission");
     }
 }
+
+// The toolset payment commit row, stellar_toolset_invoke/stellar_pay_commit.
+#[path = "approval_cap_toolset_rows.rs"]
+mod toolset_rows;

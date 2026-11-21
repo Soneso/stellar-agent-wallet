@@ -23,6 +23,9 @@ use stellar_agent_toolsets_runtime::{PinKey, record_first_invoke_grant};
 #[path = "toolsets_payment_process_tests.rs"]
 mod process;
 
+#[path = "toolsets_proof_row_tests.rs"]
+mod proof_rows;
+
 const TOOLSET: &str = "unattended-payments";
 const INSTALL: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 

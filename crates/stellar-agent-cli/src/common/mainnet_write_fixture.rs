@@ -226,6 +226,8 @@ pub(crate) fn balance_floor(min_stroops: i64) -> String {
 pub(crate) struct LateWriter {
     target: Arc<Mutex<Option<(Profile, &'static str)>>>,
     held: Arc<Mutex<Option<Result<stellar_agent_core::audit_log::AuditWriter, String>>>>,
+    /// The armed method's requests the take lets pass first.
+    skip: Arc<Mutex<usize>>,
 }
 
 impl LateWriter {
@@ -243,13 +245,32 @@ impl LateWriter {
 
     /// Names the profile whose writer the next take holds.
     pub(crate) fn arm(&self, fixture: &MainnetFixture) {
+        self.arm_after(fixture, 0);
+    }
+
+    /// [`Self::arm`] whose take runs at the `skipped + 1`th request of the
+    /// method after the arm.
+    pub(crate) fn arm_after(&self, fixture: &MainnetFixture, skipped: usize) {
+        *self.skip.lock().unwrap() = skipped;
         *self.target.lock().unwrap() = Some((fixture.profile(), fixture.name));
     }
 
     fn take(&self) {
-        let Some((profile, name)) = self.target.lock().unwrap().take() else {
+        let mut target = self.target.lock().unwrap();
+        if target.is_none() {
+            return;
+        }
+        {
+            let mut skip = self.skip.lock().unwrap();
+            if *skip > 0 {
+                *skip -= 1;
+                return;
+            }
+        }
+        let Some((profile, name)) = target.take() else {
             return;
         };
+        drop(target);
         stellar_agent_core::audit_log::AuditWriterRegistry::remove_for_test(name);
         let writer = crate::commands::value_audit::open_best_effort_audit_writer(
             &profile,

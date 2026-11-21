@@ -208,6 +208,79 @@ async fn a_canonical_commit_pays_the_prepared_fee() {
     }
 }
 
+/// A canonical claim commit pays the fee per operation of the envelope its
+/// record stores. A claim preparation takes no fee argument, so the record is
+/// seeded: its intent and envelope carry 200 stroops, above the fee the
+/// fixture's claim preparation selects. The commit rebuilds the envelope, takes
+/// a fresh sequence, and sends 200.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn a_canonical_claim_commit_pays_the_prepared_fee() {
+    use stellar_agent_core::audit_log::PolicyDecision;
+    use stellar_agent_network::fees::ClassicFeeChoice;
+    use stellar_agent_network::operation_entry::{IntentBaseFacts, Preparation};
+    use stellar_agent_network::policy_state::{OperationKind, OperationTool};
+    let run = ClassicRun::allowed(Tool::Claim).await;
+    let server = &run.f.server;
+    let selected = sent_transaction(run.args["envelope_xdr"].as_str().unwrap()).fee;
+    assert_ne!(selected, 200, "the preparation selects another fee");
+    let prepared = stored_intent(&run);
+    let intent = stellar_agent_network::operation_entry::classic_intent(
+        IntentBaseFacts::new(
+            server.security_profile(),
+            prepared.base().source(),
+            server.current_mainnet_policy().unwrap(),
+            ClassicFeeChoice::Explicit(200),
+            prepared.base().memo().clone(),
+        ),
+        prepared.payload().clone(),
+    )
+    .unwrap();
+    let id = BusinessId::parse("claim-prepared-fee").unwrap();
+    let operation = server
+        .prepare_entry(
+            id.clone(),
+            Preparation::Canonical {
+                intent: Box::new(intent.clone()),
+                decision: PolicyDecision::Allow,
+                rule_ttl_ms: Some(300_000),
+            },
+        )
+        .unwrap();
+    let envelope = stellar_agent_network::operation_entry::intent_envelope(
+        &intent,
+        server.context.network_passphrase(),
+        2,
+        200,
+        stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1000 + 120,
+    )
+    .unwrap();
+    server
+        .prepared_envelope(
+            Some(&operation),
+            OperationTool::StellarClaim,
+            OperationKind::Claim,
+            envelope,
+        )
+        .unwrap();
+    let mut args = nonce_free(&run);
+    args["business_id"] = json!(id.as_str());
+    let result = run.commit_with(args).await;
+    assert_eq!(result["ok"], true, "{result}");
+    let sent = run.control.sent();
+    assert_eq!(sent.len(), 1);
+    let sent = sent_transaction(&sent[0]);
+    assert_eq!(sent.fee, 200, "the sent envelope pays the stored fee");
+    assert_eq!(
+        sent.seq_num.0,
+        sent_transaction(run.args["envelope_xdr"].as_str().unwrap())
+            .seq_num
+            .0,
+        "the rebuild takes the source's next sequence, not the stored one"
+    );
+}
+
 /// The rebuild's fee refusal on the commit route names the prepared envelope
 /// as the fee's source. The record is seeded: its intent bounds the fee at 99
 /// stroops and its envelope pays 100, within the current caps, so the
@@ -362,7 +435,8 @@ async fn consecutive_canonical_commits_wait_for_the_sequence_floor() {
 /// envelope's 120-second deadline, signs under both authorities. The source
 /// sequence rose by five in the ledger since the preparation; the sent
 /// envelope takes the next one, and its deadline is 120 seconds after the
-/// moved mainnet clock.
+/// moved mainnet clock. Its operations are the operations the stored intent
+/// builds.
 #[tokio::test]
 #[serial_test::serial(keyring)]
 #[serial_test::serial]
@@ -381,6 +455,18 @@ async fn a_late_canonical_commit_takes_a_fresh_sequence_and_deadline() {
                 panic!("{context}: the prepared envelope carries time bounds")
             };
             let prepared_end = bounds.max_time.0;
+            let intent_operations = sent_transaction(
+                &stellar_agent_network::operation_entry::intent_envelope(
+                    &stored_intent(&run),
+                    run.f.server.context.network_passphrase(),
+                    1,
+                    100,
+                    1,
+                )
+                .unwrap(),
+            )
+            .operations
+            .to_vec();
             let raised = prepared.seq_num.0 + 4;
             let entries = entries_with_source_sequence(&run.f, raised);
             *run.control.entries.lock().unwrap() = Some(entries.clone());
@@ -408,6 +494,11 @@ async fn a_late_canonical_commit_takes_a_fresh_sequence_and_deadline() {
                 "{context}: the fresh deadline"
             );
             assert!(bounds.max_time.0 > prepared_end + 120, "{context}");
+            assert_eq!(
+                sent.operations.to_vec(),
+                intent_operations,
+                "{context}: the signed operations are the stored intent's"
+            );
         }
     }
 }

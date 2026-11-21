@@ -49,6 +49,9 @@ const MOVED_ORACLE_LEDGER: u32 = 1500;
 /// [`MOVED_ORACLE_LEDGER`].
 #[derive(Clone)]
 struct Moves {
+    /// How far the move advances [`REBUILD_CLOCK_MS`], in milliseconds; zero
+    /// leaves every clock as it is.
+    clock_step_ms: u64,
     moved: Arc<AtomicBool>,
     fee: Arc<AtomicU32>,
     /// The fee reads the primary answered before the move.
@@ -61,6 +64,7 @@ struct Moves {
 impl Moves {
     fn new() -> Self {
         Self {
+            clock_step_ms: 0,
             moved: Arc::default(),
             fee: Arc::new(AtomicU32::new(MOVED_FEE)),
             prepared_fee_reads: Arc::default(),
@@ -78,6 +82,7 @@ impl Moves {
                 advance_primary.advance_sequence(&agent(), OTHER_SENDS);
                 advance_oracle.advance_sequence(&agent(), OTHER_SENDS);
                 advance_oracle.report_entries_ledger(MOVED_ORACLE_LEDGER);
+                REBUILD_CLOCK_MS.fetch_add(moves.clock_step_ms, Ordering::SeqCst);
                 moves.moved.store(true, Ordering::SeqCst);
             }
             if method != "getFeeStats" {
@@ -217,23 +222,113 @@ const REBUILD_NAMES: [[&str; 2]; 4] = [
     ],
 ];
 
+/// The wallet clock of [`cli_four_classics_rebuild_after_consent`], in Unix
+/// milliseconds: it stands still, and the move advances it.
+static REBUILD_CLOCK_MS: AtomicU64 = AtomicU64::new(0);
+
+fn rebuild_close_secs() -> u64 {
+    REBUILD_CLOCK_MS.load(Ordering::SeqCst) / 1000
+}
+
+/// How far the wallet clock moves between the preparation and the rebuild of
+/// [`cli_four_classics_rebuild_after_consent`], in milliseconds.
+const REBUILD_CLOCK_STEP_MS: u64 = 60_000;
+
+/// The operations of an envelope built from the intent the record under
+/// `business_id` stores, validated under the profile's current policy.
+fn stored_intent_operations(
+    fixture: &MainnetFixture,
+    business_id: &str,
+) -> Vec<stellar_xdr::Operation> {
+    use stellar_agent_network::operation_entry::{
+        CanonicalUse, canonical_slot_intent, intent_envelope,
+    };
+    use stellar_agent_network::policy_state::OperationRecorder;
+    let profile = fixture.profile();
+    let policy = crate::commands::policy_engine::load_mainnet_policy_engine(
+        "pay",
+        "policy.engine_unavailable",
+        &crate::common::mainnet_write::mainnet_context(
+            &profile,
+            &stellar_agent_core::profile::name::resolve_profile_name(Some(fixture.name)),
+            stellar_agent_network::MainnetEndpointFlags::default(),
+        )
+        .unwrap(),
+        stellar_agent_core::profile::name::ProfileNameSource::Flag,
+        &crate::common::mainnet_write::mainnet_profiles_dir().unwrap(),
+    )
+    .unwrap();
+    let view = operation(fixture, business_id);
+    let writer = crate::commands::submission_record::accounting_audit_writer(
+        &profile,
+        fixture.name,
+        crate::common::profile_access::ProfileOrigin::Persisted,
+    )
+    .unwrap();
+    let mut writer = writer.lock().unwrap();
+    let slot = OperationRecorder::new(
+        &PersistedWindowStore::for_profile(fixture.name),
+        &profile,
+        &mut *writer,
+        "stored-intent",
+    )
+    .retained_intent(view.operation_id)
+    .unwrap()
+    .expect("the record retains its intent");
+    let intent = canonical_slot_intent(
+        &slot,
+        &CanonicalUse {
+            chain_id: profile.chain_id.caip2_str(),
+            source: &fixture.agent.g,
+            policy_digest: policy.verified.digest(),
+        },
+    )
+    .unwrap();
+    let envelope =
+        intent_envelope(&intent, profile.chain_id.network_passphrase(), 1, 100, 1).unwrap();
+    let TransactionEnvelope::Tx(tx) =
+        TransactionEnvelope::from_xdr_base64(envelope, Limits::none()).unwrap()
+    else {
+        panic!("a transaction envelope")
+    };
+    tx.tx.operations.to_vec()
+}
+
+/// The operations of a signed transaction envelope.
+fn sent_operations(envelope: &str) -> Vec<stellar_xdr::Operation> {
+    let TransactionEnvelope::Tx(tx) =
+        TransactionEnvelope::from_xdr_base64(envelope, Limits::none()).unwrap()
+    else {
+        panic!("a transaction envelope")
+    };
+    tx.tx.operations.to_vec()
+}
+
 /// Each verb prepares a canonical record from the endpoint's state at the
 /// preparation, then signs an envelope rebuilt from the stored intent after
 /// the decision: the sequence another wallet advanced meanwhile, the fee the
-/// endpoint reports now, and a fresh oracle check, whose outcome the result
-/// reports. Under an approval rule the consent is a version 6 consent to the
-/// intent.
+/// endpoint reports now, a deadline taken from the clock at the rebuild,
+/// which stands a minute after the preparation's, and a fresh oracle check,
+/// whose outcome the result reports. The signed operations are the
+/// operations the stored intent builds. Under an approval rule the consent
+/// is a version 6 consent to the intent.
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial]
 async fn cli_four_classics_rebuild_after_consent() {
+    let start = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+    let _clock = stellar_agent_core::timefmt::test_clock::install(Arc::new(
+        stellar_agent_core::timefmt::MockClock::new(|| Ok(REBUILD_CLOCK_MS.load(Ordering::SeqCst))),
+    ));
     for (verb, names) in Verb::ALL.into_iter().zip(REBUILD_NAMES) {
         for (approval, name) in [false, true].into_iter().zip(names) {
-            let moves = Moves::new();
+            REBUILD_CLOCK_MS.store(start, Ordering::SeqCst);
+            let mut moves = Moves::new();
+            moves.clock_step_ms = REBUILD_CLOCK_STEP_MS;
             let (primary, oracle) = moves.endpoints(verb);
             let fixture = verb
                 .spec(name)
-                .primary(primary)
-                .oracle(oracle)
+                .primary(primary.with_close_clock(rebuild_close_secs))
+                .oracle(oracle.with_close_clock(rebuild_close_secs))
                 .rules(rules(verb, approval))
                 .build()
                 .await;
@@ -254,6 +349,20 @@ async fn cli_four_classics_rebuild_after_consent() {
                     MOVED_FEE
                 ),
                 "{name}: the signed envelope takes the sequence and fee read after the decision"
+            );
+            assert_eq!(
+                deadline(&sent[0]),
+                (start + REBUILD_CLOCK_STEP_MS) / 1000 + 120,
+                "{name}: the deadline is 120 seconds after the clock at the rebuild"
+            );
+            assert!(
+                deadline(&sent[0]) > start / 1000 + 120,
+                "{name}: the deadline is not the preparation's"
+            );
+            assert_eq!(
+                sent_operations(&sent[0]),
+                stored_intent_operations(&fixture, &id),
+                "{name}: the signed operations are the stored intent's"
             );
             // The verb's check before the confirmation and the rebuild's read
             // the same observations; the 2 XLM create stays below the native

@@ -2661,7 +2661,7 @@ fn record_v4(f: &Fixture, entry: &PendingApproval, approver: &AttestedApprover) 
 /// An assertion the verifier refuses, in place of the genuine one of a
 /// consent.
 #[derive(Clone, Copy, Debug)]
-enum Forged {
+pub(super) enum Forged {
     /// The pinned credential over another challenge.
     OtherChallenge,
     /// The pinned credential's assertion carrying the signature of another
@@ -2673,7 +2673,7 @@ enum Forged {
     Unpinned,
 }
 
-const FORGED: [Forged; 4] = [
+pub(super) const FORGED: [Forged; 4] = [
     Forged::OtherChallenge,
     Forged::BadSignature,
     Forged::PresenceOnly,
@@ -2759,7 +2759,7 @@ fn edit_stored(f: &Fixture, nonce: &str, edit: impl FnOnce(&mut toml_edit::Table
 /// over the same challenge and origin, and recomputes its version 5 HMAC, or
 /// its version 6 HMAC over the record's intent digest, with the attestation
 /// key; returns that blob.
-fn forge(f: &Fixture, nonce: &str, forged: Forged) -> String {
+pub(super) fn forge(f: &Fixture, nonce: &str, forged: Forged) -> String {
     edit_stored(f, nonce, |entry| {
         let assertion = &mut entry["mainnet_presence"]["assertion"];
         let client: serde_json::Value =
@@ -2821,14 +2821,14 @@ fn forge(f: &Fixture, nonce: &str, forged: Forged) -> String {
 
 /// The debug log of this thread, which names the stable code behind each
 /// uniform refusal.
-struct Diagnostics {
+pub(super) struct Diagnostics {
     capture: stellar_agent_test_support::CaptureWriter,
     _guard: tracing::subscriber::DefaultGuard,
     _inert: tracing::Dispatch,
 }
 
 impl Diagnostics {
-    fn install() -> Self {
+    pub(super) fn install() -> Self {
         let inert = stellar_agent_test_support::inert_dispatcher();
         let capture = stellar_agent_test_support::CaptureWriter::new();
         let subscriber = tracing_subscriber::fmt()
@@ -2846,7 +2846,7 @@ impl Diagnostics {
     }
 
     /// Asserts that the log since the last call names `code`, and clears it.
-    fn assert_refused_with(&self, context: &str, code: &str) {
+    pub(super) fn assert_refused_with(&self, context: &str, code: &str) {
         let log = self.capture.captured_str();
         self.capture.clear();
         assert!(log.contains(code), "{context}: expected {code} in {log}");
@@ -2856,7 +2856,7 @@ impl Diagnostics {
 /// The stable code the durable verifier refuses a proof over a forged
 /// assertion with: the forged receipt is only in the inbox, so the presented
 /// bytes do not authenticate the record's genuine consent.
-const FORGED_PROOF_REFUSAL: &str = "approval.attestation_invalid";
+pub(super) const FORGED_PROOF_REFUSAL: &str = "approval.attestation_invalid";
 
 /// A fresh operation of `run`'s prepared envelope and the durable record of
 /// a new, unattested pay entry for it, opened through the classic producer,
@@ -2900,7 +2900,7 @@ fn normalized(mut value: serde_json::Value) -> serde_json::Value {
 }
 
 /// Asserts that `result` is the uniform approval-required refusal.
-fn assert_uniform(context: &str, result: &serde_json::Value) {
+pub(super) fn assert_uniform(context: &str, result: &serde_json::Value) {
     assert_eq!(result["ok"], false, "{context}: {result}");
     assert_eq!(
         normalized(result.clone()),
@@ -5012,7 +5012,7 @@ async fn durable_approval_keeps_state_and_windows_across_restart_for_every_kind(
 
 /// The policy `raw` re-signed at sequence 8 with the signed approval origin
 /// and its certificate pin.
-fn signed_origin_policy(raw: &str) -> String {
+pub(super) fn signed_origin_policy(raw: &str) -> String {
     use stellar_agent_core::approval::mainnet_fixtures::{SIGNED_CERT_SPKI_SHA256, SIGNED_ORIGIN};
     raw.replace("sequence = 7", "sequence = 8").replace(
         "[mainnet]",
@@ -5030,7 +5030,7 @@ fn signed_origin_policy(raw: &str) -> String {
 /// The challenge is issued for the listener identity captured from the
 /// current signed policy, the fixture credential asserts over it at that
 /// origin, and the consent persists on the remote surface.
-fn signed_origin_consent(f: &Fixture, entry: &PendingApproval) -> String {
+pub(super) fn signed_origin_consent(f: &Fixture, entry: &PendingApproval) -> String {
     use stellar_agent_core::approval::{
         ConsentAudit, ConsentAuthorization, ListenerIdentity, MainnetApprovalAuthority,
         PresenceListener, Surface, attest_and_persist, issue_mainnet_intent_presence,

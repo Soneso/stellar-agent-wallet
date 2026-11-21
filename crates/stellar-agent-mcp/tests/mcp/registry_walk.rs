@@ -1721,6 +1721,70 @@ fn write_audit_routes_both_branches_through_the_keyed_preflight() {
     );
 }
 
+/// The toolset payment commit, `stellar_toolset_invoke/stellar_pay_commit`,
+/// reaches the shared payment commit handler, whose writer order
+/// [`every_approval_consumer_acquires_the_writer_between_the_approval_read_and_the_signer`]
+/// checks: the invoke handler routes a signing action to the gated resolver,
+/// the resolver hands a verified invocation to the gated commit route, that
+/// route dispatches to the gated tool router with the payment context, and
+/// the router's payment arm calls `stellar_pay_commit_impl` with it. The
+/// handler reads the approval through `mainnet_authority` or the testnet gate,
+/// acquires the writer through `write_audit`, and only then signs through
+/// `sign_and_submit_classic`, so the toolset commit acquires the audit writer
+/// before the signing key loads on mainnet and off it.
+#[test]
+fn the_toolset_commit_reaches_the_handler_that_acquires_the_writer_before_the_signer() {
+    let toolsets = include_str!("../../src/tools/toolsets.rs");
+    assert_calls_in_order(
+        "toolsets.rs",
+        toolsets,
+        "async fn stellar_toolset_invoke(",
+        &[
+            "if is_signing_action {",
+            ".route_to_gated_resolver(&toolset_name, &action, &args, &toolsets_root, outer)",
+        ],
+    );
+    assert_calls_in_order(
+        "toolsets.rs",
+        toolsets,
+        "pub(crate) async fn route_to_gated_resolver(",
+        &["self.route_to_gated_commit(tool_name, toolset_args, envelope_xdr, context)"],
+    );
+    assert_calls_in_order(
+        "toolsets.rs",
+        toolsets,
+        "async fn route_to_gated_commit(",
+        &["self.route_to_gated_tool(tool_name, tool_args_value, Some(context))"],
+    );
+    assert_calls_in_order(
+        "toolsets.rs",
+        toolsets,
+        "pub(crate) async fn route_to_gated_tool(",
+        &[
+            "\"stellar_pay_commit\" =>",
+            "self.stellar_pay_commit_impl(typed, context).await",
+            "\"stellar_rule_create_commit\" =>",
+        ],
+    );
+    let pay = include_str!("../../src/tools/pay.rs");
+    for read in ["mainnet_authority(", "verify_attestation_gate("] {
+        assert_called_between(
+            "pay.rs",
+            pay,
+            "pub(crate) async fn stellar_pay_commit_impl(",
+            read,
+            ".write_audit()",
+            "sign_and_submit_classic(",
+        );
+    }
+    assert_calls_in_order(
+        "submission_record.rs",
+        include_str!("../../src/tools/submission_record.rs"),
+        "pub(crate) async fn sign_and_submit_classic(",
+        &["audit.ok_or_else(", "mainnet_enrolled_signer("],
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Audit-writer (path, key) discipline
 // ─────────────────────────────────────────────────────────────────────────────
