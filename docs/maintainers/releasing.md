@@ -203,13 +203,13 @@ in `.github/actions/macos-sign-notarize/`.
 The Windows build leg links libsodium from `libsodium-1.0.22-stable-msvc.zip`,
 and `.github/scripts/release/sodium.sh` pins its SHA-256 in
 `SODIUM_MSVC_SHA256`. Upstream replaces that stable archive in place when the
-stable branch moves, and the Windows build then fails at the sodium step. To
-update the pin, download the archive and its `.minisig` from the URL that
-`sodium.sh` uses, verify the signature with the key that
-`libsodium-sys-stable` embeds in its build script, and set
-`SODIUM_MSVC_SHA256` to the archive's digest. A `libsodium-sys-stable` update
-that changes the libsodium version changes the file names and the pin
-together.
+stable branch moves, and the Windows build then fails at the sodium step. The
+failure message prints the expected and the actual SHA-256. To update the
+pin, download the archive and its `.minisig` from the URL that `sodium.sh`
+uses, verify the signature with the key that `libsodium-sys-stable` embeds in
+its build script, and set `SODIUM_MSVC_SHA256` to the archive's digest. A
+`libsodium-sys-stable` update that changes the libsodium version changes the
+file names and the pin together.
 
 ```sh
 base=https://download.libsodium.org/libsodium/releases
