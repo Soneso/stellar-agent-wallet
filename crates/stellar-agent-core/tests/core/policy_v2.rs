@@ -286,6 +286,7 @@ sequence = 7
 [mainnet]
 profile = "operator"
 endpoint_host = "rpc.example.invalid"
+oracle_host = "oracle.example.invalid"
 installation_nonce_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 classic_max_fee_per_op_stroops = 500
 authorization_ttl_seconds = 60
@@ -1848,9 +1849,43 @@ fn bundle_caps_and_accounting_use_classic_sac_identity() {
     assert!(period.evaluate(&context).unwrap().is_some());
 }
 
+/// The oracle URL of [`enabled_fixture`]'s profile, whose host the signed
+/// fixture policy names.
+const ORACLE_URL: &str = "https://oracle.example.invalid";
+
+/// `profile` with the oracle of [`ORACLE_URL`] and the provider records a
+/// mainnet profile with an oracle needs.
+fn with_oracle(profile: &Profile, oracle_url: &str) -> Profile {
+    use stellar_agent_core::profile::schema::{PrimaryProviderRecord, ProviderRecord};
+    let mut profile = profile.clone();
+    let built = Profile::builder_mainnet_named(
+        "operator",
+        "https://rpc.example.invalid",
+        "s",
+        "a",
+        "n",
+        "a",
+    )
+    .primary_provider(PrimaryProviderRecord::new(
+        "Primary operator",
+        "rpc.example.invalid",
+    ))
+    .oracle_provider_url(url::Url::parse(oracle_url).unwrap())
+    .oracle_provider(ProviderRecord::new(
+        "Oracle operator",
+        url::Url::parse(oracle_url).unwrap().host_str().unwrap(),
+        true,
+    ))
+    .build();
+    profile.oracle_provider_url = built.oracle_provider_url;
+    profile.providers = built.providers;
+    profile
+}
+
 fn enabled_fixture() -> (tempfile::TempDir, Profile, VerifiedPolicy) {
     use sha2::Digest as _;
     let (dir, profile, key) = fixture();
+    let profile = with_oracle(&profile, ORACLE_URL);
     loader::save_to_dir("operator", &profile, dir.path()).unwrap();
     let digest = stellar_agent_core::hex::encode(&sha2::Sha256::digest(b"installation-nonce"));
     let body = FULL.replace(&"0".repeat(64), &digest);
@@ -1881,6 +1916,7 @@ fn enablement_verifies_all_bindings() {
     assert_eq!(record.policy_sequence(), 7);
     assert_eq!(record.profile(), "operator");
     assert_eq!(record.endpoint_host(), "rpc.example.invalid");
+    assert_eq!(record.oracle_host(), "oracle.example.invalid");
     assert_eq!(record.fee_cap(), 500);
     assert_eq!(record.authorization_ttl(), Some(60));
 }
@@ -1976,6 +2012,88 @@ fn enablement_disk_and_merged_hosts_are_both_checked() {
         .to_string()
         .contains("on_disk_host")
     );
+}
+/// The binding a refused enablement names; another refusal reads as its
+/// error code, which names no binding.
+fn refused_binding(
+    verified: &VerifiedPolicy,
+    profile: &Profile,
+    dir: &Path,
+) -> Option<&'static str> {
+    match verify_enablement(
+        verified,
+        "operator",
+        ProfileNameSource::Flag,
+        profile,
+        dir,
+        &nonce,
+    ) {
+        Err(stellar_agent_core::error::ValidationError::MainnetEnablementInvalid { binding }) => {
+            Some(binding)
+        }
+        Err(other) => Some(other.code()),
+        Ok(_) => None,
+    }
+}
+/// The merged oracle URL must name the signed oracle host: another host, an
+/// absent URL, and a hostless URL refuse as `merged_oracle_host`, while a
+/// host differing only in case, path, or credentials enables.
+#[test]
+#[serial]
+fn enablement_refuses_a_merged_oracle_host_other_than_the_signed_one() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (dir, profile, verified) = enabled_fixture();
+    assert_eq!(refused_binding(&verified, &profile, dir.path()), None);
+    for oracle in [
+        Some("https://other-oracle.example.invalid"),
+        Some("https://oracle.example.invalid:8443"),
+        Some("data:oracle.example.invalid"),
+        None,
+    ] {
+        let mut merged = profile.clone();
+        merged.oracle_provider_url = oracle.map(|raw| url::Url::parse(raw).unwrap());
+        assert_eq!(
+            refused_binding(&verified, &merged, dir.path()),
+            Some("merged_oracle_host"),
+            "{oracle:?}"
+        );
+    }
+    let mut merged = profile.clone();
+    merged.oracle_provider_url =
+        Some(url::Url::parse("https://user:pw@ORACLE.example.invalid:443/rpc?q=1").unwrap());
+    assert_eq!(refused_binding(&verified, &merged, dir.path()), None);
+}
+/// The stored oracle URL must name the signed oracle host even when the
+/// merged one does: another stored host and a stored file without an oracle
+/// URL refuse as `on_disk_oracle_host`.
+#[test]
+#[serial]
+fn enablement_refuses_an_on_disk_oracle_host_other_than_the_signed_one() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let (dir, profile, verified) = enabled_fixture();
+    let stored = with_oracle(&profile, "https://other-oracle.example.invalid");
+    loader::save_to_dir("operator", &stored, dir.path()).unwrap();
+    assert_eq!(
+        refused_binding(&verified, &profile, dir.path()),
+        Some("on_disk_oracle_host")
+    );
+    let path = dir.path().join("operator.toml");
+    let mut file = std::fs::read_to_string(&path)
+        .unwrap()
+        .parse::<DocumentMut>()
+        .unwrap();
+    assert!(file.remove("oracle_provider_url").is_some());
+    std::fs::write(&path, file.to_string()).unwrap();
+    assert_eq!(
+        refused_binding(&verified, &profile, dir.path()),
+        Some("on_disk_oracle_host")
+    );
+    loader::save_to_dir("operator", &profile, dir.path()).unwrap();
+    assert_eq!(refused_binding(&verified, &profile, dir.path()), None);
 }
 #[test]
 fn endpoint_host_normalization() {
@@ -2822,6 +2940,7 @@ sequence = 7
 [mainnet]
 profile = "operator"
 endpoint_host = "rpc.example.invalid"
+oracle_host = "oracle.example.invalid"
 installation_nonce_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 classic_max_fee_per_op_stroops = 500
 authorization_ttl_seconds = 60
@@ -3053,11 +3172,23 @@ fn remote_approval_fields_are_signed_and_canonical() {
     assert_eq!(canonical, REMOTE_CANONICAL.as_bytes());
     assert_eq!(
         blake3::hash(&canonical).to_hex().as_str(),
+        "bcb50aa361202b94a799b83b5207fed92adbadd08cfbc3b181ee57b0b53bc8ab"
+    );
+    // Without its `oracle_host` line the document has the canonical bytes
+    // and digest of a document that names no oracle host.
+    let oracle_line = "oracle_host = \"oracle.example.invalid\"\n";
+    let without = canonical_bytes(&REMOTE.replace(oracle_line, "")).unwrap();
+    assert_eq!(
+        without,
+        REMOTE_CANONICAL.replace(oracle_line, "").as_bytes()
+    );
+    assert_eq!(
+        blake3::hash(&without).to_hex().as_str(),
         "da4a707e6f2542a1bb1cc0b9896e6e71385b3a9dc2eb6dff61e41e0901eb7658"
     );
     assert_eq!(
         stellar_agent_core::hex::encode(&key.sign(blake3::hash(&canonical).as_bytes()).to_bytes()),
-        "6213ea93bf9c1a0228d5c9323268edf896fd40304cb11b30e9d45aba8aa749b52548cceb318db3584ee9f90ea2490fe40e4c12e6327ea239e4b964542610ee03"
+        "87e898ca2ba99465335c0b98c6bb861e65c548162d2ce68edf6b7ff5864a340c990e3d0b0ad06623ac2146a7272d9ae8167147914c99ee0451900b8a4e1f9c02"
     );
     let signed_remote = signed(REMOTE, &key);
     let baseline = load(dir.path(), REMOTE, &profile, &key, PinMode::CompareOnly).unwrap();
@@ -3439,8 +3570,14 @@ fn runtime_binding_requirements_unchanged() {
         for removed in [
             vec!["profile"],
             vec!["endpoint_host"],
+            vec!["oracle_host"],
             vec!["installation_nonce_sha256"],
-            vec!["profile", "endpoint_host", "installation_nonce_sha256"],
+            vec![
+                "profile",
+                "endpoint_host",
+                "oracle_host",
+                "installation_nonce_sha256",
+            ],
         ] {
             let (dir, profile, key) = fixture();
             let mut body = source.parse::<DocumentMut>().unwrap();

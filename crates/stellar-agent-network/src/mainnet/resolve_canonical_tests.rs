@@ -73,7 +73,10 @@ impl CanonicalFx {
             },
             |raw| {
                 policy_edit(&if claim {
-                    raw.replace("stellar_pay", "stellar_claim")
+                    raw.replace("stellar_pay", "stellar_claim").replace(
+                        "oracle_host = \"oracle.example.invalid\"",
+                        "oracle_host = \"oracle.rpc.example.invalid\"",
+                    )
                 } else {
                     raw.to_owned()
                 })

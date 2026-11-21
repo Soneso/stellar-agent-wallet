@@ -35,6 +35,7 @@ const ROOT_KEYS: &[&str] = &[
 pub(crate) const MAINNET_KEYS: &[&str] = &[
     "profile",
     "endpoint_host",
+    "oracle_host",
     "installation_nonce_sha256",
     "classic_max_fee_per_op_stroops",
     "authorization_ttl_seconds",

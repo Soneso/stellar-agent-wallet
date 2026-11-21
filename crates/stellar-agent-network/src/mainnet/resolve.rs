@@ -1071,12 +1071,11 @@ mod enabled {
                 !same_provider_host(witness.authority(), context.authority()),
                 P::WitnessSameHost,
             )?;
+            // The signed oracle host, not the profile's URL, names the only
+            // oracle whose witness a mainnet signature accepts.
             require(
-                context
-                    .profile()
-                    .oracle_provider_url
-                    .as_ref()
-                    .is_some_and(|oracle| same_provider_host(witness.authority(), oracle.as_str())),
+                normalize_endpoint_host(witness.authority())
+                    .is_ok_and(|host| host == body.oracle_host),
                 P::WitnessOracleUnbound,
             )?;
         }
@@ -3703,6 +3702,24 @@ mod tests {
         set_amount(&mut f, 10_000_000_000);
         f
     }
+    /// Stores the profile with the oracle on `host`, or without an oracle,
+    /// after the enablement and the approval verified the signed one: the
+    /// write context reads the stored profile.
+    fn store_oracle(f: &mut ResolverFixture, host: Option<&str>) {
+        f.profile.oracle_provider_url = host.map(|host| format!("https://{host}").parse().unwrap());
+        f.profile
+            .providers
+            .get_or_insert_with(Default::default)
+            .oracle = host.map(|host| {
+            stellar_agent_core::profile::schema::ProviderRecord::new("oracle", host, true)
+        });
+        stellar_agent_core::profile::loader::save_to_dir(
+            "operator",
+            &f.profile,
+            &f.dir.path().join("profiles"),
+        )
+        .unwrap();
+    }
     /// A bound witness from a copy of the snapshot whose oracle is on `host`,
     /// built through `context`'s own routes.
     async fn witness_for(
@@ -3777,6 +3794,11 @@ mod tests {
         if case == "not_required" {
             set_amount(&mut f, 10);
         }
+        let approval = f.approval(&f.envelope, f.now, 600_000);
+        if case == "profile_oracle" {
+            // The stored profile now names another oracle than the signed host.
+            store_oracle(&mut f, Some("third.example.invalid"));
+        }
         let primary = f.server().await;
         let oracle = f.server().await;
         let context = f.context_with_routes(&[
@@ -3785,7 +3807,6 @@ mod tests {
             ("third.example.invalid", &oracle.uri()),
         ]);
         let client = context.primary_client().unwrap();
-        let approval = f.approval(&f.envelope, f.now, 600_000);
         let other = changed_envelope(&f, |tx| {
             tx.tx.memo = stellar_xdr::Memo::Text(b"other".to_vec().try_into().unwrap());
             let mut op = tx.tx.operations[0].clone();
@@ -3797,7 +3818,7 @@ mod tests {
         });
         let host = match case {
             "same_host" => "rpc.example.invalid",
-            "third_host" => "third.example.invalid",
+            "third_host" | "profile_oracle" => "third.example.invalid",
             _ => "oracle.example.invalid",
         };
         let witness = witness_for(
@@ -3847,6 +3868,42 @@ mod tests {
     #[serial_test::serial]
     async fn witness_oracle_binding_refuses() {
         witness_case("third_host", Some(P::WitnessOracleUnbound)).await;
+    }
+    /// A witness from the oracle the profile names refuses when that host is
+    /// not the owner-signed `oracle_host`.
+    #[tokio::test]
+    #[serial_test::serial(mainnet_clock)]
+    #[serial_test::serial]
+    async fn witness_from_an_unsigned_profile_oracle_refuses() {
+        witness_case("profile_oracle", Some(P::WitnessOracleUnbound)).await;
+    }
+    /// The write context builds its post-send oracle client only when the
+    /// stored oracle URL names the enablement's signed oracle host: another
+    /// host and an absent URL refuse with
+    /// `network.mainnet_authorization_refused`.
+    #[test]
+    #[serial_test::serial(mainnet_clock)]
+    #[serial_test::serial]
+    fn the_write_oracle_client_requires_the_signed_oracle_host() {
+        let mut f = ResolverFixture::new();
+        assert!(
+            matches!(f.context.oracle_client(&f.enablement), Ok(Some(_))),
+            "the signed oracle host builds a client"
+        );
+        for host in [Some("third.example.invalid"), None] {
+            store_oracle(&mut f, host);
+            let context = f.context_with_routes(&[]);
+            match context.oracle_client(&f.enablement) {
+                Ok(_) => panic!("built an oracle client for {host:?}"),
+                Err(error) => {
+                    assert_eq!(
+                        error.code(),
+                        "network.mainnet_authorization_refused",
+                        "{host:?}"
+                    );
+                }
+            }
+        }
     }
     #[tokio::test]
     #[serial_test::serial(mainnet_clock)]
@@ -3904,11 +3961,14 @@ mod tests {
     }
 
     async fn requirement_refusal(with_oracle: bool, expected: P) {
-        let f = large_payment_fixture(with_oracle);
+        let mut f = large_payment_fixture(with_oracle);
+        let approval = f.approval(&f.envelope, f.now, 600_000);
+        if !with_oracle {
+            store_oracle(&mut f, None);
+        }
         let server = f.server().await;
         let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
         let client = context.primary_client().unwrap();
-        let approval = f.approval(&f.envelope, f.now, 600_000);
         let before = f.wire();
         assert_refused(
             resolve_tx_sign(request(

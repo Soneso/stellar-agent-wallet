@@ -237,7 +237,8 @@ override cannot become persistent configuration and derived defaults are not
 materialised into the stored file.
 
 Enabled writes require an explicit nondefault mainnet profile whose stored
-chain and normalized endpoint host match its installation binding. A mainnet
+chain, normalized endpoint host, and oracle host match its installation
+binding. A mainnet
 `default` profile can serve reads but cannot be enabled for writes.
 
 ## Schema version handling
@@ -434,9 +435,21 @@ reads a keyring entry and writes no enablement state, and every mainnet
 write, in the CLI and in the MCP server, refuses before any signature. An
 enabled profile whose oracle is removed refuses every CLI mainnet write until
 the oracle is set again. A running MCP server checks the profile it loaded at
-startup, so it refuses mainnet writes for a removed oracle from its next
-start. On testnet the oracle is
+startup; its next start refuses the enablement with
+`profile.mainnet_enablement_invalid: on_disk_oracle_host`. On testnet the oracle is
 optional, and a required witness without one warns.
+
+On mainnet the owner-signed policy binds the oracle host. `profile
+enable-mainnet` stages the host of `oracle_provider_url` as
+`[mainnet].oracle_host`, and enablement refuses a stored or merged
+`oracle_provider_url` on another host. A mainnet signature accepts a witness
+only from the signed `oracle_host`, never from the host the profile names
+alone. Of the witness inputs, the owner signs the oracle host and the
+`[mainnet.cross_check_thresholds]`. For an asset the signed table names, a
+profile threshold can only lower the amount that requires a witness; for any
+other asset the profile threshold alone applies. The scheme, path, and credentials of
+`oracle_provider_url` and the `providers.oracle` record are unsigned profile
+fields.
 For the x402 payment tools, the oracle simulates the same unsigned transfer the
 primary simulated, and the answers are compared before the payer signs.
 Both admitted mainnet x402 tools obtain the required witness before the payer signs.
@@ -1009,8 +1022,8 @@ requirement holds in either build for every policy with a `[mainnet]` table.
 
 The profile file and policy file are separate documents. This policy example
 contains complete payment rules for CLI and MCP. Replace the destination with
-the intended account. The zero nonce digest and example endpoint are placeholders.
-Use the profile, endpoint host, and nonce digest written by
+the intended account. The zero nonce digest and example hosts are placeholders.
+Use the profile, endpoint host, oracle host, and nonce digest written by
 [the enablement ceremony](cli-reference/profile-and-governance.md#profile-enable-mainnet).
 These installation bindings cannot be reused from another installation.
 
@@ -1021,6 +1034,7 @@ sequence = 1
 
 [mainnet]
 endpoint_host = "rpc.example.invalid"
+oracle_host = "oracle.example.invalid"
 profile = "operator"
 installation_nonce_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 classic_max_fee_per_op_stroops = 500
@@ -1069,6 +1083,7 @@ reason = "review"
 | Pin comparison | A pin refuses v1 or a lower sequence. Equal sequence with another digest or owner is a fork. |
 | `[mainnet].profile` | Dedicated profile name. |
 | `[mainnet].endpoint_host` | Ceremony-normalized endpoint host. This policy field remains named `endpoint_host`. |
+| `[mainnet].oracle_host` | Required. Ceremony-normalized host of `oracle_provider_url`: lowercase, with a nondefault port. The only host whose cross-check witness a mainnet signature accepts. |
 | `[mainnet].installation_nonce_sha256` | Installation nonce digest as 64 lowercase hexadecimal characters. |
 | `[mainnet].classic_max_fee_per_op_stroops` | Required signed `u32` classic per-operation cap. |
 | `[mainnet].authorization_ttl_seconds` | Optional lifetime from 1 through 120 seconds, distinct from approval lifetime. |
@@ -1342,7 +1357,7 @@ Other build failures use `policy.engine_unavailable` or `trustline.policy_engine
 | `policy.state_lock_io` | The lock cannot be opened. The detail identifies the I/O failure. |
 | `policy.mainnet_minimum_unmet` | The enabled policy fails a named minimum requirement. |
 | `policy.pin_unusable` | The installation pin cannot be read or is malformed. |
-| `profile.mainnet_enablement_invalid` | The message names the failed binding: `mainnet_table`, `profile`, `source`, `default`, `on_disk`, `chain_id`, `on_disk_host`, `merged_host`, or `nonce_digest`. |
+| `profile.mainnet_enablement_invalid` | The message names the failed binding: `mainnet_table`, `profile`, `source`, `default`, `on_disk`, `chain_id`, `on_disk_host`, `merged_host`, `on_disk_oracle_host`, `merged_oracle_host`, or `nonce_digest`. |
 | `profile.enable_mainnet_profile_flag_required` | Supply an explicit `--profile`. |
 | `profile.enable_mainnet_default_refused` | Select a dedicated profile whose name is not `default`. |
 | `profile.enable_mainnet_not_mainnet` | Select a mainnet profile. |

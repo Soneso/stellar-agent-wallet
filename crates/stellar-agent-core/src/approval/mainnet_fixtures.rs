@@ -50,6 +50,9 @@ use crate::profile::schema::{KeyringEntryRef, Profile};
 /// The endpoint host the fixture profile and policy name.
 pub const ENDPOINT_HOST: &str = "rpc.example.invalid";
 
+/// The oracle host the fixture profile's oracle URL and policy name.
+pub const ORACLE_HOST: &str = "oracle.example.invalid";
+
 /// The listener port of the fixture's expected origin.
 pub const ORIGIN_PORT: u16 = 4100;
 
@@ -98,6 +101,29 @@ impl std::fmt::Debug for MainnetConsentFixture {
     }
 }
 
+/// Gives the mainnet `profile` the oracle on [`ORACLE_HOST`], the host the
+/// fixture policies sign, with the provider records a mainnet profile with
+/// an oracle needs. A present primary record is kept.
+///
+/// # Panics
+///
+/// Panics when the profile's RPC URL has no host.
+pub fn set_fixture_oracle(profile: &mut Profile) {
+    let primary_host =
+        crate::profile::schema::provider_host(&profile.rpc_url).expect("primary host");
+    profile.oracle_provider_url =
+        Some(url::Url::parse(&format!("https://{ORACLE_HOST}")).expect("oracle URL"));
+    let providers = profile.providers.get_or_insert_with(Default::default);
+    providers.primary.get_or_insert_with(|| {
+        crate::profile::schema::PrimaryProviderRecord::new("Fixture primary operator", primary_host)
+    });
+    providers.oracle = Some(crate::profile::schema::ProviderRecord::new(
+        "Fixture oracle operator",
+        ORACLE_HOST,
+        true,
+    ));
+}
+
 fn put(entry: &KeyringEntryRef, text: &str) {
     keyring_core::Entry::new(&entry.service, &entry.account)
         .expect("keyring entry")
@@ -106,7 +132,7 @@ fn put(entry: &KeyringEntryRef, text: &str) {
 }
 
 /// The unsigned version 2 policy body of the mainnet profile `name` at
-/// `sequence`, bound to `endpoint_host` and the digest of
+/// `sequence`, bound to `endpoint_host`, [`ORACLE_HOST`], and the digest of
 /// [`ENABLEMENT_NONCE`], admitting `credentials` as approval credentials,
 /// with one require-approval payment rule to [`ALLOWED_DESTINATION`], then
 /// one require-approval claim rule and one trust line rule for `USD` of
@@ -182,7 +208,8 @@ pub fn policy_body_with_origin(
     .join("\n");
     format!(
         "version = 2\nscope = \"profile:{name}\"\nsequence = {sequence}\n\n[mainnet]\n\
-         endpoint_host = \"{endpoint_host}\"\nprofile = \"{name}\"\n\
+         endpoint_host = \"{endpoint_host}\"\noracle_host = \"{ORACLE_HOST}\"\n\
+         profile = \"{name}\"\n\
          installation_nonce_sha256 = \"{digest}\"\n\
          classic_max_fee_per_op_stroops = 500\nauthorization_ttl_seconds = 60\n\
          approval_credentials = [\n{entries}]\n{signed_origin}\
@@ -245,6 +272,7 @@ impl MainnetConsentFixture {
             "default",
         )
         .build();
+        set_fixture_oracle(&mut profile);
         profile.audit_log_path = home.path().join("audit").join(format!("{name}.jsonl"));
         edit(&mut profile);
         let owner = ed25519_dalek::SigningKey::from_bytes(&OWNER_SEED);

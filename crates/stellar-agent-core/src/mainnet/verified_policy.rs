@@ -59,6 +59,9 @@ pub struct MainnetBody {
     pub profile: String,
     /// The RPC endpoint host the document allows.
     pub endpoint_host: String,
+    /// The oracle endpoint host the document allows, the only host whose
+    /// cross-check witness a mainnet signature accepts.
+    pub oracle_host: String,
     /// SHA-256 of the installation's mainnet enablement nonce.
     pub installation_nonce_sha256: [u8; 32],
     /// The classic per-operation fee cap, in stroops.
@@ -277,8 +280,9 @@ impl VerifiedPolicy {
     /// the approval credentials: `u32be(count)`, then per credential in
     /// ascending ID order `lp(raw_id)` and the 65-byte SEC1 key. The policy
     /// parser bounds the list to 16 entries of at most 64-byte IDs, so every
-    /// length fits its `u32` prefix. The approval origin and certificate pin
-    /// enter through the document digest, which covers their canonical bytes.
+    /// length fits its `u32` prefix. The oracle host, the approval origin, and
+    /// the certificate pin enter through the document digest, which covers
+    /// their canonical bytes.
     /// The optional contract total fee bound enters through that digest too.
     /// The engine is not a fact: the digest already names the document it
     /// was built from.
@@ -351,6 +355,7 @@ mod tests {
         MainnetBody {
             profile: "main".to_owned(),
             endpoint_host: "rpc.example.org".to_owned(),
+            oracle_host: "oracle.example.org".to_owned(),
             installation_nonce_sha256: [3; 32],
             classic_max_fee_per_op_stroops: 1_000,
             authorization_ttl_seconds: Some(60),

@@ -6,6 +6,7 @@ sequence = 7
 approval_origin = "https://approve.example.invalid:8443"
 approval_cert_spki_sha256 = "abababababababababababababababababababababababababababababababab"
 endpoint_host = "rpc.example.invalid"
+oracle_host = "oracle.example.invalid"
 profile = "operator"
 installation_nonce_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 classic_max_fee_per_op_stroops = 500

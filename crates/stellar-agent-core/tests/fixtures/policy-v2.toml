@@ -4,6 +4,7 @@ sequence = 7
 
 [mainnet]
 endpoint_host = "rpc.example.invalid"
+oracle_host = "oracle.example.invalid"
 profile = "operator"
 installation_nonce_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 classic_max_fee_per_op_stroops = 500

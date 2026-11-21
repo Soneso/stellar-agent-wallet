@@ -25,8 +25,11 @@ use stellar_agent_test_support::{StellarAgentHomeGuard, keyring_mock};
 const FULL: &str = include_str!("../../../stellar-agent-core/tests/fixtures/policy-v2.toml");
 const V1: &str = "version = 1\nscope = \"profile:operator\"\n[[rules]]\n\
     match = {tool = \"stellar_balances\", chain = \"*\"}\ncriteria = []\ndecision = \"allow\"\n";
+/// The fixture profile; a mainnet one names the oracle whose host the signed
+/// fixture policy binds, with the provider records that oracle needs.
 fn profile(mainnet: bool) -> Profile {
     if mainnet {
+        use stellar_agent_core::profile::schema::{PrimaryProviderRecord, ProviderRecord};
         Profile::builder_mainnet_named(
             "operator",
             "https://rpc.example.invalid",
@@ -35,6 +38,16 @@ fn profile(mainnet: bool) -> Profile {
             "n",
             "a",
         )
+        .primary_provider(PrimaryProviderRecord::new(
+            "Primary operator",
+            "rpc.example.invalid",
+        ))
+        .oracle_provider_url(url::Url::parse("https://oracle.example.invalid").unwrap())
+        .oracle_provider(ProviderRecord::new(
+            "Oracle operator",
+            "oracle.example.invalid",
+            true,
+        ))
         .build()
     } else {
         Profile::builder_testnet_named("operator", "s", "a", "n", "a").build()

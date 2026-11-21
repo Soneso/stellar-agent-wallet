@@ -207,7 +207,7 @@ fn selected_startup_verifies_the_installation_binding() {
         "owned wallet root is marked before the home guard"
     );
     let _home = StellarAgentHomeGuard::new(home.path());
-    let profile = Profile::builder_mainnet_named(
+    let mut profile = Profile::builder_mainnet_named(
         "operator",
         "https://rpc.example.invalid",
         "stellar-agent-signer-operator",
@@ -216,6 +216,7 @@ fn selected_startup_verifies_the_installation_binding() {
         "a",
     )
     .build();
+    stellar_agent_core::approval::mainnet_fixtures::set_fixture_oracle(&mut profile);
     stellar_agent_core::profile::loader::save_to_dir(
         "operator",
         &profile,

@@ -75,7 +75,9 @@ fn approve_binary_case(mainnet: bool, case: ApprovalCase) {
     };
     let builder = builder.audit_log_path(home.join("audit").join("approval.jsonl"));
     let mut profile = if mainnet {
-        builder.build()
+        let mut profile = builder.build();
+        stellar_agent_core::approval::mainnet_fixtures::set_fixture_oracle(&mut profile);
+        profile
     } else {
         builder.with_noop_engine().build()
     };

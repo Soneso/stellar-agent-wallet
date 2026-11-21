@@ -241,7 +241,12 @@ A signer can run before verification rejects its signature.
 
 Smart-account multicall independently requires V1 even on testnet.
 Mainnet selection requires an explicit profile. Writes require a dedicated
-nondefault profile and matching stored chain, endpoint, and installation binding.
+nondefault profile and matching stored chain, endpoint, oracle host, and
+installation binding. The owner-signed policy names both the endpoint host and
+the oracle host, and a mainnet signature accepts a cross-check witness only
+from the signed oracle host. Of the witness inputs, the owner signs the oracle
+host and the per-asset cross-check thresholds; the oracle URL's scheme, path,
+and credentials and the oracle provider record are unsigned profile fields.
 Friendbot remains scoped to testnet and futurenet. MPP, smart-account writes,
 DeFi, pool submission, generic signing, and toolset rule creation are excluded on mainnet.
 On mainnet, `stellar_toolset_invoke` admits only its exact `stellar_pay` and `stellar_pay_commit` actions; every other toolset action refuses.

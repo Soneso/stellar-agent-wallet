@@ -414,9 +414,12 @@ pub(crate) async fn sign_and_submit_classic(
             )
         })?;
         // The oracle confirms a negative answer of the primary endpoint after
-        // the send; a client that cannot be built refuses before the signer
-        // loads.
-        let oracle = guard.context.oracle_client().map_err(render)?;
+        // the send; a stored oracle URL off the signed oracle host, or a
+        // client that cannot be built, refuses before the signer loads.
+        let oracle = guard
+            .context
+            .oracle_client(guard.enablement)
+            .map_err(render)?;
         let observation = stellar_agent_network::policy_state::submission_observation(
             client,
             oracle.as_ref(),
@@ -1640,6 +1643,119 @@ mod tests {
                 assert!(state["authorizations"].as_array().is_none_or(Vec::is_empty));
             }
         }
+    }
+
+    /// The post-send oracle client is built only for the signed oracle host:
+    /// a write context whose stored profile names another oracle than the
+    /// verified enablement refuses with `network.mainnet_authorization_refused`
+    /// before the signer loads.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn a_stored_oracle_off_the_signed_host_refuses_before_the_signer() {
+        use crate::tools::common::tests::mainnet::Fixture;
+        use stellar_agent_network::mainnet::{MainnetConsumer, authority::MainnetAuthority};
+        let mut f = Fixture::new(|raw| raw);
+        let outcome = f
+            .server
+            .dispatch_gate("stellar_pay", &f.args(), "stellar:mainnet")
+            .await
+            .unwrap();
+        let decision = outcome.mainnet_decision().unwrap().clone();
+        let mut moved = f.server.security_profile().clone();
+        moved.oracle_provider_url =
+            Some(url::Url::parse("https://moved-oracle.example.invalid").unwrap());
+        moved.providers.as_mut().unwrap().oracle =
+            Some(stellar_agent_core::profile::schema::ProviderRecord::new(
+                "Moved oracle operator",
+                "moved-oracle.example.invalid",
+                true,
+            ));
+        let profiles = stellar_agent_core::profile::schema::default_profile_dir().unwrap();
+        stellar_agent_core::profile::loader::save_to_dir("operator", &moved, &profiles).unwrap();
+        f.server.mainnet_context = Some(Arc::new(
+            stellar_agent_network::NetworkContext::mainnet_write(
+                &moved,
+                &stellar_agent_core::profile::name::ResolvedProfileName::from_flag("operator"),
+                &profiles,
+                stellar_agent_network::MainnetEndpointFlags::default(),
+            )
+            .unwrap(),
+        ));
+        let guard = f
+            .server
+            .mainnet_write_admission(MainnetConsumer::McpPay)
+            .unwrap();
+        let authority = MainnetAuthority::from_decision(&decision, None).unwrap();
+        let profile = f.server.security_profile();
+        let readiness =
+            stellar_agent_network::mainnet::audit_readiness::audit_readiness(profile, "operator")
+                .unwrap();
+        let client = guard.context.primary_client().unwrap();
+        let writer = Arc::clone(readiness.writer());
+        let record = CommitRecord {
+            profile,
+            profile_name: "operator".to_owned(),
+            tool: "stellar_pay_commit",
+            policy_decision: stellar_agent_core::audit_log::PolicyDecision::Allow,
+            chain_id: "stellar:mainnet".to_owned(),
+            legs: Vec::new(),
+            engine: f.server.policy_engine.as_ref(),
+            registry: &f.server.tool_registry,
+            value_class: ValueClass::ReadOnly,
+            audit: writer,
+            nonce_id: None,
+            approval_nonce: None,
+            approval_dir: None,
+            now_ms: stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+            provenance: Some(decision.provenance()),
+        };
+        let (capture, _capture_guard) =
+            stellar_agent_test_support::WarningCapture::capture(Some("stellar_agent"));
+        let result = sign_and_submit_classic(
+            &f.server,
+            Some(&guard),
+            Some(&authority),
+            Some(readiness),
+            MainnetConsumer::McpPay,
+            &client,
+            f.envelope.envelope_xdr(),
+            f.envelope.source(),
+            record,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        let refusal = match result {
+            Ok(_) => panic!("a stored oracle off the signed host must refuse"),
+            Err(refusal) => refusal,
+        };
+        let (code, _, _) = crate::tools::common::assert_business_envelope(&refusal);
+        assert_eq!(code, "network.mainnet_authorization_refused");
+        let refusals: Vec<_> = capture
+            .seen()
+            .into_iter()
+            .filter(|fields| {
+                fields.get("message").map(String::as_str) == Some("mainnet authorization refused")
+            })
+            .map(|fields| {
+                (
+                    fields.get("path").cloned().unwrap_or_default(),
+                    fields.get("precondition").cloned().unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            refusals,
+            vec![(
+                "\"mainnet_oracle_client\"".to_owned(),
+                "\"witness_oracle_unbound\"".to_owned()
+            )]
+        );
+        assert_eq!(f.seed_reads.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     /// A profile under `dir` whose window key and audit chain key live in the

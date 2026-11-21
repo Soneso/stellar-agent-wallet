@@ -2,8 +2,8 @@
 //!
 //! An [`EnablementRecord`](crate::mainnet::enablement::EnablementRecord) states that the
 //! installation's mainnet enablement
-//! nonce, the profile, the endpoint host, and the fee and authorization
-//! limits agree with the verified signed policy. The verifier produces it
+//! nonce, the profile, the endpoint host, the oracle host, and the fee and
+//! authorization limits agree with the verified signed policy. The verifier produces it
 //! through a crate-private constructor, and its fields are private, so
 //! holding one means that verification succeeded.
 //!
@@ -45,7 +45,8 @@
 //! ```compile_fail,E0624
 //! use stellar_agent_core::mainnet::enablement::EnablementRecord;
 //! let record = EnablementRecord::from_verified(
-//!     "operator".into(), "rpc.example.invalid".into(), [0; 32], 1, 100, None, None,
+//!     "operator".into(), "rpc.example.invalid".into(), "oracle.example.invalid".into(),
+//!     [0; 32], 1, 100, None, None,
 //! );
 //! ```
 
@@ -74,6 +75,19 @@ use super::fact::{FACT_LABEL_ENABLEMENT, FactDigest};
 /// ```compile_fail,E0616
 /// use stellar_agent_core::mainnet::enablement::EnablementRecord;
 /// fn inspect(p: &EnablementRecord) { let _ = &p.endpoint_host; }
+/// ```
+///
+/// ```
+/// use stellar_agent_core::mainnet::enablement::EnablementRecord;
+/// fn need(_: Option<EnablementRecord>) {}
+/// need(None);
+/// ```
+///
+/// The `oracle_host` field cannot be projected outside this crate.
+///
+/// ```compile_fail,E0616
+/// use stellar_agent_core::mainnet::enablement::EnablementRecord;
+/// fn inspect(p: &EnablementRecord) { let _ = &p.oracle_host; }
 /// ```
 ///
 /// ```
@@ -151,6 +165,7 @@ use super::fact::{FACT_LABEL_ENABLEMENT, FactDigest};
 pub struct EnablementRecord {
     profile: String,
     endpoint_host: String,
+    oracle_host: String,
     nonce_digest: [u8; 32],
     policy_sequence: i64,
     fee_cap: u32,
@@ -159,8 +174,8 @@ pub struct EnablementRecord {
 }
 
 impl EnablementRecord {
-    /// Records a verified enablement: the profile and endpoint host it
-    /// enables, the SHA-256 of the installation nonce, the sequence of the
+    /// Records a verified enablement: the profile, endpoint host, and oracle
+    /// host it enables, the SHA-256 of the installation nonce, the sequence of the
     /// verified policy it agrees with, the classic per-operation fee cap in
     /// stroops, the authorization lifetime in seconds, and the cross-check
     /// thresholds.
@@ -171,6 +186,7 @@ impl EnablementRecord {
     pub(crate) fn from_verified(
         profile: String,
         endpoint_host: String,
+        oracle_host: String,
         nonce_digest: [u8; 32],
         policy_sequence: i64,
         fee_cap: u32,
@@ -180,6 +196,7 @@ impl EnablementRecord {
         Self {
             profile,
             endpoint_host,
+            oracle_host,
             nonce_digest,
             policy_sequence,
             fee_cap,
@@ -198,6 +215,12 @@ impl EnablementRecord {
     #[must_use]
     pub fn endpoint_host(&self) -> &str {
         &self.endpoint_host
+    }
+
+    /// The enabled oracle endpoint host.
+    #[must_use]
+    pub fn oracle_host(&self) -> &str {
+        &self.oracle_host
     }
 
     /// SHA-256 of the installation's mainnet enablement nonce.
@@ -234,7 +257,9 @@ impl EnablementRecord {
     ///
     /// Fields, in order: `lp(profile)`, `lp(endpoint_host)`, the 32-byte
     /// nonce digest, `i64be(policy_sequence)`, `u32be(fee_cap)`, the optional
-    /// `u32be(authorization_ttl)`, and the optional threshold table.
+    /// `u32be(authorization_ttl)`, and the optional threshold table. The
+    /// oracle host enters through the policy fact, whose document digest
+    /// covers the signed `oracle_host`.
     #[must_use]
     pub fn fact_digest(&self) -> [u8; 32] {
         let mut digest = FactDigest::new(FACT_LABEL_ENABLEMENT);
@@ -307,7 +332,7 @@ pub fn has_enablement_nonce(
 /// for a profile the operator selected with `--profile`.
 ///
 /// # Errors
-/// Refuses any name, source, endpoint, or nonce binding mismatch.
+/// Refuses any name, source, endpoint, oracle, or nonce binding mismatch.
 pub fn verify_enablement(
     policy: &super::verified_policy::VerifiedPolicy,
     profile_name: &str,
@@ -333,14 +358,14 @@ pub fn verify_enablement(
 /// Verifies the installation bindings of a cryptographically verified policy
 /// for the persisted profile `profile_name`: the policy's mainnet section
 /// names it, it is not `default`, its stored and merged chains are mainnet,
-/// both endpoints match the signed host, and the keyring nonce matches the
-/// signed digest.
+/// both endpoints match the signed host, both oracle URLs match the signed
+/// oracle host, and the keyring nonce matches the signed digest.
 ///
 /// It makes no claim about how the name was selected; [`verify_enablement`]
 /// adds the selection check for a write entry point.
 ///
 /// # Errors
-/// Refuses any name, endpoint, or nonce binding mismatch.
+/// Refuses any name, endpoint, oracle, or nonce binding mismatch.
 pub(crate) fn verify_enablement_bindings(
     policy: &super::verified_policy::VerifiedPolicy,
     profile_name: &str,
@@ -371,6 +396,17 @@ pub(crate) fn verify_enablement_bindings(
     if normalize_endpoint_host(&profile.rpc_url)? != body.endpoint_host {
         return Err(invalid("merged_host"));
     }
+    // An absent or hostless oracle URL matches no signed host.
+    let oracle_matches = |raw: Option<&str>| {
+        raw.and_then(|raw| normalize_endpoint_host(raw).ok())
+            .is_some_and(|host| host == body.oracle_host)
+    };
+    if !oracle_matches(disk.oracle_provider_url.as_deref()) {
+        return Err(invalid("on_disk_oracle_host"));
+    }
+    if !oracle_matches(profile.oracle_provider_url.as_ref().map(url::Url::as_str)) {
+        return Err(invalid("merged_oracle_host"));
+    }
     let coordinate =
         crate::profile::schema::mainnet_enablement_entry_ref(&profile.policy_window_state_key_id);
     let nonce = zeroize::Zeroizing::new(keyring(&coordinate)?);
@@ -381,6 +417,7 @@ pub(crate) fn verify_enablement_bindings(
     Ok(EnablementRecord::from_verified(
         body.profile.clone(),
         body.endpoint_host.clone(),
+        body.oracle_host.clone(),
         digest,
         policy.sequence(),
         body.classic_max_fee_per_op_stroops,
@@ -401,6 +438,7 @@ mod tests {
         let record = EnablementRecord::from_verified(
             "main".to_owned(),
             "rpc.example.org".to_owned(),
+            "oracle.example.org".to_owned(),
             [4; 32],
             7,
             500,
@@ -409,6 +447,7 @@ mod tests {
         );
         assert_eq!(record.profile(), "main");
         assert_eq!(record.endpoint_host(), "rpc.example.org");
+        assert_eq!(record.oracle_host(), "oracle.example.org");
         assert_eq!(record.nonce_digest(), &[4; 32]);
         assert_eq!(record.policy_sequence(), 7);
         assert_eq!(record.fee_cap(), 500);
@@ -439,6 +478,7 @@ mod tests {
         let record = EnablementRecord::from_verified(
             "main".to_owned(),
             "rpc.example.org".to_owned(),
+            "oracle.example.org".to_owned(),
             [4; 32],
             7,
             500,

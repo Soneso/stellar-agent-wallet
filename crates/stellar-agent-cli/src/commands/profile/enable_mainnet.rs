@@ -8,7 +8,10 @@
 //!
 //! Refusals use `profile.enable_mainnet_profile_flag_required`,
 //! `profile.enable_mainnet_default_refused`, `profile.enable_mainnet_not_mainnet`,
-//! `profile.mainnet_oracle_required`, `profile.enable_mainnet_precondition`,
+//! `profile.mainnet_oracle_required`, `profile.mainnet_enablement_invalid`
+//! for a merged oracle URL without a host (a stored one fails the profile
+//! load with `profile.enable_mainnet_precondition`),
+//! `profile.enable_mainnet_precondition`,
 //! `profile.enable_mainnet_nonce_exists`, `profile.spending_preview_unwritable`,
 //! `sign_policy.authoring_lock_busy`, `sign_policy.authoring_lock_io`,
 //! and `policy.pin_absent`. The pin
@@ -150,6 +153,25 @@ fn oracle_check(profile: &Profile) -> Check {
         detail: result.err().map(|error| error.to_string()),
         code: None,
     }
+}
+
+/// The host the ceremony stages as `[mainnet].oracle_host`: the profile's
+/// oracle URL normalized as the endpoint host is.
+///
+/// # Errors
+/// `profile.mainnet_enablement_invalid` naming `oracle_host` when the profile
+/// has no oracle URL or the URL has no host.
+fn staged_oracle_host(profile: &Profile) -> Result<String, Failure> {
+    profile
+        .oracle_provider_url
+        .as_ref()
+        .and_then(|url| normalize_endpoint_host(url.as_str()).ok())
+        .ok_or_else(|| {
+            let error = stellar_agent_core::error::ValidationError::MainnetEnablementInvalid {
+                binding: "oracle_host",
+            };
+            (error.code(), error.to_string())
+        })
 }
 
 #[derive(Serialize)]
@@ -532,6 +554,7 @@ pub(super) fn execute(
         ));
     }
     let host = normalize_endpoint_host(&profile.rpc_url).map_err(|e| (e.code(), e.to_string()))?;
+    let oracle_host = staged_oracle_host(profile)?;
     use rand_core::{OsRng, RngCore as _};
     let mut random = zeroize::Zeroizing::new([0_u8; 32]);
     OsRng
@@ -539,7 +562,20 @@ pub(super) fn execute(
         .map_err(|_| precondition("nonce randomness"))?;
     let nonce = zeroize::Zeroizing::new(stellar_agent_core::hex::encode(random.as_ref()));
     let digest = stellar_agent_core::hex::encode(&sha2::Sha256::digest(nonce.as_bytes()));
-    let rewritten = rewrite_policy(&body, name, &host, &digest, args.rotate)?;
+    let rewritten = rewrite_policy(&body, name, &host, &oracle_host, &digest, args.rotate)?;
+    // The result names the hosts the written `[mainnet]` table carries: a
+    // rotation of a bound table keeps its signed hosts, and an absent or
+    // non-string field reads as `null`.
+    let written = parse_policy_body(&rewritten)?;
+    let written_host = |key: &str| {
+        written
+            .get("mainnet")
+            .and_then(|table| table.get(key))
+            .and_then(toml_edit::Item::as_str)
+            .map(str::to_owned)
+    };
+    let (written_endpoint_host, written_oracle_host) =
+        (written_host("endpoint_host"), written_host("oracle_host"));
     // The bounds of the bytes the owner signs next, before the first write:
     // the rebound body with the sequence signing assigns it.
     let preview_pin = installed
@@ -618,7 +654,8 @@ pub(super) fn execute(
     }
     Ok(serde_json::json!({
         "profile": name,
-        "endpoint_host": host,
+        "endpoint_host": written_endpoint_host,
+        "oracle_host": written_oracle_host,
         "installation_nonce_sha256": digest,
         "policy_path": policy_path,
         "policy_needs_signature": true,
@@ -1018,8 +1055,8 @@ fn usage_rows(bounds: &[TotalBound], usage: &[TotalUsage]) -> Option<serde_json:
 /// Writes the installation binding into the policy body.
 ///
 /// A first ceremony, and a rotation of a body without a `[mainnet]` table,
-/// bind in full: version 2, the profile, the endpoint host, and the nonce
-/// digest. A full binding also writes the preset fee cap,
+/// bind in full: version 2, the profile, the endpoint host, the oracle host,
+/// and the nonce digest. A full binding also writes the preset fee cap,
 /// `classic_max_fee_per_op_stroops = 10000`, when the body states none, and
 /// keeps an authored cap. Every rewrite inserts an absent contract total fee
 /// bound and preserves an explicit value, including zero.
@@ -1027,6 +1064,7 @@ fn rewrite_policy(
     body: &toml_edit::DocumentMut,
     name: &str,
     host: &str,
+    oracle_host: &str,
     digest: &str,
     rotate: bool,
 ) -> Result<String, Failure> {
@@ -1062,6 +1100,7 @@ fn rewrite_policy(
             .ok_or_else(|| precondition("mainnet_table"))?;
         table.insert("profile", toml_edit::value(name));
         table.insert("endpoint_host", toml_edit::value(host));
+        table.insert("oracle_host", toml_edit::value(oracle_host));
         if !table.contains_key("classic_max_fee_per_op_stroops") {
             let fee = i64::try_from(PRESET_FEE_PER_OPERATION_STROOPS)
                 .map_err(|_| precondition("classic_max_fee_per_op_stroops"))?;
@@ -1104,6 +1143,8 @@ mod tests {
     };
     use stellar_agent_test_support::keyring_mock;
     const FULL: &str = include_str!("../../../../stellar-agent-core/tests/fixtures/policy-v2.toml");
+    /// The oracle host of the fixture profile's oracle URL.
+    const ORACLE: &str = "oracle.example.invalid";
 
     /// A policy body whose malformed line holds a credential is refused by the
     /// position of the failure; the line is not repeated.
@@ -1676,6 +1717,167 @@ mod tests {
                 "{window}"
             );
             assert_eq!(fixture.listing(), listing, "{window}");
+        }
+    }
+
+    /// The ceremony stages the oracle URL's host, normalized as the endpoint
+    /// host is: lowercase, with a nondefault port and without the path.
+    #[test]
+    #[serial]
+    fn the_ceremony_stages_the_normalized_oracle_host() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        keyring_mock::install().unwrap();
+        let mut profile = Fixture::profile();
+        profile.oracle_provider_url =
+            Some(url::Url::parse("https://Oracle.Example.Invalid:8443/rpc?x=1").unwrap());
+        let fixture = Fixture::seeded(profile);
+        let output = fixture.run().unwrap();
+        assert_eq!(output["oracle_host"], "oracle.example.invalid:8443");
+        let doc = std::fs::read_to_string(fixture.path())
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            doc["mainnet"]["oracle_host"].as_str(),
+            Some("oracle.example.invalid:8443")
+        );
+        fixture.sign_rewritten_and_verify(2);
+    }
+
+    /// A profile without an oracle URL, or with a hostless one, has no
+    /// oracle host to stage.
+    #[test]
+    #[serial]
+    fn an_oracle_url_without_a_host_stages_nothing() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let mut profile = Fixture::profile();
+        assert_eq!(staged_oracle_host(&profile).unwrap(), ORACLE);
+        for url in [None, Some("data:oracle.example.invalid")] {
+            profile.oracle_provider_url = url.map(|raw| url::Url::parse(raw).unwrap());
+            assert_eq!(
+                staged_oracle_host(&profile).unwrap_err(),
+                (
+                    "profile.mainnet_enablement_invalid",
+                    "profile.mainnet_enablement_invalid: oracle_host".to_owned()
+                ),
+                "{url:?}"
+            );
+        }
+    }
+
+    /// The public entry refuses a stored oracle URL without a host at the
+    /// profile load, with `profile.enable_mainnet_precondition` and the
+    /// loader's message, and writes nothing.
+    #[test]
+    #[serial]
+    fn the_public_entry_refuses_a_stored_oracle_url_without_a_host() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let fixture = Fixture::new();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(fixture.dir.path());
+        let path = fixture.dir.path().join("profiles").join("operator.toml");
+        let mut stored = std::fs::read_to_string(&path)
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        stored["oracle_provider_url"] = toml_edit::value("https://");
+        std::fs::write(&path, stored.to_string()).unwrap();
+        let before = persisted(&fixture);
+        render::take_rendered_for_test();
+        assert_eq!(run_with_keyring(&fixture.args, || Ok(())), 1);
+        let output = render::take_rendered_for_test();
+        assert_eq!(output.len(), 1);
+        assert_eq!(
+            output[0]["error"]["code"], "profile.enable_mainnet_precondition",
+            "{}",
+            output[0]
+        );
+        assert!(
+            output[0]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("oracle_provider_url"),
+            "{}",
+            output[0]
+        );
+        assert_eq!(persisted(&fixture), before);
+        assert!(get(&fixture.nonce_ref()).is_none());
+    }
+
+    /// `execute` refuses a merged profile whose oracle URL has no host with
+    /// `profile.mainnet_enablement_invalid: oracle_host`, before the audit
+    /// row, the nonce, or the policy rewrite.
+    #[test]
+    #[serial]
+    fn execute_refuses_a_merged_oracle_url_without_a_host() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let mut fixture = Fixture::new();
+        fixture.profile.oracle_provider_url =
+            Some(url::Url::parse("data:oracle.example.invalid").unwrap());
+        let before = persisted(&fixture);
+        assert_eq!(
+            fixture.run().unwrap_err(),
+            (
+                "profile.mainnet_enablement_invalid",
+                "profile.mainnet_enablement_invalid: oracle_host".to_owned()
+            )
+        );
+        assert_eq!(persisted(&fixture), before);
+        assert!(get(&fixture.nonce_ref()).is_none());
+    }
+
+    /// After a matching profile enables and signs, `--check` passes the
+    /// installation binding, and fails it naming the binding once the stored
+    /// or the merged oracle URL names another host than the signed one.
+    #[test]
+    #[serial]
+    fn check_fails_the_enablement_for_an_oracle_host_other_than_the_signed_one() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let mut fixture = Fixture::new();
+        fixture.run().unwrap();
+        fixture.sign_rewritten_and_verify(2);
+        fixture.args.check = true;
+        assert_eq!(
+            check_of(&fixture.run().unwrap(), "enablement"),
+            ("passed".to_owned(), None)
+        );
+        let signed = fixture.profile.clone();
+        let mut lying = signed.clone();
+        lying.oracle_provider_url =
+            Some(url::Url::parse("https://lying-oracle.example.invalid").unwrap());
+        if let Some(providers) = lying.providers.as_mut() {
+            providers.oracle = Some(ProviderRecord::new(
+                "Oracle operator",
+                "lying-oracle.example.invalid",
+                true,
+            ));
+        }
+        let profiles = fixture.dir.path().join("profiles");
+        for (stored, merged, binding) in [
+            (&lying, &signed, "on_disk_oracle_host"),
+            (&signed, &lying, "merged_oracle_host"),
+        ] {
+            loader::save_to_dir("operator", stored, &profiles).unwrap();
+            fixture.profile = merged.clone();
+            let output = fixture.run().unwrap();
+            assert_eq!(output["valid"], false, "{binding}: {output}");
+            assert_eq!(
+                check_of(&output, "enablement"),
+                (
+                    "failed".to_owned(),
+                    Some(format!("profile.mainnet_enablement_invalid: {binding}"))
+                ),
+                "{output}"
+            );
         }
     }
 
@@ -2379,7 +2581,21 @@ mod tests {
                 .filter(|check| check["status"] == "failed")
                 .map(|check| check["item"].as_str().unwrap().to_owned())
                 .collect();
-            assert_eq!(failed, ["oracle_provider_url"], "{gap:?}: {output}");
+            // Without a URL the merged profile also names no signed oracle
+            // host, so the installation binding fails with it.
+            if gap == MainnetOracleGap::UrlMissing {
+                assert_eq!(
+                    failed,
+                    ["enablement", "oracle_provider_url"],
+                    "{gap:?}: {output}"
+                );
+                assert_eq!(
+                    check_of(&output, "enablement").1.as_deref(),
+                    Some("profile.mainnet_enablement_invalid: merged_oracle_host")
+                );
+            } else {
+                assert_eq!(failed, ["oracle_provider_url"], "{gap:?}: {output}");
+            }
             assert_eq!(std::fs::read(fixture.path()).unwrap(), file, "{gap:?}");
             assert_eq!(get(&fixture.nonce_ref()), nonce, "{gap:?}");
             assert_eq!(fixture.pin(), pin, "{gap:?}");
@@ -2533,6 +2749,81 @@ mod tests {
             old.to_string()
         );
     }
+    /// A rotation of a bound table keeps its signed hosts, and the result
+    /// reports those hosts, not the ones the profile names after its oracle
+    /// URL moved.
+    #[test]
+    #[serial]
+    fn rotate_reports_the_bound_hosts_after_the_oracle_url_moved() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let mut fixture = Fixture::new();
+        fixture.run().unwrap();
+        fixture.signed_body(7);
+        fixture.profile.oracle_provider_url =
+            Some(url::Url::parse("https://moved-oracle.example.invalid").unwrap());
+        if let Some(providers) = fixture.profile.providers.as_mut() {
+            providers.oracle = Some(ProviderRecord::new(
+                "Oracle operator",
+                "moved-oracle.example.invalid",
+                true,
+            ));
+        }
+        loader::save_to_dir(
+            "operator",
+            &fixture.profile,
+            &fixture.dir.path().join("profiles"),
+        )
+        .unwrap();
+        fixture.args.rotate = true;
+        let output = fixture.run().unwrap();
+        assert_eq!(output["oracle_host"], ORACLE, "{output}");
+        assert_eq!(output["endpoint_host"], "rpc.example.invalid", "{output}");
+        let doc = std::fs::read_to_string(fixture.path())
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        assert_eq!(doc["mainnet"]["oracle_host"].as_str(), Some(ORACLE));
+    }
+    /// A rotation of a bound table that names no oracle host string reports
+    /// none: the written table keeps its absent or non-string `oracle_host`.
+    #[test]
+    #[serial]
+    fn rotate_of_a_bound_table_without_an_oracle_host_reports_none() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        for absent in [true, false] {
+            let mut fixture = Fixture::new();
+            fixture.run().unwrap();
+            fixture.signed_body(7);
+            let mut doc = std::fs::read_to_string(fixture.path())
+                .unwrap()
+                .parse::<toml_edit::DocumentMut>()
+                .unwrap();
+            let table = doc["mainnet"].as_table_like_mut().unwrap();
+            if absent {
+                table.remove("oracle_host").unwrap();
+            } else {
+                table.insert("oracle_host", toml_edit::value(1));
+            }
+            std::fs::write(fixture.path(), doc.to_string()).unwrap();
+            fixture.args.rotate = true;
+            let output = fixture.run().unwrap();
+            assert_eq!(output["oracle_host"], serde_json::Value::Null, "{output}");
+            assert_eq!(output["endpoint_host"], "rpc.example.invalid", "{output}");
+            let doc = std::fs::read_to_string(fixture.path())
+                .unwrap()
+                .parse::<toml_edit::DocumentMut>()
+                .unwrap();
+            assert_eq!(
+                doc["mainnet"].get("oracle_host").is_none(),
+                absent,
+                "absent={absent}"
+            );
+        }
+    }
     #[test]
     #[serial]
     fn rotate_binds_in_full_after_a_failed_policy_rewrite() {
@@ -2591,6 +2882,8 @@ mod tests {
             doc["mainnet"]["endpoint_host"].as_str(),
             Some("rpc.example.invalid")
         );
+        assert_eq!(doc["mainnet"]["oracle_host"].as_str(), Some(ORACLE));
+        assert_eq!(output["oracle_host"], ORACLE);
         assert_eq!(
             doc["mainnet"]["installation_nonce_sha256"].as_str(),
             output["installation_nonce_sha256"].as_str()
@@ -2855,6 +3148,7 @@ mod tests {
             &body,
             "operator",
             "rpc.example.invalid",
+            ORACLE,
             &"0".repeat(64),
             false,
         )
@@ -3268,7 +3562,7 @@ mod tests {
         let authored = format!("{unbound}\n[mainnet]\nclassic_max_fee_per_op_stroops = 500\n");
         let bound = format!(
             "{unbound}\n[mainnet]\nprofile = \"operator\"\nendpoint_host = \"rpc.example.invalid\"\n\
-             installation_nonce_sha256 = \"{}\"\n",
+             oracle_host = \"oracle.example.invalid\"\ninstallation_nonce_sha256 = \"{}\"\n",
             "1".repeat(64)
         );
         let rewrite = |raw: &str, rotate: bool| {
@@ -3276,6 +3570,7 @@ mod tests {
                 &raw.parse().unwrap(),
                 "operator",
                 "rpc.example.invalid",
+                ORACLE,
                 &digest,
                 rotate,
             )
@@ -3320,7 +3615,8 @@ mod tests {
                         body["contract_transfer_max_fee_stroops"] = toml_edit::value(value);
                     }
                     let rewritten =
-                        rewrite_policy(&body, "operator", host, &"2".repeat(64), rotate).unwrap();
+                        rewrite_policy(&body, "operator", host, ORACLE, &"2".repeat(64), rotate)
+                            .unwrap();
                     let parsed = rewritten.parse::<toml_edit::DocumentMut>().unwrap();
                     assert_eq!(
                         parsed
@@ -3330,7 +3626,8 @@ mod tests {
                         "bound={bound}, rotate={rotate}"
                     );
                     assert_eq!(
-                        rewrite_policy(&parsed, "operator", host, &"2".repeat(64), rotate).unwrap(),
+                        rewrite_policy(&parsed, "operator", host, ORACLE, &"2".repeat(64), rotate)
+                            .unwrap(),
                         rewritten
                     );
                 }
@@ -3346,6 +3643,7 @@ mod tests {
                             &body.parse().unwrap(),
                             "operator",
                             host,
+                            ORACLE,
                             &"2".repeat(64),
                             rotate
                         )
@@ -3451,7 +3749,12 @@ mod tests {
         };
         let mut doc = raw.parse::<toml_edit::DocumentMut>().unwrap();
         let table = doc["mainnet"].as_table_like_mut().unwrap();
-        for field in ["profile", "endpoint_host", "installation_nonce_sha256"] {
+        for field in [
+            "profile",
+            "endpoint_host",
+            "oracle_host",
+            "installation_nonce_sha256",
+        ] {
             table.remove(field);
         }
         doc.to_string()
@@ -3896,8 +4199,13 @@ mod tests {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        let fields = ["profile", "endpoint_host", "installation_nonce_sha256"];
-        for mask in 1_u8..7 {
+        let fields = [
+            "profile",
+            "endpoint_host",
+            "oracle_host",
+            "installation_nonce_sha256",
+        ];
+        for mask in 1_u8..15 {
             for nonce in ["absent", "present", "unreadable"] {
                 let present = nonce == "present";
                 let fixture = Fixture::new();
@@ -4278,6 +4586,8 @@ mod tests {
             body["mainnet"]["endpoint_host"].as_str(),
             Some("rpc.example.invalid")
         );
+        assert_eq!(body["mainnet"]["oracle_host"].as_str(), Some(ORACLE));
+        assert_eq!(enabled["oracle_host"], ORACLE);
         assert_eq!(
             body["mainnet"]["installation_nonce_sha256"].as_str(),
             enabled["installation_nonce_sha256"].as_str()
