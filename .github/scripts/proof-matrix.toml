@@ -276,14 +276,16 @@ builds = "feature-on"
 [[claim]]
 id = "approval.binds_intent"
 family = "approval"
-statement = "the consent binds the canonical intent digest"
+statement = "on mainnet, the consent binds the canonical intent digest"
 applies = ["commit", "verb"]
+builds = "feature-on"
 
 [[claim]]
 id = "approval.rebuild_from_intent"
 family = "approval"
-statement = "the commit rebuilds from the intent; only sequence, time bounds and a fee within the bound differ"
+statement = "on mainnet, the commit rebuilds from the intent; only sequence, time bounds and a fee within the bound differ"
 applies = ["commit", "verb"]
+builds = "feature-on"
 
 [[claim]]
 id = "sizing.caps_refuse"
@@ -437,18 +439,6 @@ builds = "feature-on"
 # Delivery keys.
 
 [[delivery]]
-key = "accounting-counters"
-change = "accounting persists the unlisted counter, the budget epoch and the balance floor inputs"
-
-[[delivery]]
-key = "intent-consent"
-change = "the consent page renders the intent, and the consent binds its digest"
-
-[[delivery]]
-key = "intent-commit"
-change = "the commit rebuilds the envelope from the intent"
-
-[[delivery]]
 key = "operation-notification"
 change = "operation-state notifications on MCP"
 
@@ -531,7 +521,8 @@ tests = [
   { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "common::mainnet_authority_tests::every_value_verb_needs_presence_verified_against_the_signed_policy", builds = "feature-on" },
 ]
 
-# Cells: the approval claims a later change delivers.
+# Cells: approval.follows_decision, approval.durable and
+# approval.durable_mainnet.
 
 [[cell]]
 claim = "approval.follows_decision"
@@ -579,15 +570,42 @@ tests = [
   { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "common::mainnet_authority_tests::every_value_verb_keeps_its_approval_across_a_restart", builds = "feature-on" },
 ]
 
+# Cells: approval.binds_intent and approval.rebuild_from_intent. A
+# canonical intent exists only on mainnet, and the build without mainnet
+# writes refuses mainnet at every row, so both claims hold in the feature-on
+# build only.
+
 [[cell]]
 claim = "approval.binds_intent"
-rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
-pending = "intent-consent"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::canonical_commit_tests::mcp_four_classics_prepare_canonical_records", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::mainnet_presence_tests::producers::a_published_canonical_payment_binds_the_intent_digest", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "approval.binds_intent"
+rows = ["cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+tests = [
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "common::mainnet_authority_tests::canonical_activation::cli_four_classics_rebuild_after_consent", builds = "feature-on" },
+]
 
 [[cell]]
 claim = "approval.rebuild_from_intent"
-rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
-pending = "intent-commit"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit"]
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::canonical_commit_tests::a_late_canonical_commit_takes_a_fresh_sequence_and_deadline", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::canonical_commit_tests::mcp_four_classics_restart_without_process_nonce", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::canonical_commit_tests::a_canonical_commit_pays_the_prepared_fee", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::canonical_commit_tests::a_canonical_claim_commit_pays_the_prepared_fee", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "approval.rebuild_from_intent"
+rows = ["cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
+tests = [
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "common::mainnet_authority_tests::canonical_activation::cli_four_classics_rebuild_after_consent", builds = "feature-on" },
+]
 
 [[claim]]
 id = "approval.payment_envelope_facts"
@@ -879,7 +897,7 @@ tests = [
 [[cell]]
 claim = "sizing.accounting_inputs"
 rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.pay", "cli.claim", "cli.trustline", "cli.accounts_create"]
-pending = "accounting-counters"
+pending = "row-test"
 
 [[cell]]
 claim = "sizing.hold_follows_evidence"
@@ -923,15 +941,42 @@ tests = [
 
 [[cell]]
 claim = "audit.writer_before_signer_mainnet"
-rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment", "cli.trustline", "cli.accounts_create"]
-pending = "row-test"
+rows = ["mcp.pay_commit", "mcp.create_account_commit", "mcp.claim_commit", "mcp.trustline_commit", "mcp.x402_create_payment", "mcp.x402_authenticated_payment"]
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "registry_walk::every_approval_consumer_acquires_the_writer_between_the_approval_read_and_the_signer", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "registry_walk::write_audit_routes_both_branches_through_the_keyed_preflight", builds = "feature-on" },
+]
+
+# The trustline and create cells each pin two acquisitions before the
+# signer: a writer held from the start refuses at the business id lookup
+# of classic_start, and a writer taken after that lookup, on a resumed
+# operation, refuses at the verb's own audit preflight
+# (commands/trustline.rs:1506, commands/accounts/create.rs:1638).
+
+[[cell]]
+claim = "audit.writer_before_signer_mainnet"
+rows = ["cli.trustline"]
+tests = [
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "commands::trustline::tests::mainnet_full::a_writer_held_from_the_start_refuses_at_the_lookup_before_the_signer", builds = "feature-on" },
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "commands::trustline::tests::mainnet_full::the_trustline_preflight_refuses_a_writer_taken_after_the_lookup", builds = "feature-on" },
+]
+
+[[cell]]
+claim = "audit.writer_before_signer_mainnet"
+rows = ["cli.accounts_create"]
+tests = [
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "commands::accounts::create::tests::mainnet_full::a_writer_held_from_the_start_refuses_at_the_lookup_before_the_signer", builds = "feature-on" },
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "commands::accounts::create::tests::mainnet_full::the_create_preflight_refuses_a_writer_taken_after_the_lookup", builds = "feature-on" },
+]
 
 # Cells: audit.outcome_row and audit.outbox_at_shutdown.
 #
-# The two audit.outcome_row cells prove the outcomes their tests reach. A
-# classic call writes one value_action_pending row and no other value row
-# when the endpoint applies it, times it out, reports it FAILED or refuses
-# its send, on testnet and, for an applied call, on mainnet. An x402 call
+# The three audit.outcome_row cells, of the MCP rows, the CLI rows and the
+# toolset commit, prove the outcomes their tests reach. A classic call,
+# the toolset commit included, writes one value_action_pending row and no
+# other value row when the endpoint applies it, times it out, reports it
+# FAILED or refuses its send, on testnet and, for an applied call of the
+# MCP and CLI rows, on mainnet. An x402 call
 # writes one x402_payment_authorized row when paid, or one
 # x402_authorization_withheld row when withheld. No row test reaches a
 # transport failure after the send or the not-sent exit, which writes the
@@ -1217,8 +1262,9 @@ tests = [
 ]
 
 # Cells: remote approval. Without a signed approval origin, the listener
-# refuses mainnet before binding. The two signed-origin cells name their
-# proofs: each commits on a consent from the signed-origin listener.
+# refuses mainnet before binding. The three signed-origin cells, of the MCP
+# rows, the CLI rows and the toolset commit, name their proofs: each commits
+# on a consent from the signed-origin listener.
 
 [[cell]]
 claim = "remote.refused_without_signed_origin"
@@ -1298,7 +1344,9 @@ tests = [
 [[cell]]
 claim = "approval.mainnet_presence"
 rows = ["mcp.toolset_pay_commit"]
-pending = "row-test"
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::proof_rows::the_toolset_commit_needs_a_presence_verified_approval_of_the_signed_policy", builds = "feature-on" },
+]
 
 [[cell]]
 claim = "approval.follows_decision"
@@ -1310,22 +1358,26 @@ tests = [
 [[cell]]
 claim = "approval.durable"
 rows = ["mcp.toolset_pay_commit"]
-pending = "row-test"
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "approval_cap_integration::toolset_rows::the_toolset_commit_keeps_its_approval_state_and_window_across_restart" },
+]
 
 [[cell]]
 claim = "approval.durable_mainnet"
 rows = ["mcp.toolset_pay_commit"]
-pending = "row-test"
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::proof_rows::a_toolset_approval_keeps_its_state_and_windows_across_restart", builds = "feature-on" },
+]
 
 [[cell]]
 claim = "approval.binds_intent"
 rows = ["mcp.toolset_pay_commit"]
-pending = "row-test"
+not_applicable = "a toolset-first record binds the exact envelope its consent signed, which fixes every operation of the intent: the toolset preparation opens an envelope record (crates/stellar-agent-mcp/src/tools/pay.rs:1290-1294), its approval binds the envelope text (crates/stellar-agent-mcp/src/tools/business_entry.rs:524-528), and the commit verifies the consent against that envelope (crates/stellar-agent-mcp/src/tools/pay.rs:2303-2305); a direct-first canonical record it continues binds the intent digest (pay.rs:2298-2302). tools::toolsets_mainnet_tests::proof_rows::a_toolset_first_record_binds_the_exact_envelope_text pins the envelope binding."
 
 [[cell]]
 claim = "approval.rebuild_from_intent"
 rows = ["mcp.toolset_pay_commit"]
-pending = "row-test"
+not_applicable = "the toolset commit never rebuilds: it signs the exact envelope its consent or its canonical record bound, and refuses any other intent with operation.business_id_conflict before sending."
 
 [[cell]]
 claim = "sizing.caps_refuse"
@@ -1365,27 +1417,37 @@ pending = "row-test"
 [[cell]]
 claim = "sizing.hold_follows_evidence"
 rows = ["mcp.toolset_pay_commit"]
-pending = "row-test"
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "approval_cap_integration::toolset_rows::the_toolset_commit_settles_its_hold_only_on_outcome_evidence" },
+]
 
 [[cell]]
 claim = "audit.writer_before_signer"
 rows = ["mcp.toolset_pay_commit"]
-pending = "row-test"
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "registry_walk::the_toolset_commit_reaches_the_handler_that_acquires_the_writer_before_the_signer" },
+]
 
 [[cell]]
 claim = "audit.writer_before_signer_mainnet"
 rows = ["mcp.toolset_pay_commit"]
-pending = "row-test"
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "registry_walk::the_toolset_commit_reaches_the_handler_that_acquires_the_writer_before_the_signer", builds = "feature-on" },
+]
 
 [[cell]]
 claim = "audit.outcome_row"
 rows = ["mcp.toolset_pay_commit"]
-pending = "row-test"
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "approval_cap_integration::toolset_rows::every_toolset_commit_outcome_writes_one_audit_row" },
+]
 
 [[cell]]
 claim = "audit.outbox_at_shutdown"
 rows = ["mcp.toolset_pay_commit"]
-pending = "row-test"
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "approval_cap_integration::toolset_rows::the_toolset_commit_queued_approval_row_drains_or_persists_at_shutdown" },
+]
 
 [[cell]]
 claim = "halt.refuses_first"
@@ -1434,17 +1496,23 @@ tests = [
 [[cell]]
 claim = "status.transaction_reconciles"
 rows = ["mcp.toolset_pay_commit"]
-pending = "row-test"
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "approval_cap_integration::toolset_rows::the_toolset_commit_status_reconciles_its_receipt_and_hold" },
+]
 
 [[cell]]
 claim = "status.operation_view"
 rows = ["mcp.toolset_pay_commit"]
-pending = "row-test"
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::proof_rows::the_toolset_commit_reports_its_operation_and_next_step", builds = "feature-on" },
+]
 
 [[cell]]
 claim = "status.approval_view"
 rows = ["mcp.toolset_pay_commit"]
-pending = "row-test"
+tests = [
+  { package = "stellar-agent-mcp", target = "test:mcp", name = "approval_cap_integration::toolset_rows::the_toolset_commit_approval_status_reports_without_consuming" },
+]
 
 [[cell]]
 claim = "status.retry_returns_stored"
@@ -1456,22 +1524,31 @@ tests = [
 [[cell]]
 claim = "notification.committed_transition"
 rows = ["mcp.toolset_pay_commit"]
-pending = "row-test"
+pending = "operation-notification"
 
+# The toolset revocation test proves the refusal on the toolset route; the
+# audit row is written by `approve revoke`, which the CLI test drives.
 [[cell]]
 claim = "revocation.refuses_commit"
 rows = ["mcp.toolset_pay_commit"]
-pending = "row-test"
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::proof_rows::a_revoked_approval_refuses_the_toolset_commit", builds = "feature-on" },
+  { package = "stellar-agent-cli", target = "bin:stellar-agent", name = "common::mainnet_authority_tests::every_mcp_commit_refuses_a_revoked_approval", builds = "feature-on" },
+]
 
 [[cell]]
 claim = "remote.refused_without_signed_origin"
 rows = ["mcp.toolset_pay_commit"]
-pending = "row-test"
+tests = [
+  { package = "stellar-agent-approval-remote", target = "lib", name = "mainnet_presence_tests::mainnet_remote_refuses_before_bind" },
+]
 
 [[cell]]
 claim = "remote.consent_at_signed_origin"
 rows = ["mcp.toolset_pay_commit"]
-pending = "row-test"
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::proof_rows::a_consent_at_the_signed_origin_commits_the_toolset_payment", builds = "feature-on" },
+]
 
 [[cell]]
 claim = "approval.payment_envelope_facts"
@@ -1490,7 +1567,10 @@ tests = [
 [[cell]]
 claim = "approval.payment_authority_end"
 rows = ["mcp.toolset_pay_commit"]
-pending = "row-test"
+tests = [
+  { package = "stellar-agent-network", target = "lib", name = "mainnet::resolve::tests::captured_authority_ends_survive_resolution_and_reopen", builds = "feature-on" },
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::public_toolset_commit_under_a_shorter_later_authority_refuses_and_direct_sends", builds = "feature-on" },
+]
 
 [[cell]]
 claim = "approval.payment_recovery"
@@ -1504,7 +1584,9 @@ tests = [
 [[cell]]
 claim = "approval.payment_settlement_refusal"
 rows = ["mcp.toolset_pay"]
-pending = "row-test"
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::proof_rows::a_refused_toolset_preparation_preserves_the_prior_settlement", builds = "feature-on" },
+]
 
 [[cell]]
 claim = "audit.payment_destination"
@@ -1787,7 +1869,9 @@ builds = "feature-on"
 [[cell]]
 claim = "status.toolset_sequence_process_lock_order"
 rows = ["mcp.toolset_pay_commit"]
-pending = "row-test"
+tests = [
+  { package = "stellar-agent-mcp", target = "lib", name = "tools::toolsets_mainnet_tests::proof_rows::the_toolset_commit_takes_its_locks_across_processes_in_order", builds = "feature-on" },
+]
 
 [[cell]]
 claim = "status.toolset_sequence_process_lock_order"

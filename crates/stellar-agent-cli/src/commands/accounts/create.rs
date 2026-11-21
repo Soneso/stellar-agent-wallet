@@ -3861,6 +3861,130 @@ pub(crate) mod tests {
             assert!(fixture.sent_envelopes().await.is_empty(), "nothing is sent");
         }
 
+        /// The audit writer is acquired before the signing key loads, at the
+        /// business id lookup of `classic_start`. With the profile's keyed
+        /// audit writer held from the start by another handle, as a writer of
+        /// another process holds it, the mainnet create refuses with the
+        /// writer's refusal before the confirmation: no authorization record,
+        /// no confirmation entry, no signer resolution, no consent ceremony,
+        /// and nothing sent.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_writer_held_from_the_start_refuses_at_the_lookup_before_the_signer() {
+            let fixture = Spec::new("mainnet-create-held-writer")
+                .primary(sponsor_ledger())
+                .build()
+                .await;
+            let profile = fixture.profile();
+            // The enrollment ceremony left this process's registry holding the
+            // writer; dropping that entry leaves the log to the handle below.
+            stellar_agent_core::audit_log::AuditWriterRegistry::remove_for_test(fixture.name);
+            let _held = crate::commands::value_audit::open_best_effort_audit_writer(
+                &profile,
+                fixture.name,
+                crate::common::profile_access::ProfileOrigin::Persisted,
+            )
+            .unwrap_or_else(|e| panic!("the test holds the keyed writer: {e}"));
+            let resolutions = signer_resolutions_on_this_thread();
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_refused_before_confirmation(&fixture, &run, "audit.chain_key_unavailable").await;
+            assert!(
+                run.envelope.to_string().contains("audit.writer_locked"),
+                "{}",
+                run.envelope
+            );
+            assert_eq!(
+                signer_resolutions_on_this_thread(),
+                resolutions,
+                "no signer resolution"
+            );
+            fixture.assert_no_consent_ceremony();
+        }
+
+        /// The audit writer is acquired before the signing key loads, at the
+        /// create's own audit preflight. A matched balance floor makes the
+        /// run read its operating account between the lookup and the
+        /// preflight. A first run under a business id cancels its ceremony
+        /// and leaves the operation waiting. The rerun under the same id
+        /// resumes it, so the lookup in `classic_start` finds the record,
+        /// and another handle then takes the writer at the floor's account
+        /// read, which follows the lookup. The rerun
+        /// refuses with the writer's code at the preflight: it shows no
+        /// summary, runs no ceremony, leaves the waiting entry as it was,
+        /// resolves no signer and sends nothing.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_create_preflight_refuses_a_writer_taken_after_the_lookup() {
+            use stellar_agent_core::error::{ApprovalFailure, WalletError};
+            let late = crate::common::mainnet_write_fixture::LateWriter::default();
+            let mut fixture = Spec::new("mainnet-create-late-writer")
+                .primary(late.on(
+                    sponsor_ledger().entries_at_readiness_ledger(),
+                    "getLedgerEntries",
+                ))
+                .rules(vec![create_rule("require_approval", &balance_floor(1))])
+                .build()
+                .await;
+            fixture.cover_native_history();
+            let mut args = mainnet_args(&fixture);
+            args.business_id = Some("late-writer".to_owned());
+            fixture.present_with(|_: &crate::common::mainnet_presence::driver::Ceremony| {
+                Err(WalletError::Approval(ApprovalFailure::PresenceCanceled))
+            });
+            let first = run(&fixture, &args).await;
+            assert_eq!(first.code, 1, "canceled: {}", first.envelope);
+            let entries = fixture.pending_entries();
+            assert_eq!(entries.len(), 1, "{entries:?}");
+            let (summaries, ceremonies) = (fixture.summaries().len(), fixture.ceremonies().len());
+            stellar_agent_core::audit_log::AuditWriterRegistry::remove_for_test(fixture.name);
+            // The rerun reads the sponsor before the lookup and the floor's
+            // operating account after it; the take runs at the second read.
+            late.arm_after(&fixture, 1);
+            let resolutions = signer_resolutions_on_this_thread();
+
+            let run = run(&fixture, &args).await;
+
+            assert_eq!(late.held(), Ok(true), "the late handle holds the writer");
+            assert_eq!(run.code, 1, "late writer: {}", run.envelope);
+            assert_eq!(
+                run.code(),
+                "audit.chain_key_unavailable",
+                "late writer: {}",
+                run.envelope
+            );
+            assert!(
+                run.envelope.to_string().contains("audit.writer_locked"),
+                "late writer: {}",
+                run.envelope
+            );
+            assert_eq!(
+                fixture.summaries().len(),
+                summaries,
+                "late writer: no summary is shown"
+            );
+            assert_eq!(
+                fixture.ceremonies().len(),
+                ceremonies,
+                "late writer: no ceremony runs"
+            );
+            assert_eq!(
+                fixture.pending_entries(),
+                entries,
+                "late writer: the waiting entry stays as it was"
+            );
+            assert_eq!(
+                signer_resolutions_on_this_thread(),
+                resolutions,
+                "late writer: no signer resolution"
+            );
+            assert!(
+                fixture.sent_envelopes().await.is_empty(),
+                "late writer: nothing is sent"
+            );
+        }
+
         /// Operational check: the build checks the primary's identity, then
         /// its health and latest ledger, and reads the sponsor only after
         /// both checks.

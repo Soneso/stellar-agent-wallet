@@ -7689,6 +7689,9 @@ pub(crate) mod tests {
             /// Runs before every read of the window-state key, which every
             /// authorization ledger operation reads.
             pub on_window_key_read: Observer,
+            /// Runs before every read of the protocol nonce key, which the
+            /// commit's nonce verification reads.
+            pub on_nonce_read: Observer,
             pub envelope: SignedTestEnvelope,
             _home: StellarAgentHomeGuard,
             pub(crate) _dir: stellar_agent_test_support::sandbox::StateSandbox,
@@ -7769,10 +7772,12 @@ pub(crate) mod tests {
                 let on_seed_read = Observer::default();
                 let on_identity_read = Observer::default();
                 let on_window_key_read = Observer::default();
-                let (seed, identity, window) = (
+                let on_nonce_read = Observer::default();
+                let (seed, identity, window, nonce) = (
                     Arc::clone(&on_seed_read),
                     Arc::clone(&on_identity_read),
                     Arc::clone(&on_window_key_read),
+                    Arc::clone(&on_nonce_read),
                 );
                 let identity_ref = signer_identity_entry_ref(&profile.mcp_signer_default);
                 keyring_mock::install_with_read_hooks(vec![
@@ -7781,6 +7786,7 @@ pub(crate) mod tests {
                         &profile.mcp_nonce_key_alias.account,
                         Arc::new(move || {
                             nonce_observer.fetch_add(1, Ordering::SeqCst);
+                            notify(&nonce);
                         }),
                     ),
                     keyring_mock::ReadHook::new(
@@ -7902,6 +7908,7 @@ pub(crate) mod tests {
                     on_seed_read,
                     on_identity_read,
                     on_window_key_read,
+                    on_nonce_read,
                     envelope,
                     _home: home,
                     _dir: dir,
