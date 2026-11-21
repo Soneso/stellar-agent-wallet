@@ -89,6 +89,38 @@ fn mint_refusals_follow_the_record_order() {
     }
 }
 
+/// A revoked record refuses the first mint inside its execution window,
+/// where the same request without the revocation mints.
+#[test]
+#[serial(mainnet_clock)]
+#[serial]
+fn a_revoked_record_refuses_the_mint_inside_its_window() {
+    for revoked in [false, true] {
+        let mut fx = Fx::new(300_000);
+        fx.open();
+        fx.consent();
+        let at = fx.payload.receipt.verified_at_unix_ms();
+        fx.clock.set(at + 1);
+        if revoked {
+            let id = fx.id();
+            fx.recorder().revoke(id).unwrap();
+        }
+        let view = fx.view();
+        assert!(!view.expired, "inside the execution window");
+        assert!(view.record.consent.as_ref().unwrap().payload.is_some());
+        let before = fx.bytes();
+        let result = fx
+            .store
+            .mint_authorization(fx.fixture.profile(), &fx.mint_request());
+        if revoked {
+            mint_refusal(&result, MainnetPrecondition::ApprovalRevoked);
+            assert_eq!(fx.bytes(), before, "the refused mint writes nothing");
+        } else {
+            assert!(result.is_ok(), "the unrevoked control mints: {result:?}");
+        }
+    }
+}
+
 #[test]
 #[serial(mainnet_clock)]
 #[serial]
@@ -472,6 +504,35 @@ fn missing_record_refuses_with_its_own_precondition() {
         );
         assert_eq!(fx.bytes(), before, "a recordless continuation writes nothing");
         assert_eq!(fx.wire().generation, generation);
+    }
+}
+
+/// A revocation between a used Soroban intent and its `X402Submit` payload
+/// release refuses the child's mint with `ApprovalRevoked` and writes
+/// nothing; without the revocation the same child mints.
+#[test]
+#[serial(mainnet_clock)]
+#[serial]
+fn a_revocation_refuses_the_x402_payload_release_child() {
+    for revoked in [false, true] {
+        let mut fx = Fx::x402(300_000);
+        fx.open();
+        fx.consent();
+        let child = x402_child_request(&fx, x402_intent_request(&fx));
+        assert_eq!(fx.view().record.state, ApprovalState::Consumed);
+        if revoked {
+            let id = fx.id();
+            let view = fx.recorder().revoke(id).unwrap();
+            assert_eq!(view.record.state, ApprovalState::Revoked);
+        }
+        let before = fx.bytes();
+        let result = fx.store.mint_authorization(fx.fixture.profile(), &child);
+        if revoked {
+            mint_refusal(&result, MainnetPrecondition::ApprovalRevoked);
+            assert_eq!(fx.bytes(), before, "the refused child writes nothing");
+        } else {
+            assert!(result.is_ok(), "the unrevoked child mints: {result:?}");
+        }
     }
 }
 

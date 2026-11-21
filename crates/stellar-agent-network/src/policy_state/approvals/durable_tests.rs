@@ -381,6 +381,27 @@ fn durable_scope_and_policy_are_current() {
         .code(),
         "approval.presence_policy_unavailable"
     );
+    // The reloaded current policy refuses too: it passes the current-policy
+    // check, and the receipt, which names the earlier signature, refuses.
+    let current = fx.fixture.current_policy();
+    assert_eq!(current.sequence(), policy.sequence() + 1);
+    let result = verify_durable_approval(
+        Some(&original),
+        &fx.payload.attestation,
+        fx.fixture.profile(),
+        fx.fixture.name(),
+        &expected,
+        &current,
+        at,
+    );
+    assert!(
+        result.is_err(),
+        "the consent verified under the re-signed policy"
+    );
+    assert_eq!(
+        result.unwrap_err().code(),
+        "approval.presence_policy_unavailable"
+    );
 }
 
 #[test]
@@ -603,8 +624,39 @@ pub(crate) struct IntentFx {
     _unpublished: ConsentEvidenceDisableGuard,
 }
 
+/// The open, unconsented intent record of an [`IntentFx`] and the consent
+/// its inbox entry holds.
+struct UnconsentedIntent {
+    store: PersistedWindowStore,
+    rows: super::tests::Rows,
+    id: [u8; 32],
+    witness: ApprovalWitness,
+    /// Two more witnesses of the same consent, for completions built from it.
+    spare: [ApprovalWitness; 2],
+    payload: ConsentPayload,
+}
+
 impl IntentFx {
     pub(crate) fn new(ttl: u64) -> Self {
+        let (mut fx, mut parts) = Self::unconsented(ttl);
+        ApprovalRecorder::new(
+            &parts.store,
+            fx.fixture.profile(),
+            &mut parts.rows,
+            "request",
+        )
+        .record_consent(parts.id, &parts.witness, &parts.payload)
+        .unwrap();
+        fx.facts = ApprovalStatus::new(&parts.store, fx.fixture.profile())
+            .facts_by_nonce(&fx.facts.record().nonce)
+            .unwrap()
+            .unwrap();
+        fx
+    }
+
+    /// An intent record opened with `ttl` whose consent receipt, verified
+    /// inside the waiting window, is not committed.
+    fn unconsented(ttl: u64) -> (Self, UnconsentedIntent) {
         use super::super::operations::{
             BusinessId, IntentSlot, OpenOutcome, OpenRequest, OperationKind, OperationTool,
         };
@@ -629,18 +681,22 @@ impl IntentFx {
             .clone()
             .unwrap();
         let at = receipt.verified_at_unix_ms();
-        let witness = stellar_agent_core::approval::witness::verify_intent_approval(
-            &inbox,
-            fixture.profile(),
-            fixture.name(),
-            &entry.approval_nonce,
-            &blob,
-            &intent,
-            &fixture.decision(ttl),
-            &policy,
-            at,
-        )
-        .unwrap();
+        let verify = || {
+            stellar_agent_core::approval::witness::verify_intent_approval(
+                &inbox,
+                fixture.profile(),
+                fixture.name(),
+                &entry.approval_nonce,
+                &blob,
+                &intent,
+                &fixture.decision(ttl),
+                &policy,
+                at,
+            )
+            .unwrap()
+        };
+        let witness = verify();
+        let spare = [verify(), verify()];
         let clock = crate::mainnet::clock::set_now_ms_for_test(at);
         let store = PersistedWindowStore::at_path(
             stellar_agent_core::profile::schema::default_policy_window_state_path_for(
@@ -676,37 +732,40 @@ impl IntentFx {
             waiting_expires_at_ms: entry.expires_at_unix_ms,
             rule_ttl_ms: ttl,
         };
-        let mut recorder = ApprovalRecorder::new(&store, fixture.profile(), &mut rows, "request");
-        let record = recorder
+        let record = ApprovalRecorder::new(&store, fixture.profile(), &mut rows, "request")
             .open_pending(handle.id(), &pending, PolicyDecision::RequireApproval)
             .unwrap()
             .record;
-        recorder
-            .record_consent(
-                record.id,
-                &witness,
-                &ConsentPayload::new(
-                    blob,
-                    receipt,
-                    entry.process_uid.clone(),
-                    ConsentRow::Written,
-                ),
-            )
-            .unwrap();
+        let payload = ConsentPayload::new(
+            blob,
+            receipt,
+            entry.process_uid.clone(),
+            ConsentRow::Written,
+        );
         let facts = ApprovalStatus::new(&store, fixture.profile())
             .facts_by_nonce(&entry.approval_nonce)
             .unwrap()
             .unwrap();
         drop(inbox);
-        Self {
-            fixture,
-            intent,
-            facts,
-            policy,
-            blob,
-            clock,
-            _unpublished: unpublished,
-        }
+        (
+            Self {
+                fixture,
+                intent,
+                facts,
+                policy,
+                blob,
+                clock,
+                _unpublished: unpublished,
+            },
+            UnconsentedIntent {
+                store,
+                rows,
+                id: record.id,
+                witness,
+                spare,
+                payload,
+            },
+        )
     }
 
     pub(crate) fn decision(&self, decision: Decision, ttl: u64, at: u64) -> MainnetDecision {
@@ -1113,4 +1172,137 @@ fn scope_proof(
     );
     payload.attestation = blob;
     (ApprovalFacts::new(name.to_owned(), chain, record), blob)
+}
+
+/// A revocation after the waiting expiry of an unconsented intent record
+/// writes `Revoked`. The receipt verified before that expiry then commits no
+/// consent, the durable verifier and the mint check refuse the record as
+/// revoked, and a lookup does not keep its operation waiting.
+#[test]
+#[serial(mainnet_clock)]
+#[serial]
+fn a_revocation_after_the_waiting_expiry_stops_a_late_consent() {
+    use super::super::operations::{BusinessId, LookupOutcome, OperationRecorder, OperationState};
+    let (fx, mut parts) = IntentFx::unconsented(300_000);
+    let profile = fx.fixture.profile();
+    let record = fx.facts.record().clone();
+    assert!(record.consent.is_none());
+    assert!(parts.payload.receipt.verified_at_unix_ms() < record.expires_at_ms);
+    let at = record.expires_at_ms + 1;
+    fx.clock.set(at);
+    let [unrevoked_witness, revoked_witness] = parts.spare;
+    // A refused commit of an unrevoked record keeps the store's own refusal.
+    let mut tampered = parts.payload.clone();
+    tampered.process_uid.push('9');
+    let other = crate::operation_entry::witnessed_completion(
+        &parts.store,
+        profile,
+        unrevoked_witness,
+        tampered,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        crate::operation_entry::commit_consent(&parts.store, profile, &other)
+            .unwrap_err()
+            .code(),
+        "internal.unexpected_state"
+    );
+    let view = ApprovalRecorder::new(&parts.store, profile, &mut parts.rows, "revoke")
+        .revoke(parts.id)
+        .unwrap();
+    assert_eq!(view.record.state, ApprovalState::Revoked);
+    assert_eq!(view.record.revoked_at_ms, Some(at));
+    assert_eq!(view.record.closed_at_ms, Some(at));
+    let before = std::fs::read(parts.store.path()).unwrap();
+    let consent = ApprovalRecorder::new(&parts.store, profile, &mut parts.rows, "consent")
+        .record_consent(parts.id, &parts.witness, &parts.payload);
+    assert!(consent.is_err(), "a consent committed after the revocation");
+    // The consent commit of every surface refuses `approval.revoked`.
+    let completion = crate::operation_entry::witnessed_completion(
+        &parts.store,
+        profile,
+        revoked_witness,
+        parts.payload.clone(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        crate::operation_entry::commit_consent(&parts.store, profile, &completion)
+            .unwrap_err()
+            .code(),
+        "approval.revoked"
+    );
+    assert_eq!(std::fs::read(parts.store.path()).unwrap(), before);
+    let facts = ApprovalStatus::new(&parts.store, profile)
+        .facts_by_nonce(&record.nonce)
+        .unwrap()
+        .unwrap();
+    assert!(facts.record().consent.is_none());
+    assert_eq!(facts.record().disposition, ApprovalDisposition::Revoked);
+    refusal(
+        fx.verify(&facts, &fx.fixture.decision(300_000), at),
+        "approval.revoked",
+        "this approval has been revoked",
+    );
+    let wire = parts.store.read_for_inspection(profile).unwrap().unwrap();
+    let checked = check_record(&wire, &record.nonce, Some(view.record.operation_id), at);
+    assert!(
+        matches!(
+            checked,
+            Err(WindowStoreError::AuthorizationRefused {
+                precondition: MainnetPrecondition::ApprovalRevoked
+            })
+        ),
+        "{checked:?}"
+    );
+    let found = OperationRecorder::new(&parts.store, profile, &mut parts.rows, "lookup")
+        .lookup(&BusinessId::parse("durable-intent").unwrap())
+        .unwrap();
+    assert!(
+        matches!(&found, Some(LookupOutcome::Replay(view)) if view.state == OperationState::Expired),
+        "{found:?}"
+    );
+}
+
+/// A re-sign at a higher sequence with an unchanged body invalidates an
+/// intent consent under the earlier and under the reloaded current policy.
+/// Under the current policy the intent, bound to the earlier digest, no
+/// longer matches the policy the decision names.
+#[test]
+#[serial(mainnet_clock)]
+#[serial]
+fn durable_intent_consent_refuses_after_a_resign() {
+    let fx = IntentFx::new(300_000);
+    let decision = fx.fixture.decision(300_000);
+    assert!(fx.verify(&fx.facts, &decision, fx.at()).is_ok());
+    let body = std::fs::read_to_string(fx.fixture.policy_path()).unwrap();
+    fx.fixture.write_signed(
+        &body
+            .split("[signature]")
+            .next()
+            .unwrap()
+            .replace("sequence = 1", "sequence = 2"),
+    );
+    assert_eq!(
+        fx.verify(&fx.facts, &decision, fx.at()).unwrap_err().code(),
+        "approval.presence_policy_unavailable"
+    );
+    let current = fx.fixture.current_policy();
+    assert_eq!(current.sequence(), fx.policy.sequence() + 1);
+    let decision = fx.fixture.decision(300_000);
+    refusal(
+        verify_durable_intent_approval(
+            Some(&fx.facts),
+            &fx.blob,
+            fx.fixture.profile(),
+            fx.fixture.name(),
+            &fx.intent,
+            &decision,
+            &current,
+            fx.at(),
+        ),
+        "approval.attestation_invalid",
+        "the decision does not govern this approval",
+    );
 }

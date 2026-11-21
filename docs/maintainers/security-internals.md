@@ -185,7 +185,7 @@ The table distinguishes tested properties from operational claims that are not p
 | Pool allocator | One shared `ChannelPool` instance. | Exclusive in-process lease until release: `n4_m8_exactly_n_succeed_m_minus_n_exhausted_immediately` in `crates/stellar-agent-pool/tests/concurrency.rs`. | Full pool refuses immediately: `acquire_returns_exhausted_immediately_when_full` in the same file. | Two processes using one pool state can lease the same channel; not pinned. | A collision surfaces as a sequence refusal at submit, with no authorization effect; cross-process behavior: not pinned. |
 | Keyring store registration and entries | Registration is per process, last writer wins; not pinned. Persistent entries are shared. | Backend registration has no cross-process exclusion; not pinned. | A rotation through one headless handle is read by another at its next read: network `keyring::tests::a_rotation_is_visible_to_another_headless_store_handle`. | Entries persist; an actual restart is not pinned by the two-handle test. | Platform-keyring rotation visibility is not pinned by the headless test. |
 | Receipt store | Per receipt file. | Advisory sidecar lock during mutation, with bounded retries: core `profile::receipt::tests::a_held_sidecar_lock_refuses_a_write_after_the_bounded_retry`. | Duplicate envelope: `the_same_envelope_twice_reports_already_present`; source and sequence: `a_second_submission_at_the_same_sequence_is_refused`; approval: `approval_hold_survives_reopen_and_refuses_another_sequence`, all in core `profile::receipt::tests`. Wire mapping under lock contention: not pinned here. | Approval identity survives reopen: the approval-hold test. Actual restart: not pinned. | A receipt settled as failed frees its sequence: `a_settled_receipt_does_not_block_the_same_sequence`. |
-| Audit writer | Per audit log sidecar, across sessions. | A held sidecar lock refuses a second acquire: core `audit_log::lock::tests::second_acquire_returns_file_locked`. After a rotation the active path stays locked: core `audit_log::writer::tests::post_rotation_active_path_is_locked`; a second session interleaving with the rotation itself is not pinned. The lock held for the writer's whole lifetime: not pinned. | A held writer lock maps to `audit.chain_key_unavailable` with message sub-code `audit.writer_locked`: CLI `commands::value_audit::tests::writer_locked_refusal_names_the_holder_and_recovery_without_a_path`. A second session's value pre-flight end to end: not pinned. Reset refuses with that code: CLI `profile_window_reset::audit_writer_contention_keeps_window_state_unchanged`. | The OS releases the lock when its holder exits; actual process death is not pinned. | Reset acquires the audit writer first: `profile_window_reset::both_locks_refuse_with_the_audit_code_first`. The key-scope check reserves the tip-anchor entry the writer reads: network `keyring::tests::key_scope_reserves_the_audit_writer_tip_anchor`. Readers do not take the writer lock; this table does not pin that claim. |
+| Audit writer | Per audit log sidecar, across sessions. | A held sidecar lock refuses a second acquire: core `audit_log::lock::tests::second_acquire_returns_file_locked`. After a rotation the active path stays locked: core `audit_log::writer::tests::post_rotation_active_path_is_locked`. A second session that opens between the rotation's rename and its new active file refuses: core `audit_log::writer::tests::a_second_session_inside_a_rotation_refuses`. The lock is held from open through every write and rotation until the writer drops: core `audit_log::writer::tests::the_writer_lock_spans_the_whole_writer_lifetime`. | A held writer lock maps to `audit.chain_key_unavailable` with message sub-code `audit.writer_locked`: CLI `commands::value_audit::tests::writer_locked_refusal_names_the_holder_and_recovery_without_a_path`. A second session's value pre-flight end to end: not pinned. Reset refuses with that code: CLI `profile_window_reset::audit_writer_contention_keeps_window_state_unchanged`. | The OS releases the lock when its holder exits; actual process death is not pinned. | Reset acquires the audit writer first: `profile_window_reset::both_locks_refuse_with_the_audit_code_first`. The key-scope check reserves the tip-anchor entry the writer reads: network `keyring::tests::key_scope_reserves_the_audit_writer_tip_anchor`. Readers do not take the writer lock: core `audit_log::writer::tests::readers_take_no_writer_lock`. |
 | Operator-credential store | Per store path. Enrollment, removal, and the sign-count update after a remote login are its writers. | Advisory sidecar lock (the store path plus `.lock`) held across load and atomic replacement, with bounded retries; the sidecar is never deleted. | Concurrent writers keep every enrollment and never lower a counter: core `approval::operator_credentials::tests::concurrent_enrollments_preserve_both_entries` and `concurrent_counter_updates_never_regress`. A stale writer cannot restore a removed record: `removal_cannot_be_undone_by_stale_writer`. A held lock refuses every writer with `approval.writer_locked` and writes nothing: `held_lock_refuses_every_mutation_without_writing`. | The store file persists; actual restart is not pinned. | Reads take no lock and see either the old or the new file. That claim is not pinned. |
 | Approval and MPP stores | Per store path. | Approval lifetime lock; MPP operation lock. | Exclusion refuses without waiting: core `approval::store::tests::second_opener_returns_writer_locked`; MPP `store::tests::lock_contention_fails_without_mutation`. Codes are `approval.writer_locked` and `mpp.state_unavailable`; wire mapping is not pinned by those store tests. | Durable state remains; actual restart is not pinned by these contention tests. | These locks do not authorize a transaction. That negative claim is not pinned. |
 | Counterparty cache | Per profile cache; default TTL is one hour on the host clock. Default duration: one hour (`DEFAULT_TTL`) in the four production callers; not pinned by a test. An entry whose fetch time lies more than five minutes in the future counts as expired. | Per refresh cache lock; `concurrent_refresh_second_gets_writer_locked` in network `counterparty_cache_integration.rs`. | Fetch time is authenticated: network `counterparty::cache::tests::hmac_v2_different_fetched_at_returns_mismatch`. The file time does not change it: `counterparty::cache::tests::touch_mtime_does_not_change_fetched_at`. Listing skips expired entries: `expired_cache_entry_is_skipped_by_list_cached`. Expiry at equality and the five-minute future-fetch tolerance: the `is_expired_*` unit tests and `future_fetch_tolerance_is_five_minutes`. Snapshot filtering: `snapshot_keeps_only_live_bindings`. | The disk cache persists; listing and snapshot construction enforce expiry on every read. Actual restart is not pinned. | The stale-return API has no production caller. Opt-in fallback on a transient failure until one TTL past expiry, the deadline included: `stale_if_error_returns_expired_hmac_verified_cache_entry` and `stale_fallback_permitted_at_grace_deadline`; caller absence is not pinned. Refusals: `stale_fallback_refused_one_nanosecond_past_grace_deadline`, `stale_if_error_refuses_entry_past_grace_bound`, `stale_if_error_refuses_permanent_fetch_failure`, `stale_read_refuses_an_entry_fetched_in_the_future`, and `stale_if_error_false_ignores_stale_cache_on_failure`. `stale_if_error_false_fail_closed_no_stale_return` pins that a failed fetch without a cached entry refuses. Expired fallback evidence cannot enter policy snapshots. |
@@ -1045,9 +1045,11 @@ then removes the marker. A marker that cannot be read refuses with
 `profile.halt_unreadable` and writes no row. A row that cannot be appended
 refuses and leaves the marker in place. A marker that cannot be removed after
 the row refuses with `io.halt_marker` and leaves the profile halted. The
-marker is therefore never absent before the row is committed: no agent call
-passes the halt check during the append, and a resume that took effect is
-always recorded. A `profile_resumed` row records that the command ran, and the
+marker is therefore never absent before the row is written or queued: no agent
+call passes the halt check during the append. A row queued in the audit outbox
+is reported as `queued`, and a dropped tail of queued rows that carry no
+reference, such as halt and resume, is not detected before delivery
+([audit-log recovery](audit-log-recovery.md)). A `profile_resumed` row records that the command ran, and the
 marker file decides the state, so a removal failure, or an append that reports
 an error after its row landed, leaves a row on a profile that stays halted.
 Resuming a profile that is not halted writes its row best effort. Both commands write through the operator-row sink of
@@ -1356,8 +1358,10 @@ layout hashes them under `stellar-agent-wallet/intent-consent-view/v1`,
 followed by `tag(intent_digest32)`. Given an intent, the page shows the intent
 view in place of the envelope summary: the kind, the network, the source, the
 payment, account, trustline or claim fields, the memo, the fee bound, and the
-short policy digest. It shows no sequence number and no exact fee. The inbox
-and the command's ceremony pass no intent and keep the legacy page.
+short policy digest. It shows no sequence number and no exact fee. For a
+canonical record the command's ceremony and the inbox both pass the
+authenticated stored intent and show the intent page; an envelope record
+keeps the legacy page.
 
 Verification runs the shared assertion primitive in
 `stellar-agent-core::approval::webauthn`, beside the DER-to-compact low-S
@@ -2501,10 +2505,11 @@ consumes the record for that operation in the mint's generation. It stores no
 operation link and adopts no authority, so the operation keeps waiting. A
 second message under the same approval refuses with `approval_nonce_reused`.
 The authenticated payment then continues the used message record. A later
-revocation does not refuse it at the resolver when the message receipt names
-the same approval nonce, the record was consumed, and the request names the
-record's operation. Every other check still runs, expiry and a released
-payload included, and the mint caps the payment at the record bound. On the
+revocation refuses it with `approval_revoked`, at the resolver and at the
+mint's continuation check under the window lock, so no payment authorization
+is minted after the revocation. The message authorization minted before the
+revocation keeps its lifetime. Every other check still runs, expiry and a
+released payload included, and the mint caps the payment at the record bound. On the
 operation route the handle names the identity: a raw mint carrying
 `approval_operation`, or an `operation` link to another operation, refuses
 with `internal.unexpected_state` before any read. A link to the handle's own
@@ -2517,9 +2522,13 @@ record protects single use independently of retained authorization history.
 Pending records without consent refuse with `approval_consent_missing` while
 the waiting window is open. After the waiting window closes, they refuse with
 `approval_expired`.
-Revocation records its time and refuses later first mints and unused-carrier
-remints at the durable check with `approval_revoked`, before expiry refusal.
-Child mints under used parents retain their state exemption. Every approval
+Revocation records its time and refuses later first mints, unused-carrier
+remints, and child mints under used parents at the durable check with
+`approval_revoked`, before expiry refusal. A pending record is revoked at any
+time, also after its waiting expiry, because a receipt verified before that
+expiry can still commit consent until a revocation; a consent commit under a
+revoked record then refuses with `approval.revoked`. A consumed record is
+revoked only inside its window. Every approval
 authorization with a retained durable record, including a child, ends by the
 durable consent bound and any earlier signed envelope-approval expiry.
 Operation adoption uses the same bound
@@ -2603,11 +2612,12 @@ opens a record or selects a preparation. The store wire version is unchanged.
 
 `approve revoke --id <nonce> --profile <name>` resolves the nonce through authenticated status.
 Only `ApprovalRecorder::revoke` changes the durable record.
-The profile owner can revoke consumed records inside execution, including after inbox collection.
+The profile owner can revoke a pending record at any time, also after its waiting expiry or the closure of its operation, and consumed records inside execution, including after inbox collection.
 Inbox actions require an authenticated, eligible pending entry and a live unconsented durable record.
+An inbox revocation admitted on such a record still revokes it, and appends its row, when the waiting expiry passes before the adapter reads the record again; consent or an operation closure still refuses with `approval.denied`.
 Signed-origin actions reuse current-policy assertion verification, counter updates and listener identity checks.
-Revoked, expired and closed records return secret-free views without a facade call or audit row.
-Expiry between lookup and revoke succeeds without an audit row.
+Revoked records, and consumed records whose window ended or whose operation is closed, return secret-free views without a facade call or audit row.
+A pending record revokes and appends its row also when its expiry passes between lookup and revoke; a consumed record whose window ends there returns its view without an audit row.
 Consent, both clocks, consumption identity, holds and operation history remain intact.
 
 The surface appends `approval_revoked` through tool `approval.revoked` after the state commit.
@@ -2707,9 +2717,16 @@ the audit writer. Reporting does not wait for delivery. A failed commit returns
 the store's refusal code and retains the attested entry. Repeating the command
 authenticates that entry's receipt and completes missing consent with its
 original timestamp and `recovered` provenance. It then returns
-`approval.already_attested`. A revoked, consumed or expired record, or one that
-does not match the inbox entry, refuses with its approval code before presence
-and before recovery. These refusals write nothing. An already consented record
+`approval.already_attested`. A revoked or consumed record, or one that does
+not match the inbox entry, refuses with its approval code before presence and
+before recovery, and writes nothing. An expired record of an envelope entry,
+or of an intent entry not yet attested, also refuses with `approval.expired`
+before presence and before recovery, and writes nothing. For an attested
+intent entry of a canonical record the order is the reverse: the command first
+completes the missing consent from the stored receipt, then answers
+`approval.expired`. A consent received before the waiting expiry can therefore
+still commit after that expiry, until a revocation. After a revocation the command
+refuses with `approval.revoked` and commits no consent. An already consented record
 writes nothing on this path and skips re-verification of its inbox attestation.
 After presence returns, the command rereads the durable record before writing
 the consent row or attestation. A revocation during the ceremony therefore

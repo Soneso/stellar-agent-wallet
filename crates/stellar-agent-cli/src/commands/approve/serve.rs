@@ -899,14 +899,13 @@ mod tests {
         );
     }
 
-    /// Revoking a consumed record inside execution leaves a child mint under
-    /// its used parent authorization unaffected; the child mint reads no
-    /// durable record.
+    /// Revoking a consumed record inside execution refuses a child mint under
+    /// its used parent authorization; the child mint reads the durable record.
     #[cfg(feature = "mainnet-write")]
     #[test]
     #[serial_test::serial(mainnet_clock)]
     #[serial_test::serial]
-    fn surface_revocation_preserves_child_mint_under_used_parent() {
+    fn surface_revocation_refuses_child_mint_under_used_parent() {
         use stellar_agent_approval_ui::decision::RevocationAccess as _;
         use stellar_agent_network::mainnet::{MainnetConsumer, MessageDomain};
         use stellar_agent_network::policy_state::approvals::ApprovalState;
@@ -960,9 +959,114 @@ mod tests {
         };
         child.parent = Some(minted.id);
         child.operation = None;
+        let before = std::fs::read(f.store.path()).unwrap();
         let result = f.store.mint_authorization(f.core.profile(), &child);
-        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            matches!(
+                result,
+                Err(
+                    stellar_agent_network::policy_state::WindowStoreError::AuthorizationRefused {
+                        precondition:
+                            stellar_agent_network::mainnet::MainnetPrecondition::ApprovalRevoked
+                    }
+                )
+            ),
+            "{result:?}"
+        );
+        assert_eq!(std::fs::read(f.store.path()).unwrap(), before);
         assert_eq!(f.view().record.state, ApprovalState::Revoked);
+    }
+
+    /// After `approve revoke` reports `revoked`, the payment authorization
+    /// of an authenticated x402 approval under its used SEP-10 message
+    /// authorization refuses `approval_revoked`, and no payment
+    /// authorization exists; the message authorization minted before the
+    /// revocation keeps its lifetime.
+    #[cfg(feature = "mainnet-write")]
+    #[test]
+    #[serial_test::serial(mainnet_clock)]
+    #[serial_test::serial]
+    fn revocation_refuses_the_payment_authorization_under_a_used_message() {
+        use stellar_agent_approval_ui::decision::RevocationAccess as _;
+        use stellar_agent_network::mainnet::{MainnetConsumer, MainnetPrecondition, MessageDomain};
+        use stellar_agent_network::policy_state::{
+            ConsumptionBinding, DomainBinding, WindowStoreError,
+        };
+        let mut f = super::super::revoke::tests::Fixture::new();
+        f.consent();
+        let domain = MessageDomain {
+            home_domain: "example.invalid".to_owned(),
+            web_auth_domain: "auth.example.invalid".to_owned(),
+            server_key: [3; 32],
+        };
+        // The SEP-10 message leg consumes the approval.
+        let mut message = f.mint();
+        message.consumer = MainnetConsumer::X402Authenticated;
+        message.binding = DomainBinding::Message {
+            domain: domain.clone(),
+            content_digest: [4; 32],
+            ephemeral_public_key: [5; 32],
+        };
+        message.holds = vec![];
+        message.authorization_ttl_ms = 300_000;
+        let minted = f
+            .store
+            .mint_authorization(f.core.profile(), &message)
+            .unwrap();
+        stellar_agent_network::mainnet::test_support::consume_minted(
+            &f.store,
+            f.core.profile(),
+            &message,
+            &minted,
+            &ConsumptionBinding::Message {
+                domain,
+                content_digest: [4; 32],
+                ephemeral_public_key: [5; 32],
+            },
+        )
+        .unwrap();
+        // The owner revokes before the payment leg.
+        let view = f
+            .access()
+            .revoke(
+                &f.entry.approval_nonce,
+                stellar_agent_core::approval::Surface::Cli,
+                None,
+            )
+            .unwrap();
+        assert_eq!(view.state, "revoked");
+        let revoked_at = view.revoked_at_ms.expect("a committed revocation time");
+        assert!(
+            minted.expires_at_ms > revoked_at,
+            "the message authorization keeps its lifetime"
+        );
+        let before = std::fs::read(f.store.path()).unwrap();
+        // The payment leg refuses its authorization.
+        let mut payment = message.clone();
+        payment.binding = DomainBinding::Soroban {
+            intent_digest: [6; 32],
+        };
+        payment.parent = Some(minted.id);
+        payment.operation = None;
+        let result = f.store.mint_authorization(f.core.profile(), &payment);
+        assert!(
+            matches!(
+                result,
+                Err(WindowStoreError::AuthorizationRefused {
+                    precondition: MainnetPrecondition::ApprovalRevoked
+                })
+            ),
+            "the payment authorization is minted after the revocation: {result:?}"
+        );
+        assert_eq!(
+            MainnetPrecondition::ApprovalRevoked.label(),
+            "approval_revoked"
+        );
+        assert_eq!(
+            std::fs::read(f.store.path()).unwrap(),
+            before,
+            "the refusal writes no payment authorization"
+        );
     }
 
     #[tokio::test]

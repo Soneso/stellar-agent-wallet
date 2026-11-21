@@ -1106,7 +1106,7 @@ The command loads the profile first, like `profile halt`. On a halted profile it
 2. It appends the `profile_resumed` row through the audit writer or the outbox. A row that cannot be appended refuses with its audit code and leaves the marker in place.
 3. It removes the marker. A removal failure refuses with `io.halt_marker`; the marker stays, the profile stays halted, and the message tells the operator to fix the file and run `profile resume` again.
 
-The marker is removed only after a committed row, so a resume that took effect is always recorded, and no agent action passes the halt check while the row is pending. A `profile_resumed` row records that the command ran; the marker file decides the state. Exit code `1` means the profile is still halted. A removal failure in step 3, or an append in step 2 that reports an error after its row landed, leaves a `profile_resumed` row on a profile that stays halted. A running MCP server serves its next call normally; it needs no restart.
+The marker is removed only after the row is written or queued in the audit outbox, and no agent action passes the halt check while the row is pending. A row queued in the outbox is reported as `queued`, and a dropped tail of queued rows that carry no reference, such as halt and resume, is not detected before delivery; see [audit-log recovery](../maintainers/audit-log-recovery.md). A `profile_resumed` row records that the command ran; the marker file decides the state. Exit code `1` means the profile is still halted. A removal failure in step 3, or an append in step 2 that reports an error after its row landed, leaves a `profile_resumed` row on a profile that stays halted. A running MCP server serves its next call normally; it needs no restart.
 
 Resuming a profile that is not halted exits `0` with `halted: false` and `was_halted: false`. Its row is written when the audit writer is available and reported as `not_written` otherwise.
 
@@ -1382,8 +1382,8 @@ stellar-agent approve revoke --id <nonce> --profile default --output table
 Revokes an existing authenticated durable approval selected by its inbox nonce.
 Mainnet approval preparation in the CLI and MCP opens a durable pending record.
 The command acts only on existing durable records.
-The profile owner can revoke pending or consumed records inside their active window,
-including consumed records whose inbox entries are collected.
+The profile owner can revoke a pending record at any time, also after its waiting expiry,
+and a consumed record inside its active window, also after inbox collection.
 The inbox's distinct "Revoke approval" action covers eligible pending, unconsented records only.
 Local actions require the session, per-entry CSRF, session proof and matching entry identity.
 Signed-origin actions also require a fresh assertion from a current-policy passkey.
@@ -1391,11 +1391,13 @@ Signed-origin actions also require a fresh assertion from a current-policy passk
 The result contains state, expiry, both window deadlines, consent time, revoked time and closed time.
 JSON uses the standard envelope; `--output table` prints escaped fields on separate lines.
 Unknown nonces return `approval.not_found` and exit 1. Other failures retain their mapped code.
-Success exits 0. Revoked, expired and closed records return their view without a write or audit row.
+Success exits 0. A pending record is revoked also after its waiting expiry, because consent received before that expiry can still commit until a revocation.
+Revoked records, and consumed records whose window ended or whose operation is closed, return their view without a write or audit row.
 Both windows exclude their expiry boundary. Revocation preserves consent, clocks, operation history and accounting.
 
-Revocation prevents later first mints and unused-carrier remints that reach the durable check.
-It does not affect child mints under used parents or submissions already sent.
+After a revocation, a consent commit under the record refuses with `approval.revoked`.
+Revocation prevents every later mint under the record: first mints, unused-carrier remints, the payment mint under a used SEP-10 message authorization, and the x402 payload-release mint under a used Soroban intent authorization.
+It does not affect an authorization minted before it, which keeps its lifetime, or submissions already sent.
 After revocation commits, `approval.revoked` appends an `approval_revoked` audit event.
 It carries the durable record's approval kind, eight-character nonce prefix and origin, also after inbox collection.
 Only signed-origin rows carry a credential pseudonym.

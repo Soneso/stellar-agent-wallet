@@ -564,14 +564,15 @@ stellar-agent approve --id ABCxyzNonce --profile myprofile --yes
 `stellar-agent approve revoke --id <nonce> --profile default` revokes an existing durable record.
 Mainnet MCP preparation opens a durable approval record; testnet preparation opens none.
 The command acts only on records that already exist.
-The profile owner can revoke consumed records inside execution, including after inbox collection.
+The profile owner can revoke a pending record at any time, also after its waiting expiry, and consumed records inside execution, including after inbox collection.
 The inbox's "Revoke approval" action accepts eligible pending entries and unconsented durable records only.
 Local actions require a session, per-entry CSRF, session proof and matching entry identity.
 Signed-origin actions also require a fresh assertion from a current-policy credential.
-Revoked, expired and closed records return their view without writes or rows.
+Revoked records, and consumed records whose window ended or whose operation is closed, return their view without writes or rows.
 Revocation preserves consent, both clocks, operation history and accounting.
-It prevents later first mints and unused-carrier remints at the durable check.
-It does not affect child mints under used parents or submissions already sent.
+A consent commit under a revoked record refuses with `approval.revoked`.
+It prevents every later mint at the durable check: first mints, unused-carrier remints, the payment mint under a used SEP-10 message authorization, and the x402 payload-release mint under a used Soroban intent authorization.
+It does not affect an authorization minted before it, which keeps its lifetime, or submissions already sent.
 
 The state commits before the `approval.revoked` row with event kind `approval_revoked`.
 Rows contain the durable record's kind, nonce prefix and origin; signed-origin rows add a credential pseudonym.

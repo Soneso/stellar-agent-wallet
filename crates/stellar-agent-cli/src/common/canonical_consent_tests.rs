@@ -798,3 +798,92 @@ async fn canonical_consent_commit_preserves_provenance_and_order() {
         );
     }
 }
+
+/// `approve revoke` after the waiting expiry of an attested, uncommitted
+/// canonical approval writes `Revoked` and appends its audit row; the next
+/// run of the command refuses `approval.revoked` and commits no consent.
+#[tokio::test]
+#[serial_test::serial]
+async fn revoke_after_waiting_expiry_stops_the_recovered_consent() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+    let (fixture, context, _) = confirmation_fixture("late-revoke");
+    let _unenforced =
+        stellar_agent_network::policy_state::approvals::ConsentEvidenceDisableGuard::every_kind(
+            fixture.name(),
+        );
+    let time = Arc::new(AtomicU64::new(clock_now().unwrap()));
+    let read = time.clone();
+    let _clock = stellar_agent_core::timefmt::test_clock::install(Arc::new(
+        stellar_agent_core::timefmt::MockClock::new(move || Ok(read.load(Ordering::SeqCst))),
+    ));
+    let (intent, summary, handle) = staged(&fixture, &context, 0, MemoFact::None, 0);
+    let entry = park_staged(&fixture, &context, &intent, &summary, &handle);
+    // The operator consents one minute into the two-minute waiting window.
+    time.fetch_add(60_000, Ordering::SeqCst);
+    let policy = fixture.current_policy();
+    let presence = fixture.intent_presence(&entry, &policy, &intent);
+    let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+    let OperatorRowSink::Writer(writer) =
+        acquire_operator_row_sink(fixture.profile(), fixture.name()).unwrap()
+    else {
+        panic!("fixture writer")
+    };
+    // The inbox attestation persists; the durable consent commit does not
+    // run, as after a crash between the two durable writes.
+    stellar_agent_core::approval::attest_and_persist(
+        &mut store,
+        &entry,
+        &stellar_agent_core::approval::mainnet_fixtures::ATTESTATION_KEY,
+        &fixture.binding(),
+        stellar_agent_core::approval::Surface::Cli,
+        ConsentAudit::Writer(&mut writer.lock().unwrap()),
+        stellar_agent_core::approval::ConsentAuthorization::Mainnet {
+            presence,
+            policy: &policy,
+        },
+        |_, _| unreachable!(),
+    )
+    .unwrap();
+    drop(store);
+    drop(writer);
+    assert!(durable_record(&context, &handle).unwrap().consent.is_none());
+
+    // The waiting window ends, and the owner revokes the approval.
+    let revoked_at = entry.expires_at_unix_ms + 1;
+    time.store(revoked_at, Ordering::SeqCst);
+    crate::common::render::take_rendered_for_test();
+    let code = crate::commands::approve::revoke::run(crate::commands::approve::revoke::RevokeArgs {
+        id: entry.approval_nonce.clone(),
+        profile: Some(fixture.name().into()),
+        output: stellar_agent_core::envelope::OutputFormat::Json,
+    })
+    .await;
+    let output = crate::common::render::take_rendered_for_test();
+    assert_eq!(code, 0, "the revocation reports success: {output:?}");
+    let view = &output.last().unwrap()["data"];
+    assert_eq!(view["state"], "revoked", "{output:?}");
+    assert_eq!(view["revoked_at_ms"], revoked_at, "{output:?}");
+    let record = durable_record(&context, &handle).unwrap();
+    assert_eq!(
+        record.state,
+        stellar_agent_network::policy_state::approvals::ApprovalState::Revoked,
+        "the revocation writes the record"
+    );
+    let audit = std::fs::read_to_string(fixture.audit_path()).unwrap();
+    let row: serde_json::Value = serde_json::from_str(audit.lines().last().unwrap()).unwrap();
+    assert_eq!(row["kind"], "approval_revoked");
+
+    // The next run of the same command refuses, and no consent commits.
+    let refused = confirm_staged(&fixture, &context, &summary, &handle).await;
+    assert_eq!(
+        refused.as_ref().map(drop).unwrap_err().code(),
+        "approval.revoked",
+        "{refused:?}"
+    );
+    let record = durable_record(&context, &handle).unwrap();
+    assert!(record.consent.is_none(), "no consent commits after the revocation");
+    assert_eq!(record.revoked_at_ms, Some(revoked_at));
+}

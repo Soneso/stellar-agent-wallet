@@ -1106,7 +1106,6 @@ mod enabled {
         now: u64,
         store: &PersistedWindowStore,
         operation: Option<OperationLink>,
-        parent: Option<&MessageUseReceipt>,
     ) -> Result<(), MainnetAuthorizationError> {
         match authority {
             MainnetAuthority::Approval(approval) => {
@@ -1117,7 +1116,6 @@ mod enabled {
                     facts.as_ref(),
                     approval.witness(),
                     operation.map(|link| link.operation_id),
-                    parent.and_then(MessageUseReceipt::approval_nonce),
                     now,
                 )?;
                 approval_checks(
@@ -1154,25 +1152,19 @@ mod enabled {
     /// Compares a witness with the retained consent after ordered state checks.
     ///
     /// A missing record refuses `ApprovalNotFound`, so no approval admits on
-    /// inbox material alone. `parent` is the approval nonce of the used
-    /// message proof an authenticated payment continues. When it names this
-    /// record, the record was consumed, and the operation is the record's,
-    /// a later revocation does not refuse; every other check still runs.
+    /// inbox material alone. A revoked record refuses `ApprovalRevoked`, also
+    /// for the payment that continues a used message proof of the record.
     pub(super) fn check_approval_facts(
         facts: Option<&ApprovalFacts>,
         approval: &ApprovalWitness,
         operation: Option<crate::policy_state::OperationId>,
-        parent: Option<&str>,
         now: u64,
     ) -> Result<(), MainnetAuthorizationError> {
         let facts = facts.ok_or_else(|| refused(P::ApprovalNotFound))?;
         let record = facts.record();
         let same_operation = operation.is_some_and(|id| *id.as_bytes() == record.operation_id);
-        let used_parent = parent == Some(record.nonce.as_str())
-            && record.consumed_at_ms.is_some()
-            && same_operation;
         require(
-            record.disposition != ApprovalDisposition::Revoked || used_parent,
+            record.disposition != ApprovalDisposition::Revoked,
             P::ApprovalRevoked,
         )?;
         if record.disposition == ApprovalDisposition::Consumed {
@@ -1673,7 +1665,6 @@ mod enabled {
             now,
             req.store,
             req.operation,
-            None,
         )?;
         // A canonical envelope signs only when its deadline lies strictly
         // before the end of the live authority, which holds strictly before
@@ -1958,7 +1949,6 @@ mod enabled {
             now,
             req.store,
             req.operation,
-            authenticated,
         )?;
         let mut request = request(
             req.context,
@@ -2076,7 +2066,7 @@ mod enabled {
                 let facts = ApprovalStatus::new(req.store, req.context.profile())
                     .facts_by_nonce(approval.nonce())
                     .map_err(mint::store_error)?;
-                check_approval_facts(facts.as_ref(), approval, req.approval_operation, None, now)?;
+                check_approval_facts(facts.as_ref(), approval, req.approval_operation, now)?;
             }
             MainnetAuthority::Policy(authority) => {
                 check_policy_authority(req.context, req.policy, authority, now)?;
@@ -4664,7 +4654,6 @@ mod tests {
                 f.now,
                 &f.window,
                 f.link_of(&authority),
-                None,
             )
         };
         assert_eq!(approval.kind(), ApprovedKind::Payment);
@@ -7472,7 +7461,6 @@ mod tests {
                 now,
                 &f.window,
                 f.link_of(authority),
-                None,
             )
         };
         let authority = policy_authority(&f, AuthorityScope::Classic, f.now, 60_000);

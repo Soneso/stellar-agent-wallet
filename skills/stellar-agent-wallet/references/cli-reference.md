@@ -1096,7 +1096,7 @@ Missing pin uses `enroll_signer.repair_unpinned`; conflicts use
 
 While the profile is halted, these refuse with `profile.halted` (exit `1`), before reading a signer or sending a request: `pay` and `claim` (each except `--build-only`), `accounts create` in both modes, `accounts deploy-c`, `trustline`, `trade`, `vault deposit` and `withdraw`, `mpp charge authorize`, `pool init`, `smart-account multicall` and `execute`, the `rules` and `signers` write verbs, `migrate-verifier` (except `--dry-run`), the four `deploy-*` commands, and `timelock schedule`, `cancel`, and `execute`. The MCP server refuses every tool that is not read-only from its next call. Read-only commands, `profile show`, `audit verify`, `profile sign-policy`, `profile policy add-counterparty`, the `enroll-*` and `rotate-*` subcommands, `approve`, and the verbs that only record or reconcile local state (`mpp receipt record`, `mpp settlement reconcile`, `mpp state prune`, `tx status`) keep working. An unreadable marker refuses the same actions with `profile.halt_unreadable`.
 
-`profile resume <NAME>` loads the profile, reads the marker, appends a `profile_resumed` row, and removes the marker only after the row is committed. On a halted profile a marker that cannot be read, such as a directory at its path, refuses with `profile.halt_unreadable` and writes no row; the operator repairs the file or removes the path by hand. A row that cannot be appended refuses with its audit code and keeps the marker. A marker that cannot be removed after the row refuses with `io.halt_marker` and keeps the halt; fix the file and run `profile resume` again. A `profile_resumed` row records that the command ran; the marker file decides the state, and exit `1` means the profile is still halted. Resuming a profile that is not halted exits `0` with `halted: false` and `was_halted: false`.
+`profile resume <NAME>` loads the profile, reads the marker, appends a `profile_resumed` row, and removes the marker only after the row is written or queued in the audit outbox. A queued row is reported as `queued`, and a dropped tail of queued rows that carry no reference, such as halt and resume, is not detected before delivery. On a halted profile a marker that cannot be read, such as a directory at its path, refuses with `profile.halt_unreadable` and writes no row; the operator repairs the file or removes the path by hand. A row that cannot be appended refuses with its audit code and keeps the marker. A marker that cannot be removed after the row refuses with `io.halt_marker` and keeps the halt; fix the file and run `profile resume` again. A `profile_resumed` row records that the command ran; the marker file decides the state, and exit `1` means the profile is still halted. Resuming a profile that is not halted exits `0` with `halted: false` and `was_halted: false`.
 
 ```text
 profile "default" is halted since 2026-10-31T12:00:00Z: agent sent unexpected payments; run "stellar-agent profile resume --profile default" to lift it
@@ -1310,14 +1310,14 @@ stellar-agent approve revoke --id <nonce> --profile default --output table
 Revokes an existing durable approval by nonce in the selected profile.
 Mainnet MCP preparation opens a durable approval record; testnet preparation opens none.
 The command acts only on records that already exist.
-The profile owner can revoke consumed records inside execution, including after inbox collection.
+The profile owner can revoke a pending record at any time, also after its waiting expiry, and consumed records inside execution, including after inbox collection.
 The inbox action requires an eligible pending entry and an unconsented pending durable record.
 Signed-origin revocation requires a fresh current-policy passkey assertion.
-Revoked, expired and closed records return a view without writes or audit rows.
+Revoked records, and consumed records whose window ended or whose operation is closed, return a view without writes or audit rows.
 The result excludes consent payloads and includes state, expiry, both deadlines and consent, revoked and closed times.
 Unknown nonces return `approval.not_found` and exit 1; successful views exit 0.
-Revocation blocks later first mints and unused-carrier remints, preserving clocks and operation state.
-Child mints under used parents and submissions already sent retain their behavior.
+Revocation blocks every later mint, the payment mint under a used SEP-10 message authorization and the x402 payload-release mint under a used Soroban intent authorization included, preserving clocks and operation state.
+A later consent commit refuses with `approval.revoked`. An authorization minted before the revocation and submissions already sent retain their behavior.
 The `approval_revoked` audit event follows the state commit and names the durable record's approval kind.
 If its append fails, the error states that the record is revoked. Retrying does not repair that row.
 

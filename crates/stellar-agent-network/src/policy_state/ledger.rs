@@ -2309,7 +2309,8 @@ impl PersistedWindowStore {
     /// The approval check refreshes its time under that lock, as
     /// [`super::approvals::decision_time`] states, so both mint entries
     /// decide on a floor read after any earlier validation. A continuation
-    /// mint under a parent refuses when the record cap is at or below it.
+    /// mint under a parent refuses when its record is revoked or the record
+    /// cap is at or below it.
     pub(super) fn mint_record_checks(
         &self,
         profile: &Profile,
@@ -3595,6 +3596,69 @@ mod tests {
             refusal(reopened.mint_authorization(&l.profile, &request)),
             MainnetPrecondition::ApprovalNonceReused
         );
+    }
+
+    /// A window file restored to an older authentic image, one that holds an
+    /// open authorization and one that holds a claimed one, refuses every
+    /// mainnet read and write and stays as restored.
+    #[test]
+    #[serial(mainnet_clock)]
+    #[serial]
+    fn a_restored_older_file_refuses_every_read_and_write() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let l = Ledger::with_approvals();
+        let request = l.approved(tx(1), vec![hold(70)]);
+        let minted = l.mint(&request).unwrap();
+        let open = l.bytes();
+        l.claim(&request, &minted).unwrap();
+        let claimed = l.bytes();
+        l.consume(&request, &minted, &consumption_of(&request.binding))
+            .unwrap();
+        for (name, image) in [("open", &open), ("claimed", &claimed)] {
+            fs::write(l.store.path(), image).unwrap();
+            let mut another = request.clone();
+            another.binding = tx(2);
+            let results = [
+                ("inspect", l.store.read_for_inspection(&l.profile).map(drop)),
+                (
+                    "load",
+                    l.store
+                        .load_into("ledger", &l.profile, &PolicyStateStore::new())
+                        .map(drop),
+                ),
+                ("claim", l.claim(&request, &minted).map(drop)),
+                (
+                    "consume",
+                    l.consume(&request, &minted, &consumption_of(&request.binding))
+                        .map(drop),
+                ),
+                ("mint", l.mint(&another).map(drop)),
+            ];
+            for (step, result) in results {
+                #[cfg(feature = "mainnet-write")]
+                assert!(
+                    matches!(
+                        result,
+                        Err(WindowStoreError::MainnetStateUnverifiable {
+                            defect: super::super::StateDefect::GenerationMismatch
+                        })
+                    ),
+                    "{name} {step}: {result:?}"
+                );
+                #[cfg(not(feature = "mainnet-write"))]
+                assert!(
+                    matches!(result, Err(WindowStoreError::GenerationMismatch)),
+                    "{name} {step}: {result:?}"
+                );
+            }
+            assert_eq!(
+                &l.bytes(),
+                image,
+                "{name}: a refusal wrote the restored file"
+            );
+        }
     }
 
     #[test]

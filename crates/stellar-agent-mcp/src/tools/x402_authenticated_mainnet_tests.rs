@@ -2709,3 +2709,50 @@ async fn the_policy_session_prints_no_jwt_and_no_envelope() {
         serde_json::json!({"kind":"x402_authenticated", "home_domain": HOME, "tool": TOOL})
     );
 }
+
+/// On a mainnet profile in a build with mainnet writes, a server that lacks
+/// one input of its mainnet admission refuses the authenticated tool at
+/// entry with `network.mainnet_write_forbidden`. It sends no RPC or SEP-10
+/// request, reads no key, writes no approval and no authorization, and
+/// returns no payment signature. The same run with every input writes its
+/// pending approval.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+#[serial_test::serial]
+async fn a_mainnet_server_without_admission_refuses_at_entry() {
+    let control = Run::new().await;
+    let admitted = control.call(control.args(HOME, None)).await;
+    assert_eq!(
+        admitted["ok"], true,
+        "the admitted control proposes: {admitted}"
+    );
+    drop(control);
+    for missing in ["engine", "policy", "enablement", "context", "profiles"] {
+        let mut run = Run::new().await;
+        match missing {
+            "engine" => {
+                let mut profile = (*run.f.server.profile).clone();
+                profile.policy.engine = stellar_agent_core::profile::schema::PolicyEngineKind::Noop;
+                run.f.server.profile = Arc::new(profile);
+            }
+            "policy" => run.f.server.verified_policy = None,
+            "enablement" => run.f.server.enablement = None,
+            "context" => run.f.server.mainnet_context = None,
+            _ => run.f.server.profiles_dir = None,
+        }
+        let result = run.call_raw(run.args(HOME, None)).await;
+        let (code, message, text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "network.mainnet_write_forbidden", "{missing}: {text}");
+        assert!(
+            message.contains("network.mainnet_write_forbidden"),
+            "{missing}"
+        );
+        assert!(!text.contains("\"paymentSignature\""), "{missing}: {text}");
+        assert!(run.control.methods().is_empty(), "{missing}");
+        assert!(run.oracle_control.methods().is_empty(), "{missing}");
+        assert_eq!(run.double.requests().await, 0, "{missing}");
+        assert_eq!(run.f.seed_reads.load(Ordering::SeqCst), 0, "{missing}");
+        assert!(!approval_file_exists(&run.f), "{missing}");
+        assert!(authorizations(&run.f).is_empty(), "{missing}");
+    }
+}

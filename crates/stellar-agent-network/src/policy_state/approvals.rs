@@ -950,7 +950,8 @@ impl<'a> ApprovalRecorder<'a> {
         })
     }
 
-    /// Revokes a live approval without an operation transition or audit row.
+    /// Revokes an approval without an operation transition or audit row: a
+    /// pending record at any time, a consumed record before its window ends.
     ///
     /// # Errors
     ///
@@ -1045,7 +1046,11 @@ pub fn seed_existing_consent_delivery_for_test(
     })
 }
 
-/// Revokes the live record `id` in `session`.
+/// Revokes the record `id` in `session`. A pending record is revoked at any
+/// time, also after its waiting expiry, because a receipt verified before
+/// that expiry can still commit consent until a revocation. A revoked
+/// record, and a consumed one whose window ended, return their view
+/// without a write.
 fn revoke_step(session: &mut Session<'_>, id: [u8; 32]) -> Result<ApprovalView, WindowStoreError> {
     let record = session
         .wire
@@ -1053,7 +1058,9 @@ fn revoke_step(session: &mut Session<'_>, id: [u8; 32]) -> Result<ApprovalView, 
         .as_mut()
         .and_then(|s| s.records.iter_mut().find(|r| r.id == id))
         .ok_or_else(|| unexpected("the approval record is absent"))?;
-    if record.state == ApprovalState::Revoked || session.now >= record.expiry() {
+    if record.state == ApprovalState::Revoked
+        || (record.state != ApprovalState::Pending && session.now >= record.expiry())
+    {
         return Ok(record.view(session.now));
     }
     if session.now < record.created_at_ms
@@ -1894,17 +1901,20 @@ fn cap_of(record: &WireApproval) -> Option<u64> {
 }
 
 /// The consent bound of a continuation under the approval `nonce`.
-/// A missing record refuses `ApprovalNotFound`, as for every approval mint;
-/// a used parent skips the state checks of [`check_record`].
+/// A missing record refuses `ApprovalNotFound`, as for every approval mint,
+/// and a revoked record refuses `ApprovalRevoked`; a used parent skips the
+/// other state checks of [`check_record`].
 pub(super) fn continuation_cap(
     wire: &WireFile,
     nonce: &str,
 ) -> Result<Option<u64>, WindowStoreError> {
+    let refuse = |precondition| WindowStoreError::AuthorizationRefused { precondition };
     let Some(record) = records(wire).iter().find(|r| r.nonce == nonce) else {
-        return Err(WindowStoreError::AuthorizationRefused {
-            precondition: MainnetPrecondition::ApprovalNotFound,
-        });
+        return Err(refuse(MainnetPrecondition::ApprovalNotFound));
     };
+    if record.state == ApprovalState::Revoked {
+        return Err(refuse(MainnetPrecondition::ApprovalRevoked));
+    }
     Ok(cap_of(record))
 }
 
@@ -3586,11 +3596,18 @@ pub(in crate::policy_state) mod tests {
     #[test]
     #[serial(mainnet_clock)]
     #[serial]
-    fn revoke_is_idempotent_and_writes_nothing_after_the_window() {
-        for expired in [false, true] {
+    fn revoke_is_idempotent_and_writes_nothing_for_a_used_record_after_the_window() {
+        // A pending record revokes inside and after its window; a consumed
+        // record whose window ended keeps its state and writes nothing.
+        for (expired, consumed) in [(false, false), (true, false), (true, true)] {
             let mut fx = Fx::new(300_000);
             fx.open();
             let expiry = fx.consent().record.consent.unwrap().execution_expires_at_ms;
+            if consumed {
+                fx.store
+                    .mint_authorization(fx.fixture.profile(), &fx.mint_request())
+                    .unwrap();
+            }
             if expired {
                 fx.clock.set(expiry);
             }
@@ -3605,17 +3622,32 @@ pub(in crate::policy_state) mod tests {
             assert!(recorder.take_committed().is_empty());
             assert_eq!(
                 view.record.state,
-                if expired {
-                    ApprovalState::Pending
+                if consumed {
+                    ApprovalState::Consumed
                 } else {
                     ApprovalState::Revoked
-                }
+                },
+                "expired {expired}, consumed {consumed}"
             );
-            if expired {
+            if consumed {
                 assert_eq!(fx.bytes(), before);
+            } else {
+                assert_ne!(fx.bytes(), before);
+                assert_eq!(
+                    view.record.revoked_at_ms,
+                    Some(crate::mainnet::clock::now_ms().unwrap())
+                );
             }
             let bytes = fx.bytes();
-            assert_eq!(fx.recorder().revoke(id).unwrap(), view);
+            let again = fx.recorder().revoke(id).unwrap();
+            if !expired {
+                assert_eq!(again, view);
+            }
+            // After the window the later read releases the payload.
+            assert_eq!(again.record.state, view.record.state);
+            assert_eq!(again.record.revoked_at_ms, view.record.revoked_at_ms);
+            assert_eq!(again.record.closed_at_ms, view.record.closed_at_ms);
+            assert_eq!(again.expired, view.expired);
             assert_eq!(fx.bytes(), bytes);
             assert_eq!(fx.rows.entries.len(), rows);
             let operation_after = fx.wire().operations.unwrap().records.remove(0);
