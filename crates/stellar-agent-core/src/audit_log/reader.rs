@@ -701,30 +701,33 @@ impl AuditReader {
         Ok(None)
     }
 
-    /// Scans the full rotated chain and returns ALL pin records (the pin rows
-    /// of both versions), deduplicated to the most-recent row per
-    /// `(rule_id, smart_account_redacted)`.
+    /// Scans the full rotated chain and returns the pin records of installed
+    /// rules (the pin rows of both versions), deduplicated to the most-recent
+    /// row per `(rule_id, smart_account_redacted)`.
     ///
     /// Reads the writer's bounded walk, so rows past the writer's verified tip
     /// and quarantined rows are not part of the result. Unlike
     /// `find_latest_context_rule_pinned_hashes`, this method does NOT filter by
-    /// a specific `(rule_id, smart_account_redacted)` pair — it collects ALL
-    /// rules across the full log chain.
+    /// a specific `(rule_id, smart_account_redacted)` pair: it collects all
+    /// installed rules across the full log chain.
     ///
     /// # Deduplication
     ///
     /// If the same `(rule_id, smart_account_redacted)` appears more than once
-    /// (e.g. after a rule reinstall), the MOST RECENT row wins. Scan order is
-    /// newest-file-first, newest-entry-last-within-file — same as the other
-    /// `find_latest_*` methods.
+    /// (a pins-updated row after the created row), the MOST RECENT row wins.
+    /// Scan order is newest-file-first, newest-entry-last-within-file, the same
+    /// as the other `find_latest_*` methods.
     ///
     /// # Returns
     ///
     /// A `Vec` of `(rule_id, smart_account_redacted, ContextRulePinRecord)` tuples,
-    /// deduplicated to the most-recent row per `(rule_id, smart_account)` — the
-    /// newest file wins on conflict — and sorted by `(rule_id, smart_account)`
-    /// ascending for deterministic output. Empty when the log is absent or
-    /// contains no pin-record rows.
+    /// deduplicated to the most-recent row per `(rule_id, smart_account)` (the
+    /// newest file wins on conflict) and sorted by `(rule_id, smart_account)`
+    /// ascending for deterministic output. A rule with an
+    /// `SaContextRuleDeleted` row for the same rule id and smart account is
+    /// left out; rule ids are never reused, so a deletion is final. Empty when
+    /// the log is absent, contains no pin-record rows, or every pinned rule has
+    /// been deleted.
     ///
     /// # Errors
     ///
@@ -884,8 +887,10 @@ impl AuditReader {
     }
 }
 
-/// Collects every pin record of `files`, deduplicated to the newest row per
-/// `(rule_id, smart_account_redacted)` and sorted by that key.
+/// Collects the pin records of installed rules in `files`, deduplicated to the
+/// newest row per `(rule_id, smart_account_redacted)` and sorted by that key.
+/// A rule with an `SaContextRuleDeleted` row for the same rule id and smart
+/// account is left out; rule ids are never reused, so a deletion is final.
 ///
 /// Files come newest first; within a file the last row of a key wins, and
 /// across files the newest file's.
@@ -894,6 +899,7 @@ fn all_pin_records(
 ) -> Result<Vec<(u32, String, ContextRulePinRecord)>, AuditLogIntegrityError> {
     let mut latest: std::collections::HashMap<(u32, String), ContextRulePinRecord> =
         std::collections::HashMap::new();
+    let mut deleted: std::collections::HashSet<(u32, String)> = std::collections::HashSet::new();
     for file in files {
         let file = file?;
         let mut this_file: std::collections::HashMap<(u32, String), ContextRulePinRecord> =
@@ -904,25 +910,34 @@ fn all_pin_records(
                     (row.rule_id, row.smart_account.to_owned()),
                     row.record(*line)?,
                 );
+            } else if let EventKind::SaContextRuleDeleted {
+                rule_id,
+                smart_account,
+            } = &entry.event_kind
+            {
+                deleted.insert((*rule_id, smart_account.clone()));
             }
         }
-        // Keep the first-seen (newest) row per key, so a reinstall in a newer
-        // file wins over an older file's.
+        // Keep the first-seen (newest) row per key, so a pins update in a
+        // newer file wins over an older file's row.
         for (key, record) in this_file {
             latest.entry(key).or_insert(record);
         }
     }
     let mut result: Vec<(u32, String, ContextRulePinRecord)> = latest
         .into_iter()
+        .filter(|(key, _)| !deleted.contains(key))
         .map(|((rule_id, account), record)| (rule_id, account, record))
         .collect();
     result.sort_by_key(|(rule_id, account, _)| (*rule_id, account.clone()));
     Ok(result)
 }
 
-/// Every pin record of the log at `log_path`, as
+/// Pin records of installed rules in the log at `log_path`, as
 /// [`AuditReader::scan_all_context_rule_pin_records`] returns them, read
-/// without a writer and without its bound.
+/// without a writer and without its bound. A rule with an
+/// `SaContextRuleDeleted` row for the same rule id and smart account is left
+/// out; rule ids are never reused, so a deletion is final.
 ///
 /// Takes no lock: it serves the startup advisory when no writer can be
 /// opened, for example on a keyed log whose key did not load, and its result
@@ -5208,6 +5223,172 @@ mod tests {
         let r1_rec = complete(Some(r1_rec.clone()));
         assert_eq!(r1_rec.pinned_verifier_hashes, vec![h(0xcc)]);
         assert_eq!(r1_rec.pinned_policy_hashes, vec![h(0xdd)]);
+    }
+
+    /// A deleted rule is absent from both the anchored and unanchored pin scans,
+    /// leaving only installed rules on the same smart account.
+    #[test]
+    fn scan_all_context_rule_pin_records_excludes_deleted_rule() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        let sa = "CDABC...12345";
+
+        {
+            let mut w = writer.lock().unwrap();
+            write_event(
+                &mut w,
+                v1_created_event(1, sa, vec!["4242424242424242".to_owned()], vec![], vec![]),
+            );
+            write_event(&mut w, context_rule_deleted_event(1, sa));
+            write_event(
+                &mut w,
+                context_rule_created_event(2, sa, vec![h(0xaa)], vec![], false, false),
+            );
+        }
+
+        let reader = AuditReader::new(Arc::clone(&writer), None);
+        let anchored = reader.scan_all_context_rule_pin_records().unwrap();
+        assert_eq!(
+            anchored.len(),
+            1,
+            "deleted rule 1 must be excluded: {anchored:?}"
+        );
+        assert_eq!(anchored[0].0, 2);
+        assert_eq!(anchored[0].1, sa);
+        assert_eq!(
+            complete(Some(anchored[0].2.clone())).pinned_verifier_hashes,
+            vec![h(0xaa)]
+        );
+
+        let unanchored = scan_all_context_rule_pin_records_unanchored(&path).unwrap();
+        assert_eq!(
+            unanchored, anchored,
+            "unanchored scan must return the same installed rules as the anchored scan"
+        );
+    }
+
+    /// A delete row matches on `(rule_id, smart_account)`: deleting rule 1 on
+    /// another smart account leaves this account's rule 1 in the result.
+    #[test]
+    fn scan_all_context_rule_pin_records_delete_on_other_account_keeps_rule() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        let sa_keep = "CAAA1...11111";
+        let sa_delete = "CBBB2...22222";
+
+        {
+            let mut w = writer.lock().unwrap();
+            write_event(
+                &mut w,
+                context_rule_created_event(1, sa_keep, vec![h(0xaa)], vec![], false, false),
+            );
+            write_event(
+                &mut w,
+                context_rule_created_event(1, sa_delete, vec![h(0xbb)], vec![], false, false),
+            );
+            write_event(&mut w, context_rule_deleted_event(1, sa_delete));
+        }
+
+        let reader = AuditReader::new(Arc::clone(&writer), None);
+        let anchored = reader.scan_all_context_rule_pin_records().unwrap();
+        assert_eq!(
+            anchored.len(),
+            1,
+            "only rule 1 on the deleted account is removed: {anchored:?}"
+        );
+        assert_eq!(anchored[0].0, 1);
+        assert_eq!(anchored[0].1, sa_keep);
+        assert_eq!(
+            complete(Some(anchored[0].2.clone())).pinned_verifier_hashes,
+            vec![h(0xaa)]
+        );
+
+        let unanchored = scan_all_context_rule_pin_records_unanchored(&path).unwrap();
+        assert_eq!(unanchored, anchored);
+    }
+
+    /// A pin row in an older rotated file is excluded when a newer file holds
+    /// its delete row, while surviving rules from the older file remain.
+    #[test]
+    fn scan_all_context_rule_pin_records_excludes_rule_deleted_after_rotation() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        let sa = "CDABC...12345";
+
+        {
+            let mut w = writer.lock().unwrap();
+            write_event(
+                &mut w,
+                v1_created_event(1, sa, vec!["4242424242424242".to_owned()], vec![], vec![]),
+            );
+            write_event(
+                &mut w,
+                context_rule_created_event(2, sa, vec![h(0xbb)], vec![], false, false),
+            );
+            w.force_rotate_for_test().unwrap();
+            write_event(&mut w, context_rule_deleted_event(1, sa));
+        }
+
+        let reader = AuditReader::new(Arc::clone(&writer), None);
+        let anchored = reader.scan_all_context_rule_pin_records().unwrap();
+        assert_eq!(
+            anchored.len(),
+            1,
+            "rule 1 deleted in newer file must be excluded: {anchored:?}"
+        );
+        assert_eq!(anchored[0].0, 2);
+        assert_eq!(anchored[0].1, sa);
+        assert_eq!(
+            complete(Some(anchored[0].2.clone())).pinned_verifier_hashes,
+            vec![h(0xbb)]
+        );
+
+        let unanchored = scan_all_context_rule_pin_records_unanchored(&path).unwrap();
+        assert_eq!(unanchored, anchored);
+    }
+
+    /// A delete row in an older rotated file still excludes a pin row for the
+    /// same `(rule_id, smart_account)` in a newer file.
+    #[test]
+    fn scan_all_context_rule_pin_records_excludes_rule_deleted_in_older_file() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        let sa = "CDABC...12345";
+
+        {
+            let mut w = writer.lock().unwrap();
+            write_event(&mut w, context_rule_deleted_event(1, sa));
+            w.force_rotate_for_test().unwrap();
+            write_event(
+                &mut w,
+                context_rule_created_event(1, sa, vec![h(0xaa)], vec![], false, false),
+            );
+            write_event(
+                &mut w,
+                context_rule_created_event(2, sa, vec![h(0xbb)], vec![], false, false),
+            );
+        }
+
+        let reader = AuditReader::new(Arc::clone(&writer), None);
+        let anchored = reader.scan_all_context_rule_pin_records().unwrap();
+        assert_eq!(
+            anchored.len(),
+            1,
+            "rule 1 deleted in older file must be excluded: {anchored:?}"
+        );
+        assert_eq!(anchored[0].0, 2);
+        assert_eq!(anchored[0].1, sa);
+        assert_eq!(
+            complete(Some(anchored[0].2.clone())).pinned_verifier_hashes,
+            vec![h(0xbb)]
+        );
+
+        let unanchored = scan_all_context_rule_pin_records_unanchored(&path).unwrap();
+        assert_eq!(unanchored, anchored);
     }
 
     // ── 18. scan_all_context_rule_pin_records: empty log returns empty vec ─────────

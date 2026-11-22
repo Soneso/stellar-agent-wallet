@@ -8,7 +8,9 @@
 //! retired entry is never assigned that entry's status. A rule whose pin
 //! record holds eight-byte hash prefixes gets an advisory naming
 //! `sa.wasm_pin_incomplete` and its recovery instead: a prefix cannot name
-//! an allowlist entry.
+//! an allowlist entry. The scan leaves out every rule with an
+//! `SaContextRuleDeleted` row for the same rule id and smart account in the
+//! local audit log.
 //!
 //! # No-network invariant
 //!
@@ -66,13 +68,15 @@ use stellar_agent_smart_account::verifier_allowlist::{
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct AdvisoryResult {
-    /// Rule IDs that referenced a `Revoked` or `Retired` verifier hash.
+    /// IDs of rules that referenced a `Revoked` or `Retired` verifier hash and
+    /// have no `SaContextRuleDeleted` row in the audit log.
     ///
-    /// Empty when no revoked/retired verifier hashes are found in the audit
-    /// log, or when the audit log is absent or unreadable.
+    /// Empty when no such rule exists, or when the audit log is absent or
+    /// unreadable.
     pub triggered_rule_ids: Vec<u32>,
-    /// Rule IDs whose pin record holds eight-byte hash prefixes, which
-    /// signing refuses with `sa.wasm_pin_incomplete`. No allowlist status is
+    /// IDs of rules whose pin record holds eight-byte hash prefixes, which
+    /// signing refuses with `sa.wasm_pin_incomplete`, and that have no
+    /// `SaContextRuleDeleted` row in the audit log. No allowlist status is
     /// looked up for them.
     pub incomplete_pin_rule_ids: Vec<u32>,
 }
@@ -123,8 +127,9 @@ pub fn run_startup_advisory(
 /// # Algorithm
 ///
 /// 1. If the audit-log file is absent or empty, return early.
-/// 2. Scan every rule's newest pin record without a writer through
-///    `scan_all_context_rule_pin_records_unanchored`.
+/// 2. Read the newest pin record of each rule without a writer through
+///    `scan_all_context_rule_pin_records_unanchored`, which leaves out a rule
+///    with an `SaContextRuleDeleted` row.
 /// 3. Keep `open_writer` for the first finding that needs an audit row.
 /// 4. For a record of eight-byte hash prefixes, emit one `[advisory]` stderr
 ///    line naming `sa.wasm_pin_incomplete` and the recovery, record the rule
@@ -460,6 +465,21 @@ mod tests {
             pinned_verifier_executable_refs: vec![],
             pinned_policy_executable_refs: vec![],
         };
+        writer.lock().unwrap().write_entry(entry).unwrap();
+    }
+
+    /// Writes a `SaContextRuleDeleted` row for `(rule_id, smart_account)`.
+    fn write_context_rule_deleted(
+        writer: &Arc<Mutex<AuditWriter>>,
+        rule_id: u32,
+        smart_account: &str,
+    ) {
+        let entry = AuditEntry::new_sa_context_rule_deleted(
+            smart_account,
+            rule_id,
+            Option::<String>::None,
+            Uuid::new_v4().to_string(),
+        );
         writer.lock().unwrap().write_entry(entry).unwrap();
     }
 
@@ -1397,6 +1417,84 @@ mod tests {
                 .unwrap()
                 .contains("sa_verifier_allowlist_advisory"),
             "an incomplete record writes no advisory row"
+        );
+    }
+
+    /// A deleted rule whose pin record held eight-byte prefixes produces no
+    /// incomplete-pin advisory.
+    #[test]
+    fn advisory_skips_deleted_rule_with_incomplete_pin_record() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        write_prefix_context_rule_created(
+            &writer,
+            1,
+            "CDABC...12345",
+            vec!["abababababababab".to_owned()],
+        );
+        write_context_rule_deleted(&writer, 1, "CDABC...12345");
+        drop(writer);
+        let allowlist = [VerifierAllowlistEntry::new_for_test(
+            [0xAB; 32],
+            VerifierAuditStatus::Revoked {
+                revoked_at: "2026-01-01",
+                reason: "deleted incomplete rule fixture",
+            },
+        )];
+
+        let result = run_startup_advisory_with_allowlist(&path, &allowlist, || {
+            panic!("a deleted rule needs no writer")
+        });
+
+        assert!(
+            result.incomplete_pin_rule_ids.is_empty(),
+            "deleted rule 1 must not appear in incomplete_pin_rule_ids: {result:?}"
+        );
+        assert!(result.triggered_rule_ids.is_empty(), "{result:?}");
+    }
+
+    /// A deleted rule whose pinned verifier hash is revoked triggers no
+    /// advisory and appends no `sa_verifier_allowlist_advisory` row.
+    #[test]
+    fn advisory_skips_deleted_rule_with_revoked_verifier_hash() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        write_context_rule_created(&writer, 1, "CDABC...12345", vec![h(0xab)]);
+        write_context_rule_deleted(&writer, 1, "CDABC...12345");
+        drop(writer);
+        let before = std::fs::read(&path).unwrap();
+        let allowlist = [VerifierAllowlistEntry::new_for_test(
+            [0xAB; 32],
+            VerifierAuditStatus::Revoked {
+                revoked_at: "2026-01-01",
+                reason: "deleted revoked rule fixture",
+            },
+        )];
+
+        let mut opens = 0;
+        let result = run_startup_advisory_with_allowlist(&path, &allowlist, || {
+            opens += 1;
+            Ok(open_writer(path.clone()))
+        });
+
+        assert!(
+            result.triggered_rule_ids.is_empty(),
+            "deleted rule 1 must not trigger advisory: {result:?}"
+        );
+        assert!(result.incomplete_pin_rule_ids.is_empty(), "{result:?}");
+        assert_eq!(opens, 0, "a deleted rule opens no audit writer");
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("sa_verifier_allowlist_advisory"),
+            "a deleted rule appends no advisory row"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "audit log must remain unchanged"
         );
     }
 
