@@ -2182,6 +2182,61 @@ mod tests {
             "CREDMARKER7",
         );
     }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    async fn toolset_invoke_refuses_muxed_contract_payment_before_outer_gate() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let rpc = wiremock::MockServer::start().await;
+        let profile = stellar_agent_core::profile::schema::Profile::builder_testnet(
+            "svc", "acct", "n-svc", "n-acct",
+        )
+        .with_noop_engine()
+        .rpc_url(rpc.uri())
+        .build();
+        let server = WalletServer::new(profile).unwrap();
+        let source = stellar_strkey::ed25519::PublicKey([1; 32]).to_string();
+        let destination =
+            stellar_agent_test_support::xdr_fixtures::muxed_contract_address().to_string();
+        for (with_memo, expected_code) in [
+            (false, "validation.contract_payment_unavailable"),
+            (true, "validation.contract_payment_memo_unsupported"),
+        ] {
+            for action in ["stellar_pay", "stellar_pay_commit"] {
+                let mut args = serde_json::json!({
+                    "source": source.as_str(),
+                    "destination": destination.as_str(),
+                    "asset": "native",
+                    "amount": "1 XLM",
+                });
+                if with_memo {
+                    args["memo_text"] = serde_json::json!("memo");
+                }
+                let result = server
+                    .call_stellar_toolset_invoke(StellarToolsetInvokeArgs {
+                        toolset: "not-even-installed".to_owned(),
+                        action: action.to_owned(),
+                        chain_id: Some("stellar:testnet".to_owned()),
+                        args,
+                    })
+                    .await
+                    .expect("business error envelope for W destination");
+                let (code, _, text) = crate::tools::common::assert_business_envelope(&result);
+                assert_eq!(
+                    code, expected_code,
+                    "{action}, with_memo={with_memo}: {text}"
+                );
+            }
+        }
+        assert!(
+            rpc.received_requests().await.unwrap().is_empty(),
+            "no network request may be sent for W destination"
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

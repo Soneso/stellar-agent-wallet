@@ -437,15 +437,15 @@ pub(crate) fn parse_asset_and_amount(
     Ok((asset, amount))
 }
 
-/// Refuses a payment to a canonical C contract before any account read,
+/// Refuses a payment to a canonical C or W contract before any account read,
 /// approval, nonce, hold, or signing.
 ///
 /// A contract transfer `envelope_xdr` refuses first, proven for `asset` on
 /// `chain`: `validation.contract_payment_invalid` without a valid `asset`,
 /// otherwise `validation.contract_payment_memo_unsupported` for an envelope
 /// memo, `validation.contract_payment_unavailable` once proven, and
-/// `validation.contract_payment_invalid` when not proven. A C `destination`
-/// then refuses with
+/// `validation.contract_payment_invalid` when not proven. A C or W
+/// `destination` then refuses with
 /// `validation.contract_payment_memo_unsupported` when `memo` is set, and
 /// otherwise with `validation.contract_payment_unavailable`.
 pub(crate) fn contract_payment_refusal(
@@ -2961,6 +2961,7 @@ mod tests {
         );
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         stellar_agent_test_support::keyring_mock::install().expect("keyring");
+        let rpc = wiremock::MockServer::start().await;
         let server = WalletServer::new(
             stellar_agent_core::profile::schema::Profile::builder_testnet(
                 "svc",
@@ -2969,7 +2970,7 @@ mod tests {
                 "nonce-acct",
             )
             .with_noop_engine()
-            .rpc_url(format!("http://{}:9", std::net::Ipv4Addr::LOCALHOST))
+            .rpc_url(rpc.uri())
             .build(),
         )
         .expect("server");
@@ -2988,33 +2989,52 @@ mod tests {
             )
             .expect("operation");
         let envelope = builder.build().expect("envelope");
-        let args = serde_json::json!({
-            "chain_id": "stellar:testnet",
-            "source": stellar_strkey::ed25519::PublicKey([1; 32]).to_string().as_str(),
-            "destination": stellar_agent_test_support::xdr_fixtures::muxed_contract_address().to_string(),
-            "asset": "native", "amount": "1 XLM",
-            "nonce": "nonce", "expires_at_unix_ms": 1, "envelope_xdr": envelope
-        });
+        let destination =
+            stellar_agent_test_support::xdr_fixtures::muxed_contract_address().to_string();
         let before = std::fs::read_dir(home.path()).expect("state").count();
-        for result in [
-            server
-                .call_stellar_pay(serde_json::from_value(args.clone()).expect("prepare"))
-                .await,
-            server
-                .call_stellar_pay_commit(serde_json::from_value(args).expect("commit"))
-                .await,
+        for (with_memo, expected_code) in [
+            (false, "validation.contract_payment_unavailable"),
+            (true, "validation.contract_payment_memo_unsupported"),
         ] {
-            let error = result.expect_err("W refused");
-            assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
-            assert!(
-                error
-                    .message
-                    .starts_with("invalid destination (expected G-strkey):")
-            );
+            let mut args = serde_json::json!({
+                "chain_id": "stellar:testnet",
+                "source": source.as_str(),
+                "destination": destination.as_str(),
+                "asset": "native", "amount": "1 XLM",
+                "nonce": "nonce", "expires_at_unix_ms": 1, "envelope_xdr": envelope
+            });
+            if with_memo {
+                args["memo_text"] = serde_json::json!("memo");
+            }
+            for (stage, result) in [
+                (
+                    "stellar_pay",
+                    server
+                        .call_stellar_pay(serde_json::from_value(args.clone()).expect("prepare"))
+                        .await,
+                ),
+                (
+                    "stellar_pay_commit",
+                    server
+                        .call_stellar_pay_commit(serde_json::from_value(args).expect("commit"))
+                        .await,
+                ),
+            ] {
+                let result = result.expect("business error envelope for W destination");
+                let (code, _, text) = crate::tools::common::assert_business_envelope(&result);
+                assert_eq!(
+                    code, expected_code,
+                    "{stage}, with_memo={with_memo}: {text}"
+                );
+            }
         }
         assert_eq!(
             std::fs::read_dir(home.path()).expect("state").count(),
             before
+        );
+        assert!(
+            rpc.received_requests().await.expect("requests").is_empty(),
+            "no network request may be sent for W destination"
         );
     }
 
@@ -3329,5 +3349,110 @@ mod tests {
             // The base64 decoder names the offending byte as "Invalid symbol".
             assert_no_marker_in_text(output, "symbol");
         }
+    }
+
+    /// An explicit `fee` above `classic_max_fee_per_op_stroops` on `stellar_pay`
+    /// refuses naming `fee` (not `--fee`).
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    #[allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        reason = "test fixtures and assertions"
+    )]
+    async fn pay_explicit_fee_above_cap_names_mcp_fee_argument() {
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+
+        let source = stellar_agent_test_support::signed_envelope::account_id_for_seed([0x21; 32]);
+        let dest = stellar_agent_test_support::signed_envelope::account_id_for_seed([0x22; 32]);
+        let now_s = stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1_000;
+        let rpc = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_partial_json(
+                json!({ "method": "getNetwork" }),
+            ))
+            .respond_with(stellar_agent_test_support::EchoIdResponder::new(
+                stellar_agent_test_support::signed_envelope::get_network_result(
+                    stellar_agent_test_support::signed_envelope::TESTNET_PASSPHRASE,
+                ),
+            ))
+            .mount(&rpc)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_partial_json(
+                json!({ "method": "getHealth" }),
+            ))
+            .respond_with(stellar_agent_test_support::EchoIdResponder::new(json!({
+                "status": "healthy",
+                "latestLedger": 100,
+                "oldestLedger": 1,
+                "ledgerRetentionWindow": 99,
+                "oldestLedgerCloseTime": 1,
+                "latestLedgerCloseTime": now_s,
+            })))
+            .mount(&rpc)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_partial_json(
+                json!({ "method": "getLedgers" }),
+            ))
+            .respond_with(stellar_agent_test_support::EchoIdResponder::new(json!({
+                "latestLedger": 100,
+                "oldestLedger": 1,
+                "latestLedgerCloseTime": now_s.to_string(),
+                "oldestLedgerCloseTime": 1,
+                "cursor": "100",
+                "ledgers": [],
+            })))
+            .mount(&rpc)
+            .await;
+        let mut ledger = stellar_agent_test_support::KeyedLedgerEntriesResponder::new();
+        for entry in stellar_agent_test_support::signed_envelope::ledger_entries_result_for(&[
+            source.as_str(),
+            dest.as_str(),
+        ])["entries"]
+            .as_array()
+            .unwrap()
+        {
+            ledger = ledger.with_entry(entry.clone());
+        }
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_partial_json(
+                json!({ "method": "getLedgerEntries" }),
+            ))
+            .respond_with(ledger)
+            .mount(&rpc)
+            .await;
+
+        let profile = stellar_agent_core::profile::schema::Profile::builder_testnet(
+            "svc", "acct", "n-svc", "n-acct",
+        )
+        .with_noop_engine()
+        .rpc_url(rpc.uri())
+        .classic_max_fee_per_op_stroops(Some(150))
+        .build();
+        let server = WalletServer::new(profile).unwrap();
+        let args: StellarPayArgs = serde_json::from_value(json!({
+            "chain_id": "stellar:testnet",
+            "source": source,
+            "destination": dest,
+            "asset": "native",
+            "amount": "1 XLM",
+            "fee": "200",
+        }))
+        .unwrap();
+
+        let result = server.call_stellar_pay(args).await.unwrap();
+        let (code, message, _) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "fees.percentile_exceeds_cap");
+        assert_eq!(
+            message,
+            "fee must be a per-operation stroop amount within classic_max_fee_per_op_stroops; \
+             lower fee or raise classic_max_fee_per_op_stroops."
+        );
+        assert!(!message.contains("--fee"), "{message}");
     }
 }

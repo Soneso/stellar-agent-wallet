@@ -268,10 +268,13 @@ where
     // `commands::policy_engine::build_v1_policy_engine` (policy_engine.rs:132)
     // and `build_policy_engine` in `stellar-agent-mcp/src/server.rs:478`. Signing
     // any other file has no effect unless the operator moves it there.
-    let policy_path = match args.file.clone() {
-        Some(p) => p,
+    let (policy_path, path_source) = match args.file.clone() {
+        Some(p) => (p, super::policy_authoring::PolicyPathSource::ExplicitFile),
         None => match default_policy_dir() {
-            Ok(dir) => dir.join(format!("{engine_profile_name}.toml")),
+            Ok(dir) => (
+                dir.join(format!("{engine_profile_name}.toml")),
+                super::policy_authoring::PolicyPathSource::ProfileDefault,
+            ),
             Err(e) => {
                 render::render_json(&Envelope::<()>::err_raw(
                     "sign_policy.policy_dir_unavailable",
@@ -282,7 +285,7 @@ where
         },
     };
 
-    let _authoring = match super::policy_authoring::acquire(&policy_path) {
+    let _authoring = match super::policy_authoring::acquire_for(&policy_path, path_source) {
         Ok(guard) => guard,
         Err((code, detail)) => {
             render::render_json(&Envelope::<()>::err_raw(code, detail));
@@ -294,10 +297,8 @@ where
     let raw = match std::fs::read_to_string(&policy_path) {
         Ok(s) => s,
         Err(e) => {
-            render::render_json(&Envelope::<()>::err_raw(
-                "sign_policy.policy_file_unreadable",
-                format!("could not read the policy file --file names: {e}"),
-            ));
+            let (code, detail) = super::policy_authoring::unreadable_policy_file(path_source, &e);
+            render::render_json(&Envelope::<()>::err_raw(code, detail));
             return 1;
         }
     };
@@ -1145,6 +1146,87 @@ pub(super) mod tests {
                 .starts_with("could not read the policy file --file names: ")
         );
         assert!(!dir.path().join("missing").exists());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn sign_policy_unreadable_names_flag_only_when_passed() {
+        keyring_mock::install().unwrap();
+        let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        let profile = provisioning_profile();
+        let (_, owner, _) = seed_material([11; 32]);
+        enroll_owner_pubkey("operator", &owner);
+
+        // 1. Default policy path with missing `policies/` directory (authoring lock NotFound).
+        let default_args = SignPolicyArgs {
+            profile: Some("operator".into()),
+            secret_env: "UNUSED_VAR".into(),
+            previous_owner_secret_env: None,
+            file: None,
+        };
+        crate::common::render::take_rendered_for_test();
+        let p = profile.clone();
+        let status = run_with_dependencies(&default_args, move |_| Ok(p.clone()), || Ok(())).await;
+        let output = crate::common::render::take_rendered_for_test().remove(0);
+        assert_eq!(status, 1, "{output}");
+        assert_eq!(
+            output["error"]["code"],
+            "sign_policy.policy_file_unreadable"
+        );
+        let msg = output["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.starts_with("could not read the profile's policy file: "),
+            "missing policy dir without --file must name profile's policy file: {msg}"
+        );
+        assert!(!msg.contains("--file"), "{msg}");
+
+        // 2. Default policy path with existing `policies/` directory but missing file.
+        let policies_dir = default_policy_dir().unwrap();
+        std::fs::create_dir_all(&policies_dir).unwrap();
+        crate::common::render::take_rendered_for_test();
+        let p = profile.clone();
+        let status = run_with_dependencies(&default_args, move |_| Ok(p.clone()), || Ok(())).await;
+        let output = crate::common::render::take_rendered_for_test().remove(0);
+        assert_eq!(status, 1, "{output}");
+        assert_eq!(
+            output["error"]["code"],
+            "sign_policy.policy_file_unreadable"
+        );
+        let msg = output["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.starts_with("could not read the profile's policy file: "),
+            "missing policy file without --file must name profile's policy file: {msg}"
+        );
+        assert!(!msg.contains("--file"), "{msg}");
+
+        // 3. Explicit `--file` with missing parent directory and with missing file.
+        for explicit_path in [
+            dir.path().join("no-such-dir/policy.toml"),
+            policies_dir.join("explicit-missing.toml"),
+        ] {
+            let explicit_args = SignPolicyArgs {
+                profile: Some("operator".into()),
+                secret_env: "UNUSED_VAR".into(),
+                previous_owner_secret_env: None,
+                file: Some(explicit_path),
+            };
+            crate::common::render::take_rendered_for_test();
+            let p = profile.clone();
+            let status =
+                run_with_dependencies(&explicit_args, move |_| Ok(p.clone()), || Ok(())).await;
+            let output = crate::common::render::take_rendered_for_test().remove(0);
+            assert_eq!(status, 1, "{output}");
+            assert_eq!(
+                output["error"]["code"],
+                "sign_policy.policy_file_unreadable"
+            );
+            let msg = output["error"]["message"].as_str().unwrap();
+            assert!(
+                msg.starts_with("could not read the policy file --file names: "),
+                "explicit --file refusal must name --file: {msg}"
+            );
+        }
     }
 
     /// `(S-strkey, pubkey bytes, G-strkey)` for a fixed 32-byte seed.

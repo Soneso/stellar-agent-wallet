@@ -1620,4 +1620,56 @@ mod tests {
         assert!(logs.contains("audit write failed"), "{logs}");
         assert_eq!(std::fs::read(&anchored_path).unwrap(), b"", "no row lands");
     }
+
+    /// Value verbs continue reporting carrier refusals under
+    /// `audit.chain_key_unavailable` with the carrier code at the head of the
+    /// message detail.
+    #[test]
+    #[serial_test::serial]
+    fn value_audit_keeps_chain_key_unavailable_with_carrier_code_head() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+
+        // Upgraded keyed log with no carrier record -> `audit.chain_key_unavailable`
+        // leading detail with `audit.carriers_unbound:`.
+        let name = "value-audit-unbound";
+        let mut profile = Profile::builder_testnet(name, "acct", "n-svc", "n-acct").build();
+        profile.audit_log_path = dir.path().join("unbound.jsonl");
+        let coord = profile.audit_log_hash_chain_key_id.clone();
+        stellar_agent_network::keyring::rotate_keyring_secret_32(&coord.service, &coord.account)
+            .unwrap();
+        let key = stellar_agent_network::keyring::load_hmac_key_32(&coord).unwrap();
+        {
+            let mut writer =
+                AuditWriter::open_keyed_unanchored_for_test(profile.audit_log_path.clone(), key)
+                    .unwrap();
+            writer
+                .write_entry(AuditEntry::new_profile_halted(
+                    "fixture",
+                    "2026-01-01T00:00:00Z",
+                    None,
+                    "req-unbound",
+                ))
+                .unwrap();
+        }
+        // Existing outbox file beside a keyed log without a carrier record
+        // triggers `CarriersUnbound` (same as an upgraded profile from the
+        // previous release).
+        std::fs::write(
+            stellar_agent_core::audit_log::outbox_path(&profile.audit_log_path),
+            b"",
+        )
+        .unwrap();
+        let error = require_value_audit_writer(&profile, name).unwrap_err();
+        assert_eq!(error.code(), "audit.chain_key_unavailable", "{error}");
+        assert!(
+            error
+                .message()
+                .contains("cannot be audited: audit.carriers_unbound:"),
+            "{error}"
+        );
+    }
 }

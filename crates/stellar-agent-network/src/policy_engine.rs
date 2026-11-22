@@ -47,6 +47,19 @@ pub struct ProfileSelection<'a> {
     pub profile_dir: &'a Path,
 }
 
+/// Prefixes `code` onto `text` only when `text` does not already start with
+/// `code` (either bare or followed by `:`).
+fn with_wire_code(code: &str, text: String) -> String {
+    if text
+        .strip_prefix(code)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
+    {
+        text
+    } else {
+        format!("{code}: {text}")
+    }
+}
+
 /// A typed cause preserved by binary-specific error rendering.
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyEngineBuildError {
@@ -57,10 +70,10 @@ pub enum PolicyEngineBuildError {
         kind: PolicyEngineKind,
     },
     /// Policy parsing, signature, restrictions, or freshness failed.
-    #[error("{code}: {0}", code = .0.wire_code())]
+    #[error("{}", with_wire_code(.0.wire_code(), .0.to_string()))]
     Policy(PolicyError),
     /// Enrolled owner discovery failed in the registered keyring backend.
-    #[error("{code}: {0}", code = .0.code())]
+    #[error("{}", with_wire_code(.0.code(), .0.to_string()))]
     OwnerKeyring(stellar_agent_core::error::WalletError),
     /// The persisted window state could not be hydrated.
     #[error("policy-window-state store for profile '{store_name}' failed to load ({source})")]
@@ -213,4 +226,130 @@ pub fn build_policy_engine(
         enablement,
         policy_path: Some(path),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every `PolicyError` carries its wire code once through
+    /// `PolicyEngineBuildError::Policy`, whether its own `Display` starts with
+    /// the code or not; `OwnerKeyring` obeys the same rule.
+    #[test]
+    fn policy_engine_build_error_does_not_double_wire_code() {
+        let self_prefixed = [
+            PolicyError::ResetConsentReplayed,
+            PolicyError::EngineSelectionUnsigned { selection: "noop" },
+            PolicyError::MainnetTableOnTestnet,
+            PolicyError::SequenceRollback,
+            PolicyError::SequenceFork,
+            PolicyError::PinAbsent,
+            PolicyError::OwnerRotationRequired,
+            PolicyError::OwnerRotationInvalid,
+            PolicyError::StateLockBusy,
+            PolicyError::StateLockIo {
+                kind: std::io::ErrorKind::PermissionDenied,
+            },
+            PolicyError::MainnetMinimumUnmet {
+                requirement: "rules",
+                rule: None,
+            },
+            PolicyError::PinUnusable {
+                detail: "corrupt".to_owned(),
+            },
+            PolicyError::TestOwnerKeyRefused,
+        ];
+        for error in self_prefixed {
+            let code = error.wire_code();
+            let rendered = PolicyEngineBuildError::Policy(error).to_string();
+            assert!(
+                rendered.starts_with(code),
+                "expected code {code} at start of {rendered:?}"
+            );
+            assert_eq!(
+                rendered.matches(code).count(),
+                1,
+                "wire code {code} must appear once: {rendered:?}"
+            );
+        }
+
+        let unprefixed = [
+            PolicyError::MissingOwnerKey {
+                profile: "alpha".to_owned(),
+            },
+            PolicyError::OwnerSignatureInvalid {
+                profile: "alpha".to_owned(),
+                rules_with_signed_optional_keys: Vec::new(),
+            },
+            PolicyError::PolicyFileLoadFailed {
+                detail: "not found".to_owned(),
+            },
+        ];
+        for error in unprefixed {
+            let code = error.wire_code();
+            let rendered = PolicyEngineBuildError::Policy(error).to_string();
+            assert!(
+                rendered.starts_with(&format!("{code}: ")),
+                "expected prefixed {code}: in {rendered:?}"
+            );
+            assert_eq!(
+                rendered.matches(code).count(),
+                1,
+                "wire code {code} must appear once: {rendered:?}"
+            );
+        }
+
+        let self_coded_wallet = stellar_agent_core::error::WalletError::Validation(
+            stellar_agent_core::error::ValidationError::AuditCarriersUnbound {
+                detail: "audit.carriers_unbound: stop every wallet process".to_owned(),
+            },
+        );
+        let rendered_self = PolicyEngineBuildError::OwnerKeyring(self_coded_wallet).to_string();
+        assert!(rendered_self.starts_with("audit.carriers_unbound: "));
+        assert_eq!(
+            rendered_self.matches("audit.carriers_unbound").count(),
+            1,
+            "{rendered_self:?}"
+        );
+
+        let plain_wallet = stellar_agent_core::error::WalletError::Auth(
+            stellar_agent_core::error::AuthError::KeyringConfigInvalid {
+                detail: "backend missing".to_owned(),
+            },
+        );
+        let plain_code = plain_wallet.code();
+        let rendered_plain = PolicyEngineBuildError::OwnerKeyring(plain_wallet).to_string();
+        assert!(
+            rendered_plain.starts_with(&format!("{plain_code}: ")),
+            "{rendered_plain:?}"
+        );
+        assert_eq!(
+            rendered_plain.matches(plain_code).count(),
+            1,
+            "{rendered_plain:?}"
+        );
+    }
+
+    #[test]
+    fn with_wire_code_checks_code_boundary() {
+        assert_eq!(
+            with_wire_code("policy.pin_absent", "policy.pin_absent".to_owned()),
+            "policy.pin_absent"
+        );
+        assert_eq!(
+            with_wire_code("policy.pin_absent", "policy.pin_absent: missing".to_owned()),
+            "policy.pin_absent: missing"
+        );
+        assert_eq!(
+            with_wire_code(
+                "policy.pin_absent",
+                "policy.pin_absent_extra: other".to_owned()
+            ),
+            "policy.pin_absent: policy.pin_absent_extra: other"
+        );
+        assert_eq!(
+            with_wire_code("policy.pin_absent", "plain text".to_owned()),
+            "policy.pin_absent: plain text"
+        );
+    }
 }

@@ -76,10 +76,9 @@
 //! `--asset` picks USDC or XLM, and XLM takes `--tolerated-loss` and
 //! `--typical-payment`. `--unlisted-budget` chooses one budget for
 //! unlisted recipients, shared by every payment tool, and `--total-budget`
-//! a total for the signed policy's digest: signing the same policy body
-//! again keeps that allocation, and a different digest starts another.
-//! These flags and `--output`
-//! apply to mainnet V1 only.
+//! a non-renewing total for the signed policy's digest (see
+//! `stellar_agent_core::policy::v1::presets::TOTAL_BUDGET_ALLOCATION_RULE`).
+//! These flags and `--output` apply to mainnet V1 only.
 //!
 //! At a terminal (stdin and stderr), `init` asks for a missing XLM amount,
 //! for a missing unlisted choice of an api preset, and for a missing total
@@ -136,7 +135,7 @@
 //!       "Run `stellar-agent profile enroll-owner-key --profile default --secret-env <VAR>` to enroll the policy-file owner key.",
 //!       "Run `stellar-agent profile rotate-attestation-key default` to mint the approval-attestation key.",
 //!       "Create the V1 policy file `policies/default.toml` in the wallet's state directory, with `version = 1` and `scope = \"profile:default\"` (see \"Create the V1 policy file\" in the getting-started guide).",
-//!       "Run `stellar-agent profile sign-policy --profile default --secret-env <VAR>` to sign the V1 policy file."
+//!       "Run `stellar-agent profile sign-policy --profile default --secret-env <VAR>` to sign `policies/default.toml`."
 //!     ]
 //!   },
 //!   "request_id": "..."
@@ -578,6 +577,15 @@ where
     }
 }
 
+/// Builds the `total_budget` question of `profile init`.
+fn total_budget_prompt(loss_stroops: i128, code: &str) -> String {
+    format!(
+        "Limit total spending to {} {code} for this policy? {} [Y/n]: ",
+        presets::format_amount(loss_stroops),
+        presets::TOTAL_BUDGET_ALLOCATION_RULE
+    )
+}
+
 /// Resolves the preset inputs from the flags and, at a terminal, the
 /// prompts, and derives the limits.
 ///
@@ -664,11 +672,7 @@ where
         let loss = input
             .tolerated_loss_stroops
             .unwrap_or(preset.tolerated_loss_stroops);
-        let question = format!(
-            "Limit total spending to {} {code} for this policy? Signing the same policy body \
-             again keeps the allocation; a different digest starts another. [Y/n]: ",
-            presets::format_amount(loss)
-        );
+        let question = total_budget_prompt(loss, code);
         let answer = prompter.ask(&question, "total_budget").await?;
         input.total_budget = match answer.to_ascii_lowercase().as_str() {
             "" | "y" | "yes" => true,
@@ -934,7 +938,7 @@ fn next_steps(profile_name: &str, engine: PolicyEngineKind, network: TargetNetwo
         });
         steps.push(format!(
             "Run `stellar-agent profile sign-policy --profile {profile_name} --secret-env \
-             <VAR>` to sign the V1 policy file."
+             <VAR>` to sign `policies/{profile_name}.toml`."
         ));
         if network == TargetNetwork::Mainnet {
             steps.push(format!(
@@ -1970,17 +1974,20 @@ mod tests {
         );
     }
 
-    /// The total budget question defaults to yes at a terminal, and without a
-    /// terminal the total budget is chosen without a question.
+    /// The total budget question defaults to yes at a terminal, without a
+    /// terminal the total budget is chosen without a question, and the `init`
+    /// envelope carries the version 2 allocation note.
     #[tokio::test]
     #[serial_test::serial]
     async fn total_budget_prompt_defaults_to_yes() {
         let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
         let _storage_home =
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
-        let question = "Limit total spending to 2 USDC for this policy? Signing the same policy \
-                        body again keeps the allocation; a different digest starts another. \
-                        [Y/n]: ";
+        let question = "Limit total spending to 2 USDC for this policy? Signing identical \
+                        version 1 bytes keeps the allocation; every signing of a version 2 body \
+                        gives it a new sequence, a new digest, and a new allocation. [Y/n]: ";
+        let v2_note = "Every signing of a version 2 body gives it a new sequence, a new digest, \
+                       and a new total_budget allocation.";
         let dir = tempfile::tempdir().unwrap();
         for (n, (answer, total)) in [
             ("", true),
@@ -1999,6 +2006,15 @@ mod tests {
             let out = init_at(&a, dir.path(), true, queue(&[answer])).await;
             assert_eq!(out.code, 0, "{answer:?}: {}", out.envelope);
             assert!(out.stderr.starts_with(question), "{}", out.stderr);
+            assert!(
+                out.envelope["data"]["spending_summary"]["notes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|note| note.as_str() == Some(v2_note)),
+                "{answer:?}: {}",
+                out.envelope["data"]["spending_summary"]["notes"]
+            );
             assert_eq!(
                 std::fs::read_to_string(policy_path(dir.path(), &name)).unwrap(),
                 usdc_body(&name, "api-day", false, total),
@@ -2623,5 +2639,136 @@ mod tests {
         }
         let testnet = next_steps("alpha", PolicyEngineKind::V1, TargetNetwork::Testnet);
         assert!(testnet[5].contains("`version = 1`"), "{}", testnet[5]);
+    }
+
+    /// On both mainnet and testnet, `profile init` names the policy file to
+    /// sign by its `policies/<name>.toml` path, and mainnet never calls it
+    /// "the V1 policy file".
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn profile_init_sign_step_names_policy_file_path() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+        let mainnet_dir = tempfile::tempdir().unwrap();
+        let mut mainnet_args = mainnet("alpha");
+        mainnet_args.unlisted_budget = Some(YesNo::No);
+        let mainnet_out = init_at(&mainnet_args, mainnet_dir.path(), false, queue(&[])).await;
+        assert_eq!(mainnet_out.code, 0, "{}", mainnet_out.envelope);
+        let mainnet_steps: Vec<&str> = mainnet_out.envelope["data"]["next_steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| step.as_str().unwrap())
+            .collect();
+        assert!(
+            mainnet_steps
+                .iter()
+                .all(|step| !step.contains("the V1 policy file")),
+            "mainnet next_steps must not say 'the V1 policy file': {mainnet_steps:#?}"
+        );
+        assert_eq!(
+            mainnet_steps[6],
+            "Run `stellar-agent profile sign-policy --profile alpha --secret-env <VAR>` to sign \
+             `policies/alpha.toml`."
+        );
+
+        let testnet_dir = tempfile::tempdir().unwrap();
+        let testnet_out = init_at(&args("beta"), testnet_dir.path(), false, queue(&[])).await;
+        assert_eq!(testnet_out.code, 0, "{}", testnet_out.envelope);
+        let testnet_steps: Vec<&str> = testnet_out.envelope["data"]["next_steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| step.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            testnet_steps[6],
+            "Run `stellar-agent profile sign-policy --profile beta --secret-env <VAR>` to sign \
+             `policies/beta.toml`."
+        );
+    }
+
+    /// The user-facing spending preview for a version 1 policy states that
+    /// signing identical version 1 bytes keeps its allocation.
+    #[test]
+    fn spending_summary_allocation_note_version_1() {
+        let doc: toml_edit::DocumentMut = "version = 1\nscope = \"profile:v1-alloc\"\n"
+            .parse()
+            .unwrap();
+        let summary = presets::summarize(&doc, MAINNET_PASSPHRASE, AuthorityStatus::Draft);
+        assert_eq!(summary.policy_version, Some(1));
+        let mut out = Vec::new();
+        SpendingPreview::new(&mut out)
+            .show(Some(&summary), None, OutputFormat::Table)
+            .unwrap();
+        let table = String::from_utf8(out).unwrap();
+        let expected = "Signing identical version 1 bytes keeps its total_budget allocation.";
+        assert!(
+            summary.notes.iter().any(|n| n == expected),
+            "v1 summary notes: {:#?}",
+            summary.notes
+        );
+        assert!(table.contains(expected), "{table}");
+        assert!(
+            !table.contains("Signing the same policy body again keeps"),
+            "{table}"
+        );
+        assert!(
+            !table.contains("Every signing of a version 2 body"),
+            "{table}"
+        );
+    }
+
+    /// The user-facing spending preview for a version 2 policy states that
+    /// every signing gives it a new sequence, digest, and allocation.
+    #[test]
+    fn spending_summary_allocation_note_version_2() {
+        let doc: toml_edit::DocumentMut = usdc_body("v2-alloc", "api-day", false, true)
+            .parse()
+            .unwrap();
+        let summary = presets::summarize(&doc, MAINNET_PASSPHRASE, AuthorityStatus::Draft);
+        assert_eq!(summary.policy_version, Some(2));
+        let mut out = Vec::new();
+        SpendingPreview::new(&mut out)
+            .show(Some(&summary), None, OutputFormat::Table)
+            .unwrap();
+        let table = String::from_utf8(out).unwrap();
+        let expected = "Every signing of a version 2 body gives it a new sequence, a new digest, \
+                        and a new total_budget allocation.";
+        assert!(
+            summary.notes.iter().any(|n| n == expected),
+            "v2 summary notes: {:#?}",
+            summary.notes
+        );
+        assert!(table.contains(expected), "{table}");
+        assert!(
+            !table.contains("Signing the same policy body again keeps"),
+            "{table}"
+        );
+    }
+
+    /// A policy body with no recognized version states the full per-version
+    /// allocation rule in its spending preview.
+    #[test]
+    fn spending_summary_allocation_note_unknown_version() {
+        let doc: toml_edit::DocumentMut = "scope = \"profile:no-version\"\n".parse().unwrap();
+        let summary = presets::summarize(&doc, MAINNET_PASSPHRASE, AuthorityStatus::Draft);
+        assert_eq!(summary.policy_version, None);
+        let mut out = Vec::new();
+        SpendingPreview::new(&mut out)
+            .show(Some(&summary), None, OutputFormat::Table)
+            .unwrap();
+        let table = String::from_utf8(out).unwrap();
+        let expected = "Signing identical version 1 bytes keeps the allocation; every signing of \
+                        a version 2 body gives it a new sequence, a new digest, and a new \
+                        allocation.";
+        assert!(
+            summary.notes.iter().any(|n| n == expected),
+            "unknown-version summary notes: {:#?}",
+            summary.notes
+        );
+        assert!(table.contains(expected), "{table}");
     }
 }

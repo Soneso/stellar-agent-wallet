@@ -184,10 +184,11 @@ entry refusal with the prerequisite named. Resolver refusal uses
 `network.mainnet_authorization_refused`. Its core message is
 `the mainnet write was refused before submission; nothing was sent`.
 
-`network.mainnet_keyring_backend_unsupported` means the process uses a
-headless keyring backend (`STELLAR_AGENT_KEYRING_BACKEND` is set). Mainnet
-readiness and `profile enable-mainnet` refuse it before any keyring entry is
-read; mainnet needs the platform keyring. Testnet is unaffected.
+`network.mainnet_keyring_backend_unsupported` means
+`STELLAR_AGENT_KEYRING_BACKEND` selects a backend other than the platform
+keyring. Mainnet readiness and `profile enable-mainnet` refuse it before the
+keyring initializes; mainnet needs the platform keyring. Testnet is
+unaffected.
 
 CLI messages distinguish the withheld result:
 

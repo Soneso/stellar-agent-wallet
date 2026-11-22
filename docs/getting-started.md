@@ -650,7 +650,7 @@ Review it before you sign it with `profile sign-policy`:
   on the draft for each recipient; it edits every payment rule's list. On a
   signed policy, the same command adds a recipient later and signs the change
   after a seed prompt. CLI `pay` and MCP `stellar_pay` accept only G or M
-  destinations and refuse a `C...` recipient.
+  destinations and refuse a `C...` or `W...` recipient.
 - Unlisted recipients: with `--unlisted-budget yes`, an api preset pays
   recipients outside the list from one budget per rolling day, shared by
   CLI `pay` and the MCP payment tools. Beyond the budget, mainnet CLI `pay`

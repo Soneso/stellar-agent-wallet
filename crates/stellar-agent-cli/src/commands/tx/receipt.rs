@@ -450,23 +450,21 @@ async fn run_clear(args: &ClearArgs) -> i32 {
     if let Some(existing) = &existing
         && !clearable(&existing.status, held.as_ref())
     {
-        render_json(&Envelope::<()>::err_raw(
-            "submission.not_clearable",
-            if unbounded_hold {
-                format!(
-                    "a submission recorded as '{}' is already cleared by an operator",
-                    existing.status.label()
-                )
-            } else {
+        let envelope = if matches!(existing.status, ReceiptStatus::ClearedByOperator) {
+            already_cleared_refusal(&existing.status)
+        } else {
+            Envelope::<()>::err_raw(
+                "submission.not_clearable",
                 format!(
                     "a submission recorded as '{}' is not cleared by an operator; only a \
                      submission the endpoint cannot account for, one whose outcome is \
                      recorded as ambiguous, a failed one without an authenticated hold, and \
                      one whose authenticated hold has no time bound, are",
                     existing.status.label()
-                )
-            },
-        ));
+                ),
+            )
+        };
+        render_json(&envelope);
         return 1;
     }
 
@@ -1137,6 +1135,17 @@ fn unbounded_exposure(
     }
 }
 
+/// Refuses a second clear on a submission already cleared by an operator.
+fn already_cleared_refusal(status: &ReceiptStatus) -> Envelope<()> {
+    Envelope::<()>::err_raw(
+        "submission.not_clearable",
+        format!(
+            "a submission recorded as '{}' is already cleared by an operator",
+            status.label()
+        ),
+    )
+}
+
 /// Applies the decision table to the receipt as reconciliation left it.
 ///
 /// `held_now` is the reservation the window holds for the submission after
@@ -1166,13 +1175,20 @@ fn clear_decision(
 ) -> ClearDecision {
     let unbounded_hold = held_now.is_some_and(|hold| hold.max_time == 0);
     let max_time = held_now.map_or(receipt.max_time, |hold| hold.max_time);
-    // A terminal receipt report is not operator-clearable under a bounded hold.
+    // A terminal receipt report is not operator-clearable under a bounded hold,
+    // and a receipt already cleared by an operator is never clearable again.
     if !clearable(&receipt.status, held_now) {
-        return ClearDecision::Refuse(settled_by_reconciliation(
-            "reconciliation",
-            receipt.status.label(),
-            &receipt.tx_hash,
-        ));
+        return ClearDecision::Refuse(
+            if matches!(receipt.status, ReceiptStatus::ClearedByOperator) {
+                already_cleared_refusal(&receipt.status)
+            } else {
+                settled_by_reconciliation(
+                    "reconciliation",
+                    receipt.status.label(),
+                    &receipt.tx_hash,
+                )
+            },
+        );
     }
     if let Some(error) = &report.receipt_write_error {
         return ClearDecision::Refuse(Envelope::<()>::err_raw(
@@ -2839,6 +2855,221 @@ mod tests {
         assert!(
             elapsed < DEADLINE + std::time::Duration::from_secs(1),
             "the deadline ends the wait: {elapsed:?}"
+        );
+    }
+
+    /// `clear_decision` refuses a `cleared_by_operator` receipt with the
+    /// "already cleared by an operator" wording regardless of hold state,
+    /// while other non-clearable statuses keep the reconciliation refusal.
+    #[test]
+    fn clear_decision_refuses_cleared_by_operator_with_already_cleared_text() {
+        let mut cleared = submitted_receipt(0);
+        cleared.status = ReceiptStatus::ClearedByOperator;
+        let bounded_hold = SubmissionHold {
+            max_time: 1_700_000_000,
+            ..held_for(&cleared)
+        };
+        let untimed_hold = SubmissionHold {
+            max_time: 0,
+            ..held_for(&cleared)
+        };
+        for (label, held) in [
+            ("unheld", None),
+            ("bounded", Some(&bounded_hold)),
+            ("untimed", Some(&untimed_hold)),
+        ] {
+            let decision = clear_decision(
+                &cleared,
+                &ReconcileReport::default(),
+                held,
+                None,
+                0,
+                false,
+                true,
+            );
+            let (code, message) = refusal_of(decision).expect("cleared receipt must refuse");
+            assert_eq!(code, "submission.not_clearable", "{label}");
+            assert_eq!(
+                message,
+                "a submission recorded as 'cleared_by_operator' is already cleared by an operator",
+                "{label}"
+            );
+        }
+
+        let mut succeeded = submitted_receipt(1_700_000_000);
+        succeeded.status = ReceiptStatus::Success;
+        let decision = clear_decision(
+            &succeeded,
+            &ReconcileReport::default(),
+            Some(&bounded_hold),
+            None,
+            0,
+            false,
+            false,
+        );
+        let (code, message) = refusal_of(decision).expect("succeeded receipt must refuse");
+        assert_eq!(code, "submission.not_clearable");
+        assert!(
+            message.contains("reconciliation reports this transaction as success"),
+            "{message}"
+        );
+    }
+
+    /// A `cleared_by_operator` receipt refuses a second `tx receipt clear`
+    /// with the "already cleared by an operator" text whether or not a hold
+    /// remains; other terminal receipts keep the "not cleared by an operator"
+    /// wording.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn cleared_by_operator_refuses_second_clear_with_already_cleared_text() {
+        use stellar_agent_core::policy::v1::criteria::state_store::{
+            StateKey, WindowEntry, WindowLimit,
+        };
+        use stellar_agent_core::profile::loader;
+
+        let storage_sandbox =
+            stellar_agent_test_support::sandbox::StateSandbox::new().expect("sandbox");
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        keyring_mock::install().expect("mock keyring store");
+
+        let source = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+        let now_ms = stellar_agent_core::timefmt::now_unix_ms().expect("clock");
+        let now_s = now_ms / 1_000;
+
+        for (label, hold_max_time, envelope_byte) in [
+            ("unheld", None, "a1"),
+            ("bounded", Some(now_s + 600), "b2"),
+            ("untimed", Some(0), "c3"),
+        ] {
+            let name = format!("clear-already-{label}");
+            let mut profile = Profile::builder_testnet_named(&name, "s", &name, "n", &name).build();
+            profile.audit_log_path = storage_sandbox.path().join(format!("{name}.audit.jsonl"));
+            let coord = &profile.audit_log_hash_chain_key_id;
+            rotate_keyring_secret_32(&coord.service, &coord.account).expect("audit key");
+            loader::save_to_dir(&name, &profile, &storage_sandbox.path().join("profiles"))
+                .expect("save profile");
+
+            let envelope_hash = envelope_byte.repeat(32);
+            let tx_hash = "d2".repeat(32);
+            let receipts = ReceiptStore::open(&name).expect("receipt store");
+            receipts
+                .try_begin(
+                    &envelope_hash,
+                    &tx_hash,
+                    source,
+                    7,
+                    hold_max_time.unwrap_or(0),
+                    1_000,
+                )
+                .expect("receipt");
+            receipts.mark_submitted(&envelope_hash).expect("submitted");
+            receipts
+                .finalize(&envelope_hash, ReceiptStatus::ClearedByOperator, None)
+                .expect("cleared");
+            if let Some(max_time) = hold_max_time {
+                PersistedWindowStore::for_profile(&name)
+                    .record_pending(
+                        &profile,
+                        &[WindowEntry::new(
+                            StateKey::new(&name, 1, "native", 86_400),
+                            now_ms,
+                            75,
+                            WindowLimit::Amount {
+                                asset: "native".to_owned(),
+                                window: "1d".to_owned(),
+                                max_stroops: 1_000_000,
+                            },
+                        )],
+                        &SubmissionHold {
+                            destinations: Default::default(),
+                            chain_scope: stellar_agent_network::policy_state::ChainScope::for_chain(
+                                profile.chain_id,
+                            ),
+                            id: envelope_hash.clone(),
+                            tx_hash: tx_hash.clone(),
+                            source: source.to_owned(),
+                            sequence: 7,
+                            max_time,
+                            pending_since_ms: now_ms - 400_000,
+                            submission_ledger: 1_000,
+                            submission_anchor: None,
+                            operator_required: false,
+                        },
+                    )
+                    .expect("hold");
+            }
+
+            crate::common::render::take_rendered_for_test();
+            let code = run_clear(&ClearArgs {
+                envelope_hash,
+                profile: Some(name),
+                acknowledge: true,
+                acknowledge_unbounded: hold_max_time == Some(0),
+                output: OutputFormat::Json,
+            })
+            .await;
+            let rendered = crate::common::render::take_rendered_for_test();
+            assert_eq!(code, 1, "{label}: {rendered:?}");
+            assert_eq!(rendered.len(), 1, "{label}");
+            assert_eq!(rendered[0]["error"]["code"], "submission.not_clearable");
+            assert_eq!(
+                rendered[0]["error"]["message"],
+                "a submission recorded as 'cleared_by_operator' is already cleared by an operator",
+                "{label}: {}",
+                rendered[0]
+            );
+        }
+
+        // Control: an unheld `success` receipt keeps the "not cleared by an operator" message.
+        let control_name = "clear-already-control-success";
+        let mut control =
+            Profile::builder_testnet_named(control_name, "s", control_name, "n", control_name)
+                .build();
+        control.audit_log_path = storage_sandbox.path().join("control.audit.jsonl");
+        let coord = &control.audit_log_hash_chain_key_id;
+        rotate_keyring_secret_32(&coord.service, &coord.account).expect("audit key");
+        loader::save_to_dir(
+            control_name,
+            &control,
+            &storage_sandbox.path().join("profiles"),
+        )
+        .expect("save profile");
+        let envelope_hash = "e5".repeat(32);
+        let receipts = ReceiptStore::open(control_name).expect("receipt store");
+        receipts
+            .try_begin(
+                &envelope_hash,
+                &"f6".repeat(32),
+                source,
+                7,
+                now_s + 600,
+                1_000,
+            )
+            .expect("receipt");
+        receipts.mark_submitted(&envelope_hash).expect("submitted");
+        receipts
+            .finalize(&envelope_hash, ReceiptStatus::Success, Some(1_005))
+            .expect("success");
+
+        crate::common::render::take_rendered_for_test();
+        let code = run_clear(&ClearArgs {
+            envelope_hash,
+            profile: Some(control_name.to_owned()),
+            acknowledge: true,
+            acknowledge_unbounded: false,
+            output: OutputFormat::Json,
+        })
+        .await;
+        let rendered = crate::common::render::take_rendered_for_test();
+        assert_eq!(code, 1, "{rendered:?}");
+        assert_eq!(rendered[0]["error"]["code"], "submission.not_clearable");
+        assert_eq!(
+            rendered[0]["error"]["message"],
+            "a submission recorded as 'success' is not cleared by an operator; only a submission \
+             the endpoint cannot account for, one whose outcome is recorded as ambiguous, a \
+             failed one without an authenticated hold, and one whose authenticated hold has no \
+             time bound, are"
         );
     }
 

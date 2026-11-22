@@ -381,7 +381,9 @@ fn live_acceptance_entry(explicit: bool) -> Result<(), stellar_agent_core::error
 
 /// Selects the process role before either role initializes its runtime.
 ///
-/// The tool hardens while still single-threaded and exits if hardening fails.
+/// Both roles harden on the initial thread before spawning any other thread.
+/// The tool role sets non-dumpable and exits on failure; the server role sets
+/// non-dumpable and no-new-privs so every server thread inherits both.
 /// Each role's body then runs on a thread of [`BODY_STACK_SIZE`] bytes.
 fn main() {
     #[allow(unused_mut)]
@@ -404,6 +406,7 @@ fn main() {
     }
     match role::select(&args, cfg!(windows)) {
         role::Role::Server { skip, display_name } => {
+            stellar_agent_mcp::entry::harden_process();
             #[allow(
                 clippy::expect_used,
                 reason = "no thread means no server, as no runtime does in run_server_process"

@@ -1478,7 +1478,13 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(error.code(), "policy.engine_selection_unsigned");
-        assert!(error.to_string().contains("engine selection 'noop'"));
+        let rendered = error.to_string();
+        assert!(rendered.contains("engine selection 'noop'"), "{rendered}");
+        assert_eq!(
+            rendered.matches("policy.engine_selection_unsigned").count(),
+            1,
+            "wire code must appear once: {rendered}"
+        );
         assert!(
             !stellar_agent_core::profile::schema::default_policy_window_state_path_for(name)
                 .exists()
@@ -1530,7 +1536,13 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(error.code(), "policy.engine_selection_unsigned");
-        assert!(error.to_string().contains("engine selection 'v1'"));
+        let rendered = error.to_string();
+        assert!(rendered.contains("engine selection 'v1'"), "{rendered}");
+        assert_eq!(
+            rendered.matches("policy.engine_selection_unsigned").count(),
+            1,
+            "wire code must appear once: {rendered}"
+        );
         assert!(
             !stellar_agent_core::profile::schema::default_policy_window_state_path_for(name)
                 .exists()

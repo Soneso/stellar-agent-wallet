@@ -322,6 +322,11 @@ pub(crate) fn is_canonical_contract(text: &str) -> bool {
     stellar_strkey::Contract::from_string(text).is_ok_and(|key| format!("{key}") == text)
 }
 
+/// Whether `text` is a canonical W muxed contract strkey.
+pub(crate) fn is_canonical_muxed_contract(text: &str) -> bool {
+    stellar_strkey::MuxedContract::from_string(text).is_ok_and(|key| format!("{key}") == text)
+}
+
 /// The transfer operation and its arguments when `tx` holds exactly one
 /// `transfer(Account, Contract, I128)` contract invocation.
 type TransferParts<'a> = (
@@ -368,7 +373,8 @@ pub(crate) fn is_transfer_shaped(envelope_xdr: &str) -> bool {
     )
 }
 
-/// Refuses a payment request whose destination is a canonical C contract.
+/// Refuses a payment request whose destination is a canonical C contract or W
+/// muxed contract.
 ///
 /// No payment surface executes a contract payment. Other destinations pass,
 /// and their own checks still apply.
@@ -377,7 +383,7 @@ pub(crate) fn is_transfer_shaped(envelope_xdr: &str) -> bool {
 /// `validation.contract_payment_memo_unsupported` when `memo` is set,
 /// otherwise `validation.contract_payment_unavailable`.
 pub fn refuse_contract_destination(destination: &str, memo: bool) -> Result<(), SacPaymentError> {
-    if !is_canonical_contract(destination) {
+    if !is_canonical_contract(destination) && !is_canonical_muxed_contract(destination) {
         return Ok(());
     }
     Err(if memo {

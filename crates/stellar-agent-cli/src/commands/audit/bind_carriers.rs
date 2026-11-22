@@ -574,4 +574,24 @@ mod tests {
         drop(AuditWriter::open(path.clone(), Some(access(&restored))).unwrap());
         assert_eq!(rows_with_id(&path, "R"), 1);
     }
+
+    #[test]
+    #[serial_test::serial]
+    fn bind_carriers_reports_carriers_busy_under_its_own_code() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let name = "bind-carriers-busy";
+        let mut profile = Profile::builder_testnet(name, "acct", "n-svc", "n-acct").build();
+        profile.audit_log_path = dir.path().join("audit.jsonl");
+        let _held = AuditWriter::open(profile.audit_log_path.clone(), None).unwrap();
+        let error = bind_profile(&profile, name).unwrap_err();
+        assert_eq!(error.code(), "audit.carriers_busy", "{error}");
+        assert!(
+            error.message().starts_with("audit.carriers_busy:"),
+            "{error}"
+        );
+    }
 }
