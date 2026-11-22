@@ -114,11 +114,13 @@ passkey ceremony. RequireApproval runs a ceremony with its rule lifetime.
 A mainnet RequireApproval rule sets `ttl_secs` from 1 through 86,400 seconds;
 an unlisted approval escalation uses the default one-day lifetime.
 The presence challenge retains its separate 120-second bound.
-Classic MCP approvals expire at the shorter prepare/commit
+On mainnet, classic MCP approvals expire at the shorter prepare/commit
 lifetime, with Allow contributing 600 seconds. Both names need matching rules.
 On a mainnet MCP server, Allow signs without an approval, and RequireApproval
-needs a verified approval. A commit evaluates both names, and the stricter
-decision governs.
+needs a verified approval. On mainnet a commit evaluates both names, and the
+stricter decision governs. On testnet the commit's own rule alone decides, so
+a commit rule needs its own `decision = "require_approval"` to require an
+approval.
 
 Authorization defaults to 120 seconds, bounded by approval expiry.
 Minted authorization holds count against window headroom. Consumption,
@@ -1220,6 +1222,10 @@ again: it advances `generation`, retires the current outbox under the next
 carriers refuse with `audit.carrier_replaced`. A staged
 generation refuses with `audit.carrier_binding_incomplete`; rerun this command
 to finish it.
+A `v0.1.0-alpha.13` build cannot open the log after this command, because it
+does not know the `audit_carriers_bound` row. The first keyed open of this
+build writes an `audit_entry_tags_started` row, which alpha.13 does not know
+either.
 
 ## The governance loop end to end
 

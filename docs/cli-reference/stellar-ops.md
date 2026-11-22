@@ -491,6 +491,7 @@ Reads the native XLM balance and trustlines for an account via the Stellar RPC `
 - Network: No mainnet gate; the command queries whatever `--rpc-url` points at.
 - Account: `--account` is required. When omitted, the command exits `1` with `validation.usage_error`.
 - Trustlines: Pass `--asset CODE:ISSUER` to query specific trustlines; repeat the flag for multiple assets. Assets the account does not trust are silently omitted from the output.
+- Output: `balances` lists native XLM first, then each trusted asset in the order of the `--asset` flags. Each entry's `asset.asset_type` is `native` for XLM or the asset code, such as `USDC`, and a trustline adds `asset.issuer`. `balance`, `buying_liabilities` and `selling_liabilities` are 7-decimal strings, and `limit` is the trustline limit, or `null` for XLM. The table output shows `native` or `CODE:GABC...WXYZ`.
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
@@ -709,9 +710,18 @@ writes no submitted row. A reported failure
 preserves the existing receipt status. So does a missing transaction while the
 endpoint retains the submission's ledger; beyond that retention it marks a
 `pending` or `ambiguous` receipt `ambiguous`. No reported answer releases the
-reservation. The reservation ends at its accounting horizon, which owes one
-`submission_accounting_expired` audit event. This is the way out of
+reservation. A time-bounded reservation ends at its accounting horizon, which
+owes one `submission_accounting_expired` audit event. This is the way out of
 `submission.tx_timeout`.
+
+A reservation without a time bound has no accounting horizon. The classic
+envelopes the wallet builds on testnet carry no time bound. A testnet
+submission whose policy produced window entries therefore keeps its hold open
+after a reported success. `tx status` then answers `chain_status: SUCCESS`
+with `record.reservation_open: true`. Close the hold with
+`stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge --acknowledge-unbounded`.
+A submission that reserved no spending holds nothing and answers
+`record.reservation_open: false`.
 
 | Flag / arg | Meaning | Required | Default |
 |---|---|---|---|
@@ -760,7 +770,10 @@ An included decision supplies `SUCCESS` or `FAILED`; proven non-inclusion
 supplies `NOT_FOUND`. Without validated cached evidence it shows `UNKNOWN`.
 This path sends no additional transaction lookup. A record without a managed
 attempt keeps the primary lookup. Only a checked recovery decision settles
-the chain outcome.
+the chain outcome. The decision runs once this host's clock is at least six
+seconds past the envelope's maxTime. It needs the oracle the enablement binds
+and identical answers from the primary endpoint and the oracle. It also takes
+the profile's audit writer.
 
 On mainnet the verb reconciles, recovers and releases only after the
 profile's enablement verifies, with the primary and oracle clients built from
@@ -836,7 +849,7 @@ stored intent, such as a claimable balance whose amount changed, refuses with
 
 A reported failure or missing transaction does not release possible spending. Bounded uncertainty counts through the later of the signed deadline and the first local success observation, plus each affected spending window.
 
-A reported success time does not backdate accounting. Untimed pending transactions remain reserved until an explicit acknowledgement clears their unbounded exposure.
+A reported success time does not backdate accounting. An untimed transaction remains reserved after every reported answer, a success included, until an explicit acknowledgement clears its unbounded exposure.
 
 Pending spending records retain their authenticated network. A profile whose
 network differs cannot reconcile or clear them. A checked independent anchor
@@ -872,10 +885,15 @@ No step of the verb sends the transaction again.
 
 Accounting audit delivery holds the writer's exclusive lock while verifying history, checking the decision identifier, appending and acknowledging. V1 payment simulations can reconcile reservations and deliver owed accounting events.
 
-The verb acquires the profile's audit writer only to deliver an
-unacknowledged accounting event. While the MCP server holds that writer, the
-verb still reconciles and reports. The event stays owed and the refusal is
-logged at WARN. Stop the server and run the verb again to deliver it. See
+On testnet the verb acquires the profile's audit writer only to deliver an
+unacknowledged accounting event. On mainnet the recovery decision and the
+receipt repair take it as well. While the MCP server holds that writer, the
+verb still reconciles and reports. An owed event stays owed and the refusal is
+logged at WARN. On mainnet no recovery decision runs then: an attempt without
+a checked decision answers `chain_status: UNKNOWN`,
+`record.reservation_open: true` and
+`recovery.refusal.code: audit.chain_key_unavailable`. Stop the server and run
+the verb again to deliver the event and settle the submission. See
 [Audit pre-flight](../mcp.md#audit-pre-flight-fail-closed) for when the server
 holds the writer.
 

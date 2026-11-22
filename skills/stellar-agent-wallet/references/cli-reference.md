@@ -456,7 +456,7 @@ and removes only terminal markers older than 30 days.
 
 ## balances
 
-`balances [flags]`: reads native XLM balance and trustlines via RPC `getLedgerEntries`. Read-only; no mainnet gate. `--account` is required; omitting it exits `1` with `validation.usage_error`.
+`balances [flags]`: reads native XLM balance and trustlines via RPC `getLedgerEntries`. Read-only; no mainnet gate. `--account` is required; omitting it exits `1` with `validation.usage_error`. In each `balances` entry, `asset.asset_type` is `native` for XLM or the asset code, such as `USDC`, and a trustline adds `asset.issuer`.
 
 | Flag | Meaning | Default |
 |---|---|---|
@@ -722,7 +722,7 @@ require `--profile <NAME>`, without a default.
 | `list` | `profile list` | Read-only. Returns known profile names sorted as a JSON array. Takes no profile selector. |
 | `show <NAME>` | `profile show default` | Read-only. URL fields (`rpc_url`, `secondary_rpc_url`, `oracle_provider_url`) show scheme, host, and port only. Resolved config; keyring refs appear as opaque `{service, account}`, secrets never read. Exits `1` with `validation.profile_not_found` when the profile does not exist. A mainnet file without `rpc_url` exits with `validation.mainnet_rpc_url_required`. An invalid provider attestation exits with `validation.provider_attestation_invalid`; correct the named field in the profile file. An endpoint URL that breaks the endpoint rule, an unsupported schema version, or another unreadable file exits with `validation.config_invalid`. Also reports `halted`, `halted_at`, and `halt_reason`; an unreadable halt marker shows `halted: true` and `halt_marker_error`. |
 | `migrate <NAME>` | `profile migrate default` | State-changing (atomic temp+rename). No-op if already current (`status:"no_op"`); else `status:"migrated"` with `from_version`/`to_version`/`path`. A refused migration exits `1`, writes nothing, and leaves the v1 file unchanged. A missing profile file: `validation.profile_not_found`. A v1 mainnet file without `rpc_url`: `validation.mainnet_rpc_url_required`, because mainnet has no default endpoint; add `rpc_url` to the v1 file and run the command again. An endpoint URL that breaks the endpoint rule, or a file that cannot be read: `validation.config_invalid`. |
-| `enroll-signer` | `profile enroll-signer --profile default --secret-env WALLET_SK` | State-changing (keyring, and the profile TOML when the account is still a placeholder). Imports the operator's `S...` ed25519 seed from the named env var and stores it verbatim at the profile's `mcp_signer_default` coordinate (the signer every MCP fund-movement tool and keyring-signing CLI verb resolves). Classification uses the raw on-disk value: the literal placeholder `"default"` is pinned to the derived G-strkey (only that key is patched); a pinned G-strkey mismatch refuses; any other value refuses as malformed (`enroll_signer.account_malformed`). `--secret-env <VAR>` (the variable name; required unless `--repair-identity`, which it conflicts with), `--profile <NAME>` (resolves `--profile` → `STELLAR_AGENT_PROFILE` → `default`), `--expected-address <G_STRKEY>`, `--force`, `--repair-identity` (writes only the identity record; conflicts with `--force`). |
+| `enroll-signer` | `profile enroll-signer --profile default --secret-env WALLET_SK` | State-changing (keyring, and the profile TOML when the account is still a placeholder). Imports the operator's `S...` ed25519 seed from the named env var and stores it verbatim at the profile's `mcp_signer_default` coordinate (the signer every MCP fund-movement tool and keyring-signing CLI verb resolves). Classification uses the raw on-disk value: the literal placeholder `"default"` is pinned to the derived G-strkey before the keyring write; a pinned G-strkey mismatch refuses; any other value refuses as malformed (`enroll_signer.account_malformed`). The pin changes only that value and writes the whole file again, with sorted keys and no comments. After a refused keyring write, a re-run with the same seed completes the enrollment. `--secret-env <VAR>` (the variable name; required unless `--repair-identity`, which it conflicts with), `--profile <NAME>` (resolves `--profile` → `STELLAR_AGENT_PROFILE` → `default`), `--expected-address <G_STRKEY>`, `--force`, `--repair-identity` (writes only the identity record; conflicts with `--force`). |
 | `enroll-rpc-credential` | `profile enroll-rpc-credential --profile default --role primary --header X-API-Key` | State-changing (keyring, and the profile TOML when the record names no reference). Stores an RPC provider key at the keyring entry the role's provider record names, or at the default `stellar-agent-rpc-<profile>` / `<role>`, and adds `credential` and `placement` to a record without them. Reads the key from a hidden prompt, or from standard input with `--stdin`; the key is never printed. The role's URL and record must exist; the loader's credential checks run on the record before anything is written. `--role <primary\|secondary\|oracle>` (required), `--header <NAME>` \| `--query <NAME>` \| `--path` (required when the record names no placement), `--stdin`, `--force`. Refusals: `enroll_rpc_credential.record_missing`, `.placement_required`, `.placement_mismatch`, `.entry_exists`, `.terminal_required`, `.input_unreadable`, `validation.provider_attestation_invalid`, `network.rpc_credential_refused`. See [Provider credentials](profiles-and-keys.md#provider-credentials). |
 | `enroll-owner-key` | `profile enroll-owner-key --profile default --secret-env WALLET_OWNER_SK` | State-changing (keyring). Derives the owner ed25519 public key from an operator `S...` seed and stores it at `policy_owner_key_id` (the key the V1 engine verifies against) as its G-strkey, a form no 32-byte symmetric-key loader accepts. Owner readers refuse a base64 owner entry; enroll the owner public key again to store its G-strkey form. The seed is never stored. `--expected-address`, `--force`. When an enablement nonce or a policy pin exists at the profile's window-state entry, or an enablement nonce exists at its default entry, whatever chain the profile file names, a key other than the pinned owner requires an installed policy carrying a valid previous-owner rotation statement; re-enrolling the pinned owner's key needs none. |
 | `halt <NAME>` | `profile halt default --reason "agent sent unexpected payments"` | State-changing (writes the halt marker and one audit row). Operator-only. See [Profile halt and resume](#profile-halt-and-resume). |
@@ -1033,7 +1033,16 @@ the output's `next` list directs.
 
 See [the policy schema and minimum](profiles-and-keys.md#mainnet-policy-body) for
 required signed fields and rules. After enablement, complete and sign the
-policy, run `--check`, and restart the MCP server.
+policy, restart the MCP server, and then run `--check`.
+
+Signing leaves the pin at its sequence. The first CLI value verb or MCP
+server start on the new body moves the pin to it, and `--check` never moves
+it. A check before that move reports `valid: true` and the `pin` check at the
+old sequence. It also reports `total_budget_usage: null`, with that check
+`not_evaluated` and code `policy.total_epoch_stale`. A CLI value verb moves
+the pin and runs. An MCP server started before the signing refuses mainnet
+commits with `network.mainnet_write_forbidden` and the detail
+`enablement or policy changed, restart the server`.
 
 Binding failures name `mainnet_table`, `profile`, `source`, `default`, `on_disk`,
 `chain_id`, `on_disk_host`, `merged_host`, `on_disk_oracle_host`,
@@ -1140,7 +1149,9 @@ stellar-agent profile sign-policy --profile operator --secret-env WALLET_OWNER_S
 ```
 
 V2 signing assigns `max(pin, body) + 1`, returning `sequence` and
-`previous_sequence`. Signing does not advance the pin; a verified load can.
+`previous_sequence`. Signing does not advance the pin. The first CLI value
+verb or MCP server start on the new body advances it;
+`profile enable-mainnet --check` does not.
 It creates no window-state directory or lock file. V1 warns about mainnet v2
 requirements and pin rollback. A refusal names the policy file and leaves it
 unwritten. Pin and lock errors retain their `policy.*` codes. Signing does
@@ -1732,6 +1743,10 @@ again: it advances `generation`, retires the current outbox under the next
 carriers refuse with `audit.carrier_replaced`. A staged
 generation refuses with `audit.carrier_binding_incomplete`; rerun this command
 to finish it.
+A `v0.1.0-alpha.13` build cannot open the log after this command, because it
+does not know the `audit_carriers_bound` row. The first keyed open of this
+build writes an `audit_entry_tags_started` row, which alpha.13 does not know
+either.
 
 ### Governance loop
 
@@ -1750,7 +1765,9 @@ Reconciles and clears the submission records the value verbs write. Every value-
 
 Asks the endpoint what became of `<HASH>`. On testnet it records a reported success on the wallet's record of it. This is the way out of `submission.tx_timeout`.
 
-On a mainnet profile no single endpoint answer settles a submission. Before its accounting horizon, a submission with an unknown outcome stays `pending` with its reservation open, even when the primary endpoint reports `SUCCESS`. For an authenticated classic attempt, `chain_status` uses the recovery result. An included decision supplies `SUCCESS` or `FAILED`; proven non-inclusion supplies `NOT_FOUND`. Without validated cached evidence it shows `UNKNOWN`. This path sends no additional transaction lookup. A record without a managed attempt keeps the primary lookup. Only a checked recovery decision settles the chain outcome, and it needs the same answer from the primary endpoint and the oracle in one pass.
+The classic envelopes the wallet builds on testnet carry no time bound. A testnet submission whose policy produced window entries therefore keeps a hold without an accounting horizon, open after a reported success. `tx status` then answers `chain_status: SUCCESS` with `record.reservation_open: true`. Close the hold with `stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge --acknowledge-unbounded`. A submission that reserved no spending answers `record.reservation_open: false`.
+
+On a mainnet profile no single endpoint answer settles a submission. Before its accounting horizon, a submission with an unknown outcome stays `pending` with its reservation open, even when the primary endpoint reports `SUCCESS`. For an authenticated classic attempt, `chain_status` uses the recovery result. An included decision supplies `SUCCESS` or `FAILED`; proven non-inclusion supplies `NOT_FOUND`. Without validated cached evidence it shows `UNKNOWN`. This path sends no additional transaction lookup. A record without a managed attempt keeps the primary lookup. Only a checked recovery decision settles the chain outcome, and it needs the same answer from the primary endpoint and the oracle in one pass. The decision runs once this host's clock is at least six seconds past the envelope's maxTime, and it takes the profile's audit writer.
 
 On mainnet the verb reconciles, recovers and releases only after the profile's enablement verifies, with the primary and oracle clients built from the profile whose hosts the signed policy binds. When the signed policy has a `[mainnet]` table and the enablement does not verify, for example because the stored `rpc_url` or `oracle_provider_url` names another host, the verb refuses with `profile.mainnet_enablement_invalid` before any endpoint is asked. When the owner key or the signed policy does not load and the installation holds an enablement nonce, the verb refuses with that load's code, for example `policy.engine_unavailable` or `policy.owner_signature_invalid`, before any endpoint is asked. A mainnet profile without an enablement record, because its verified policy has no `[mainnet]` table or its installation holds no enablement nonce, runs none of these steps: the reservation stays as stored, and the answer comes from the stored state and the primary's lookup. Without an enablement record the verb runs no recovery stage, so `--retry-recovery` has no effect. A testnet profile accepts `--retry-recovery`, and it has no effect there either: the verb runs its recovery stage only on mainnet.
 
@@ -1770,7 +1787,7 @@ Returns `{tx_hash, business_id, chain_status, ledger, record, reservation, recov
 
 A reported failure or missing transaction does not release possible spending. Bounded uncertainty counts through the later of the signed deadline and the first local success observation, plus each affected spending window.
 
-A reported success time does not backdate accounting. Untimed pending transactions remain reserved until an explicit acknowledgement clears their unbounded exposure.
+A reported success time does not backdate accounting. An untimed transaction remains reserved after every reported answer, a success included, until an explicit acknowledgement clears its unbounded exposure.
 
 Classic mainnet envelopes carry a deadline at most 120 seconds after
 construction. For a canonical record, consent covers the stored intent.
@@ -1788,7 +1805,7 @@ No failure row follows from an endpoint's failure, absence, or time claim.
 The authenticated reservation controls the bound and chain; editing a receipt
 cannot shorten either. A checked independent witness supplies anchor provenance.
 
-Accounting audit delivery needs the audit writer's exclusive lock. While a `stellar-agent-mcp` server holds that writer, the verb still reconciles and reports. The event stays owed and the refusal is logged at WARN. Stop the server and run the verb again to deliver it.
+Accounting audit delivery needs the audit writer's exclusive lock, and on mainnet the recovery decision and the receipt repair take it as well. While a `stellar-agent-mcp` server holds that writer, the verb still reconciles and reports. An owed event stays owed and the refusal is logged at WARN. On mainnet no recovery decision runs then: an attempt without a checked decision answers `chain_status: UNKNOWN`, `record.reservation_open: true` and `recovery.refusal.code: audit.chain_key_unavailable`. Stop the server and run the verb again to deliver the event and settle the submission.
 
 ### `tx receipt clear <ENVELOPE_HASH> --acknowledge [flags]`
 

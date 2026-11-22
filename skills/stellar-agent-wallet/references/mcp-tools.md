@@ -86,6 +86,10 @@ approval attestations) see `./approvals-and-audit.md` and `./security.md`.
   not a safe path component, or when the profile file's keyring coordinates name
   a different profile than the one selected, the state a profile file copied
   from another profile is in.
+- A mainnet profile that `STELLAR_AGENT_PROFILE` or the name `default` selects
+  exits with `profile.mainnet_requires_explicit_profile`. The message names
+  the selection source and `stellar-agent-mcp --profile <name>`, and leaves
+  out the requested name, which may be a value typed into the wrong place.
 
 At startup, an invalid V1 owner signature prompts policy review and re-signing, while a policy body error, such as an unknown key, gets no signing hint.
 
@@ -264,9 +268,11 @@ build omits it. The MCP server in these builds admits `stellar_pay_commit`,
 `stellar_trustline_commit` after setup.
 Both prepare and commit policy names need matching rules. Under Allow, a
 mainnet commit signs without an approval. Under RequireApproval, it needs a
-verified approval. A commit evaluates both its own name and its preparation's
-name, and the stricter decision governs.
-A pending approval uses the shorter lifetime from the two evaluations. Allow
+verified approval. On mainnet a commit evaluates both its own name and its
+preparation's name, and the stricter decision governs.
+On testnet the commit's own rule alone decides, so a commit rule needs its own
+`decision = "require_approval"` to require an approval.
+On mainnet a pending approval uses the shorter lifetime from the two evaluations. Allow
 contributes 600 seconds; RequireApproval supplies its configured lifetime.
 Authorization defaults to 120 seconds and cannot outlive the governing
 decision.
@@ -284,8 +290,8 @@ preparation rule's floor.
 A denied rule retains its wire code, `policy.deny.*` or a balance floor's
 `account.*`; an unknown decision uses
 `policy.unexpected_decision`. None of these refusals persists an approval.
-Each commit evaluates both names before attestation validation. On mainnet, a
-proof supplied under Allow to a classic commit or an x402 payment tool verifies
+On mainnet, each commit evaluates both names before attestation validation. A
+proof supplied there under Allow to a classic commit or an x402 payment tool verifies
 against its approval's durable record and is spent like a required one. A proof
 without a durable record refuses and stays unspent. Off mainnet, Allow neither
 verifies nor spends a proof supplied to `stellar_pay_commit`,
@@ -616,6 +622,9 @@ omits the binding triple.
 | `chain_id` | string | yes | |
 | `account_id` | string | yes | G-strkey, or M-strkey whose G base account is read; the response echoes the address as given. |
 | `assets` | array | no | Each entry `{ "code": "USDC", "issuer": "GA5Z..." }`. Empty/absent returns native XLM only. |
+
+In each returned `balances` entry, `asset.asset_type` is `native` for XLM or
+the asset code, such as `USDC`, and a trustline adds `asset.issuer`.
 
 ### stellar_friendbot arguments
 
@@ -1324,9 +1333,13 @@ success on the wallet's record. A reported failure or missing transaction does n
 possible spending:
 
 - `SUCCESS`: the endpoint reports that the payment went through. Report it as
-  done. The spend keeps counting against the window through the transaction's
-  accounting horizon. No submitted row is written, and the pending row stays
-  open.
+  done. A time-bounded spend keeps counting against the window through the
+  transaction's accounting horizon. A testnet classic envelope carries no time
+  bound, so the hold of a testnet commit that reserved spending stays open,
+  with `record.reservation_open: true`, until the operator clears it with both
+  acknowledgement flags. A commit that reserved nothing answers
+  `record.reservation_open: false`. No submitted row is written, and the
+  pending row stays open.
 - `FAILED`: the endpoint reports that the transaction applied and failed. The
   record keeps its status, the reservation keeps counting through its
   accounting horizon, and no failed row is written. Without a time bound it
@@ -1335,7 +1348,10 @@ possible spending:
   transaction can still apply. Wait and call again.
 - On a mainnet profile, an authenticated classic attempt reports cached recovery
   evidence or `UNKNOWN` as `chain_status` and sends no additional transaction
-  lookup. An unmanaged record keeps its primary lookup; its `FAILED` or
+  lookup. A checked recovery decision settles it once this host's clock is at
+  least six seconds past the envelope's maxTime. The decision needs identical
+  answers from the primary endpoint and the oracle, and the profile's audit
+  writer. An unmanaged record keeps its primary lookup; its `FAILED` or
   `NOT_FOUND` decides nothing alone, and the oracle named by
   `oracle_provider_url` is asked as well.
 - `record.status: "ambiguous"` with `record.release_code:
