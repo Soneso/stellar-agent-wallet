@@ -289,14 +289,17 @@ pub enum TipAnchorParseError {
 /// Failure reading or writing the anchor's backing store.
 ///
 /// The concrete backend lives outside this crate (the platform keyring), so the
-/// error carries a human-readable detail rather than a typed backend cause. The
-/// detail names the operation and the backend's own message; it never carries
-/// key material, since the anchor is not secret.
+/// error carries a human-readable detail alongside an optional typed
+/// [`AuthError`](crate::error::AuthError) when the failure came from a
+/// classified keyring operation. The detail names the operation and the
+/// backend's own message; it never carries key material, since the anchor is
+/// not secret.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("audit tip anchor store: {detail}")]
 pub struct TipAnchorStoreError {
     /// What failed, and the backend's message.
     pub detail: String,
+    auth: Option<crate::error::AuthError>,
 }
 
 impl TipAnchorStoreError {
@@ -305,7 +308,25 @@ impl TipAnchorStoreError {
     pub fn new(detail: impl Into<String>) -> Self {
         Self {
             detail: detail.into(),
+            auth: None,
         }
+    }
+
+    /// Constructs a store error that carries a classified keyring
+    /// [`AuthError`](crate::error::AuthError).
+    #[must_use]
+    pub fn from_auth(detail: impl Into<String>, auth: crate::error::AuthError) -> Self {
+        Self {
+            detail: detail.into(),
+            auth: Some(auth),
+        }
+    }
+
+    /// Returns the classified keyring error when the failure came from a
+    /// keyring operation.
+    #[must_use]
+    pub fn auth_error(&self) -> Option<&crate::error::AuthError> {
+        self.auth.as_ref()
     }
 }
 
@@ -947,7 +968,7 @@ struct InMemoryAnchorState {
     /// The evidence scope a test sets; `None` is the fixture scope.
     evidence_scope: Option<[u8; 32]>,
     /// The scripted result of the next audit-key reloads.
-    reload: Option<Result<Option<[u8; 32]>, String>>,
+    reload: Option<Result<Option<[u8; 32]>, TipAnchorStoreError>>,
     reloads: usize,
     anchor: Option<TipAnchor>,
     reanchors: u64,
@@ -1073,7 +1094,18 @@ impl InMemoryTipAnchorStore {
     pub fn set_reload(&self, result: Result<Option<[u8; 32]>, &str>) {
         #[allow(clippy::expect_used, reason = "test seam; poison means a failed test")]
         let mut state = self.state.lock().expect("in-memory anchor store mutex");
-        state.reload = Some(result.map_err(str::to_owned));
+        state.reload = Some(result.map_err(TipAnchorStoreError::new));
+    }
+
+    /// Scripts every later audit-key reload to fail with `error`, such as a
+    /// store error that carries a classified keyring refusal.
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_reload_error(&self, error: TipAnchorStoreError) {
+        #[allow(clippy::expect_used, reason = "test seam; poison means a failed test")]
+        let mut state = self.state.lock().expect("in-memory anchor store mutex");
+        state.reload = Some(Err(error));
     }
 
     /// Returns the number of audit-key reloads so far.
@@ -1229,7 +1261,7 @@ impl TipAnchorStore for InMemoryTipAnchorStore {
         match state.reload.clone() {
             None => Ok(None),
             Some(Ok(key)) => Ok(key.map(Zeroizing::new)),
-            Some(Err(detail)) => Err(TipAnchorStoreError::new(detail)),
+            Some(Err(error)) => Err(error),
         }
     }
 
@@ -1600,6 +1632,26 @@ mod tests {
             PriorAnchoring::find(BindingHistory::NotRecorded, &log, 0, false),
             Some(PriorAnchoring::ChainRootSidecar),
             "an empty file with a sidecar was truncated"
+        );
+    }
+
+    #[test]
+    fn store_error_preserves_optional_auth_error() {
+        let plain = TipAnchorStoreError::new("anchor value is unusable");
+        assert_eq!(plain.auth_error(), None);
+        assert_eq!(
+            plain.to_string(),
+            "audit tip anchor store: anchor value is unusable"
+        );
+
+        let auth = crate::error::AuthError::KeyringPlatformError {
+            detail: "write Linux Secret Service: credential store operation failed".to_owned(),
+        };
+        let wrapped = TipAnchorStoreError::from_auth("carrier record write failed", auth.clone());
+        assert_eq!(wrapped.auth_error(), Some(&auth));
+        assert_eq!(
+            wrapped.to_string(),
+            "audit tip anchor store: carrier record write failed"
         );
     }
 }

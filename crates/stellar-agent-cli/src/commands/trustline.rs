@@ -3564,6 +3564,27 @@ pub(crate) mod tests {
                 "{}",
                 run.message()
             );
+            assert!(
+                run.message().contains(&fixture.agent.g),
+                "must name the enrolled signer address: {}",
+                run.message()
+            );
+            assert!(
+                run.message()
+                    .contains("pass it as the source with `--from`"),
+                "must tell the operator to pass the enrolled signer with `--from`: {}",
+                run.message()
+            );
+            assert!(
+                !run.message().contains("--repair-identity"),
+                "must not suggest --repair-identity: {}",
+                run.message()
+            );
+            assert!(
+                !run.message().contains("bind-signer"),
+                "must not suggest bind-signer: {}",
+                run.message()
+            );
             fixture.assert_no_consent_ceremony();
         }
 

@@ -34,10 +34,12 @@
 //! Directly before the key write, under the same lock, the anchor must cover
 //! the writer's last row, which carries a tag under the key being replaced.
 //! Rows the open drained whose anchor write failed would otherwise lie past
-//! the anchor with no key left to authenticate them. The refusal
-//! (`audit.chain_key_unavailable` with the `audit.tip_anchor_unavailable`
-//! detail) writes nothing and leaves the key as it is; the rotation is retried
-//! once the keyring is reachable.
+//! the anchor with no key left to authenticate them. A keyring refusal of the
+//! owed anchor write reports the keyring's `auth.*` code; any other failure
+//! refuses with `audit.chain_key_unavailable` and the
+//! `audit.tip_anchor_unavailable` detail. Either refusal writes nothing,
+//! leaves the key as it is, and its message says that the key was not rotated
+//! and names the command to rerun.
 //!
 //! The profile's audit binding is checked before the lock is taken. A binding
 //! that names another log path or audit key refuses with
@@ -182,25 +184,44 @@ fn open_locked_audit_writer_with_key(
 /// The refusal for an anchor that does not cover the writer's last row when
 /// the key is about to be replaced.
 ///
-/// An owed anchor write the keyring still rejects names its recovery: the key
-/// is unchanged, and the rotation is retried once the keyring is reachable.
-/// Every other refusal is the one the writer's other strict callers report.
-fn anchor_not_current(profile_name: &str, e: &WriterError) -> WalletError {
+/// An owed anchor write the keyring refuses with a classified keyring error
+/// reports that `auth.*` code. Every owed anchor write failure names its
+/// recovery, [`key_not_rotated`]. Any other owed anchor write failure is
+/// `audit.chain_key_unavailable` with the `audit.tip_anchor_unavailable`
+/// detail. Every other refusal is the one the writer's other strict callers
+/// report.
+fn anchor_not_current(profile_name: &str, e: &WriterError) -> RotateRefusal {
     tracing::warn!(error = %e, "rotate-audit-key: the tip anchor is not current; key left as it is");
     match e {
-        WriterError::TipAnchorStore(detail) => {
-            WalletError::Validation(ValidationError::AuditLogUnusable {
-                profile: profile_name.to_owned(),
-                detail: format!(
-                    "audit.tip_anchor_unavailable: the tip anchor does not cover the audit log's \
-                     last entry and could not be written ({detail}); the audit key was not \
-                     rotated: retry `stellar-agent profile rotate-audit-key {profile_name}` once \
-                     the keyring is reachable"
-                ),
-            })
+        WriterError::TipAnchorStore(store_error) => {
+            match crate::commands::audit::tip_anchor_keyring_refusal(store_error) {
+                Some(error) => RotateRefusal::OwedAnchorRefused {
+                    error,
+                    profile_name: profile_name.to_owned(),
+                },
+                None => RotateRefusal::Wallet(WalletError::Validation(
+                    ValidationError::AuditLogUnusable {
+                        profile: profile_name.to_owned(),
+                        detail: format!(
+                            "audit.tip_anchor_unavailable: the tip anchor does not cover the \
+                             audit log's last entry and could not be written ({store_error}); {}",
+                            key_not_rotated(profile_name)
+                        ),
+                    },
+                )),
+            }
         }
-        other => audit_writer_refusal(profile_name, other),
+        other => RotateRefusal::Wallet(audit_writer_refusal(profile_name, other)),
     }
+}
+
+/// The recovery an owed anchor write refusal names: the key is unchanged,
+/// and the rotation is rerun.
+fn key_not_rotated(profile_name: &str) -> String {
+    format!(
+        "the audit key was not rotated: retry `stellar-agent profile rotate-audit-key \
+         {profile_name}`"
+    )
 }
 
 /// The refusal for a stored audit key this verb cannot read or decode.
@@ -337,18 +358,32 @@ where
             render::render_json(&Envelope::ok(data));
             0
         }
-        Err(RotateRefusal::ProfileAccess(e)) => {
+        Err(refusal) => {
+            render::render_json(&refusal_envelope(&refusal));
+            1
+        }
+    }
+}
+
+/// The envelope the verb prints for `refusal`.
+fn refusal_envelope(refusal: &RotateRefusal) -> Envelope<()> {
+    match refusal {
+        RotateRefusal::ProfileAccess(e) => {
             tracing::debug!(error = %e, "profile access refused");
-            render::render_json(&profile_access_envelope(&e));
-            1
+            profile_access_envelope(e)
         }
-        Err(RotateRefusal::Integrity(e)) => {
-            render::render_json(&Envelope::<()>::err_raw(e.wire_code(), e.to_string()));
-            1
-        }
-        Err(RotateRefusal::Wallet(e)) => {
-            render::render_json(&Envelope::<()>::err(&e));
-            1
+        RotateRefusal::Integrity(e) => Envelope::<()>::err_raw(e.wire_code(), e.to_string()),
+        RotateRefusal::Wallet(e) => Envelope::<()>::err(e),
+        RotateRefusal::OwedAnchorRefused {
+            error,
+            profile_name,
+        } => {
+            let mut envelope = Envelope::<()>::err(error);
+            if let Some(refused) = envelope.error.as_mut() {
+                refused.message.push_str("; ");
+                refused.message.push_str(&key_not_rotated(profile_name));
+            }
+            envelope
         }
     }
 }
@@ -366,6 +401,15 @@ enum RotateRefusal {
     Integrity(VerifyError),
     /// Every other refusal.
     Wallet(WalletError),
+    /// A classified keyring refusal of the anchor write the writer owes
+    /// before the key write. Rendered under the keyring's own code, with
+    /// [`key_not_rotated`] appended to its message.
+    OwedAnchorRefused {
+        /// The keyring refusal.
+        error: WalletError,
+        /// The profile whose rotation the message names.
+        profile_name: String,
+    },
 }
 
 impl From<WalletError> for RotateRefusal {
@@ -784,6 +828,9 @@ mod tests {
             Err(RotateRefusal::Integrity(e)) => panic!("unexpected integrity refusal: {e}"),
             Err(RotateRefusal::Wallet(e)) => panic!("the rotation must succeed: {e}"),
             Err(RotateRefusal::ProfileAccess(e)) => panic!("the rotation must succeed: {e}"),
+            Err(RotateRefusal::OwedAnchorRefused { error, .. }) => {
+                panic!("the rotation must succeed: {error}")
+            }
         }
     }
 
@@ -1126,6 +1173,9 @@ mod tests {
             Err(RotateRefusal::Integrity(e)) => panic!("unexpected integrity refusal: {e}"),
             Err(RotateRefusal::Wallet(e)) => panic!("the rotation must succeed: {e}"),
             Err(RotateRefusal::ProfileAccess(e)) => panic!("the rotation must succeed: {e}"),
+            Err(RotateRefusal::OwedAnchorRefused { error, .. }) => {
+                panic!("the rotation must succeed: {error}")
+            }
         }
 
         let active: Vec<serde_json::Value> = std::fs::read_to_string(&log_path)
@@ -1224,6 +1274,9 @@ mod tests {
             Err(RotateRefusal::ProfileAccess(e)) => {
                 panic!("the refusal must come from the rotation, not from profile access: {e}")
             }
+            Err(RotateRefusal::OwedAnchorRefused { error, .. }) => {
+                panic!("unexpected owed-anchor refusal: {error}")
+            }
             Ok(_) => panic!("a rolled-back log must refuse the rotation"),
         };
         assert_eq!(
@@ -1318,6 +1371,9 @@ mod tests {
                 Err(RotateRefusal::ProfileAccess(error)) => {
                     panic!("unexpected profile refusal: {error}")
                 }
+                Err(RotateRefusal::OwedAnchorRefused { error, .. }) => {
+                    panic!("unexpected owed-anchor refusal: {error}")
+                }
                 Ok(_) => panic!("an audit-key read failure must refuse rotation: {expected}"),
             };
             assert_eq!(error.code(), expected.code());
@@ -1337,6 +1393,125 @@ mod tests {
                     )
                 );
             }
+            assert!(binding_raw(name).is_none(), "no binding is recorded");
+            assert!(
+                matches!(
+                    keyring_core::Entry::new(&entry_ref.service, &entry_ref.account)
+                        .expect("audit-key entry")
+                        .get_password(),
+                    Err(keyring_core::Error::NoEntry)
+                ),
+                "no audit key is minted"
+            );
+            assert_eq!(
+                std::fs::read(&profile.audit_log_path).expect("read log after refusal"),
+                log_before,
+                "the log is byte-identical"
+            );
+            assert_eq!(
+                KeyringTipAnchorStore::new(entry_ref, &profile.audit_log_path)
+                    .load_raw()
+                    .expect("read anchor"),
+                None,
+                "no anchor is recorded"
+            );
+        }
+    }
+
+    /// A refused carrier write during writer open reports the typed `auth.*`
+    /// keyring code (`auth.keyring_platform_error` for a platform refusal,
+    /// `auth.keyring_interactive_session_required` for a non-interactive
+    /// Windows session) and writes nothing.
+    #[tokio::test]
+    #[serial]
+    async fn rotate_audit_key_refuses_carrier_write_with_keyring_platform_error() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        use stellar_agent_core::audit_log::tip_anchor::AuditKeyringEntries;
+        use stellar_agent_core::audit_log::{
+            AuditEntry, PolicyDecision, TipAnchorStore, log_path_sha256,
+        };
+        use stellar_agent_test_support::keyring_mock;
+
+        for (injected, expected_code) in [
+            (
+                keyring_core::Error::PlatformFailure(Box::new(std::io::Error::other(
+                    "credential store locked",
+                ))),
+                "auth.keyring_platform_error",
+            ),
+            (
+                keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::from(
+                    std::io::ErrorKind::PermissionDenied,
+                ))),
+                "auth.keyring_platform_error",
+            ),
+            (
+                keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::other(
+                    "Windows ERROR_NO_SUCH_LOGON_SESSION",
+                ))),
+                "auth.keyring_interactive_session_required",
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("tmp dir");
+            let name = "rotate-carrier-write-error";
+            let mut profile = Profile::builder_testnet(name, "acct", "n-svc", "n-acct")
+                .with_profile_name(name)
+                .build();
+            profile.audit_log_path = dir.path().join("audit.jsonl");
+            {
+                let mut writer = AuditWriter::open(profile.audit_log_path.clone(), None)
+                    .expect("unkeyed writer");
+                writer
+                    .write_entry(AuditEntry::new_value_action_submitted(
+                        "stellar_pay",
+                        "stellar:testnet",
+                        Vec::new(),
+                        "abcd1234…wxyz5678",
+                        7,
+                        PolicyDecision::Allow,
+                        None,
+                        None,
+                        None,
+                        "req-before-carrier-write-error",
+                        None,
+                    ))
+                    .expect("append");
+            }
+            let log_before = std::fs::read(&profile.audit_log_path).expect("read log");
+            let entry_ref = &profile.audit_log_hash_chain_key_id;
+            let carrier = AuditKeyringEntries::for_path_digest(
+                entry_ref,
+                &log_path_sha256(&profile.audit_log_path),
+            )
+            .carrier_record;
+            keyring_mock::install_with_write_error(
+                &carrier.service,
+                &carrier.account,
+                None,
+                injected,
+            )
+            .expect("mock keyring store with carrier write refusal");
+
+            let args = RotateAuditKeyArgs {
+                name: Some(name.to_owned()),
+                profile: None,
+            };
+            let cloned_profile = profile.clone();
+            let error = match rotate(&args, move |_| Ok(cloned_profile.clone()), || Ok(())).await {
+                Err(RotateRefusal::Integrity(e)) => panic!("unexpected integrity refusal: {e}"),
+                Err(RotateRefusal::Wallet(error)) => error,
+                Err(RotateRefusal::ProfileAccess(error)) => {
+                    panic!("unexpected profile refusal: {error}")
+                }
+                Err(RotateRefusal::OwedAnchorRefused { error, .. }) => {
+                    panic!("unexpected owed-anchor refusal: {error}")
+                }
+                Ok(_) => panic!("a refused carrier write must refuse rotation"),
+            };
+
+            assert_eq!(error.code(), expected_code, "{error}");
             assert!(binding_raw(name).is_none(), "no binding is recorded");
             assert!(
                 matches!(
@@ -1421,6 +1596,9 @@ mod tests {
                 Err(RotateRefusal::ProfileAccess(error)) => {
                     panic!("unexpected profile refusal: {error}")
                 }
+                Err(RotateRefusal::OwedAnchorRefused { error, .. }) => {
+                    panic!("unexpected owed-anchor refusal: {error}")
+                }
                 Ok(_) => panic!("an undecodable audit key must refuse rotation"),
             };
             assert_eq!(error.code(), "internal.unexpected_state");
@@ -1495,6 +1673,9 @@ mod tests {
             Err(RotateRefusal::Integrity(e)) => panic!("unexpected integrity refusal: {e}"),
             Err(RotateRefusal::Wallet(error)) => error,
             Err(RotateRefusal::ProfileAccess(e)) => panic!("unexpected profile refusal: {e}"),
+            Err(RotateRefusal::OwedAnchorRefused { error, .. }) => {
+                panic!("unexpected owed-anchor refusal: {error}")
+            }
             Ok(_) => panic!("a changed binding must refuse the rotation"),
         };
         assert_eq!(error.code(), "audit.log_binding_changed", "{error}");
@@ -1576,6 +1757,9 @@ mod tests {
             Err(RotateRefusal::Integrity(e)) => panic!("unexpected integrity refusal: {e}"),
             Err(RotateRefusal::Wallet(error)) => error,
             Err(RotateRefusal::ProfileAccess(e)) => panic!("unexpected profile refusal: {e}"),
+            Err(RotateRefusal::OwedAnchorRefused { error, .. }) => {
+                panic!("unexpected owed-anchor refusal: {error}")
+            }
             Ok(_) => panic!("an owner-namespace coordinate must refuse the rotation"),
         };
         assert_eq!(error.code(), "validation.key_matches_owner_public_key");
@@ -1689,6 +1873,9 @@ mod tests {
                 panic!("the first key must adopt a quickstart log: {error}")
             }
             Err(RotateRefusal::ProfileAccess(error)) => panic!("profile access refused: {error}"),
+            Err(RotateRefusal::OwedAnchorRefused { error, .. }) => {
+                panic!("the first key must adopt a quickstart log: {error}")
+            }
         }
         let adopted = std::fs::read_to_string(&profile.audit_log_path)
             .expect("read the log")
@@ -1776,6 +1963,9 @@ mod tests {
             Err(RotateRefusal::Wallet(error)) => error,
             Err(RotateRefusal::Integrity(e)) => panic!("unexpected integrity refusal: {e}"),
             Err(RotateRefusal::ProfileAccess(e)) => panic!("unexpected profile refusal: {e}"),
+            Err(RotateRefusal::OwedAnchorRefused { error, .. }) => {
+                panic!("unexpected owed-anchor refusal: {error}")
+            }
             Ok(_) => panic!("evidence without an owner must refuse the rotation"),
         };
         assert_eq!(error.code(), "audit.outbox_evidence_unusable", "{error}");
@@ -1815,6 +2005,9 @@ mod tests {
             Err(RotateRefusal::Integrity(e)) => panic!("unexpected integrity refusal: {e}"),
             Err(RotateRefusal::Wallet(e)) => panic!("the rotation must succeed: {e}"),
             Err(RotateRefusal::ProfileAccess(e)) => panic!("the rotation must succeed: {e}"),
+            Err(RotateRefusal::OwedAnchorRefused { error, .. }) => {
+                panic!("the rotation must succeed: {error}")
+            }
         }
 
         let rows: Vec<serde_json::Value> = std::fs::read_to_string(&profile.audit_log_path)
@@ -1910,10 +2103,18 @@ mod tests {
         };
         let cloned_profile = profile.clone();
         let refused = rotate(&args, move |_name| Ok(cloned_profile.clone()), || Ok(())).await;
-        let Err(RotateRefusal::Integrity(error)) = refused else {
+        let Err(refusal) = refused else {
+            panic!("the tag walk under the old key must refuse the rotation");
+        };
+        let RotateRefusal::Integrity(error) = &refusal else {
             panic!("the tag walk under the old key must refuse the rotation");
         };
         assert_eq!(error.wire_code(), "audit.entry_tag_invalid", "{error}");
+        assert_eq!(
+            rendered(&refusal),
+            ("audit.entry_tag_invalid".to_owned(), error.to_string()),
+            "the verb prints the verifier's own code and message"
+        );
         assert_eq!(
             *load_audit_hmac_key(&profile, name).expect("load the key"),
             *old_key,
@@ -1935,16 +2136,14 @@ mod tests {
             .collect()
     }
 
-    /// A consent row the rotation's open drains while the anchor write fails
-    /// lies past the anchor: the rotation refuses before the key write, with
-    /// the recovery in the message, the old key in the keyring and no rekey
-    /// row in the log.
+    /// A consent row the rotation's open drains while the keyring refuses the
+    /// anchor write lies past the anchor: the verb exits 1 before the key
+    /// write and prints the keyring's `auth.*` code and a message that names
+    /// the rerun, the old key in the keyring and no rekey row in the log.
     #[tokio::test]
     #[serial]
     async fn rotate_audit_key_refuses_while_the_anchor_is_behind_the_last_row() {
-        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
-        let _storage_home =
-            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let fixture = crate::common::refusal_fixture::RefusalFixture::new();
         use stellar_agent_core::audit_log::{AuditEntry, AuditOutbox};
 
         let dir = tempfile::tempdir().expect("tmp dir");
@@ -1987,19 +2186,17 @@ mod tests {
             profile: None,
         };
         let cloned_profile = profile.clone();
-        let refused = rotate(&args, move |_name| Ok(cloned_profile.clone()), || Ok(())).await;
+        let code =
+            run_with_dependencies(&args, move |_name| Ok(cloned_profile.clone()), || Ok(())).await;
         failing.store(false, std::sync::atomic::Ordering::SeqCst);
-        let error = match refused {
-            Err(RotateRefusal::Wallet(error)) => error,
-            Err(RotateRefusal::Integrity(e)) => panic!("unexpected integrity refusal: {e}"),
-            Err(RotateRefusal::ProfileAccess(e)) => panic!("unexpected profile refusal: {e}"),
-            Ok(_) => panic!("a rotation with the anchor behind the last row must refuse"),
-        };
-        assert_eq!(error.code(), "audit.chain_key_unavailable", "{error}");
-        assert!(
-            error.message().contains("audit.tip_anchor_unavailable")
-                && error.message().contains("the audit key was not rotated"),
-            "{error}"
+        assert_eq!(code, 1, "the verb exits 1 on an owed anchor refusal");
+        fixture.assert_refusal(
+            Some("auth.keyring_platform_error"),
+            &[
+                "the audit key was not rotated",
+                "; the audit key was not rotated: retry `stellar-agent profile rotate-audit-key \
+                 rotate-anchor-behind`",
+            ],
         );
         assert_eq!(
             *load_audit_hmac_key(&profile, name).expect("load the key"),
@@ -2016,6 +2213,84 @@ mod tests {
             ],
             "the open drained the consent row and the rotation wrote nothing"
         );
+    }
+
+    /// The code and message the verb prints for `refusal`.
+    fn rendered(refusal: &RotateRefusal) -> (String, String) {
+        let error = refusal_envelope(refusal)
+            .error
+            .expect("a refusal renders an error envelope");
+        (error.code, error.message)
+    }
+
+    /// An owed anchor write the keyring refuses reports the keyring's
+    /// `auth.*` code, and its message ends with the sentence that the key was
+    /// not rotated and the command to rerun. Any other store failure is
+    /// `audit.chain_key_unavailable` with the `audit.tip_anchor_unavailable`
+    /// detail and the same sentence. A writer refusal other than a store
+    /// error is the one the writer's other strict callers report.
+    #[test]
+    fn anchor_not_current_reports_a_keyring_refusal_under_its_auth_code() {
+        use stellar_agent_core::audit_log::TipAnchorStoreError;
+
+        let name = "rotate-anchor-owed";
+        let not_rotated = "the audit key was not rotated: retry \
+                           `stellar-agent profile rotate-audit-key rotate-anchor-owed`";
+        for (auth, code, message) in [
+            (
+                AuthError::KeyringPlatformError {
+                    detail: "write Linux Secret Service: credential store operation failed"
+                        .to_owned(),
+                },
+                "auth.keyring_platform_error",
+                format!(
+                    "keyring operation failed: write Linux Secret Service: credential store \
+                     operation failed; {not_rotated}"
+                ),
+            ),
+            (
+                AuthError::KeyringInteractiveSessionRequired,
+                "auth.keyring_interactive_session_required",
+                format!(
+                    "{}; {not_rotated}",
+                    AuthError::KeyringInteractiveSessionRequired
+                ),
+            ),
+        ] {
+            let typed = anchor_not_current(
+                name,
+                &WriterError::TipAnchorStore(TipAnchorStoreError::from_auth(
+                    "anchor write failed",
+                    auth,
+                )),
+            );
+            assert_eq!(rendered(&typed), (code.to_owned(), message));
+        }
+
+        let untyped = anchor_not_current(
+            name,
+            &WriterError::TipAnchorStore(TipAnchorStoreError::new("anchor write failed")),
+        );
+        assert_eq!(
+            rendered(&untyped),
+            (
+                "audit.chain_key_unavailable".to_owned(),
+                format!(
+                    "profile 'rotate-anchor-owed' cannot be audited: audit.tip_anchor_unavailable: \
+                     the tip anchor does not cover the audit log's last entry and could not be \
+                     written (audit tip anchor store: anchor write failed); {not_rotated}; the \
+                     command refuses to proceed unaudited. See \
+                     docs/maintainers/audit-log-recovery.md"
+                )
+            )
+        );
+
+        let unsettled = WriterError::AppendUnsettled {
+            kind: std::io::ErrorKind::Other,
+        };
+        let (code, message) = rendered(&anchor_not_current(name, &unsettled));
+        assert_eq!(code, "audit.chain_key_unavailable", "{message}");
+        assert!(message.contains(&unsettled.to_string()), "{message}");
     }
 
     /// A rotation stopped after its key write, with the anchor covering every
@@ -2048,6 +2323,9 @@ mod tests {
             Err(RotateRefusal::Integrity(e)) => panic!("unexpected integrity refusal: {e}"),
             Err(RotateRefusal::Wallet(e)) => panic!("the rerun must rotate: {e}"),
             Err(RotateRefusal::ProfileAccess(e)) => panic!("the rerun must rotate: {e}"),
+            Err(RotateRefusal::OwedAnchorRefused { error, .. }) => {
+                panic!("the rerun must rotate: {error}")
+            }
         }
         let rows: Vec<serde_json::Value> = std::fs::read_to_string(&profile.audit_log_path)
             .expect("read the log")
@@ -2102,6 +2380,9 @@ mod tests {
             Err(RotateRefusal::Wallet(error)) => error,
             Err(RotateRefusal::Integrity(e)) => panic!("unexpected integrity refusal: {e}"),
             Err(RotateRefusal::ProfileAccess(e)) => panic!("unexpected profile refusal: {e}"),
+            Err(RotateRefusal::OwedAnchorRefused { error, .. }) => {
+                panic!("unexpected owed-anchor refusal: {error}")
+            }
             Ok(_) => panic!("a keyed log without its key must not take a first mint"),
         };
         assert_eq!(error.code(), "audit.chain_key_unavailable", "{error}");
@@ -2156,6 +2437,9 @@ mod tests {
             Err(RotateRefusal::Integrity(e)) => panic!("unexpected integrity refusal: {e}"),
             Err(RotateRefusal::Wallet(e)) => panic!("the first mint on the new log: {e}"),
             Err(RotateRefusal::ProfileAccess(e)) => panic!("the first mint on the new log: {e}"),
+            Err(RotateRefusal::OwedAnchorRefused { error, .. }) => {
+                panic!("the first mint on the new log: {error}")
+            }
         }
         let key = load_audit_hmac_key(&profile, name).expect("the minted key");
         let verified =
@@ -2215,6 +2499,9 @@ mod tests {
             Err(RotateRefusal::Integrity(e)) => panic!("unexpected integrity refusal: {e}"),
             Err(RotateRefusal::Wallet(e)) => panic!("the first mint: {e}"),
             Err(RotateRefusal::ProfileAccess(e)) => panic!("the first mint: {e}"),
+            Err(RotateRefusal::OwedAnchorRefused { error, .. }) => {
+                panic!("the first mint: {error}")
+            }
         }
         let key = load_audit_hmac_key(&profile, name).expect("the minted key");
         let verified = verify_log(&profile.audit_log_path, Some(&key)).expect("the log verifies");

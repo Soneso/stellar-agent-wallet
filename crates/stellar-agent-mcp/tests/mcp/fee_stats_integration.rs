@@ -143,7 +143,7 @@ async fn stellar_fee_stats_mainnet_read_only_succeeds() {
 
 #[tokio::test]
 #[serial]
-async fn stellar_fee_stats_non_allowlisted_rpc_url_is_invalid_params() {
+async fn stellar_fee_stats_unconfigured_rpc_url_is_invalid_params() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let _storage_home =
         stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
@@ -157,10 +157,145 @@ async fn stellar_fee_stats_non_allowlisted_rpc_url_is_invalid_params() {
             rpc_url: Some("https://untrusted.example.com".to_owned()),
         })
         .await
-        .expect_err("non-allowlisted rpc_url must fail");
+        .expect_err("an unconfigured rpc_url must fail");
 
     assert!(
         err.to_string().contains("invalid rpc_url"),
         "expected invalid rpc_url, got: {err}"
     );
+}
+
+fn fee_stats_result_at_ledger(latest_ledger: &str) -> serde_json::Value {
+    serde_json::json!({
+        "sorobanInclusionFee": fee_stat_json("300"),
+        "inclusionFee": fee_stat_json("200"),
+        "latestLedger": latest_ledger
+    })
+}
+
+#[tokio::test]
+#[serial]
+async fn stellar_fee_stats_accepts_profile_and_oracle_endpoints_and_refuses_unconfigured() {
+    use stellar_agent_core::redact::redact_url_authority;
+    use stellar_agent_test_support::rejected_value::CREDENTIAL_MARKER;
+
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+
+    let primary_mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(EchoIdResponder::new(fee_stats_result_at_ledger("11111")))
+        .mount(&primary_mock)
+        .await;
+    let secondary_mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(EchoIdResponder::new(fee_stats_result_at_ledger("33333")))
+        .mount(&secondary_mock)
+        .await;
+    let oracle_mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(EchoIdResponder::new(fee_stats_result_at_ledger("22222")))
+        .mount(&oracle_mock)
+        .await;
+
+    let mut profile = testnet_profile_with_rpc(&format!("{}/v1/rpc", primary_mock.uri()));
+    profile.secondary_rpc_url = Some(format!("{}/v2", secondary_mock.uri()));
+    profile.oracle_provider_url = Some(
+        url::Url::parse(&format!("{}/oracle", oracle_mock.uri())).expect("valid oracle mock URL"),
+    );
+    let printed_primary = redact_url_authority(&profile.rpc_url);
+    assert_eq!(printed_primary, primary_mock.uri());
+
+    let server = WalletServer::new(profile).expect("WalletServer::new");
+
+    // Primary endpoint as printed by `mcp-resource://profiles/<name>` (scheme, host, port).
+    let primary_res = server
+        .call_stellar_fee_stats(StellarFeeStatsArgs {
+            chain_id: "stellar:testnet".to_owned(),
+            rpc_url: Some(printed_primary),
+        })
+        .await
+        .expect("profile primary endpoint must be accepted");
+    assert_ne!(primary_res.is_error, Some(true));
+    let primary_json: serde_json::Value =
+        serde_json::from_str(call_result_text(&primary_res)).expect("primary JSON");
+    assert_eq!(
+        primary_json.pointer("/data/latest_ledger"),
+        Some(&serde_json::json!(11111))
+    );
+
+    // Secondary endpoint configured on the profile.
+    let secondary_res = server
+        .call_stellar_fee_stats(StellarFeeStatsArgs {
+            chain_id: "stellar:testnet".to_owned(),
+            rpc_url: Some(secondary_mock.uri()),
+        })
+        .await
+        .expect("profile secondary endpoint must be accepted");
+    assert_ne!(secondary_res.is_error, Some(true));
+    let secondary_json: serde_json::Value =
+        serde_json::from_str(call_result_text(&secondary_res)).expect("secondary JSON");
+    assert_eq!(
+        secondary_json.pointer("/data/latest_ledger"),
+        Some(&serde_json::json!(33333))
+    );
+
+    // Oracle endpoint configured on the profile.
+    let oracle_res = server
+        .call_stellar_fee_stats(StellarFeeStatsArgs {
+            chain_id: "stellar:testnet".to_owned(),
+            rpc_url: Some(oracle_mock.uri()),
+        })
+        .await
+        .expect("profile oracle endpoint must be accepted");
+    assert_ne!(oracle_res.is_error, Some(true));
+    let oracle_json: serde_json::Value =
+        serde_json::from_str(call_result_text(&oracle_res)).expect("oracle JSON");
+    assert_eq!(
+        oracle_json.pointer("/data/latest_ledger"),
+        Some(&serde_json::json!(22222))
+    );
+
+    // Hosts the profile does not configure, public RPC hosts among them,
+    // refuse with invalid_params, naming the rule and never the URL or a host list.
+    for rejected in [
+        format!("https://untrusted.example.com/{CREDENTIAL_MARKER}"),
+        "https://soroban-testnet.stellar.org".to_owned(),
+        "https://mainnet.sorobanrpc.com".to_owned(),
+    ] {
+        let err = server
+            .call_stellar_fee_stats(StellarFeeStatsArgs {
+                chain_id: "stellar:testnet".to_owned(),
+                rpc_url: Some(rejected.clone()),
+            })
+            .await
+            .expect_err("unconfigured rpc_url must fail");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("configured endpoint"),
+            "expected configured-endpoint rule in refusal for {rejected}, got: {msg}"
+        );
+        assert!(
+            !msg.contains("allow-list"),
+            "must not name allow-list: {msg}"
+        );
+        assert!(
+            !msg.contains("untrusted.example.com"),
+            "must not echo host: {msg}"
+        );
+        assert!(
+            !msg.contains(CREDENTIAL_MARKER),
+            "must not echo URL path: {msg}"
+        );
+        assert!(
+            !msg.contains("soroban-testnet.stellar.org"),
+            "must not name a host list: {msg}"
+        );
+        assert!(
+            !msg.contains("mainnet.sorobanrpc.com"),
+            "must not name a host list: {msg}"
+        );
+    }
 }

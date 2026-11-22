@@ -587,13 +587,13 @@ Fee-statistics group. Subcommand: `stats`.
 
 Fetches Stellar RPC fee statistics, the helper behind classic fee selection.
 
-- Signing: Read-only; no signing key access. With `--profile`, the client loads the profile's RPC provider credential from the keyring when one is configured.
-- Network: With `--profile`, load the profile and apply the shared endpoint rules. Without it, use `--rpc-url`, else the testnet endpoint. A given URL must pass the allowlist.
+- Signing: Read-only; no signing key access. With `--profile`, the client loads the profile's RPC provider credential from the keyring when one is configured and the URL it reads equals the profile's `rpc_url`.
+- Network: With `--profile`, load the profile and apply the [shared endpoint rules](index.md#rpc-endpoints). On testnet `--rpc-url` replaces the profile's endpoint; on mainnet it refuses with `profile.non_overlayable_field`. Without `--profile`, use `--rpc-url`, else the testnet endpoint. Without a profile, `--rpc-url` must be an HTTPS URL without credentials; an `http` URL refuses with `validation.config_invalid`.
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
 | `--profile <NAME>` | Profile whose RPC URL to use | optional | none (falls back to testnet default) |
-| `--rpc-url <URL>` | Allowlisted testnet override; refused with a mainnet profile | optional | profile endpoint, or testnet without `--profile` |
+| `--rpc-url <URL>` | Endpoint override. Replaces a testnet profile's endpoint and is refused with a mainnet profile; without `--profile`, an HTTPS URL without credentials | optional | profile endpoint, or testnet without `--profile` |
 | `--output <FORMAT>` | `json` or `table` | optional | `json` |
 
 Example: print fee stats as a table:

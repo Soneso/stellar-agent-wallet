@@ -449,7 +449,9 @@ mod tests {
             ),
             (
                 WriterError::TipAnchorStore(
-                    stellar_agent_core::audit_log::TipAnchorStoreError::new("keyring locked"),
+                    stellar_agent_core::audit_log::TipAnchorStoreError::new(
+                        "anchor value is unusable",
+                    ),
                 ),
                 "audit.chain_key_unavailable",
                 "audit.tip_anchor_unavailable",

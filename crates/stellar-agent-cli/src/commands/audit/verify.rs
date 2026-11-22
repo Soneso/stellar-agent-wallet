@@ -369,8 +369,10 @@ fn verify_resolved(
 /// A held outbox lock carries `audit.outbox_busy`, and an outbox that cannot
 /// be read carries `audit.io_error`, the verifier's code for a file it cannot
 /// read. Missing or changed committed rows carry `audit.outbox_rows_missing`,
-/// as the writer's refusal does, and a commitment that cannot be read carries
-/// `audit.tip_anchor_unavailable`, as an anchor that cannot be read does.
+/// as the writer's refusal does. A commitment the keyring refuses to read
+/// reports the keyring's `auth.*` code; any other commitment read failure
+/// carries `audit.tip_anchor_unavailable`, as an anchor that cannot be read
+/// does.
 fn outbox_commitment_failure(e: &WriterError, profile_name: &str) -> VerifyFailure {
     match e {
         WriterError::OutboxBusy => VerifyFailure::Raw {
@@ -385,9 +387,7 @@ fn outbox_commitment_failure(e: &WriterError, profile_name: &str) -> VerifyFailu
             ),
         },
         WriterError::TipAnchorStore(store) => {
-            VerifyFailure::Wallet(WalletError::Internal(InternalError::UnexpectedState {
-                detail: format!("audit.tip_anchor_unavailable: {store}"),
-            }))
+            VerifyFailure::Wallet(super::tip_anchor_unavailable(store))
         }
         _ => VerifyFailure::Wallet(super::audit_writer_error(
             e,
@@ -544,9 +544,7 @@ fn resolve_profile_inputs_with_profile(
             ),
             missing_anchor_binding: Some(binding),
         }),
-        Err(e) => Err(WalletError::Internal(InternalError::UnexpectedState {
-            detail: format!("audit.tip_anchor_unavailable: {e}"),
-        })),
+        Err(e) => Err(super::tip_anchor_unavailable(&e)),
     }
 }
 
@@ -2012,6 +2010,73 @@ mod tests {
                 if message.starts_with("audit.io_error: the audit outbox")),
             "{error:?}"
         );
+    }
+
+    /// A commitment read the keyring refuses fails the profile's verification
+    /// with the keyring's `auth.*` code.
+    #[test]
+    #[serial]
+    fn verify_reports_a_refused_commitment_read_under_its_auth_code() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let name = "verify-commitment-refused";
+        let profile = keyed_unanchored_profile(name, dir.path(), 0);
+        let carrier =
+            stellar_agent_core::audit_log::tip_anchor::AuditKeyringEntries::for_path_digest(
+                &profile.audit_log_hash_chain_key_id,
+                &stellar_agent_core::audit_log::log_path_sha256(&profile.audit_log_path),
+            )
+            .carrier_record;
+        keyring_mock::inject_error(
+            &carrier.service,
+            &carrier.account,
+            keyring_core::Error::PlatformFailure(Box::new(std::io::Error::other(
+                "credential store locked",
+            ))),
+        )
+        .unwrap();
+        let error = verify_profile_log(&profile, name).unwrap_err();
+        assert!(
+            matches!(error, VerifyFailure::Wallet(ref e) if e.code() == "auth.keyring_platform_error"),
+            "{error:?}"
+        );
+    }
+
+    /// An anchor read the keyring refuses fails the profile's verification
+    /// with the keyring's `auth.*` code.
+    #[test]
+    #[serial]
+    fn verify_reports_a_refused_anchor_read_under_its_auth_code() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let name = "verify-anchor-refused";
+        let profile = keyed_unanchored_profile(name, dir.path(), 1);
+        let anchor = KeyringTipAnchorStore::new(
+            &profile.audit_log_hash_chain_key_id,
+            &profile.audit_log_path,
+        )
+        .anchor_entry_ref()
+        .clone();
+        keyring_mock::inject_error(
+            &anchor.service,
+            &anchor.account,
+            keyring_core::Error::PlatformFailure(Box::new(std::io::Error::other(
+                "credential store locked",
+            ))),
+        )
+        .unwrap();
+        let Err(error) =
+            resolve_profile_inputs_with_profile(&profile, name, &profile.audit_log_path)
+        else {
+            panic!("a refused anchor read fails the verification");
+        };
+        assert_eq!(error.code(), "auth.keyring_platform_error", "{error}");
     }
 
     #[test]

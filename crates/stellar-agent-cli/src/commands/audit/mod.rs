@@ -24,7 +24,7 @@ pub mod reanchor;
 pub mod verify;
 
 use clap::{Args, Subcommand};
-use stellar_agent_core::audit_log::WriterError;
+use stellar_agent_core::audit_log::{TipAnchorStoreError, WriterError};
 use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
 
 /// Returns `true` when `text` already starts with an `audit.<subcode>:` wire
@@ -66,6 +66,9 @@ fn starts_with_audit_wire_code(text: &str) -> bool {
 /// - A keyed log opened without its audit key is `audit.chain_key_unavailable`,
 ///   and unusable consent evidence is `audit.outbox_evidence_unusable`, via
 ///   [`stellar_agent_core::audit_log::audit_writer_refusal`].
+/// - A tip-anchor store error that carries a classified keyring
+///   [`AuthError`](stellar_agent_core::error::AuthError) reports that `auth.*`
+///   code, through [`tip_anchor_keyring_refusal`].
 ///
 /// Everything else carries `fallback_code`, unless its own text already starts
 /// with an `audit.*` code. `fallback_code` is the caller's own label for "this
@@ -136,20 +139,49 @@ pub(crate) fn audit_writer_error(
         WriterError::KeyedLogNeedsKey { .. } | WriterError::OutboxEvidenceUnusable { .. } => {
             stellar_agent_core::audit_log::audit_writer_refusal(profile_name, e)
         }
+        // A keyring refusal in the tip-anchor store reports its `auth.*` code.
+        // Any other store error, such as a corrupt stored value, keeps its
+        // `audit.tip_anchor_unavailable` detail.
+        WriterError::TipAnchorStore(store_error) => tip_anchor_keyring_refusal(store_error)
+            .unwrap_or_else(|| fallback_writer_error(e, fallback_code)),
         // Variants whose own Display already leads with an `audit.*` wire code
         // carry it through unchanged; prefixing the caller's fallback would put
         // two codes in one detail and an agent matching on the first would read
         // the wrong one.
-        _ => {
-            let text = e.to_string();
-            let detail = if starts_with_audit_wire_code(&text) {
-                text
-            } else {
-                format!("{fallback_code}: {text}")
-            };
-            WalletError::Internal(InternalError::UnexpectedState { detail })
-        }
+        _ => fallback_writer_error(e, fallback_code),
     }
+}
+
+/// Returns the keyring refusal a tip-anchor store error carries, as the
+/// wallet error that reports its `auth.*` code.
+///
+/// Every audit verb maps a tip-anchor store error through this classifier
+/// first. `None` means the error carries no classified keyring
+/// [`AuthError`](stellar_agent_core::error::AuthError), and the caller keeps
+/// its own code and message.
+pub(crate) fn tip_anchor_keyring_refusal(e: &TipAnchorStoreError) -> Option<WalletError> {
+    e.auth_error().cloned().map(WalletError::Auth)
+}
+
+/// Maps a tip-anchor store error read outside the writer: a keyring refusal
+/// reports its `auth.*` code, and any other store error is
+/// `internal.unexpected_state` with the `audit.tip_anchor_unavailable` detail.
+pub(crate) fn tip_anchor_unavailable(e: &TipAnchorStoreError) -> WalletError {
+    tip_anchor_keyring_refusal(e).unwrap_or_else(|| {
+        WalletError::Internal(InternalError::UnexpectedState {
+            detail: format!("audit.tip_anchor_unavailable: {e}"),
+        })
+    })
+}
+
+fn fallback_writer_error(e: &WriterError, fallback_code: &str) -> WalletError {
+    let text = e.to_string();
+    let detail = if starts_with_audit_wire_code(&text) {
+        text
+    } else {
+        format!("{fallback_code}: {text}")
+    };
+    WalletError::Internal(InternalError::UnexpectedState { detail })
 }
 
 /// Arguments for the `audit` subcommand group.
@@ -453,7 +485,7 @@ mod tests {
 
         let cases = [
             (
-                WriterError::TipAnchorStore(TipAnchorStoreError::new("keyring locked")),
+                WriterError::TipAnchorStore(TipAnchorStoreError::new("anchor value is unusable")),
                 "audit.tip_anchor_unavailable",
             ),
             (
@@ -488,6 +520,87 @@ mod tests {
                 "fallback code must not prefix self-coded error: {message}"
             );
         }
+    }
+
+    /// Each audit verb's fallback code: a tip-anchor store error that carries
+    /// a classified keyring refusal reports its `auth.*` code on every verb,
+    /// and one without keeps `internal.unexpected_state` with the
+    /// `audit.tip_anchor_unavailable` detail. The mapper for a store error
+    /// read outside the writer follows the same rule.
+    #[test]
+    fn tip_anchor_store_auth_error_keeps_its_auth_code() {
+        use stellar_agent_core::audit_log::TipAnchorStoreError;
+        use stellar_agent_core::error::AuthError;
+
+        let refusals = [
+            (
+                AuthError::KeyringPlatformError {
+                    detail: "write Linux Secret Service: credential store operation failed"
+                        .to_owned(),
+                },
+                "auth.keyring_platform_error",
+                "credential store operation failed",
+            ),
+            (
+                AuthError::KeyringInteractiveSessionRequired,
+                "auth.keyring_interactive_session_required",
+                "",
+            ),
+        ];
+        let untyped = TipAnchorStoreError::new(
+            "anchor value is unusable: expected three colon-separated fields",
+        );
+        // `profile rotate-audit-key`, `audit reanchor`, `audit bind-carriers`,
+        // `audit acknowledge-outbox-loss`, and `audit verify`.
+        for fallback_code in [
+            "audit.writer_unavailable",
+            "audit.reanchor_failed",
+            "audit.carrier_binding_failed",
+            "audit.outbox_acknowledgement_failed",
+            "audit.tip_anchor_unavailable",
+        ] {
+            for (auth, code, text) in &refusals {
+                let typed = WriterError::TipAnchorStore(TipAnchorStoreError::from_auth(
+                    "carrier record write failed",
+                    auth.clone(),
+                ));
+                let err = audit_writer_error(&typed, fallback_code, "default");
+                assert_eq!(err.code(), *code, "{fallback_code}: {}", err.message());
+                assert!(err.message().contains(text), "{}", err.message());
+                assert!(!err.message().contains(fallback_code), "{}", err.message());
+            }
+
+            let err = audit_writer_error(
+                &WriterError::TipAnchorStore(untyped.clone()),
+                fallback_code,
+                "default",
+            );
+            assert_eq!(err.code(), "internal.unexpected_state", "{fallback_code}");
+            assert_eq!(
+                err.message(),
+                "unexpected internal state: audit.tip_anchor_unavailable: audit log tip anchor \
+                 unavailable: audit tip anchor store: anchor value is unusable: expected three \
+                 colon-separated fields",
+                "{fallback_code}"
+            );
+        }
+
+        for (auth, code, _) in &refusals {
+            let typed = TipAnchorStoreError::from_auth("anchor read failed", auth.clone());
+            assert_eq!(tip_anchor_unavailable(&typed).code(), *code);
+            assert_eq!(
+                tip_anchor_keyring_refusal(&typed).map(|e| e.code()),
+                Some(*code)
+            );
+        }
+        assert!(tip_anchor_keyring_refusal(&untyped).is_none());
+        let err = tip_anchor_unavailable(&untyped);
+        assert_eq!(err.code(), "internal.unexpected_state");
+        assert_eq!(
+            err.message(),
+            "unexpected internal state: audit.tip_anchor_unavailable: audit tip anchor store: \
+             anchor value is unusable: expected three colon-separated fields"
+        );
     }
 
     #[test]

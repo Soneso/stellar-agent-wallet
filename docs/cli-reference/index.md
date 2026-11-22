@@ -71,7 +71,7 @@ Smart-account writes require a secondary endpoint on the same network and on a h
 Read-only smart-account commands use the primary when no secondary is configured.
 A configured mainnet secondary requires `providers.secondary`, a host distinct from the primary, and a `[providers.primary]` record; the fallback provides no independent provider.
 `balances` keeps its testnet endpoint default. Standalone `friendbot` derives its endpoint from its network selector.
-`fees stats --profile` applies the endpoint rules above and keeps its flag allowlist. Without `--profile`, it uses `--rpc-url`, else the testnet endpoint.
+`fees stats --profile` applies the endpoint rules above. Without `--profile`, it reads `--rpc-url`, else the testnet endpoint, and sends no credential. That `--rpc-url` must be an HTTPS URL; another scheme refuses with `validation.config_invalid`.
 
 ### Timeout
 

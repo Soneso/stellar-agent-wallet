@@ -30,7 +30,9 @@ use std::time::Duration;
 use stellar_agent_core::approval::witness::ApprovalWitness;
 use stellar_agent_core::cross_check::ThresholdSet;
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::error::{FeeSource, InternalError, ValidationError, WalletError};
+use stellar_agent_core::error::{
+    AuthError, FeeSource, InternalError, ValidationError, WalletError,
+};
 use stellar_agent_core::mainnet::oracle::require_mainnet_oracle;
 use stellar_agent_core::profile::Profile;
 use stellar_agent_core::profile::name::ResolvedProfileName;
@@ -468,6 +470,14 @@ fn confirm_decision(verdict: MainnetVerdict) -> ConfirmDecision {
     }
 }
 
+/// Sets `flag`, the verb's own source flag, on an enrolled-identity refusal.
+fn name_source_flag(mut err: WalletError, flag: &'static str) -> WalletError {
+    if let WalletError::Auth(AuthError::EnrolledIdentityUnusable { source_flag, .. }) = &mut err {
+        *source_flag = Some(flag);
+    }
+    err
+}
+
 /// The enrolled-signer refusal, with the Ledger sentence for the Ledger
 /// choice.
 fn enrollment_refusal(err: &WalletError, choice: &MainnetSignerChoice) -> Envelope<()> {
@@ -578,7 +588,7 @@ pub(crate) async fn authorize_and_submit(
         &source_key,
         &policy.verified.owner(),
     )
-    .map_err(|e| enrollment_refusal(&e, &choice))?;
+    .map_err(|e| enrollment_refusal(&name_source_flag(e, source_flag), &choice))?;
 
     // Both decisions require a valid summary. Approval rules present it
     // during the passkey ceremony, whose store closes before recorder use.

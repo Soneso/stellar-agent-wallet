@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use stellar_agent_core::error::{
     DerivedFee, FeeSource, NetworkError, ValidationError, WalletError,
 };
-use stellar_agent_core::profile::schema::Profile;
+use stellar_agent_core::profile::schema::{Profile, ProviderRole};
 use stellar_agent_core::{
     mainnet::verified_policy::VerifiedPolicy,
     policy::v1::schema::DEFAULT_CONTRACT_TRANSFER_MAX_FEE_STROOPS,
@@ -23,14 +23,7 @@ use crate::client::StellarRpcClient;
 /// CLI and MCP handlers and accepted by the staged decoder.
 pub const CLASSIC_SINGLE_OPERATION_COUNT: u32 = 1;
 
-/// Allowed public Stellar RPC host names for explicit RPC URL overrides.
-pub const ALLOWED_RPC_HOSTS: &[&str] = &[
-    "soroban-testnet.stellar.org",
-    "mainnet.sorobanrpc.com",
-    "soroban-mainnet.stellar.org",
-];
-
-/// Errors returned by [`validate_rpc_url`].
+/// Errors returned by [`validate_rpc_url`] and [`validate_profile_rpc_url`].
 ///
 /// Each variant names the rule the URL breaks and never the URL or any part
 /// of it, because an RPC URL can carry a credential.
@@ -46,12 +39,9 @@ pub enum RpcUrlError {
     /// The URL contains embedded credentials.
     #[error("RPC URL must not contain embedded credentials")]
     CredentialsInUrl,
-    /// The URL's host is not in the allow-list.
-    #[error("the RPC host is not in the allow-list (allowed: {allowed})")]
-    HostNotAllowed {
-        /// Human-readable list of allowed hosts.
-        allowed: String,
-    },
+    /// The URL does not match any endpoint configured on the active profile.
+    #[error("RPC URL is not a configured endpoint of the active profile")]
+    NotConfiguredEndpoint,
 }
 
 /// Per-fee-class distribution returned by `getFeeStats`. Stroops are
@@ -500,14 +490,45 @@ pub async fn fetch_fee_stats(client: &StellarRpcClient) -> Result<FeeStatsView, 
     client.get_fee_stats().await
 }
 
-/// Validates an RPC URL override against the production allow-list.
+/// Validates an explicit RPC URL override as an HTTPS URL without credentials.
 ///
 /// # Errors
 ///
-/// Returns [`RpcUrlError`] if the URL is malformed, non-HTTPS, credentialed,
-/// or not allow-listed.
+/// Returns [`RpcUrlError`] if the URL is malformed, non-HTTPS, or credentialed.
 pub fn validate_rpc_url(url: &str) -> Result<(), RpcUrlError> {
     validate_rpc_url_inner(url, false)
+}
+
+/// Validates that `url` carries no credentials and has the same scheme, host,
+/// and port as an endpoint configured on `profile` (`rpc_url`,
+/// `secondary_rpc_url`, or `oracle_provider_url`).
+///
+/// # Errors
+///
+/// Returns [`RpcUrlError::InvalidUrl`] when `url` is not an absolute URL with a
+/// host, [`RpcUrlError::CredentialsInUrl`] when `url` carries embedded
+/// credentials, or [`RpcUrlError::NotConfiguredEndpoint`] when no endpoint
+/// configured on `profile` shares its scheme, host, and port.
+pub fn validate_profile_rpc_url(url: &str, profile: &Profile) -> Result<(), RpcUrlError> {
+    let parsed = url::Url::parse(url).map_err(|_| RpcUrlError::InvalidUrl)?;
+    if parsed.username() != "" || parsed.password().is_some() {
+        return Err(RpcUrlError::CredentialsInUrl);
+    }
+    let target = url_origin(&parsed).ok_or(RpcUrlError::InvalidUrl)?;
+    let configured = [
+        ProviderRole::Primary,
+        ProviderRole::Secondary,
+        ProviderRole::Oracle,
+    ]
+    .into_iter()
+    .filter_map(|role| profile.role_url(role))
+    .filter_map(|configured_url| url::Url::parse(configured_url).ok())
+    .any(|configured_url| url_origin(&configured_url) == Some(target));
+    if configured {
+        Ok(())
+    } else {
+        Err(RpcUrlError::NotConfiguredEndpoint)
+    }
 }
 
 /// Validates an RPC URL override, additionally allowing loopback addresses.
@@ -544,6 +565,11 @@ fn parse_percentile(raw: &str) -> Result<FeePercentile, WalletError> {
     }
 }
 
+fn url_origin(url: &url::Url) -> Option<(&str, &str, Option<u16>)> {
+    url.host_str()
+        .map(|host| (url.scheme(), host, url.port_or_known_default()))
+}
+
 fn validate_rpc_url_inner(url: &str, allow_loopback: bool) -> Result<(), RpcUrlError> {
     let parsed = url::Url::parse(url).map_err(|_| RpcUrlError::InvalidUrl)?;
     if parsed.username() != "" || parsed.password().is_some() {
@@ -563,13 +589,7 @@ fn validate_rpc_url_inner(url: &str, allow_loopback: bool) -> Result<(), RpcUrlE
         return Err(RpcUrlError::NonHttps);
     }
 
-    if ALLOWED_RPC_HOSTS.contains(&host) {
-        Ok(())
-    } else {
-        Err(RpcUrlError::HostNotAllowed {
-            allowed: ALLOWED_RPC_HOSTS.join(", "),
-        })
-    }
+    Ok(())
 }
 
 #[cfg(test)]

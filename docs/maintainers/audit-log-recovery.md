@@ -756,6 +756,10 @@ The CLI reports such a row as `queued`, never as `written`.
 **Detail sub-code:** `audit.tip_anchor_unavailable`
 
 **What it means.** The keyring-held tip anchor could not be read or written.
+The audit verbs `profile rotate-audit-key`, `audit reanchor`,
+`audit bind-carriers`, `audit acknowledge-outbox-loss`, and `audit verify`
+report a keyring refusal on this state under the keyring's `auth.*` code, such
+as `auth.keyring_platform_error`. Any other store failure keeps this sub-code.
 A keyed append retries its anchor once immediately. Two failed writes leave
 the row durable and the anchor behind. Plain appends continue best-effort, and
 `require_anchor_current()` repairs or refuses without writing a row.
@@ -783,7 +787,9 @@ MPP's charge row keeps its existing flow.
 anchor value it still owes; a keyed reopen absorbs an honest tail in the same
 generation. Reopening still refuses while the keyring is unavailable. Use
 `audit reanchor` only for an established mismatch, including the rotation
-outage in section 2.5.
+outage in section 2.5. On the five audit verbs above, this sub-code means a
+value the keyring holds for the log, the anchor or a companion entry, is
+unusable, not that the keyring is unreachable. The operator reports it.
 
 **Unusable outbox commitment.** A detail that contains `outbox state is
 unusable` names a different cause: the keyring holds a value at an outbox

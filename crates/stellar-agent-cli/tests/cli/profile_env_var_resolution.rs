@@ -1166,24 +1166,23 @@ fn mainnet_signers_list_rpc_flag_refuses_before_endpoint_contact() {
 }
 
 #[test]
-fn fees_stats_mainnet_equal_rpc_flag_refuses() {
+fn fees_stats_mainnet_rpc_flag_refuses() {
     let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let endpoint = "https://mainnet.sorobanrpc.com";
     write_mainnet_profile(home.path(), "mainnet", endpoint);
-    let run = run_cli(
-        home.path(),
-        None,
-        &[
-            "fees",
-            "stats",
-            "--profile",
-            "mainnet",
-            "--rpc-url",
-            endpoint,
-        ],
-    );
-    assert_eq!(run.code, 1, "{} {}", run.stdout, run.stderr);
-    assert_eq!(run.json()["error"]["code"], "profile.non_overlayable_field");
+    for url in [endpoint, "http://custom-rpc.example"] {
+        let run = run_cli(
+            home.path(),
+            None,
+            &["fees", "stats", "--profile", "mainnet", "--rpc-url", url],
+        );
+        assert_eq!(run.code, 1, "{url}: {} {}", run.stdout, run.stderr);
+        assert_eq!(
+            run.json()["error"]["code"],
+            "profile.non_overlayable_field",
+            "{url}"
+        );
+    }
 }
 
 /// A credentialed `--rpc-url` is a usage error: exit `1` with one

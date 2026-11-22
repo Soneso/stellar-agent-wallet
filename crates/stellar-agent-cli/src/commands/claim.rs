@@ -5325,12 +5325,17 @@ pub(crate) mod tests {
 
             assert_refused_before_confirmation(&fixture, &run, "auth.enrolled_identity_unusable")
                 .await;
+            let message = run.envelope["error"]["message"].as_str().unwrap();
+            assert!(message.contains("public_key_mismatch"), "{message}");
             assert!(
-                run.envelope["error"]["message"]
-                    .as_str()
-                    .unwrap()
-                    .contains("public_key_mismatch")
+                message.contains(&format!(
+                    "the enrolled signer is `{}`; pass it as the source with `--source`",
+                    fixture.agent.g
+                )),
+                "must name the enrolled signer address and `--source`: {message}"
             );
+            assert!(!message.contains("--repair-identity"), "{message}");
+            assert!(!message.contains("bind-signer"), "{message}");
             fixture.assert_no_consent_ceremony();
         }
 

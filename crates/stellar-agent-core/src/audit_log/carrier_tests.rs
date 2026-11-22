@@ -1688,7 +1688,27 @@ pub(super) fn owner_diagnostic_failures() -> Vec<(WriterError, String)> {
     ));
     let (_dir, path, store) = owned_fixture(false);
     store.set_reload(Err("private-marker"));
-    cases.push((crate::audit_log::outbox::check_outbox_commitment(&path, store.as_ref()).unwrap_err(), "audit.tip_anchor_unavailable: audit log tip anchor unavailable: audit tip anchor store: audit key reload failed".to_owned()));
+    let untyped =
+        crate::audit_log::outbox::check_outbox_commitment(&path, store.as_ref()).unwrap_err();
+    assert!(
+        matches!(&untyped, WriterError::TipAnchorStore(e) if e.auth_error().is_none()),
+        "an untyped reload failure carries no keyring error: {untyped:?}"
+    );
+    cases.push((untyped, "audit.tip_anchor_unavailable: audit log tip anchor unavailable: audit tip anchor store: audit key reload failed".to_owned()));
+    let auth = crate::error::AuthError::KeyringPlatformError {
+        detail: "read Linux Secret Service: credential store operation failed".to_owned(),
+    };
+    store.set_reload_error(crate::audit_log::TipAnchorStoreError::from_auth(
+        "private-marker",
+        auth.clone(),
+    ));
+    let typed =
+        crate::audit_log::outbox::check_outbox_commitment(&path, store.as_ref()).unwrap_err();
+    assert!(
+        matches!(&typed, WriterError::TipAnchorStore(e) if e.auth_error() == Some(&auth)),
+        "a keyring refusal on reload keeps its AuthError: {typed:?}"
+    );
+    cases.push((typed, "audit.tip_anchor_unavailable: audit log tip anchor unavailable: audit tip anchor store: audit key reload failed".to_owned()));
     let (_dir, path, store) = owned_fixture(false);
     let mut record = store.load_carrier_record().unwrap().unwrap();
     for watch in ["owner:sha256:invalid:01", "private-marker"] {
