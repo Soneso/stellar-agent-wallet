@@ -10,7 +10,7 @@ For the cryptographic detail behind these states see [Security internals](securi
 
 **What it means.** The keyring holds a tip anchor for the log file: the number of entries in it, the SHA-256 hash of its last entry, and the byte offset just past that entry. The log at that path diverges from that tip. It is shorter than the anchor, or the entry ending at the anchored offset is not the anchored entry. A live writer also refuses growth beyond its own last append offset, including complete foreign rows or a torn prefix. Once the log holds its `audit_entry_tags_started` row, a keyed writer also refuses a log that grew past the anchor when an entry of that tail carries no valid entry tag; the reason is `unauthenticated_tail`.
 
-**Why it is checked at all.** The hash chain links each entry to its predecessor, and each file's `.root_hmac` sidecar signs that file's first entry. Both verify a PREFIX. Restoring yesterday's copy of the active log, or truncating the last few entries off it, leaves a log that passes the chain walk and the root signature and looks clean. The anchor is the only thing that knows how far the log had got. The anchor, the re-anchor counter, and the audit binding live in the keyring, outside the log file. Anyone who can restore the keyring's own storage together with the log can restore an older state. With a headless keyring backend these entries are kept in a file on the same host. Anyone who can write that file can restore older entries or delete one, which needs no key material. A deleted binding is recorded again from the profile file at the next keyed use. A deleted anchor is refused while anything shows it was written (section 1.1). Mainnet readiness refuses a headless backend, because a restored copy of its file can make a truncated log and its anchor agree.
+**Why it is checked at all.** The hash chain links each entry to its predecessor, and each file's `.root_hmac` sidecar signs that file's first entry. Both verify a prefix. Restoring yesterday's copy of the active log, or truncating the last few entries off it, leaves a log that passes the chain walk and the root signature and looks clean. The anchor is the only thing that knows how far the log had got. The anchor, the re-anchor counter, and the audit binding live in the keyring, outside the log file. Anyone who can restore the keyring's own storage together with the log can restore an older state. With a headless keyring backend these entries are kept in a file on the same host. Anyone who can write that file can restore older entries or delete one, which needs no key material. A deleted binding is recorded again from the profile file at the next keyed use. A deleted anchor is refused while anything shows it was written (section 1.1). Mainnet readiness refuses a headless backend, because a restored copy of its file can make a truncated log and its anchor agree.
 
 **Where it surfaces.**
 
@@ -20,25 +20,25 @@ For the cryptographic detail behind these states see [Security internals](securi
 
 **Causes, in the order worth checking.**
 
-1. **A restore.** The audit directory, the profile's data root, or the whole home directory was restored from a backup or a filesystem snapshot. Check the log's modification time against the times of the runs you expect to see in it.
-2. **A truncation.** The file was clipped by a log-management tool, a failed copy, or a disk-full condition. `stellar-agent audit verify <log-path>` without `--profile` tells you whether the remaining prefix is intact.
-3. **A second machine.** Two hosts sharing a profile directory over a network filesystem, or a profile directory synced by a file-sync client, each anchor independently in their own keyring. The anchor is per host.
-4. **Tampering.** Someone with write access to the audit directory removed rows. Nothing about a rollback distinguishes this from case 1 on its own; the modification times, the contents, and your own change record do.
-5. **An unauthenticated tail** (reason `unauthenticated_tail`). Entries were appended past the anchor by something that does not hold the profile's audit key: a forged row, or a row written by a build without entry tags. `stellar-agent audit verify --profile <name> <log-path>` names the first such line with `audit.entry_tag_invalid`. Inspect those entries before deciding: the repair keeps them, and `--acknowledge-unauthenticated-tail` quarantines them so readers skip them.
+1. A restore: the audit directory, the profile's data root, or the whole home directory was restored from a backup or a filesystem snapshot. Check the log's modification time against the times of the runs you expect to see in it.
+2. A truncation: the file was clipped by a log-management tool, a failed copy, or a disk-full condition. `stellar-agent audit verify <log-path>` without `--profile` tells you whether the remaining prefix is intact.
+3. A second machine: two hosts sharing a profile directory over a network filesystem, or a profile directory synced by a file-sync client, each anchor independently in their own keyring. The anchor is per host.
+4. Tampering: someone with write access to the audit directory removed rows. Nothing about a rollback distinguishes this from case 1 on its own; the modification times, the contents, and your own change record do.
+5. An unauthenticated tail (reason `unauthenticated_tail`). Entries were appended past the anchor by something that does not hold the profile's audit key: a forged row, or a row written by a build without entry tags. `stellar-agent audit verify --profile <name> <log-path>` names the first such line with `audit.entry_tag_invalid`. Inspect those entries before deciding: the repair keeps them, and `--acknowledge-unauthenticated-tail` quarantines them so readers skip them.
 
 **Recovery.**
 
-Establish which of the five it was BEFORE running the repair. Once the anchor moves, the evidence that it had moved is gone from the anchor. Only the row the repair writes remains.
+Establish which of the five it was before running the repair. Once the anchor moves, the evidence that it had moved is gone from the anchor. Only the row the repair writes remains.
 
 ```
 stellar-agent audit verify <log-path>                       # is the remaining prefix intact
-stellar-agent audit reanchor --profile <name>               # report only, changes nothing, exits 1
+stellar-agent audit reanchor --profile <name>               # report only, writes no row or anchor, exits 1
 stellar-agent audit reanchor --profile <name> --acknowledge-rollback
 ```
 
-When the profile's audit binding has also changed, the verb needs `--acknowledge-binding-change` as well; see §4. For an unauthenticated tail it also needs `--acknowledge-unauthenticated-tail`: it appends `audit_entries_quarantined { quarantined_count }` directly after those entries, then its `audit_tip_anchored` rows, and reports `quarantined_rows`. Without the flag it exits 1 with `validation.acknowledgement_required` and writes nothing. A tail that ends on a rotation handoff without a valid tag refuses with `audit.reanchor_failed` and names that line; remove the line, then rerun the repair.
+When the profile's audit binding has also changed, the verb needs `--acknowledge-binding-change` as well; see section 4. For an unauthenticated tail it also needs `--acknowledge-unauthenticated-tail`: it appends `audit_entries_quarantined { quarantined_count }` directly after those entries, then its `audit_tip_anchored` rows, and reports `quarantined_rows`. Without the flag it exits 1 with `validation.acknowledgement_required` and writes nothing. A tail that ends on a rotation handoff without a valid tag refuses with `internal.unexpected_state`, whose detail begins `audit.reanchor_failed` and names that line; remove the line, then rerun the repair.
 
-The reporting form prints the anchor in force and the anchor it would write, both as `<entry count>:<byte offset>`, and exits 1. A stored anchor that cannot be parsed at all is reported as `unusable (<field count> colon-separated fields, <n> bytes)` rather than echoed. This includes a corrupted value and a value in another format. The acknowledging form replaces it. Every other verb refuses on such a value: reading it as "nothing is anchored" would turn a corrupted anchor into a silently disarmed guard. Nothing is written. The acknowledging form replays the whole log first (a log whose own chain is broken is refused here, not blessed). It writes the current tip as the anchor, increments a monotonic per-path re-anchor counter in the keyring, and appends an `audit_tip_anchored` row naming the superseded anchor. That row is permanent: the log carries its own record that a rollback was accepted, including how far back it went.
+The reporting form prints the anchor in force and the anchor it would write, both as `<entry count>:<byte offset>`, and exits 1. A stored anchor that cannot be parsed at all is reported as `unusable (<field count> colon-separated fields, <n> bytes)` rather than echoed. This includes a corrupted value and a value in another format. The acknowledging form replaces it. Every other verb refuses on such a value: reading it as "nothing is anchored" would turn a corrupted anchor into a silently disarmed guard. The reporting form writes no row and no anchor; at an absent path it creates the empty log (section 11). The acknowledging form replays the whole log first (a log whose own chain is broken is refused here, not blessed). It writes the current tip as the anchor, increments a monotonic per-path re-anchor counter in the keyring, and appends an `audit_tip_anchored` row naming the superseded anchor. That row is permanent: the log carries its own record that a rollback was accepted, including how far back it went.
 
 **Growth underneath a live writer** refuses with the reason "the log is longer than the writer's last append". The writer stays latched after that refusal. Stop the process, preserve a copy of the log, and inspect the added bytes. Restore the last known intact prefix only after establishing which bytes are foreign or torn. Verify the repaired chain, then use the reporting and acknowledging `audit reanchor` forms above if the owed-row anchor requires repair. A chain that does not verify needs its bytes repaired first; re-anchoring cannot fix a splice. An intact tail ahead of the anchor at open remains acceptable, including a tail left by an anchor-write outage.
 
@@ -56,7 +56,7 @@ That file must satisfy the tip anchor. Overwriting the log in place (`cp`,
 `>`, or a restore that writes through) preserves its identity; the tip
 comparison detects divergence.
 
-The process then stops using that writer: the caller holding it is refused on its next row, and every later request is refused with the same message until nothing references it, at which point the next value verb opens whatever is now at the path and checks THAT file against the anchor.
+The process then stops using that writer. The caller holding it is refused on its next row, and every later request is refused with the same message until nothing references it. The next value verb then opens the file at the path and checks that file against the anchor.
 
 **A row refused on a replaced log leaves the anchor one entry ahead.** An append that is refused records, in the keyring, the row it was obliged to write: its count, its hash, and where it would have ended. That record retries once immediately and remains best-effort. When the keyring itself rejects it, the refusal still stands for the writer that made it and for every caller still holding that writer, but it does not survive the process. The signature described below is then absent, and the log looks like one that simply stopped. The action that row was going to prove has already committed, so the obligation outlives the process that failed to meet it. No file at the path satisfies the anchor afterward, including a byte-identical copy of the log as it stood a moment earlier. An anchor exactly one entry ahead of a log whose own chain verifies cleanly is that signature. `audit verify <log-path>` will report the chain intact while the anchored count exceeds the entry count by one. Treat it as a row that was owed and not written, establish what happened to the file, and recover with the acknowledging repair below. The `audit_tip_anchored` row it writes names the superseded anchor, which is the permanent record that a row went missing.
 
@@ -64,24 +64,23 @@ The same durability applies to a log truncated, extended, or overwritten in plac
 
 The MCP server acquires its audit writer when an operation needs it, such as a commit preflight before signing. MCP balance reads do not acquire it. Under V1, payment simulations can reconcile overdue reservations, acquire the writer, and deliver owed accounting events.
 
-The registry normally caches the writer and holds its lock until process exit. A replaced-file refusal during acquisition marks the cached writer for eviction. After callers release it, the next acquisition drops it and checks the file at the path against the anchor.
-
 Recovery takes all three audit carriers with immediate try-locks and refuses
 with `audit.carriers_busy` when any is held. Stop a server holding that
 profile's writer, repair, and start it again. `profile rotate-audit-key`
-refuses a held writer with `audit.writer_locked`.
+refuses a held writer with `internal.unexpected_state`, whose detail begins
+`audit.writer_locked`.
 
 **Queued operator rows.** After its `audit_tip_anchored` rows, the acknowledging repair drains the audit outbox (section 8), so rows `stellar-agent approve`, `profile halt`, and `profile resume` queued while the log was refused follow the repair rows. If the drain refuses, the repair still stands: the verb exits 0, omits `outbox_drained`, and lists the refusal under `warnings` (`audit.outbox_unusable`, `audit.outbox_busy`, `audit.outbox_rows_missing`, or the condition an append refused on, such as `audit.io_error`). Every queued row stays queued for the next drain, which appends again any row the refused drain had appended. The reporting form leaves the log, the anchor, and the outbox unchanged.
 
-## 1.1 Missing tip anchor
+### 1.1 Missing tip anchor
 
 **Wire code:** `audit.tip_anchor_missing`
 
 **What it means.** No tip anchor is stored for the log path, yet something shows that one was written. Three facts outlive a deleted anchor:
 
-- an audit binding recorded for the profile before this use (§4);
+- an audit binding recorded for the profile before this use (section 4);
 - a `.root_hmac` chain-root sidecar beside the active file, which a keyed writer writes with the file's first entry;
-- an `audit_tip_anchored` row of any reason in the active file.
+- an anchoring row in the active file: an `audit_tip_anchored` row of any reason, an entry-tag row (section 7), or any row that carries an entry tag. `entry_tags: true` on the rotation handoff the file chains from counts the same way.
 
 For an empty active file only the sidecar counts: a rotation renames the sidecar with its archive, so an empty file that still has one was truncated. The refusal names the fact it found. Adopting such a log would take a truncated file as the baseline and the removed rows would leave no trace, so the writer refuses and writes neither an anchor nor a row.
 
@@ -93,15 +92,15 @@ For an empty active file only the sidecar counts: a rotation renames the sidecar
 
 ```
 stellar-agent audit verify <log-path>
-stellar-agent audit reanchor --profile <name>               # report only, changes nothing, exits 1
+stellar-agent audit reanchor --profile <name>               # report only, writes no row or anchor, exits 1
 stellar-agent audit reanchor --profile <name> --acknowledge-rollback
 ```
 
-The reporting form prints the anchor in force as `none`. The acknowledging form anchors the current tip, bumps the re-anchor counter, and appends a `rollback_acknowledged` row with no `previous_anchor`. That row is the permanent record that a missing anchor was accepted.
+The reporting form prints the anchor in force as `none`. The acknowledging form anchors the current tip, bumps the re-anchor counter, and appends a `rollback_acknowledged` row with `previous_anchor: null`. That row is the permanent record that a missing anchor was accepted.
 
 ## 2. Partial rotation
 
-**Wire code:** `audit.partial_rotation`
+**Wire code:** `audit.partial_rotation` from `audit verify`. A writer open on a value verb reports it as a detail sub-code under `audit.chain_key_unavailable`.
 
 Rotation renames the active log to an archive, renames its `.root_hmac` sidecar alongside, and creates a fresh active file. A crash part-way through leaves a directory state the writer refuses to open, rather than guessing. Three shapes are detected.
 
@@ -121,11 +120,11 @@ Recovery: inspect the `.tmp` file. It is a partial sidecar or a partial state fi
 
 The active log's last line is not parseable JSON: the process died mid-append, before `fsync` completed.
 
-Recovery: the entries before it are intact. Truncate the file to the end of the last complete line, then reopen. `stellar-agent audit verify <log-path>` confirms the result. Expect a tip-anchor mismatch on the next acquisition if the truncation removed a row the anchor had already counted; §1 applies.
+Recovery: the entries before it are intact. Truncate the file to the end of the last complete line, then reopen. `stellar-agent audit verify <log-path>` confirms the result. Expect a tip-anchor mismatch on the next acquisition if the truncation removed a row the anchor had already counted; section 1 applies.
 
-## 2.4 Unusable rotation bridge
+### 2.4 Unusable rotation bridge
 
-**Wire code:** `audit.rotation_bridge_unusable`
+**Detail sub-code:** `audit.rotation_bridge_unusable` (under `audit.chain_key_unavailable`, or `internal.unexpected_state` from the audit verbs)
 
 A file created by a rotation chains its first entry off the outgoing file's rotation-handoff entry, so opening the active file means reading that handoff out of the newest archive. This state means the archive's last entry is not a handoff naming that archive.
 
@@ -139,11 +138,11 @@ The writer refuses rather than seeding the replay from an unverified hash. Recov
 
 The check is structural: it confirms the shape, not the archive's chain or its signature. `audit verify` is what establishes the bridge's integrity, walking every file and requiring each one's chain-root signature under the profile's key.
 
-## 2.5 Rotation and the anchor
+### 2.5 Rotation and the anchor
 
 Rotation advances the anchor onto the outgoing file's handoff entry and leaves it there. The file the rotation creates has no entry of its own to name, so it inherits nothing until its first append; the guard stays armed on the previous generation's tip throughout.
 
-An anchor naming the newest archive's handoff is recognised automatically on the next open, with no operator action and no row. That match is the fingerprint of a rotation, and nothing an attacker can write to the filesystem produces it: appending a handoff to a copy of the log yields a different tip hash. Restoring the directory to its pre-rotation state, or to an older archive-and-active pair, therefore refuses: neither holds an archive whose handoff is the anchored one, even though both restored states pass the chain walk.
+An anchor naming the newest archive's handoff is recognized automatically on the next open, with no operator action and no row. That match is the fingerprint of a rotation, and nothing an attacker can write to the filesystem produces it: appending a handoff to a copy of the log yields a different tip hash. Restoring the directory to its pre-rotation state, or to an older archive-and-active pair, therefore refuses: neither holds an archive whose handoff is the anchored one, even though both restored states pass the chain walk.
 
 There is no anchor value meaning "this file is empty". Offset 0 is a prefix of every file, so such a value would make every file read as ahead of the anchor and a restore would be absorbed rather than refused.
 
@@ -157,7 +156,7 @@ the outage, then use `audit reanchor --profile <name> --acknowledge-rollback`.
 
 The anchor detects rollback and truncation. The entry tags detect appended forgeries past the log's boundary row.
 
-The entry-to-entry chain hash is unkeyed. Someone who can write the log file can append a well-formed entry that chains correctly off the current tip; the chain walk and the anchor accept it, because the tip moved forward, which is what an honest append also looks like. The `.root_hmac` sidecar signs only each file's FIRST entry. Every entry a keyed writer appends also carries an `entry_tag`, an HMAC over the entry's hash under a key derived from the profile's audit key. Past the boundary row, an entry without a valid tag is refused by keyed writers (`unauthenticated_tail`) and by `audit verify --profile` (`audit.entry_tag_invalid`), and the readers stop at the writer's verified tip, so they never act on it.
+The entry-to-entry chain hash is unkeyed. Someone who can write the log file can append a well-formed entry that chains correctly off the current tip; the chain walk and the anchor accept it, because the tip moved forward, which is what an honest append also looks like. The `.root_hmac` sidecar signs only each file's first entry. Every entry a keyed writer appends also carries an `entry_tag`, an HMAC over the entry's hash under a key derived from the profile's audit key. Past the boundary row, an entry without a valid tag is refused by keyed writers (`unauthenticated_tail`) and by `audit verify --profile` (`audit.entry_tag_invalid`), and the readers stop at the writer's verified tip, so they never act on it.
 
 What stays open:
 
@@ -169,19 +168,19 @@ What stays open:
 
 What the substrate gives you: entries cannot be edited or removed without detection, the log cannot be rewound without detection, a file cannot be substituted for another without detection, and past the boundary row an entry cannot be appended without the audit key.
 
-The anchor is also not a cross-host guarantee. It is held in the local keyring and describes one path on one host. The anchor, the re-anchor counter, and the audit binding live in the keyring, outside the log file. Anyone who can restore the keyring's own storage together with the log can restore an older state. With a headless keyring backend these entries are kept in a file on the same host. Anyone who can write that file can restore older entries or delete one, which needs no key material. A deleted binding is recorded again from the profile file at the next keyed use. A deleted anchor is refused while anything shows it was written (section 1.1). Mainnet readiness refuses a headless backend, because a restored copy of its file can make a truncated log and its anchor agree.
+The anchor is also not a cross-host guarantee. It is held in the local keyring and describes one path on one host. Section 1 describes what a restore of the keyring's own storage allows and why mainnet readiness refuses a headless backend.
 
 It is also not continuous in time. The anchor is written after the entry it covers is fsynced, because failing an append over a keyring error would misreport a row that was written. That leaves three states, and they differ in kind:
 
-- **Lagging.** Between an entry's fsync and its anchor write landing, the anchor names the previous entry of this file. A rollback to that entry or later is absorbed; anything earlier is still refused. The write retries once immediately, then on the next append or keyed acquisition. The MCP server's exit drain retries it as well. After process exit, rollback to the previous anchor silently loses the unanchored tail. An outage widens the lag to the appends made during the outage.
-- **Off, no anchor yet.** Until the first keyed append on a log path, nothing is anchored: a new profile, or a log written only by unkeyed writers. A changed `audit_log_path` is refused by the audit binding until it is acknowledged (§4). Adoption takes the file as it finds it. A rollback performed before that first acquisition becomes the baseline, silently, because there is no earlier anchored state to compare it against. Once a keyed writer has run, a deleted anchor no longer returns the log to this state (section 1.1).
-- **Off, freshly rotated file.** From a rotation until the first append into the new file has its anchor write land, the anchor still names the archive's handoff. Any prefix of the new file, down to empty, is accepted if it chains from that handoff. Normally one append wide; a keyring outage spanning that append holds it open.
+- Lagging: between an entry's fsync and its anchor write landing, the anchor names the previous entry of this file. A rollback to that entry or later is absorbed; anything earlier is still refused. The write retries once immediately, then on the next append or keyed acquisition. The MCP server's exit drain retries it as well. After process exit, rollback to the previous anchor silently loses the unanchored tail. An outage widens the lag to the appends made during the outage.
+- Off, no anchor yet: until the first keyed append on a log path, nothing is anchored: a new profile, or a log written only by unkeyed writers. A changed `audit_log_path` is refused by the audit binding until it is acknowledged (section 4). Adoption takes the file as it finds it. A rollback performed before that first acquisition becomes the baseline, silently, because there is no earlier anchored state to compare it against. Once a keyed writer has run, a deleted anchor no longer returns the log to this state (section 1.1).
+- Off, freshly rotated file: from a rotation until the first append into the new file has its anchor write land, the anchor still names the archive's handoff. Any prefix of the new file, down to empty, is accepted if it chains from that handoff. Normally one append wide; a keyring outage spanning that append holds it open.
 
-Entries already in an ARCHIVE are guarded throughout all three: a rolled-back prefix of the pre-rotation file cannot chain from the archive's handoff and is refused. A checked keyed writer verifies the whole retained history at open and every keyed acquisition. A failed history check refuses with `audit.history_unverified`; section 11 describes recovery. Use `audit verify --profile` to inspect a log you have reason to doubt.
+Entries already in an archive are guarded throughout all three: a rolled-back prefix of the pre-rotation file cannot chain from the archive's handoff and is refused. A checked keyed writer verifies the whole retained history at open and every keyed acquisition. A failed history check refuses with the detail sub-code `audit.history_unverified`; section 11 describes recovery. Use `audit verify --profile` to inspect a log you have reason to doubt.
 
 ## 4. Scope of the anchor
 
-The anchor names one PATH inside one profile's keyring namespace. Its keyring service is the profile's audit-key service (`stellar-agent-audit-<profile>` by default) and its account is that key's account plus a digest of the lexically normalized log path, so:
+The anchor names one path inside one profile's keyring namespace. Its keyring service is the profile's audit-key service (`stellar-agent-audit-<profile>` by default) and its account is that key's account plus a digest of the lexically normalized log path, so:
 
 - A changed `audit_log_path` or audit key has an anchor coordinate of its own, with nothing stored at it. The audit binding refuses that change until the operator acknowledges it; see **Audit binding** below.
 - Paths that differ only by `.` or `..` components resolve to the same anchor. Paths that differ through a symlink do not: normalization is lexical, never `canonicalize`, because the coordinate has to be derivable before the log file exists.
@@ -194,7 +193,7 @@ To check for it, run `stellar-agent profile show <name>` on every profile on the
 
 **Wire code:** `audit.log_binding_changed`
 
-**What it means.** The keyring records, for each persisted profile, the SHA-256 of its lexically normalized `audit_log_path` and its audit-key coordinate. The record sits at service `stellar-agent-auditbinding-<profile>`, account `default`. The profile names a different log path or audit key than the record, or the record cannot be parsed. Every keyed audit writer refuses before it loads the audit key. The value-moving verbs and tools, on the zero-config profile too, exit with the code before signing. The read-only smart-account verbs, `approve --id <nonce>`, `approve serve`, `audit verify --profile`, `credentials add-passkey` (before its ceremony), and `profile rotate-audit-key` and `profile reset-window-state` exit with it too. A command whose audit row is best effort skips the row and continues: the other `profile` enroll and rotate verbs. A refusal creates nothing at the path the profile names.
+**What it means.** The keyring records, for each persisted profile, the SHA-256 of its lexically normalized `audit_log_path` and its audit-key coordinate. The record sits at service `stellar-agent-auditbinding-<profile>`, account `default`. The profile names a different log path or audit key than the record, or the record cannot be parsed. Every keyed audit writer refuses before it loads the audit key. The value-moving verbs and tools, on the zero-config profile too, exit with the code before signing. The read-only smart-account verbs, `approve --id <nonce>`, `approve serve`, `audit verify --profile`, `credentials add-passkey` (before its ceremony), and `profile rotate-audit-key` and `profile reset-window-state` exit with it too. So do `profile enable-mainnet`, `profile reset-mpp-state`, `audit bind-carriers`, and `audit acknowledge-outbox-loss`. A command whose audit row is best effort skips the row and continues: the other `profile` enroll and rotate verbs. A refusal creates nothing at the path the profile names.
 
 **When the record is written.** The first keyed use of a persisted profile records it from the profile file, once the audit key has loaded; a profile with no audit key records nothing. A synthesized zero-config profile only compares, and records nothing. Unkeyed writers neither read nor write it.
 
@@ -212,13 +211,13 @@ stellar-agent audit reanchor --profile <name> --acknowledge-binding-change
 | Changed or unreadable | Agrees, or absent without prior anchoring evidence | `--acknowledge-binding-change` | `binding_changed` |
 | Changed or unreadable | Disagrees, cannot be parsed, or absent with prior anchoring evidence | Both | `rollback_acknowledged`, then `binding_changed` |
 
-An anchor agrees when `audit verify` would accept it; a file ahead of its anchor agrees. An absent anchor is covered by the first row: with an equal or absent binding the verb needs `--acknowledge-rollback` for it as for a mismatch (section 1.1). In the changed-binding rows an absent anchor disagrees when a chain-root sidecar or an `audit_tip_anchored` row shows prior anchoring, and agrees otherwise: a changed binding names a log path and audit key no anchor was written for yet, so only the log can show that one was. The verb decides this before it opens the writer and again under the writer's lock, where it reads the rows from its replay of the active file. A missing flag refuses with `validation.acknowledgement_required`, names the flag, and writes nothing. On success the verb anchors the current tip, bumps the current path's re-anchor counter once, and appends the rows, each carrying that count. `binding_changed` names the old path's anchor as `previous_anchor`, or none when the record was unreadable. The new binding is stored last, so a run that stops earlier leaves the refusal in place and a rerun appends its rows again. The envelope lists the conditions acknowledged and how the record compared. Queued operator rows follow the repair rows, as in section 1.
+An anchor agrees when `audit verify` would accept it; a file ahead of its anchor agrees. An absent anchor is covered by the first row: with an equal or absent binding the verb needs `--acknowledge-rollback` for it as for a mismatch (section 1.1). In the changed-binding rows an absent anchor disagrees when a chain-root sidecar or an anchoring row (section 1.1) shows prior anchoring, and agrees otherwise: a changed binding names a log path and audit key no anchor was written for yet, so only the log can show that one was. The verb decides this before it opens the writer and again under the writer's lock, where it reads the rows from its replay of the active file. A missing flag refuses with `validation.acknowledgement_required`, names the flag, and writes nothing. On success the verb anchors the current tip, bumps the current path's re-anchor counter once, and appends the rows, each carrying that count. `binding_changed` names the old path's anchor as `previous_anchor`, or none when the record was unreadable. The new binding is stored last, so a run that stops earlier leaves the refusal in place and a rerun appends its rows again. The envelope lists the conditions acknowledged and how the record compared. Queued operator rows follow the repair rows, as in section 1.
 
 **Two data roots, one keyring.** The default `audit_log_path` derives from the OS data directory, which follows `$HOME` and `$XDG_DATA_HOME`. Two profile files of one name in two data roots that share one keyring bind different digests and refuse each other. Set an explicit `audit_log_path` in the profile file in such a deployment.
 
 ## 5. Adoption
 
-A log with no anchor records adoption on first keyed use when nothing shows prior anchoring: no recorded audit binding, no `.root_hmac` sidecar, and no `audit_tip_anchored` row in the file. A log with any of the three is refused with `audit.tip_anchor_missing` (section 1.1). A log with keyed history first needs `stellar-agent audit bind-carriers --profile <NAME>` with every wallet process stopped (section 8.5).
+A log with no anchor records adoption on first keyed use when nothing shows prior anchoring: no recorded audit binding, no `.root_hmac` sidecar, and no anchoring row (section 1.1) in the file. A log with any of the three is refused with `audit.tip_anchor_missing` (section 1.1). A log with keyed history first needs `stellar-agent audit bind-carriers --profile <NAME>` with every wallet process stopped (section 8.5).
 
 Adoption replays the active file before recording its tip. A broken active
 chain refuses adoption. Adoption signs the active root at byte zero, so an
@@ -231,7 +230,7 @@ On success the current tip becomes the anchor and an `audit_tip_anchored` row wi
 
 ### 5.1 The entry-tag boundary
 
-The first acquisition by a writer that holds the audit key and the anchor store appends `audit_entry_tags_started { anchored_count, absorbed_count }`, tagged like every row. From that row on, entry tags are in force: every later entry must carry a valid tag, and each rotation handoff carries `entry_tags: true`, so the rule survives rotation and prune. `anchored_count` is the stored anchor's count, 0 for an adopted log. `absorbed_count` counts the rows the acquisition took without a tag check: the tail past the anchor, the rows of a file a rotation completed, or every row of an adopted file. `audit verify` warns `entry_tags_absorbed` when that count is nonzero; inspect those rows, since nothing authenticated them. A failed boundary append does not fail the acquisition; the next one retries it. Mainnet readiness requires tags in force and refuses with `audit.tip_anchor_unavailable` until the row is written.
+The first acquisition by a writer that holds the audit key and the anchor store appends `audit_entry_tags_started { anchored_count, absorbed_count }`, tagged like every row. From that row on, entry tags are in force: every later entry must carry a valid tag, and each rotation handoff carries `entry_tags: true`, so the rule survives rotation and prune. `anchored_count` is the stored anchor's count, 0 for an adopted log. `absorbed_count` counts the rows the acquisition took without a tag check: the tail past the anchor, the rows of a file a rotation completed, or every row of an adopted file. `audit verify` warns `entry_tags_absorbed` when that count is nonzero; inspect those rows, since nothing authenticated them. A failed boundary append does not fail the acquisition; the next one retries it. Mainnet readiness requires tags in force and refuses with the detail sub-code `audit.tip_anchor_unavailable` (section 9) until the row is written.
 
 Once a log's entry tags are in force, or its active file holds a row that carries an entry tag, a writer without the audit key refuses it with `audit.chain_key_unavailable`. A writer without the key and without the anchor store also refuses a log with a chain-root sidecar or an anchoring row. Builds without entry tags cannot parse the entry-tag rows and refuse a log that holds them with `audit.parse_error`.
 
@@ -262,8 +261,8 @@ grep '"kind":"audit_tip_anchored"' <log-path>
 | --- | --- |
 | `reason` | `adopted`, the log was taken under anchor protection at its current tip. `rollback_acknowledged`, an operator accepted a rolled-back log. `binding_changed`, an operator accepted a profile whose log path or audit key differs from its recorded binding. |
 | `entry_count` | Entries in the active file when the anchor was adopted or repaired, before the first row of that adoption or repair. Every row of one repair carries the same count. |
-| `previous_anchor` | The superseded anchor as `<entry count>:<byte offset>`. For `binding_changed`, the anchor of the log path the previous binding named. Absent for an adoption, and for a binding change whose record was unreadable or whose old path had no anchor. |
-| `reanchor_count` | The current path's re-anchor counter after this repair. One repair bumps it once, so a `rollback_acknowledged` row and the `binding_changed` row after it carry the same count. Absent for an adoption. |
+| `previous_anchor` | The superseded anchor as `<entry count>:<byte offset>`. For `binding_changed`, the anchor of the log path the previous binding named. `null` for an adoption, and for a binding change whose record was unreadable or whose old path had no anchor. |
+| `reanchor_count` | The current path's re-anchor counter after this repair. One repair bumps it once, so a `rollback_acknowledged` row and the `binding_changed` row after it carry the same count. `null` for an adoption. |
 
 A `rollback_acknowledged` or `binding_changed` row is the thing to look for when reading a log's history: it marks a point where the log's own continuity was accepted rather than proven. A `rollback_acknowledged` row names how many entries and bytes were given up. A `binding_changed` row names where the previous log ended.
 
@@ -398,6 +397,7 @@ A holder of that generation wrote after it was retired, so its rows never reach 
 The active queue can be intact; `audit verify --profile` reports it as usual.
 Inspect the retired file that the binding's `audit_carriers_bound` row names in `retired_file`, then run the same acknowledgement.
 It reports `expected_rows` from the commitment recorded at retirement and `found_rows` from the commitment the keyring holds now.
+For a retired generation under owner state, `found_rows` is 0.
 It revokes as above, appends the intact active queue, and resets the retired watch to the commitment it observed.
 When active and retired losses coexist, `expected_rows` and `found_rows` describe the active queue.
 The same acknowledgement also resets the retired watch to the observed commitment; it leaves no second acknowledgement pending.
@@ -446,7 +446,7 @@ of an earlier file cannot silently change the active generation.
 | `audit.carriers_busy` | A recovery verb or an enrollment cannot take all three carriers immediately. Stop every wallet process and retry. |
 | `audit.carrier_binding_incomplete` | A staged generation exists. Rerun carrier binding with every wallet process stopped. |
 
-The audit verbs report these codes directly as their envelope codes; value verbs report `audit.chain_key_unavailable` with the carrier code at the head of the message. The queue check in `audit verify --profile` can fail with `audit.carrier_replaced`, `audit.carriers_unbound`, or `audit.carrier_identity_unavailable`.
+The audit verbs report these codes directly as their envelope codes; value verbs report `audit.chain_key_unavailable` with the carrier code at the head of the message. An incomplete binding that an evidence read finds is the exception: the audit verbs report `internal.unexpected_state` with `audit.carrier_binding_incomplete` at the head of the detail. The queue check in `audit verify --profile` can fail with `audit.carrier_replaced`, `audit.carriers_unbound`, or `audit.carrier_identity_unavailable`.
 A held outbox returns `audit.outbox_busy`; a changed retired commitment returns `audit.outbox_rows_missing`.
 
 ### 8.5 Bind carriers
@@ -556,7 +556,7 @@ Any authenticated image above the committed generation proves an older owner ent
 Two distinct authenticated images of that generation refuse with `owner rollback`.
 An image that matches no committed head refuses with `head`, and an older image never stands in for it.
 A missing or version 1 owner beside either evidence file refuses with `evidence image without owner`.
-A drain under such an owner leaves queued consent rows in place, and rows without consent evidence still deliver.
+A drain under such an owner defers a selected batch that holds a consent row and leaves its bytes unchanged; a batch without consent rows still delivers.
 Every refusal uses `audit.outbox_evidence_unusable` with a fixed reason.
 Ordinary appends and payments that need no approval never read the evidence files.
 A drain reads them before selected consent rows and while repairing an exact rotation fence.
@@ -668,7 +668,7 @@ Any other pin keeps refusing admission with `unresolved migration pin`, and no c
 **Binding and verification.** A carrier binding authenticates the source generation's evidence image with its queue before it stages anything.
 A newer authenticated source image is committed to the source owner first, while the record names the source or a staged successor that retires it.
 The successor then receives the complete source owner, so records, floor, slot paths, and scope carry over unchanged.
-Ordinary evidence reads and mutations refuse with `audit.carrier_binding_incomplete` while a stage exists or successor owner state waits.
+Ordinary evidence reads and mutations refuse with the detail sub-code `audit.carrier_binding_incomplete` while a stage exists or successor owner state waits.
 `audit verify` authenticates both evidence files under the one stored key it reads and changes no file or protected item.
 Verification reports a newer authenticated image with `owner recommit required`; the next keyed evidence query or drain recommits it.
 Neither binding nor verification uses the old-key exception of the rotation fence.
@@ -767,6 +767,9 @@ A pending-row refusal before the row writes no receipt and no row. After the
 row, the recorder attempts the release of the reservation, a
 `value_action_failed` row under `submission.record_unavailable` that closes
 the pending row, and the removal of the receipt, each best-effort and logged.
+On the authorized mainnet path, an anchor that still does not cover the
+pending row refuses with `network.mainnet_authorization_refused`, and the
+closing row carries that code.
 A resend that the reservation's duplicate check refuses after its row leaves
 that row open for the original submission's settlement. Nothing is sent.
 On testnet, an x402 refusal keeps the admitted spend. On mainnet, an anchor
@@ -791,9 +794,11 @@ in `<tip-account>-carriers`. Without a carrier record, generation 0 uses
 `retired.generation` using the same rule. Identify the malformed generation
 before removing an entry. The wallet never writes such a value, so it was
 changed outside the wallet. Restoring keyring access does not clear it. Every
-drain, every keyed acquisition, every queued operator row, and
+drain, every keyed acquisition, every unkeyed append, and
 `audit acknowledge-outbox-loss` refuse with this sub-code, and nothing is
-read as "nothing queued".
+read as "nothing queued". A keyed append without a consent-evidence
+reservation reads no commitment and queues its tagged row; the next drain
+refuses.
 
 1. Stop the processes that use the profile: the MCP server, `approve serve`,
    and any CLI verb.
@@ -836,7 +841,7 @@ record; keep it with the incident record.
 
 **Recovery.** Investigate first: a locked or failing keyring is fixed in the keyring, and the key comes back unchanged. If the stored audit key is corrupt:
 
-1. Restore the trusted key from a copy of that keyring entry, such as a keychain backup, to the entry the profile's `audit_log_hash_chain_key_id` names. The log, its anchor, and its entry tags then verify as before, and `audit verify --profile <name>` confirms it.
+1. Restore the trusted key from a copy of that keyring entry, such as a keychain backup, to the entry the profile's `audit_log_hash_chain_key_id` names. The log, its anchor, and its entry tags then verify as before, and `audit verify --profile <name> <log-path>` confirms it.
 2. Without a copy, the existing log stays evidence that only its hash chain checks. Stop the processes that use the profile, then move every file of the log out of the audit directory with the incident record: the active file, its rotated files, their `.root_hmac` sidecars, `<log>.pruned` and its sidecar, and `<log>.outbox`. `stellar-agent audit verify <saved-log>` without `--profile` still walks the moved chain.
 3. Remove the corrupt keyring entry with the platform keyring tool, such as Keychain Access on macOS, Seahorse on Linux, or Credential Manager on Windows.
 4. Run `stellar-agent audit reanchor --profile <name> --acknowledge-rollback`. The stored anchor still names the moved log, so the new, empty log is refused with `audit.tip_anchor_mismatch` until this re-anchor acknowledges it. When the keyring still commits queued operator rows of the moved outbox, the repair stands and the envelope's `warnings` list `audit.outbox_rows_missing`; acknowledge that loss as in section 8.3 before the next step. That acknowledgement also applies under owner state (section 8.6).
@@ -850,7 +855,10 @@ The retained history starts at the seed an authenticated `<log>.pruned`
 records for its oldest file, or at the zero seed without a marker.
 A missing archive, a missing or forged marker, or an edited or substituted
 archive fails verification. A keyed writer refuses such a history at open
-and at every keyed acquisition with `audit.history_unverified`.
+and at every keyed acquisition with the detail sub-code
+`audit.history_unverified`. The envelope code is `audit.chain_key_unavailable`
+on value verbs and `internal.unexpected_state` on the audit verbs and
+`profile rotate-audit-key`.
 Readers refuse a walk whose oldest file starts at another seed.
 Every prune also stops and keeps the archives when the retained chain fails
 verification. The writer never adopts a missing prefix on its own.
@@ -861,7 +869,8 @@ the operator runs `stellar-agent profile rotate-audit-key <name>` to re-sign
 every file. Adoption signs an untagged active root at byte zero; archives
 require re-signing. The rotation's dedicated recovery open checks the anchor.
 With an old key, the command verifies the chains, bridges, retained seed and
-entry tags before replacing the key; a first mint walks nothing.
+entry tags before replacing the key; a first mint has no old key and skips this check,
+while its open still replays the active file.
 It permits root and marker tags to be re-signed, including tags an interrupted
 rotation leaves under the prior key.
 If rotation refuses unbound carriers or missing outbox rows, first run
@@ -920,10 +929,11 @@ sibling placed under a name that sorts after every archive precedes the next
 archive, which the writer names after it, and stops the prune the same way.
 Pruning resumes once the offending file is removed or
 restored; rotating cannot repair an interior edit. A keyed open writes a
-missing tag only for a file its anchor proves from byte 0; for a file it
-cannot prove, such as one adopted without an anchor, `audit reanchor` writes
+missing tag for a file its anchor proves from byte 0 and for a file it
+adopts. For any other file it cannot prove, `audit reanchor` writes
 the tag after the operator acknowledges the file as it stands. Neither writes a
 tag for a file whose first entry does not start at byte 0. An archive that
 an unkeyed writer both started and rotated has no tag. After checking that it
 is genuine, `profile rotate-audit-key` re-signs every file. Past 21 rotated
-files, open and verify refuse with `audit.too_many_rotated_files`.
+files, `audit verify` refuses with `audit.too_many_rotated_files`, and a writer
+open carries that code as its detail sub-code.

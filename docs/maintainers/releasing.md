@@ -28,11 +28,9 @@ dispatch.
    preparation pull request.
    Rerun release mode when pending fragments remain, including fragments that
    arrive during preparation.
-   Never edit an existing fragment. Add a new file for a further entry.
-   Each fragment file belongs to one pull request and is never reused.
-   A sync merge deletes fragments that `main` folds and deletes.
-   It never deletes a fragment that holds an unreleased entry under this rule.
-   If a fragment violates this rule, preserve every unreleased item in a new
+   The fragment rules are in the
+   [fragment README](../../changelog.d/README.md).
+   If a fragment violates them, preserve every unreleased item in a new
    file before accepting deletion.
 2. Wait for CI to pass on that `main` commit.
 3. From a checkout of that commit, check the workspace members on crates.io:
@@ -61,12 +59,8 @@ same script with `--warn`, annotates the run with one warning per missing
 member, and the release proceeds.
 
 The changelog guard checks pull requests into `mainnet-write`.
-An eligible sync merge there has exactly two parents and brings new ancestry
-from `main` through its second parent.
-Its `CHANGELOG.md` equals the clean three-way merge over the parents' merge
-base, preserving both sides' lines.
-The guard refuses conflicts; a maintainer resolves and merges them.
-The guard never accepts hand-resolved changelog bytes.
+The [fragment README](../../changelog.d/README.md) states which sync merges it
+accepts.
 
 ## What the release preflight refuses
 
@@ -154,7 +148,7 @@ that runs the function.
 The same check holds every job of `release-rehearsal.yml` to a token that
 reads the repository contents and nothing else, with no environment, no
 secret, and no expression that reads the workflow token. Both build jobs must
-call the shared build, Perl and libsodium scripts under `.github/scripts/release/`.
+call the shared build, Perl, and libsodium scripts under `.github/scripts/release/`.
 The build immediately follows the environment setup, and its first action
 checks compiler overrides and cargo configuration files.
 
@@ -166,8 +160,9 @@ verification jobs hold no publishing or signing credential, their token has
 `contents: read`, and they download the run's artifacts and the registry
 dependencies. The archive checks run on a runner of each release target, and
 the rehearsal packages with the toolchain that `publish.yml` packages with.
-The feature jobs of `ci.yml` run unconditionally and run their defining
-commands.
+In `ci.yml`, `feature-discipline` runs unconditionally. The other feature jobs
+skip only a documentation-only pull request into `mainnet-write`, where
+`docs-tests` runs instead. Each job runs its defining commands unconditionally.
 
 The `release-cache` rule refuses cache actions in the release and rehearsal.
 Both build cold from locked sources. The `release-toolchain` rule requires
@@ -417,7 +412,7 @@ run uploads no signed archive.
 
 ### Feature-state checks
 
-Release, publish and rehearsal expect `mainnet-write` to be on. The shared
+Release, publish, and rehearsal expect `mainnet-write` to be on. The shared
 build script runs the environment guard immediately before the release recipe.
 Archive verification executes both packaged binaries and checks their embedded
 markers. Archive and host checks also refuse three test-override literals:
@@ -428,7 +423,7 @@ signing and provenance wait for that rebuild. Publication depends on the
 provenance content check, the source discipline check, and the rebuild.
 Crate publication also requires a rebuild of every vendored Wasm file of the
 verified tag's commit from its pinned source with pinned tools and matching
-bytes. A failed, cancelled or skipped rebuild stops it before the registry
+bytes. A failed, canceled, or skipped rebuild stops it before the registry
 credential is requested.
 
 The generic SLSA generator records source identity and checksum subjects.

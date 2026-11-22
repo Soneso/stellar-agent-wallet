@@ -42,7 +42,7 @@ the review approves with no blocking findings.
   below current offline coverage); 90% per crate is the aspirational target,
   and any shortfall below it is justified in the review (for example,
   live-network paths exercised by acceptance tests rather than unit tests).
-- **Tests assert correct behavior.** A test must fail if the behavior it covers
+- Tests assert correct behavior. A test must fail if the behavior it covers
   regresses. A test that only raises the coverage number by exercising or
   asserting wrong or buggy behavior, or that would still pass if the code were
   broken, is a blocking finding and must be reported. The fix is to correct the
@@ -99,20 +99,15 @@ the review approves with no blocking findings.
 - The change preserves the project invariants: self-custodial keys that never
   leave the host without explicit per-action consent, no required
   project-operated backend, no central store of user secrets, a permissive
-  license, deterministic machine-readable output, and testnet/mainnet parity.
+  license, deterministic machine-readable output, and mainnet admission only for the operations that
+  [Mainnet configurations and scope](../getting-started.md#mainnet-configurations-and-scope)
+  lists.
 
 ### 8. Build gates
 
-Start local verification with `bash .github/scripts/preflight.sh` and run the
-issue-specific acceptance commands. `bash .github/scripts/preflight.sh --full`
-runs the complete local registry, including coverage.
-
-CI runs the offline gates on every pull request; a docs-only pull request into
-`mainnet-write` runs the reduced set that [building.md](building.md#gate-suite)
-describes. Pull-request
-coverage requires the `coverage` label; live acceptance uses its separate
-workflow. Local coverage, `cargo machete`, and `cargo deny check` are optional
-reproductions. Record each local gate's exit code or unavailable status.
+Run the local preflight and the issue-specific acceptance commands as the
+[gate suite](building.md#gate-suite) describes. Record each local gate's exit
+code or unavailable status.
 
 ## Self-review before you open a pull request
 
@@ -126,22 +121,22 @@ way in the pull request description.
 
 ### Quality criteria
 
-1. **Comments and docstrings** state what holds and why. Nothing in them is
+1. Comments and docstrings state what holds and why. Nothing in them is
    stale, narrates the obvious, tells the history, or contrasts the code with
    behavior it does not have.
-2. **Dead code.** No branch is unreachable, and no condition tests a state the
+2. Dead code: no branch is unreachable, and no condition tests a state the
    callers cannot produce.
-3. **Unused surface.** Every symbol, parameter, field, constant, and import
+3. Unused surface: every symbol, parameter, field, constant, and import
    has a consumer, and each item's visibility matches what its callers need.
-4. **Duplication.** The change repeats no logic within itself and none that
+4. Duplication: the change repeats no logic within itself and none that
    the workspace already provides. Read the neighboring modules before you add
    a helper.
-5. **Dark code.** The purpose of each item follows from its name, structure,
+5. Dark code: the purpose of each item follows from its name, structure,
    and comments. Names do not mislead, and the code prefers a plain
    construction to a clever one.
-6. **Size and structure.** Each function has one responsibility, and every
+6. Size and structure: each function has one responsibility, and every
    abstraction earns its indirection.
-7. **House style.** The change follows the writing rules of
+7. House style: the change follows the writing rules of
    [CONTRIBUTING.md](../../CONTRIBUTING.md), the lint posture of the root
    `Cargo.toml`, and the test naming of the crate it changes.
 
@@ -191,7 +186,7 @@ Scope:
   every consent, witness, and authorization issued under the earlier
   signature, also when the credentials are unchanged.
   `mainnet_witness_reloads_current_policy` in
-  `crates/stellar-agent-core/src/approval/witness.rs` proves it.
+  `crates/stellar-agent-core/src/approval/witness.rs` proves it for a consent given before the re-sign.
 - The intent the consent page renders.
 - The remote listener's origin and certificate binding.
 - Enrollment.

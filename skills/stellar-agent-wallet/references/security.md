@@ -37,21 +37,24 @@ A copied profile file, including a backup in that directory, counts as a sibling
 If this profile names a sibling's entry, give this profile its own entry.
 If the sibling claims this profile's canonical entry, correct the sibling file.
 Moving an enrolled reference orphans its stored key; enroll or rotate at the new
-entry before use. An unreadable sibling warns and is skipped on both chains.
+entry before use. An unreadable sibling warns and is skipped on both chains, except for message signing, which refuses it with `profile.key_scope_conflict` on every chain.
 An unreadable selected document or profiles directory refuses on mainnet and
 warns on testnet. `profile show` still displays the document for diagnosis.
 
 `profile reset-window-state` writes its `policy_window_state_reset` audit row,
 with the wiped accrual, before it mints a key, advances the generation or
 replaces the store. A reset whose row cannot be written does not happen.
-An enablement nonce requires `--owner-secret-env VAR` with the pinned owner's
-seed in every build. With the flag, the row records that owner's signature
+Reset requires `--owner-secret-env VAR` with the owner's seed whenever a policy
+pin, an enablement nonce, or an enrolled owner exists, on testnet and mainnet.
+The pin selects the owner first; without a pin, the enrolled owner signs. An
+enablement nonce without a pin refuses. Only ownerless state permits an
+unsigned reset. With the flag, the row records that owner's signature
 over the profile, chain, store digest, generations, bounded reason, request id
 and the store's challenge. The store verifies that signature under its lock
 before the row. Owner, pin and signature refusals write no reset row and change
 no store state.
 The `profile` section of `./cli-reference.md` describes the row, the refusals,
-the failure windows.
+and the failure windows.
 
 The reset requires a current tip anchor before and after its row. If repair
 fails, `audit.chain_key_unavailable` carries `audit.tip_anchor_unavailable`,
@@ -87,8 +90,14 @@ Every tool returns one envelope shape, with five success-path exceptions:
 `stellar_dex_quote`, `stellar_defindex_vault_deposit`, and
 `stellar_defindex_vault_withdraw` return a bare object carrying a `status`
 field. Their business errors use the envelope.
-Some refusals use the JSON-RPC error channel instead of the envelope: invalid
-arguments, a `chain_id` mismatch, and the toolset capability refusals.
+Arguments that do not match the tool's input schema (a missing or unknown
+field, or a field of the wrong type) return a tool result with
+`isError: true` and the text
+`<tool>: the arguments have a missing field or a field of the wrong type or value`.
+Some refusals use the JSON-RPC error channel instead of the envelope.
+Arguments that match the schema but fail a value check, and a `chain_id`
+mismatch, return JSON-RPC error -32602. The toolset capability refusals are
+JSON-RPC errors too.
 `toolset.first_invoke_approval_required` is a JSON-RPC error too, and its error
 data carries the `approval_nonce`.
 
@@ -179,7 +188,8 @@ window works as follows:
 - An exported seed stays in the environment of the process and of every process
   the shell starts, for their whole life; copying and dropping it inside the
   wallet does not erase it. Mainnet transaction signing refuses `--secret-env` and signs with
-  the enrolled seed in the keyring or with a Ledger. On Linux the CLI marks
+  the enrolled seed in the keyring or with a Ledger that holds the enrolled key.
+  On Linux the CLI marks
   itself non-dumpable before it starts any thread, so other processes of the same
   user cannot read its memory or environment or attach to it; the shell that
   exported the variable is not protected. On macOS and Windows the CLI sets no
@@ -188,7 +198,7 @@ window works as follows:
 The `mlock_required` posture in `[wallet]` controls what happens when pinning
 fails:
 
-| Value | Behaviour on `mlock` failure |
+| Value | Behavior on `mlock` failure |
 |-------|------------------------------|
 | `true` (default Linux/macOS) | Fail closed: unlock aborts, seed zeroed. |
 | `"warn"` (default Windows) | Proceed with unprotected memory; emit a warning. |
@@ -272,7 +282,7 @@ A submission timeout has an unknown outcome and requires reconciliation.
 The audit log records the **argument key names** (`arg_keys`), never the argument
 values, at any log level. The same redaction discipline applies to wire output:
 
-- Strkeys (`G` / `C` / `T` / `M` / `P`) appearing in a decision reason are
+- Strkeys (`G`, `C`, `T`, `M`, `W`, and `P`) appearing in a decision reason are
   redacted to first-five-last-five, e.g. `GABCD...VWXYZ`.
 - Transaction hashes are redacted to first-eight-last-eight.
 - The `envelope_hash` is recorded unredacted because it is a SHA-256 digest
@@ -291,8 +301,14 @@ At the MCP boundary, account, strkey, and contract-id fields inside a deny reaso
 are redacted before they cross the wire. Policy deny states that an attacker could
 otherwise probe are collapsed. The commit-path verifier maps missing, expired,
 and invalid approvals onto `policy.approval_required`, so a caller cannot tell
-which of those states a nonce is in. Live rejected and consumed approvals keep
-`policy.approval_rejected` and `policy.approval_consumed`.
+which of those states a nonce is in. A live rejection keeps `policy.approval_rejected`. A live consumed testnet
+approval, an approval held by a submission receipt, and a mainnet proof of
+another operation keep `policy.approval_consumed`. A repeated mainnet proof of a
+completed payment returns `policy.approval_required`. Off mainnet, an
+entry with a non-canonical payment destination or an inconsistent recovery
+binding keeps `approval.entry_inconsistent`. On mainnet, a revoked approval
+keeps `approval.revoked`. A verified approval whose queued consent row has no
+Delivered evidence keeps `approval.consent_undelivered`.
 
 Agent rule: do not depend on argument values appearing in the audit log; they do
 not. Correlate with `request_id`, the envelope hash, and `arg_keys`.
@@ -334,7 +350,7 @@ operator approves it out-of-band:
 stellar-agent approve --id <nonce> --profile <name>
 ```
 
-`approve` renders a wallet-controlled summary (the destination G-strkey and asset
+`approve` renders a wallet-controlled summary (the destination G- or M-strkey and asset
 are validated on deserialize so a hostile entry cannot inject terminal content).
 On testnet the operator confirms at the terminal, and the command records an
 HMAC-SHA256 attestation. On mainnet a consent also needs a fresh WebAuthn
@@ -352,13 +368,14 @@ What this means for the threat model: the attestation proves the keyring holder
 ran `approve`. The agent's own UI is not a trust input. An attacker who can write
 to the store file can at most delete a pending entry (forcing re-approval, a
 denial-of-service nuisance) but cannot forge an attestation, because the HMAC key
-is in the keyring, not in the file. Rotating the attestation key invalidates all
-outstanding pending approvals; the operator must re-approve.
+is in the keyring, not in the file. After the attestation key rotates,
+attestations minted under the old key fail verification. Unattested pending
+requests can still be approved under the new key.
 
-Pending entries are kinded: `X402Payment`, `PaymentSimulated`, `TrustlineSimulated`,
+Pending entries are kinded: `PaymentSimulated`, `TrustlineSimulated`,
 `ClaimSimulated`, `SignWithPasskey`, `RegisterPasskey`, `ToolsetFirstInvokeGate`,
-`TrustlineClawbackOptIn`, `RuleProposalSimulated`, `MppChargeSimulated`, `Rejected`,
-and `Consumed`. The store
+`TrustlineClawbackOptIn`, `RuleProposalSimulated`, `MppChargeSimulated`, `X402Payment`,
+`Rejected`, and `Consumed`. The store
 holds a single exclusive lock, writes atomically with owner-only permissions, caps
 the number of pending entries, and applies a default entry TTL of 24 hours.
 
@@ -424,9 +441,9 @@ The `x402_authorization_withheld` stages are `anchor_unavailable`,
 authorization row. At `anchor_unavailable`, the signature stays in the wallet.
 On testnet, the spend that policy admitted earlier in the call remains.
 
-The RPC receives the signed authorization during re-simulation. On an admitted
-mainnet server, payload release additionally requires consumed release
-authorization and pending approval. For an authenticated payment, the ephemeral
+On an admitted
+mainnet server, payload release additionally requires the consumed release
+authorization and, under `RequireApproval`, the consumed pending approval. For an authenticated payment, the ephemeral
 key signs the SEP-10 challenge and the wallet submits it to the web-auth server
 before the payment build. On mainnet, that submission follows the consumption of
 its Message authorization.
@@ -440,18 +457,16 @@ receipt recording, and independent transaction reconciliation. MPP is
 testnet-only and absent from toolset routing; its configured RPC sees signed
 authorization during mandatory re-simulation.
 
-Every value-moving signing verb loaded from a persisted profile proves the
-audit writer is acquirable BEFORE the signing key is touched or a transaction
-is submitted, refusing `audit.chain_key_unavailable` if the profile's audit
-chain-root key was never minted (`profile init` mints the keyring coordinate
-only; run `profile rotate-audit-key <name>` to mint the key). The zero-config
-synthesized profile `pay`/`claim`/`accounts create` fall back to when no
-profile was NAMED and no `default.toml` exists stays fail-open for this
-specific check. A profile named through `--profile` or `STELLAR_AGENT_PROFILE`
-whose file does not exist is refused outright (`profile.load_failed`), not
-replaced by that fallback, and a profile file whose owner-key coordinate names
-a DIFFERENT profile is refused with `profile.name_mismatch` rather than used to
-sign under a name it does not own. The SEP-43
+Every value-moving signing verb loaded from a persisted profile acquires the
+audit writer before it touches the signing key or submits a transaction. It
+refuses with `audit.chain_key_unavailable` if the profile's audit chain-root
+key was never minted. `profile init` mints the keyring coordinate only; run
+`profile rotate-audit-key <name>` to mint the key. `pay`, `claim`, and
+`accounts create` fall back to a synthesized profile when no profile is named
+and no `default.toml` exists. That profile stays fail-open for this check. A
+profile named through `--profile` or `STELLAR_AGENT_PROFILE` whose file does
+not exist refuses with `profile.load_failed`. A profile file whose owner-key
+coordinate names another profile refuses with `profile.name_mismatch`. The SEP-43
 sign-only pair (`signTransaction`, `signAuthEntry`) runs the same pre-flight
 before signing. See [Troubleshooting](troubleshooting.md#audit-key-code).
 
@@ -462,7 +477,11 @@ stellar-agent audit verify <LOG_PATH> --profile <NAME>
 ```
 
 Verification checks per-entry chaining, cross-file rotation handoff (defeating
-file substitution), and, when an HMAC key is supplied, the root sidecar. Failures
+file substitution), and, when an HMAC key is supplied, the root sidecar. With
+`--profile`, it also checks each keyed entry's tag (`audit.entry_tag_invalid`)
+and the keyring tip anchor (`audit.tip_anchor_mismatch`,
+`audit.tip_anchor_missing`). See
+[`audit verify`](approvals-and-audit.md#audit-verify-command-reference). Failures
 use a closed set of wire codes, e.g. `audit.chain_broken`, `audit.rotation_gap`,
 `audit.hmac_mismatch`, `audit.hmac_sidecar_missing`. A detected mid-rotation crash
 (`audit.partial_rotation`) is surfaced as an error and requires operator
@@ -485,10 +504,10 @@ needs approval for, or that the audit log records.
 Unauthorized mainnet signing, payload release, or submission is also in scope. Out
 of scope: defects in your own keyring backend, OS, RPC endpoint, or anchor; and
 any issue that requires already holding the wallet's keyring secrets, since custody
-of those secrets is the security boundary. Two residues remain on mainnet: a
-same-user process that holds the attestation HMAC key can wrap a version 5
-record around a user-verified assertion that its own localhost page obtained,
-and the owner seed admits approval credentials, so signing the policy on a host
+of those secrets is the security boundary. Two residues remain on mainnet. A
+same-user process that holds the attestation HMAC key can wrap a version 5 or 6
+record around a user-verified assertion that its own localhost page obtained.
+The owner seed admits approval credentials, so signing the policy on a host
 where same-user code runs exposes that seed.
 
 For code running as the same OS user, the owner of an enabled mainnet profile
@@ -513,6 +532,8 @@ A schedule charge closes when both endpoints, above every authorization expirati
 
 Intents without an authenticated purpose remain open. Calls whose authorization tree names `approve`, `increase_allowance` or `approve_for_all` retain their charges without closure by authorization expiry.
 
+Reset refuses while an intent remains open or retained. A closed and pruned intent does not block reset.
+
 Timelock envelopes carry an exact maximum ledger before signing. The maximum ledger is exclusive.
 
-Snapshots containing signed intents or intent links use version 9. Records missing required intent fields refuse as unreadable. Readers that cannot account for the format refuse current and prepared snapshots.
+Snapshots containing signed intents or intent links require version 9 or later. Total-budget intent legs require version 16 or later. Committed snapshots are written at version 18. Records missing required intent fields refuse as unreadable. Readers that cannot account for the format refuse current and prepared snapshots.

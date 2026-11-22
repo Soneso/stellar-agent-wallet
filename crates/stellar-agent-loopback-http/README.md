@@ -4,7 +4,7 @@ Internal support crate for the stellar-agent-wallet.
 
 This crate is the single implementation of what the workspace's browser-facing HTTP listeners share. Its consumers are the WebAuthn bridge and the loopback approval UI, both bound to the loopback interface, and the remote-approval surface, which is served over TLS on a private network and shares the same browser-facing threat model.
 
-It provides three tower/axum middleware layers: a `Host:` header allowlist for DNS-rebinding defence, an `Origin:` header allowlist on state-changing methods, and hardened response headers with a Content-Security-Policy on every response. Each consumer constructs the layers with its own bound socket address; the layers read only the port.
+It provides tower/axum middleware layers: a `Host:` header allowlist for DNS-rebinding defense, an `Origin:` header allowlist on state-changing methods, and hardened response headers with a Content-Security-Policy on every response. A loopback consumer constructs the two allowlists with its own bound socket address; they read only the port. The `signed_origin` module holds the `Host:` and `Origin:` layers of a listener served at one owner-signed HTTPS origin, which admit that origin's exact bytes.
 
 The `loopback_pair` module is the server surface of a ceremony the browser reaches at `http://localhost:<port>`. `LoopbackPair` binds `127.0.0.1` and `[::1]` on one port before the ceremony creates any token, and `PairServer` serves one router on both sockets and closes both together. A browser can resolve `localhost` to either address, so a ceremony that cannot hold both does not start.
 

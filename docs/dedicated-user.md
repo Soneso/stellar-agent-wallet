@@ -68,8 +68,11 @@ sudo -n -u stellar-agent /usr/local/libexec/stellar-agent/mcp-launch
 ```
 
 Use the same `sudo -n -u stellar-agent` prefix for `cli-launch` and `provision`.
-Each installed wrapper enforces its argument forms, supplies `--profile mainnet`,
-and ends in `exec`. MCP stdout remains protocol-only; CLI stdout carries JSON.
+Each installed wrapper enforces its argument forms and supplies `--profile mainnet`
+to every wallet command it runs. A form whose last step is a wallet command ends
+in `exec` of that command. The `provision` forms that only apply a fragment or
+install a staged file exit `0` when that step succeeds. The keychain forms run no
+wallet command. MCP stdout remains protocol-only; CLI stdout carries JSON.
 
 Wrappers construct a clean environment: `HOME`, `PATH`, `TMPDIR`, and the
 root-owned project name in `STELLAR_AGENT_PROJECT`.
@@ -206,7 +209,7 @@ A missing policy is local-only for this guard; runtime authority checks still ap
 
 Signed-origin wrappers use the remote serve form and bare `approve --id <id>`.
 Bare approval refuses for a local-only wrapper profile and names the operator-open form.
-Serve refuses while MCP runs, and MCP refuses while the CLI serves.
+Serve refuses while MCP runs. MCP refuses while any installed `stellar-agent` CLI process of the wallet account runs.
 The native audit writer lock resolves races after those early checks.
 
 ## Refusals and keychain lifetime
@@ -214,8 +217,8 @@ The native audit writer lock resolves races after those early checks.
 | Exit | Wrapper meaning |
 |---|---|
 | 64 | Arguments do not match an allowed form. |
-| 65 | Ownership, mode, ACL, eligibility, origin, or stdin validation refuses. |
-| 66 | The early process check finds a conflicting wallet process. |
+| 65 | Ownership, mode, ACL, eligibility, origin, stdin, or installed binary pair validation refuses. |
+| 66 | The early process check fails or finds a conflicting wallet process, or a bootstrap run holds the installation lock. |
 
 Wrapper refusal lines are `stellar-agent-wrapper: refused: <reason>` on stderr.
 They contain a fixed reason and echo no rejected token.

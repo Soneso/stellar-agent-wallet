@@ -272,8 +272,9 @@ an embedding crate that takes a directory; review such code by hand.
 The full suite still covers them: every pull request into `main` runs the full
 `ci.yml` suite, every push to `mainnet-write` or `main` runs the workspace
 tests of `coverage.yml`, and a push that changes a path other than Markdown,
-`LICENSE`, or `.claude-plugin/**` runs `ci.yml`.
-A push that changes only Markdown skips `ci.yml`.
+`LICENSE`, or `.claude-plugin/**` runs `ci.yml`. A path under `skills/` counts,
+Markdown included.
+A push that changes only Markdown outside `skills/` skips `ci.yml`.
 A pull request retargeted to `main` runs the full set only after a new push.
 Local coverage, `cargo machete`, and `cargo deny check` are optional
 reproductions. See the build-gate dimension of the
@@ -317,14 +318,14 @@ python3 -m venv .venv && .venv/bin/python -m pip install --require-hashes -r .gi
 
 The changed set is the union of the paths that differ from the merge base and
 the paths that `git status` lists. It includes untracked and deleted files.
-Every run includes the three always gates: `docs-style`, `install-surface`,
-and `gate-tool-versions`. Each path selects the gates of every scope class it
+Every run includes the four always gates: `docs-style`, `install-surface`,
+`gate-tool-versions`, and `docs-reads`. Each path selects the gates of every scope class it
 matches:
 
 - A file that the install surface check reads, as its `is_scanned` function
   decides, selects that check's self-test, which injects violations into
   copies of those files. A deleted path counts too.
-- Any other docs file adds no gates beyond the three always gates. Directory
+- Any other docs file adds no gates beyond the four always gates. Directory
   scopes also apply to Markdown files.
 - A fragment under `changelog.d/`, the changelog utility, or its test selects
   `changelog` and `self-test:test-changelog.py`.
@@ -342,6 +343,8 @@ matches:
 
 Clippy, rustdoc, and tests select the packages that own the changed Rust
 paths, in path order, followed by their direct dependents, sorted by name.
+A selection that holds `stellar-agent-mcp` also takes `stellar-agent-cli`,
+whose executable the MCP tests start.
 Cargo builds the required dependency closures. A dependent names an owner by
 `path`, directly or through `workspace = true`, in `[dependencies]`,
 `[dev-dependencies]`, or a target-specific dependency table.
@@ -374,10 +377,11 @@ table for the pull request description and a summary line:
 - `python3 .github/scripts/check-docs-style.py`: exit 0
 - `python3 .github/scripts/check-install-surface.py`: exit 0
 - `bash .github/scripts/check-gate-tool-versions.sh`: exit 1
+- `python3 .github/scripts/check-docs-reads.py`: exit 0
 - `actionlint`: unavailable (actionlint: brew install actionlint, or the <version> release archive for your platform (actionlint_<version>_<os>_<arch>.tar.gz))
 - `.github/scripts/test-mpp-interop.sh`: not run (--full; needs Node <version> and Corepack)
 - `.github/scripts/test-sdk-v17-interop.sh`: not run (--full; needs Node <version> and Corepack)
-preflight: 3 gates run, 1 failed, 1 unavailable
+preflight: 4 gates run, 1 failed, 1 unavailable
 ```
 
 A gate that ran reads `exit <n>`. The two interop harnesses read `not run`
@@ -390,7 +394,7 @@ or, without `--full`, an install surface check that Python cannot load.
 The registry, in run order, with what selects each gate. `--full` selects every
 gate except `shellcheck-changed`, which needs a changed shell script.
 
-1. `docs-style`, `install-surface`, and `gate-tool-versions`: every run.
+1. `docs-style`, `install-surface`, `gate-tool-versions`, and `docs-reads`: every run.
    `changelog` and its self-test `test-changelog.py`: a change under
    `changelog.d/` or to `changelog.py`. A change to the self-test also runs
    `changelog`.
@@ -401,9 +405,13 @@ gate except `shellcheck-changed`, which needs a changed shell script.
    `crates/`, or this guide. The checker fetches the locked graph, then
    checks the topology, the workflow commands, and the resolved features
    offline.
-4. The self-tests of `check-binary-marker.sh`, of the release checks, and of
-   `check-provenance.py`: a change to the script they test, to a provenance
-   fixture, or to the self-test itself.
+4. Three self-tests, each on a change to itself or to a file in its list:
+   - `test-check-binary-marker.sh`: `check-binary-marker.sh`
+   - `test-release-checks.sh`: `check-binary-marker.sh`,
+     `check-packaged-markers.sh`, `release/verify-*.sh`, or `release/sodium.sh`.
+     It also tests `release/check-host.sh` and `derive-alias.sh`; a change to
+     those selects it only under `--full`.
+   - `test-check-provenance.py`: `check-provenance.py` or a provenance fixture
 5. `workflow-invariants`: a change to `release.yml`, `publish.yml`,
    `notarize-smoke.yml`, `labels.yml`, `stale.yml`, `triage.yml`,
    `triage-review.yml`, `triage-sweep.yml`, `welcome.yml`, `coverage.yml`,
@@ -418,6 +426,7 @@ gate except `shellcheck-changed`, which needs a changed shell script.
    tests or the self-test itself changes:
    - `test-check-coverage.py`: `check-coverage.py`
    - `test-check-crates-exist.sh`: `check-crates-exist.sh`
+   - `test-check-docs-reads.py`: `check-docs-reads.py`
    - `test-check-docs-style.py`: `check-docs-style.py`
    - `test-check-gate-tool-versions.sh`: `check-gate-tool-versions.sh`
    - `test-check-install-surface.py`: `check-install-surface.py`, or a file
@@ -429,6 +438,7 @@ gate except `shellcheck-changed`, which needs a changed shell script.
    - `test-check-workflow-invariants.py`: `check-workflow-invariants.py`, or
      any change that selects `workflow-invariants`, because the self-test
      runs that check on copies of the same files
+   - `test-classify-docs-only.py`: `classify-docs-only.py`
    - `test-compare-crate-sums.py`: `compare-crate-sums.py`
    - `test-preflight.sh`: `preflight.sh`
    - `test-publish-crates-check.sh`: `publish-crates.sh`
@@ -453,13 +463,14 @@ gate except `shellcheck-changed`, which needs a changed shell script.
 10. `vendored-tree-check`: a change under `crates/stellar-agent-smart-account/`
     or `contracts/`, or to `rebuild-vendored-wasm.sh`.
 11. `publish-check` and `baseline-gate`: `--full` only.
-12. `fmt`, `clippy`, `rustdoc`, and `test`: a Rust change. `proof-matrix` and
-    `proof-matrix:feature-on`: a change under a crate's `src/` or `tests/`, or
-    to `proof-matrix.toml` or `check-proof-matrix.py`.
+12. `fmt`, `clippy`, `rustdoc`, and `test`: a Rust change. `proof-matrix`: a
+    change under a crate's `src/` or `tests/`, or to `proof-matrix.toml` or
+    `check-proof-matrix.py`.
 13. `feature-on:clippy`, `feature-on:doc`, `feature-on:test`, and
     `feature-on:network`: a Rust change. `feature-on:network` checks the
     forwarding of the network crate without the CLI or MCP feature
-    unification.
+    unification. `proof-matrix:feature-on`: the changes that select
+    `proof-matrix`.
 14. `release-shape`: `--full` only. It needs libudev on Linux; see
     [Feature discipline and release markers](#feature-discipline-and-release-markers).
 15. `test-support-friendbot`: a Rust change whose test packages include
@@ -477,13 +488,17 @@ gate except `shellcheck-changed`, which needs a changed shell script.
     also runs on a change under `crates/stellar-agent-webauthn-bridge/src/web/`.
 20. `interop:mpp` and `interop:sdk-v17`: `--full` only.
 
-`package-skill.sh` and `release-preflight-version-check.sh` have no self-test.
+`package-skill.sh`, `release-preflight-version-check.sh`, `run-docs-tests.py`,
+and `check-payment-evidence.py` have no self-test.
 The preflight runs the workflow checks with `python3`, which needs PyYAML importable, for example from
 the `.venv` virtual environment of the PyYAML install command.
 
-The preflight does not carry these CI checks: the `windows-storage` job, the
-`stellar-agent-test-support` feature matrix of the `test` job, the setup steps,
-and the virtual environment of the workflow checks. Nor does it carry the
+The preflight does not carry these CI checks: the `windows-storage` and
+`platform-keyring` jobs, the `stellar-agent-test-support` feature matrix of the
+`test` job, the setup steps, and the virtual environment of the workflow checks.
+It also omits the integration changelog guard of `changelog.yml`, the
+measurement and cancellation checks of the `coverage` job, and the Python 3.11
+repeat of the Python self-tests. Nor does it carry the
 rebuild of the `vendored-wasm` workflow: its two stellar-cli build jobs, its
 `rebuild` and `vendored-wasm` jobs, and the rebuild decision of its `check` job.
 
@@ -572,7 +587,7 @@ Friendbot access remain disabled.
 CI runs this gate in the Coverage workflow. A push to `mainnet-write` or
 `main` runs it and seeds the coverage caches. It also runs weekly on main, on a
 pull request that carries the `coverage` label, and on demand through
-`workflow_dispatch`. A failed, cancelled, or skipped measurement fails
+`workflow_dispatch`. A failed, canceled, or skipped measurement fails
 `coverage`. A maintainer adds the label to a pull request that changes Rust
 code. Local reproduction is optional.
 
@@ -878,10 +893,12 @@ builds with `mainnet-write` off.
 
 The workflow chains `acceptance-1` with `SHARE=1/2` and `acceptance-2` with
 `SHARE=2/2`. Each job has a 360-minute limit. The second job waits for the first
-and runs after failure unless the workflow is cancelled. Both jobs honor
+and runs after failure unless the workflow is canceled. Both jobs honor
 `TESTNET_SCHEDULE=off` on scheduled events. Workflow concurrency serializes runs,
 and each driver serializes its selected suites. Both jobs use the filter,
-build selection, browser setup and secondary RPC environment.
+build selection, browser setup, and secondary RPC environment. Each job then
+checks its payment evidence with `check-payment-evidence.py` and uploads it as
+an artifact, also after a failed run.
 
 The browser suites need a Chromium binary on `PATH` (or the `CHROME` env var).
 Among them, the mainnet consent browser suite
@@ -1263,17 +1280,10 @@ and every constant and allowlist entry that pins it in the same change.
 
 ## Review process
 
-The depth of the review follows what a change touches:
-
-- A maintainer reviews a change to documentation, scripts, or workflows from the
-  diff and the CI checks.
-- A change to Rust code gets the same review and must also pass the
-  [gate suite](#gate-suite).
-- A change to signing paths, key handling, or serialized state also gets a
-  second review pass against the full [review checklist](review-checklist.md).
-
-The second review pass checks the change against every dimension of the
-checklist. Review repeats until a pass ends with no blocking findings.
+[Review process](../../CONTRIBUTING.md#review-process) in `CONTRIBUTING.md`
+defines the review depth for each kind of change. The second review pass uses
+the full [review checklist](review-checklist.md). Review repeats until a pass
+ends with no blocking findings.
 
 A release that ships the `mainnet-write` build also gets the signing-authority
 and approval-flow reviews that
@@ -1403,13 +1413,14 @@ Each error message names its rule:
   hold an even number of `"` and an even number of `'`, and no line that
   holds `GITHUB_ENV` may follow a line that ends in a backslash or a
   backtick, because the shell joins the two. Each line that holds
-  `GITHUB_ENV`, a comment included, must then be, after spaces and tabs at
-  both ends, one of two writes of one `NAME=VALUE` entry, with one or more
-  spaces or tabs between its words:
-  `echo` with one argument, bare or in double quotes, then `>>`, then one
-  of `$GITHUB_ENV`, `"$GITHUB_ENV"`, `${GITHUB_ENV}`, and `"${GITHUB_ENV}"`;
-  or `Add-Content` with `$env:GITHUB_ENV`, or with
-  `-Path $env:GITHUB_ENV -Value`, and one value in single or double quotes. `echo`, `Add-Content`, `-Path`, `-Value`, and
+  `GITHUB_ENV`, a comment included, must then be one of two writes of one
+  `NAME=VALUE` entry. The check ignores spaces and tabs at both ends of the
+  line and requires one or more spaces or tabs between its words. The first
+  write is `echo` with one argument, bare or in double quotes, then `>>`,
+  then one of `$GITHUB_ENV`, `"$GITHUB_ENV"`, `${GITHUB_ENV}`, and
+  `"${GITHUB_ENV}"`. The second is `Add-Content` with `$env:GITHUB_ENV`, or
+  with `-Path $env:GITHUB_ENV -Value`, and one value in single or double
+  quotes. `echo`, `Add-Content`, `-Path`, `-Value`, and
   `$env:GITHUB_ENV` must appear in exactly this case. NAME is an ASCII
   letter or underscore followed by ASCII letters, digits, or underscores.
   The value holds ASCII letters, digits, and `_./:@+-`, plus `$NAME` and

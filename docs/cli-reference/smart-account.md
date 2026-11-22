@@ -11,9 +11,7 @@ Only the endpoints stored in the profile authorize charge closure. Endpoint over
 
 Environment variables and programmatic overlays do not change which endpoints authorize charge closure.
 
-Mainnet signers must match `mcp_signer_default.account`, including both signers on `execute`. A placeholder or malformed pin refuses before signing.
-
-The `smart-account` command group (also available under the shorter alias `sa`) governs an on-chain OpenZeppelin smart-account: its context rules, its signer sets and thresholds, the policy contracts attached to each rule, and the supporting infrastructure (verifier registry, multicall router registry, upgrade timelock). It also submits multicall bundles through the registered router.
+The `smart-account` command group, alias `sa`, governs an on-chain OpenZeppelin smart-account: its context rules, its signer sets and thresholds, and the policy contracts attached to each rule. It manages the supporting infrastructure: the verifier registry, the multicall router registry, and the upgrade timelock. It also submits multicall bundles through the registered router.
 
 The following commands refuse a mainnet profile with `network.mainnet_write_forbidden` before any RPC call or signer access:
 
@@ -33,6 +31,7 @@ spine, audit log, [context rule](../concepts.md), auth digest), see
 The shared flags (`--profile`, `--network`, `--rpc-url`, `--secondary-rpc-url`,
 `--timeout-seconds`, `--output`, and the signer-source group) are defined once
 on the [CLI reference index](index.md#global-conventions).
+On this page, an explicitly named profile whose file is missing refuses.
 This page names each flag a command takes and only describes the flags specific
 to that command.
 
@@ -40,7 +39,7 @@ Every command prints one JSON envelope on stdout and returns exit code `0` on su
 
 ## Signer source
 
-The write verbs use the shared signer-source group: exactly one of `--signer-secret-env <VAR>` (an env-var name holding the source-account S-strkey) or `--sign-with-ledger` (the two are mutually exclusive, and the command refuses if neither is supplied), with `--account-index <INDEX>` selecting the Ledger BIP-44 index (default `0`). See [signer source](index.md#signer-source). Operations authorized by smart-account context rules sign the [auth digest](../concepts.md), which binds the authorizing rule ids. Timelock writes use direct G-key Soroban authorization for the proposer, canceller, or executor.
+The write verbs use the shared signer-source group: exactly one of `--signer-secret-env <VAR>` (an env-var name holding the source-account S-strkey) or `--sign-with-ledger` (the two are mutually exclusive, and the command refuses if neither is supplied), with `--account-index <INDEX>` selecting the Ledger BIP-44 index (default `0`). See [signer source](index.md#signer-source). Operations authorized by smart-account context rules sign the [auth digest](../concepts.md), which binds the authorizing rule ids. Timelock writes use direct G-key Soroban authorization for the proposer or canceller; `timelock execute` passes no executor.
 
 The examples on this page that sign with `--signer-secret-env WALLET_SK` read the source-account seed from `WALLET_SK`. Before the first of them, run this line on its own, paste the seed when prompted, and press Enter (see [Pass a secret seed](../getting-started.md#pass-a-secret-seed)):
 
@@ -111,6 +110,8 @@ Manages the OpenZeppelin context rules on a smart-account. Each rule has a `rule
 
 The `--auth-rule-id` flag on the write verbs names the rule whose signers authorize the operation; where it is optional it defaults to the rule being modified (`--rule-id`). The exception is `rules set-spending-limit`, whose default is `0`: a spending-limit rule is CallContract-scoped and can never authorize its own retune (see that verb's entry).
 
+Every `rules` subcommand prints JSON for both `--output` values. `rules list` logs a warning on `--output table`; the other `rules` subcommands print JSON without one.
+
 ### `smart-account rules create`
 
 Installs a new context rule (OZ `add_context_rule`) and returns the newly minted `rule_id`. Signs and submits, then records the confirmed rule as its signer-set baseline, as **Signer-set baseline** in this section describes. Testnet only.
@@ -149,8 +150,6 @@ stellar-agent smart-account rules create \
 ```
 
 ### `smart-account rules get`
-
-`--profile <NAME>` selects the profile, followed by `STELLAR_AGENT_PROFILE`, then `default`. An explicitly named missing profile refuses.
 
 Reads a single rule by id (OZ `get_context_rule`). Read-only; no signing, no submission. `mainnet` is accepted. The envelope reports `present: true` or `present: false`.
 
@@ -281,7 +280,7 @@ Flags:
 - `--install-param <SCVAL_BASE64>`: a standard-base64 XDR `ScVal` install parameter (not base64url), passed to `add_policy` as given (raw passthrough). One exception: when the policy is recognized as the allowlisted simple-threshold policy, the parameter must be exactly `{ threshold: U32(t) }` with `t >= 1`, or the add refuses with `sa.simple_threshold_install_refused`. Required with `--kind raw`; rejected with the other kinds. An `--install-param` value that fails standard base64 XDR `ScVal` decoding within depth 500 and 10 MiB is refused as `validation.xdr_argument_malformed`, naming `--install-param`.
 - `--limit <STROOPS>`: spending limit in stroops (`--kind spending-limit`, required). The `i128` amount the rolling window admits before the policy panics `SpendingLimitExceeded`.
 - `--period <LEDGERS>`: rolling-window length in ledgers (`--kind spending-limit`, required).
-- `--policy <C_STRKEY>`: spending-limit policy contract override (`--kind spending-limit`). When omitted, resolves from the registry populated by `smart-account deploy-spending-limit-policy`; fails closed with a deploy-first hint if absent.
+- `--policy <C_STRKEY>`: policy contract override for `--kind spending-limit`, `--kind simple-threshold`, and `--kind weighted-threshold`; rejected with `--kind raw`. When omitted, the address resolves from the registry entry that `smart-account deploy-policy` writes for that kind. A missing entry fails closed with a deploy-first hint.
 - `--threshold <U32>`: signer threshold (`--kind simple-threshold` / `--kind weighted-threshold`, required with both). For `simple-threshold` this is the minimum signer count; for `weighted-threshold` this is the minimum total weight.
 - `--weighted-signer-delegated <G_STRKEY=WEIGHT>`: one Delegated (ed25519) signer-weight pair (`--kind weighted-threshold`). Repeatable.
 - `--weighted-signer-webauthn <CREDENTIAL_NAME=WEIGHT>`: one External WebAuthn signer-weight pair, resolved by credential name from the passkeys registry (`--kind weighted-threshold`). Repeatable.
@@ -370,8 +369,6 @@ stellar-agent smart-account rules list --account CABC...WXYZ
 
 ### `smart-account rules get-spending-limit`
 
-`--profile <NAME>` selects the profile, followed by `STELLAR_AGENT_PROFILE`, then `default`. An explicitly named missing profile refuses.
-
 Reads an installed spending-limit policy's budget state: identifies the policy attached to `--rule-id` via wasm-hash allowlist lookup, reads its on-chain `get_spending_limit_data`, and computes the rolling-window budget snapshot. Read-only; no signing; no submission; no audit-log emission. `mainnet` is accepted.
 
 The returned `in_window_spent` and `remaining_budget` are exact only as of
@@ -382,8 +379,9 @@ fall out of the rolling window), but an intervening spend shrinks it.
 A later `set-spending-limit` or agent transfer can still cause
 `SpendingLimitExceeded`.
 
-Trust boundary: this read consults a single RPC endpoint (no two-RPC
-cross-check).
+Trust boundary: policy identification compares the policy WASM hashes across the
+profile's primary and secondary endpoints when the profile stores a secondary.
+The rule read and the budget read use the primary endpoint alone.
 It is an advisory view, not a signing input.
 The write verbs keep the full two-RPC consultation.
 
@@ -403,7 +401,7 @@ Envelope:
 because a raw JSON number above `2^53` cannot be represented exactly by an
 `f64`-backed parser.
 `cached_total_spent` is the on-chain cached total verbatim, for transparency.
-It is NOT used to compute `in_window_spent` (the on-chain cache is not evicted
+It is not used to compute `in_window_spent` (the on-chain cache is not evicted
 on read, so it can include entries already outside the rolling window).
 
 ```bash
@@ -417,10 +415,10 @@ stellar-agent smart-account rules get-spending-limit \
 
 Retunes an installed spending-limit policy's limit (OZ `set_spending_limit`) without resetting the rolling spend history. Signs and submits. Testnet only.
 
-HONESTY CONSTRAINT: `set_spending_limit` mutates ONLY the limit; the period is
+`set_spending_limit` changes only the limit; the period is
 immutable once installed.
 Retuning the period requires `remove-policy` followed by
-`add-policy --kind spending-limit`, which DOES reset the spend history (the OZ
+`add-policy --kind spending-limit`, which resets the spend history (the OZ
 contract's `install` initializes empty history).
 There is no way to change the period without that reset.
 
@@ -430,7 +428,7 @@ Flags:
 
 - `--account <C_STRKEY>` (required).
 - `--rule-id <U32>` (required): rule whose spending-limit policy to retune. This
-  rule keys the policy's storage; it does NOT authorize the call.
+  rule keys the policy's storage; it does not authorize the call.
 - `--auth-rule-id <U32>`: rule that authorizes the retune. Default `0` (the bootstrap rule), not `--rule-id`. The retune executes on the smart account itself. A CallContract-scoped target rule refuses that context on chain (`UnvalidatedContext`). Supply another admin-capable rule id when the bootstrap rule has been replaced. An authorizing rule other than `0` passes the [pre-submission checks](#pre-submission-checks).
 - `--limit <STROOPS>` (required): new spending limit, in stroops. Must be
   positive.
@@ -567,12 +565,12 @@ stellar-agent smart-account signers set-threshold \
 
 ### `smart-account signers set-weighted-threshold`
 
-Changes a rule's weighted-threshold policy's `threshold` (OZ `set_threshold` on the weighted-threshold policy contract). Signs and submits. Testnet only. The policy is identified by wasm-hash allowlist lookup (a SEPARATE allowlist from the simple threshold-policy's: the two kinds never cross-identify); zero or multiple matches refuse with the typed `WeightedThresholdNotInstalled` / `WeightedThresholdPolicyIdentificationFailed`. Refused after the policy, rule, and weight reads, before signing and submission, when the new threshold is `0` or exceeds the checked sum of current signer weights.
+Changes a rule's weighted-threshold policy's `threshold` (OZ `set_threshold` on the weighted-threshold policy contract). Signs and submits. Testnet only. The policy is identified by wasm-hash allowlist lookup (a separate allowlist from the simple threshold-policy's: the two kinds never cross-identify); zero or multiple matches refuse with the typed `sa.weighted_threshold_not_installed` / `sa.weighted_threshold_policy_identification_failed`. Refused after the policy, rule, and weight reads, before signing and submission, when the new threshold is `0` or exceeds the checked sum of current signer weights.
 
 Extra flags:
 
 - `--new-threshold <U32>` (required).
-- `--auth-rule-id <U32>` (optional): rule that AUTHORIZES the change. Defaults to `--rule-id`: a weighted policy commonly sits on a Default-scoped rule that self-authorizes. Pass an explicit admin-capable rule id when `--rule-id` names a CallContract- or CreateContract-scoped rule: a scoped rule cannot validate the `execute` auth context and can never authorize its own retune (the same constraint documented for `rules set-spending-limit`). An authorizing rule other than `0` has its signer-set baseline checked before signing (see [pre-submission checks](#pre-submission-checks)).
+- `--auth-rule-id <U32>` (optional): rule that authorizes the change. Defaults to `--rule-id`: a weighted policy commonly sits on a Default-scoped rule that self-authorizes. Pass an explicit admin-capable rule id when `--rule-id` names a CallContract- or CreateContract-scoped rule: a scoped rule cannot validate the `execute` auth context and can never authorize its own retune (the same constraint documented for `rules set-spending-limit`). An authorizing rule other than `0` has its signer-set baseline checked before signing (see [pre-submission checks](#pre-submission-checks)).
 
 ```bash
 stellar-agent smart-account signers set-weighted-threshold \
@@ -586,7 +584,7 @@ stellar-agent smart-account signers set-weighted-threshold \
 
 Changes one signer's weight in a rule's weighted-threshold policy (OZ `set_signer_weight`). Signs and submits. Testnet only. Refused client-side when the adjusted weight sum (current sum minus the target signer's old weight plus the new weight) would fall below the current threshold.
 
-Exactly one of the following identifies the TARGET signer (mutually exclusive group):
+Exactly one of the following identifies the target signer (mutually exclusive group):
 
 - `--signer-delegated <G_STRKEY>`: a delegated ed25519 signer.
 - `--signer-ed25519 <HEX_PUBKEY_64>`: a first-class external Ed25519 signer; optional `--verifier <C_STRKEY>` override.
@@ -609,13 +607,13 @@ stellar-agent smart-account signers set-signer-weight \
 
 ### `smart-account signers batch-add`
 
-Adds MULTIPLE signers to a rule in ONE transaction (OZ `batch_add_signer`). Signs and submits. Testnet only. Refused client-side if the batch is empty, or if `current_signer_count + batch_len` would exceed the per-rule signer cap (15). Emits one `SaSignerAddedV2` audit row per signer. Returns `new_signer_ids` in the order supplied: each entry is the id the chain assigned to that signer. A rule without a simple-threshold policy accepts a batch.
+Adds several signers to a rule in one transaction (OZ `batch_add_signer`). Signs and submits. Testnet only. Refused client-side if the batch is empty, or if `current_signer_count + batch_len` would exceed the per-rule signer cap (15). Emits one `SaSignerAddedV2` audit row per signer. Returns `new_signer_ids`, grouped by kind (`--signer-delegated`, then `--signer-webauthn`, then `--signer-ed25519`) and in input order within each kind: each entry is the id the chain assigned to that signer. A rule without a simple-threshold policy accepts a batch.
 
 Flags (each repeatable, any combination, at least one signer required across all three):
 
 - `--signer-delegated <G_STRKEY>`: one Delegated (ed25519) signer per occurrence.
 - `--signer-webauthn <CREDENTIAL_NAME>`: one WebAuthn passkey signer (resolved from the profile's passkey registry) per occurrence.
-- `--signer-ed25519 <HEX_PUBKEY_64>`: one first-class External-Ed25519 signer per occurrence; `--verifier <C_STRKEY>` (optional) overrides the verifier used for ALL `--signer-ed25519` entries in the call.
+- `--signer-ed25519 <HEX_PUBKEY_64>`: one first-class External-Ed25519 signer per occurrence; `--verifier <C_STRKEY>` (optional) overrides the verifier used for all `--signer-ed25519` entries in the call.
 - `--accept-mutable-verifier`, `--accept-unknown-verifier`: as on `signers add`.
 
 The batch keeps the rule's pin record in step as `signers add` does (see "Pin record" there). Each distinct new verifier address the rule does not use is probed before submission. After confirmation, one `SaContextRulePinsUpdatedV2` row (reason `signer_added`) records the resulting verifier pins.
@@ -669,7 +667,7 @@ The smart account authorizes the named call alone. The simulated authorization m
 
 On success the envelope carries `status: "submitted"`, `contract`, `function`, `arg_count`, `auth_rule_ids`, `rule_signer_pubkey_first8` (never the full key or seed), `verifier_address`, and `tx_hash`. On-chain refusals (spending-limit cap, scope mismatch, expired rule) surface through the same typed `SaError` wire codes and message annotations (for example `[OZ:SpendingLimitExceeded]`, `[OZ:UnvalidatedContext]`) every other smart-account write verb renders. A refusal carries the contract error and, for a code in the known-code table, its OZ name, for example `Error(Contract, #3221) [OZ:SpendingLimitExceeded]`. The code is the one the simulation's event-log order names first. It is shown only when an `error` diagnostic event of the invoked contract, or of a smart account the auth entries name, carries it. Unknown codes remain numeric, including `Error(Contract, #3213)`. Otherwise the message carries the top-level error, for example `Error(Auth, InvalidAction)`, or a reason that error names without a code, such as `[OZ:ContextRuleNotFound]`. The wire code and the timelock failure label are the same in both cases.
 
-Before anything is simulated or signed, every `--auth-rule-id` other than `0` goes through the [pre-submission checks](#pre-submission-checks) against the profile's audit log. A rule without a signer-set baseline refuses with `sa.signer_set_missing_baseline`, and an audit-log integrity error with `sa.audit_log`. For a checked verifier or policy, all 32 bytes of the live code hash must equal the pinned hash. An external reference must also match its pinned owner, tag, and full resolved hash. A mismatch refuses with `sa.verifier_hash_drift` / `sa.policy_hash_drift`, a pin record of eight-byte hash prefixes with `sa.wasm_pin_incomplete`, and a drift check that cannot run with `sa.pin_check_unavailable`. A rule whose record holds policy pins while the rule has no policy on chain refuses with `sa.pinned_policy_absent`. A rule holding an `External` signer while its record pins no verifier refuses with `sa.pinned_verifier_absent`. A rule whose record pins a verifier hash the allowlist marks revoked or retired refuses with `sa.verifier_wasm_revoked` / `sa.verifier_wasm_retired`. A signer set that differs from the baseline refuses with `sa.signer_set_diverged`. The checks read and fetch through the same `--rpc-url` / `--secondary-rpc-url` endpoints as the submission. Endpoint disagreement is `network.rpc_divergence`. Lock timeout is `sa.auth_entry_construction_failed` at stage `rule_lock`. A deadline that elapses during the baseline read or the comparison uses that code at `baseline_read` or `signer_set_compare`. A version 1 authorizing rule compares through its projection. Its own refusals are `sa.threshold_policy_not_installed`, `sa.threshold_policy_identification_failed`, and `sa.deployment_failed`.
+Before anything is simulated or signed, every `--auth-rule-id` other than `0` goes through the [pre-submission checks](#pre-submission-checks) against the profile's audit log. The checks read through the same endpoints as the submission. A version 1 authorizing rule compares through its projection. Its own refusals are `sa.threshold_policy_not_installed`, `sa.threshold_policy_identification_failed`, and `sa.deployment_failed`.
 
 This example also reads the agent's seed from `AGENT_SK` (see [Pass a secret seed](../getting-started.md#pass-a-secret-seed)). Run this line on its own, paste the agent's seed when prompted, and press Enter:
 
@@ -712,7 +710,7 @@ Flags:
 - `--smart-account <C_STRKEY>` (required): the smart-account executing the bundle.
 - `--rule-id <U32>` (required): the context rule authorizing the bundle.
 - `--invocation <TARGET:FN:JSON_ARGS>` (required, repeatable, 1 to 50): one invocation descriptor. More than 50 values are refused as `validation.bundle_too_large`.
-- `--secondary-rpc-url <URL>`: secondary RPC for cross-verification and the ledger witness. Resolved from the flag, else the profile's `secondary_rpc_url`, else `smart_account.ledger_witness_unavailable`. Ledger observations may differ by at most two in either order. Signature expiry is 100 ledgers beyond the lower observation. The simulated ledger height must lie between the lower observation minus two and the higher observation plus two, inclusive. A height below this range permits one unsigned re-simulation against the same pair. A height above it, or a replacement outside it, refuses with `simulation.divergence.ledger_skew`. Recovery runs within the same pre-submit deadline.
+- `--secondary-rpc-url <URL>`: secondary RPC for cross-verification and the ledger witness. Resolved from the flag, else the profile's `secondary_rpc_url`, else `smart_account.ledger_witness_unavailable`. The ledger-observation limits are in [Pre-submission checks](#pre-submission-checks).
 - `--fee <STROOPS>`: per-op base fee in stroops (default 100). Unlike the deploy verb, `auto[:pNN]` is rejected here.
 - Signer-source flags are required (one of `--signer-secret-env` or `--sign-with-ledger`); `--account-index <INDEX>` defaults to `0`.
 - Shared: `--profile`, `--network`, `--rpc-url`, `--timeout-seconds`.
@@ -753,8 +751,6 @@ Deploy-time, registry-management, migration, and upgrade-timelock operations tha
 
 ### `smart-account deploy-webauthn-verifier`
 
-`--profile <NAME>` selects the profile, followed by `STELLAR_AGENT_PROFILE`, then `default`. An explicitly named missing profile refuses.
-
 Deploys the OpenZeppelin WebAuthn-verifier WASM and records its address in the verifier registry (`<canonical_data_root>/networks.toml`). Idempotent: if the registry already holds an entry for the target network with the same WASM hash, it returns `status: "already_deployed"` with no RPC traffic. Signs and submits unless `--dry-run`. Testnet only.
 
 Exactly one deployer source is required (mutually exclusive group): `--deployer-secret-env <VAR>` or `--sign-with-ledger`.
@@ -764,13 +760,14 @@ Flags:
 - `--deployer-secret-env <VAR>`: env-var name holding the deployer S-strkey.
   Mutually exclusive with `--sign-with-ledger`.
 - `--sign-with-ledger`: use a connected Ledger as the deployer.
+- `--profile <NAME>`: see [Profile](index.md#profile).
 - `--account-index <INDEX>`: Ledger BIP-44 index. Default `0`.
 - `--network <NETWORK>`: optional assertion that must match the profile chain.
 - `--rpc-url <URL>`: optional testnet override; absent uses the profile endpoint. Mainnet profiles refuse the flag.
 - `--fee <STROOPS|auto[:pNN]>` (optional): explicit per-op stroop fee, or `auto`
   (p95), or `auto:p50` / `auto:p75` / `auto:p95` / `auto:p99`.
-  Absent uses the profile default (100 stroops base; Soroban resource fees are
-  added by simulation).
+  Absent uses the command default of 100 stroops; the profile fee is not read.
+  Simulation adds the Soroban resource fee.
 - `--timeout-seconds <SECONDS>`: default `60`.
 - `--output <FORMAT>`: `json` (default) or `table`.
 - `--dry-run`: derive the verifier address with no network access or signing;
@@ -783,8 +780,6 @@ stellar-agent smart-account deploy-webauthn-verifier --deployer-secret-env DEPLO
 ```
 
 ### `smart-account deploy-ed25519-verifier`
-
-`--profile <NAME>` selects the profile, followed by `STELLAR_AGENT_PROFILE`, then `default`. An explicitly named missing profile refuses.
 
 Deploys the OpenZeppelin Ed25519-verifier WASM and records its address in the
 verifier registry.
@@ -801,8 +796,6 @@ stellar-agent smart-account deploy-ed25519-verifier --deployer-secret-env DEPLOY
 
 ### `smart-account deploy-spending-limit-policy`
 
-`--profile <NAME>` selects the profile, followed by `STELLAR_AGENT_PROFILE`, then `default`. An explicitly named missing profile refuses.
-
 Deploys the OpenZeppelin spending-limit-policy WASM and records its address in the verifier registry. Same idempotency, signer modes, and flags as `deploy-webauthn-verifier` above. The policy is a per-network singleton: one deployed instance serves every account and context rule on the network, so this only needs to run once per network. Attach the deployed policy to a rule via [`smart-account rules add-policy --kind spending-limit`](#smart-account-rules-add-policy).
 
 This example reads the deployer seed from `DEPLOYER_SK`; set it as [Pass a secret seed](../getting-started.md#pass-a-secret-seed) shows, and unset it after the command.
@@ -813,9 +806,7 @@ stellar-agent smart-account deploy-spending-limit-policy --deployer-secret-env D
 
 ### `smart-account deploy-policy`
 
-`--profile <NAME>` selects the profile, followed by `STELLAR_AGENT_PROFILE`, then `default`. An explicitly named missing profile refuses.
-
-Deploys any one of the three OpenZeppelin policy contracts through a single verb, selected by `--kind`. Same idempotency (`status: "already_deployed"` on a repeat run with the same deployer, no RPC traffic), signer modes, and shared flags as `deploy-webauthn-verifier` above. Each kind uses its OWN salt-domain prefix, so different kinds deployed by the same deployer on the same network derive DIFFERENT addresses. This is the recommended entry point for deploying any policy; `deploy-spending-limit-policy` deploys the same spending-limit policy as `deploy-policy --kind spending-limit`.
+Deploys any one of the three OpenZeppelin policy contracts through a single verb, selected by `--kind`. Same idempotency (`status: "already_deployed"` on a repeat run with the same deployer, no RPC traffic), signer modes, and shared flags as `deploy-webauthn-verifier` above. Each kind uses its own salt-domain prefix, so different kinds deployed by the same deployer on the same network derive different addresses. This is the recommended entry point for deploying any policy; `deploy-spending-limit-policy` deploys the same spending-limit policy as `deploy-policy --kind spending-limit`.
 
 Extra flag:
 
@@ -942,11 +933,7 @@ The intent view reports the accounting horizon, retention boundary, operation pu
 
 `accounting_horizon` is `open` for executable or unclassified authority. Otherwise it is the admitted accounting horizon in milliseconds. `retained_until_ms` is the separate inclusive retention boundary.
 
-A bounded invocation charge closes when a later policy check or admission witnesses both profile endpoints above every authorization and envelope bound.
-
-Each queried window counts a closed charge through the later of its observation plus that window and its admitted accounting horizon.
-
-A closed intent record remains until more than one week has passed since its observation.
+The closure, retention, and reset-blocking rules are in [Retained smart-account charges](../concepts.md#retained-smart-account-charges).
 
 Total-budget legs charge the pinned policy allocation before signing, including repeated criteria for the same asset.
 Cancellation with the original unexposed proof releases those legs. Exposure, binding, and replay remove that cancellation authority.
@@ -957,21 +944,11 @@ Ordinary payments continue within the remaining signed allocation; reset does no
 Different authority requires `profile sign-policy --profile <profile> --secret-env OWNER_SEED`.
 Checked outcome recovery on CLI and MCP dispatch and status settles classic attempts only; no CLI or MCP path, including `tx status`, releases exposed signed intents' totals of unknown outcome without proof of non-use.
 
-A schedule charge closes when both endpoints, above every authorization expiration, report its operation done or unset.
-
-Intents without an authenticated purpose remain open. Calls whose authorization tree names `approve`, `increase_allowance` or `approve_for_all` retain their charges without closure by authorization expiry.
-
-Reset refuses while an intent remains open or retained. A closed and pruned intent does not block reset.
-
-An open intent without an authenticated purpose permanently blocks reset for this profile. Continue with a new profile.
-
-When an intent is open and the profile stores no `secondary_rpc_url`, `reset_explanations` reports that retained intents cannot close and asks for one.
-
-When an intent is open and the stored endpoint configuration cannot load, `reset_explanations` reports that only stored endpoints that load close retained intents.
+`reset_explanations` carries the reasons an open intent cannot close.
 
 ### `smart-account register-multicall`
 
-Registers a deployed multicall router address and its WASM hash in the local registry (`<canonical_data_root>/networks.toml`). State-changing on a local file plus an audit row. Idempotent. Refuses if `--wasm-sha256` does not equal the binary's compiled-in `MULTICALL_WASM_SHA256` (typo and config-plant defence). An existing entry with another digest fails lookup and blocks registration for its network: remove it with `smart-account unregister-multicall` on its normal path, without `--force`, then register.
+Registers a deployed multicall router address and its WASM hash in the local registry (`<canonical_data_root>/networks.toml`). State-changing on a local file plus an audit row. Idempotent. Refuses if `--wasm-sha256` does not equal the binary's compiled-in `MULTICALL_WASM_SHA256` (typo and config-plant defense). An existing entry with another digest fails lookup and blocks registration for its network: remove it with `smart-account unregister-multicall` on its normal path, without `--force`, then register.
 
 Flags:
 
@@ -1009,15 +986,15 @@ stellar-agent smart-account unregister-multicall --network testnet
 
 ### `smart-account timelock`: OpenZeppelin upgrade timelock
 
-Schedule, cancel, execute, and list pending operations on an OpenZeppelin timelock contract. The signer must hold the appropriate timelock role for each write verb. All four share `--timelock <C_STRKEY>` (required), `--rpc-url`, `--secondary-rpc-url`, `--network`, and `--profile`; the write verbs add the signer-source group. The write verbs (`schedule`, `cancel`, `execute`) structurally refuse `mainnet`; `list-pending` is read-only and accepts `mainnet`.
+Schedule, cancel, execute, and list pending operations on an OpenZeppelin timelock contract. The signer must hold the PROPOSER role for `schedule` and the CANCELLER role for `cancel`; `execute` needs no role. All four share `--timelock <C_STRKEY>` (required), `--rpc-url`, `--secondary-rpc-url`, `--network`, and `--profile`; the write verbs add the signer-source group. The write verbs (`schedule`, `cancel`, `execute`) structurally refuse `mainnet`; `list-pending` is read-only and accepts `mainnet`.
 
 Without `--secondary-rpc-url`, the profile secondary applies. A configured mainnet secondary requires its provider attestation and a host distinct from the primary. If neither source supplies a secondary, `list-pending` reads through the primary alone.
 
-Smart-account writes require a secondary RPC on the same network. Signing refuses unavailable or disagreeing ledger observations. The expiry bound assumes at least one independently operated endpoint reports the chain honestly. Ledger observations may differ by at most two in either order. Signature expiry is 100 ledgers beyond the lower observation. The simulated ledger height must lie between the lower observation minus two and the higher observation plus two, inclusive. A height below this range permits one unsigned re-simulation against the same pair. A height above it, or a replacement outside it, refuses with `simulation.divergence.ledger_skew`. Recovery runs within the same pre-submit deadline.
+Timelock writes follow the secondary-RPC and ledger-observation rules in [Pre-submission checks](#pre-submission-checks).
 
 Timelock envelopes carry an exact maximum ledger before signing. The maximum ledger is exclusive.
 
-See [signed intent closure](#smart-account-list-intents) for schedule closure and retained authority.
+See [signed intent closure](../concepts.md#retained-smart-account-charges) for schedule closure and retained authority.
 
 #### `smart-account timelock schedule`
 
@@ -1029,7 +1006,7 @@ be recomputed later. `cancel` takes the operation ID from
 `operation_id_full_hex` instead.
 On success the envelope also carries `operation_id_full_hex`.
 
-Scheduling authorizes value: once the delay passes, anyone can execute the operation without a wallet signature. `schedule` is sized as an unvalued contract call under `stellar_smart_account_timelock_schedule`, as `execute` is.
+Scheduling authorizes value: once the delay passes, anyone can execute the operation without a wallet signature. `schedule` is sized as an unvalued contract call under `stellar_smart_account_timelock_schedule`. A matched value rule without `allow_opaque_signing` refuses it with `policy.deny.unsizable_value_effect`.
 
 Flags add:
 
@@ -1070,7 +1047,7 @@ stellar-agent smart-account timelock cancel \
 
 #### `smart-account timelock execute`
 
-Executes a ready operation (EXECUTOR role, or open-execution mode). A pre-flight dual-RPC state check guards the ready-window race and fails closed if the operation is not ready. The `--target`, `--function`, `--operation-id`, and `--salt` must exactly match the scheduled operation, since OpenZeppelin re-derives the operation id from them.
+Executes a ready operation on a timelock in open-execution mode, where no executor is configured. The command passes no executor address, so it cannot execute on a timelock that restricts execution to EXECUTOR role holders. The signer pays the fee and needs no timelock role. A pre-flight dual-RPC state check guards the ready-window race and fails closed if the operation is not ready. The `--target`, `--function`, `--operation-id`, and `--salt` must exactly match the scheduled operation, since OpenZeppelin re-derives the operation id from them. `timelock execute` is sized the same way as `schedule`, under `stellar_smart_account_timelock_execute`.
 
 Flags add:
 

@@ -58,7 +58,7 @@ Spending summaries and `profile policy-check` include `contract_transfer_fee_cap
 | Member | Meaning |
 |---|---|
 | `configured_stroops` | Root value, or `null` when absent. |
-| `effective_stroops` | Verified cap or testnet fallback, or `null` when unavailable. |
+| `effective_stroops` | Verified cap or testnet fallback, or `null` when no bound is established. |
 | `status` | `verified`, `requires_signature`, `testnet_default`, `required`, or `unavailable`. |
 
 Unsigned policy-check input reports a declared cap as `requires_signature`,
@@ -106,5 +106,6 @@ The protocol references supplied for rent calculations are
 `soroban-env-host-30.0.0/src/fees.rs:290`, `:397`, and `storage_types.rs:8`.
 The supplied restoration reference is `e2e_invoke.rs:889` in that version.
 These references are not a claim of local source verification.
-The offline validator requires same-transaction restoration indices and refuses
-memos on contract invocations, as described in [security internals](security-internals.md).
+The offline validator requires a same-transaction restoration index for a
+read-write SAC instance and refuses memos on contract invocations, as described
+in [security internals](security-internals.md).

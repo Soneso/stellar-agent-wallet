@@ -26,7 +26,7 @@ The CLI package depends on the MCP library. No library depends on the CLI packag
 | Domain libraries | `nonce`, `pool`, `claimable`, `smart-account`, `defi`, `stablecoin`, `sep7`, `sep10`, `sep48`, `sep53`, `anchor`, and `toolsets-runtime` depend only on earlier layers. |
 | Composite libraries | `sep43`, `x402`, `x402-identity`, `mpp`, `dex`, `defindex`, `webauthn-bridge`, `approval-ui`, and `approval-remote`. Within this layer, `x402` and `mpp` depend on `sep43`; `approval-remote` depends on `approval-ui`. |
 | Server library and binary | `mcp` is a library over the layers above. `cli` builds the one executable and depends on `mcp`. |
-| Acceptance | `smart-account-acceptance` is a test-only leaf above `cli` and `mcp`. |
+| Acceptance | `smart-account-acceptance` is a test-only leaf above `mcp`; it does not depend on `cli`. |
 
 `defi` defines contract pins, typed previews, and adapter interfaces.
 `dex` and `defindex` implement its trade and vault adapters through `smart-account` submission.
@@ -108,7 +108,7 @@ See [Getting started](../getting-started.md) for installation and [Building](bui
 | `stellar-agent-toolsets-install` | Toolset install and uninstall with hash verification, ed25519 publisher signature and trust set, safe tar extraction, attestation gate, toolsets directory lock, and an atomic pin record authenticated by an HMAC under the installation's pin key. |
 | `stellar-agent-toolsets-runtime` | Capability-to-tool matrix, gated resolver, signing denylist, pin and manifest-digest verification, and the enforcement bounding what the toolset dispatcher routes (not the server's native tools). |
 | `stellar-agent-defi` | DeFi-adapter substrate: contract-pin framework, the typed-preview trait, and the dispatch-verb seam (`lend`/`trade`/`vault`/`bridge`); ships no live verb. |
-| `stellar-agent-defindex` | DeFindex vault adapter: typed deposit and withdraw with mandatory `min_out`, role disclosure, upgradable-flag refusal gate; drives the `vault` verb. |
+| `stellar-agent-defindex` | DeFindex vault adapter: typed deposit and withdraw with a mandatory minimum-output floor (`amounts_min`, `min_amounts_out`), role disclosure, upgradable-flag refusal gate; drives the `vault` verb. |
 | `stellar-agent-dex` | Soroswap router-direct swap adapter with absolute `amount_out_min`, pre-sign slippage re-verify, token canonicalization, bounded deadline, venue allowlist and router pin; drives `trade`/`quote`. |
 | `stellar-agent-stablecoin` | Stablecoin substrate: USDC/EURC issuer pins, denomination resolver, USDT hard-refusal, clawback disclosure, typed trustline preview; backs the `trustline` verb. |
 | `stellar-agent-x402` | Payer-side x402 Exact-Stellar payment payload builder (validate, build, simulate, sign, re-simulate, finalize), and the authorized mainnet path that consumes the payment intent before signed re-simulation and returns the release authorization. |
@@ -124,7 +124,7 @@ See [Getting started](../getting-started.md) for installation and [Building](bui
 
 The workspace contains one binary package, the `mcp-macros` procedural macro, ordinary libraries, and test helpers.
 `test-support` serves test code; `core`, `network`, `defi`, and the acceptance member enable it through optional dependencies.
-`windows-identity` builds on every platform; `core` and `headless-keyring` gate their dependency to Windows.
+`windows-identity` builds on every platform; `core`, `headless-keyring`, and `cli` gate their dependency to Windows.
 The acceptance member's dependencies activate through its test feature.
 
 ### Approval error taxonomy
@@ -143,7 +143,8 @@ Each MCP tool carries `#[mcp_tool_item(...)]` inside a `#[mcp_tool_router]` impl
 The macro emits an `inventory::submit!` registration; `WalletServer::new` collects the records into the descriptor map.
 Duplicate names are fatal startup errors.
 
-Gated handlers call `PolicyEngine::evaluate_full` or `evaluate_with_value_full` with a descriptor and arguments.
+The MCP gate evaluates each gated call through `PolicyEngine::evaluate_in_snapshot` with a descriptor and arguments.
+On mainnet it runs the mainnet evaluation over the same snapshot.
 The result includes the decision and sized value effects, which submission recording uses without deriving them again.
 The profile selects Noop or the signature-verified V1 engine.
 See the [payment flow](../architecture.md#one-agent-payment-end-to-end) for the order of checks, approval, and submission.
@@ -157,7 +158,7 @@ MCP handlers and CLI `pay`, `claim`, `accounts create`, and `trustline` construc
 
 ### In-process state
 
-`WalletServer` holds a nonce replay window and a sequence-floor tracker behind separate Tokio mutexes.
+`WalletServer` holds a nonce replay window, a prepared-payment map, and a sequence-floor tracker behind separate Tokio mutexes.
 The replay window belongs to one server instance; the nonce boot salt belongs to the process.
 The tracker records the highest confirmed sequence per source in a bounded map with oldest-entry eviction.
 
@@ -179,10 +180,11 @@ See [Two sessions on one profile](security-internals.md#two-sessions-on-one-prof
 The CLI uses a clap `Subcommand` tree in `main.rs`, dispatching to command `run` functions over library crates.
 Its top-level commands are `mcp`, `approve`, `tx`, `audit`, `accounts`, `balances`, `counterparty`, `friendbot`, `fees`, `pay`, `mpp`, `pool`, `profile`, `credentials`, `vault`, `trade`, `trustline`, `claim`, `toolsets`, and `smart-account`.
 
-Before dispatch, `main` installs redacting logs and scans the active profile's audit log for context rules referencing retired verifier hashes.
+Before dispatch, `main` installs redacting logs and scans the active profile's audit log for context rules that reference revoked or retired verifier hashes or hold an incomplete pin record.
 `profile init`, `profile enable-mainnet`, and the `profile policy` verbs skip the scan, and a profile that does not load skips it silently.
 This local advisory makes no network calls and never aborts startup.
 Commands render a JSON `Envelope`; success exits with `0`, and errors exit with `1`.
+Some verbs add exit codes of their own, such as `3` and `65` from `profile policy-check`; the [profile reference](../cli-reference/profile-and-governance.md) defines them.
 
 ## Security detail
 

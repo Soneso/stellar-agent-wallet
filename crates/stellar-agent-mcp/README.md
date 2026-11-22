@@ -2,7 +2,7 @@
 
 Model Context Protocol (MCP) stdio server library for the stellar-agent-wallet.
 
-`stellar-agent-mcp` exposes the agent wallet's capabilities as MCP tools over a stdio transport, so an MCP-capable agent host can drive balances, payments, signing, DeFi verbs, SEP flows, and toolsets through a policy-gated interface. Tools are registered at link time: `#[mcp_tool_item(...)]` annotations emit `McpToolRegistration` records that the `inventory` crate collects, and the server iterates them at startup to build the descriptor map consumed by the policy engine.
+`stellar-agent-mcp` exposes the wallet's capabilities as MCP tools over stdio. An MCP client can read balances, send payments, sign payloads, run DeFi and SEP flows, and invoke toolsets through a policy-gated interface. Tools register at link time through the `#[mcp_tool_item(...)]` attribute. At startup the server builds the descriptor map the policy engine consumes from those registrations.
 
 This crate is a library with no executable. The `stellar-agent` executable of the `stellar-agent-cli` crate runs it.
 
@@ -25,7 +25,7 @@ version is spelled out because a bare crate name matches stable versions only.
 cp ~/.cargo/bin/stellar-agent ~/.cargo/bin/stellar-agent-mcp
 ```
 
-For configuration, the tool catalogue, and integration walkthroughs, see the workspace README and the `docs/` directory in the repository.
+For configuration, the tool catalog, and integration walkthroughs, see the workspace README and the `docs/` directory in the repository.
 
 ## Status
 

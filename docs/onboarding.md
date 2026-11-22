@@ -20,22 +20,21 @@ transaction. It is how you stay in control while it does.
 
 The wallet answers that with a strict division of roles:
 
-- **The agent acts.** It reads balances, prepares payments, trades, and
+- The agent acts. It reads balances, prepares payments, trades, and
   submits transactions, through a set of tools designed for machines.
-- **The wallet enforces.** Every transaction and signature the agent requests
+- The wallet enforces. Every transaction and signature the agent requests
   passes a policy check you configured: allowed, refused, or held for your
   approval. The agent cannot
   talk its way around a rule, because the rules never see the agent's words:
   only the transaction itself.
-- **You decide.** Actions held for approval land in your approval inbox. You
+- You decide. Actions held for approval land in your approval inbox. You
   see what the wallet itself decoded from the transaction, never the agent's
   description of it, and approve or reject with one click.
-- **Audit events reveal tampering.** An append-only, hash-chained audit log records
+- Audit events reveal tampering. An append-only,
+  [hash-chained audit log](concepts.md#the-hash-chained-audit-log) records
   transaction submissions, signed authorizations, approvals, and explicit
-  key-management and lifecycle events. MCP balance reads and payment simulations
-  produce no automatic invocation row. Under V1, payment simulations can
-  reconcile overdue reservations and deliver owed accounting events. If anyone
-  edits the log afterward, verification fails.
+  key-management and lifecycle events. If anyone edits the log afterward,
+  verification fails.
 
 Your secret keys never reach the agent. They live in your operating system's
 keyring (Keychain on macOS, Secret Service on Linux, Credential Manager on
@@ -46,37 +45,37 @@ to sign; it never sees what signs.
 
 In plain terms, an agent connected to the wallet can:
 
-- **Hold and move money**: check balances, send XLM or issued assets like
+- Hold and move money: check balances, send XLM or issued assets like
   USDC, create accounts, and claim incoming claimable balances (payments
   parked on-chain until the recipient collects them).
-- **Manage asset access**: open trustlines (an account's opt-in to hold a
+- Manage asset access: open trustlines (an account's opt-in to hold a
   given asset) to stablecoins behind built-in protections: a known-issuer
   table, lookalike detection, and a hard refusal of assets with hostile
   settings.
-- **Pay other agents and services**: the x402 payment scheme lets an agent
+- Pay other agents and services: the x402 payment scheme lets an agent
   pay for API access machine-to-machine, optionally verifying who it is
   paying first.
-- **Use DeFi, carefully**: swap on Soroswap, and use DeFindex
+- Use DeFi, carefully: swap on Soroswap, and use DeFindex
   vaults through typed, simulation-checked verbs. The DeFi verbs refuse raw or
   opaque contract calls. Other opaque signing needs a policy rule with
   `allow_opaque_signing = true`.
-- **Talk to anchors**: start deposits and withdrawals with regulated
+- Talk to anchors: start deposits and withdrawals with regulated
   on/off-ramp services (the SEP-6 and SEP-24 standards), handing you the
   interactive part.
-- **Prove identity**: before an authenticated x402 payment, the identity gate
+- Prove identity: before an authenticated x402 payment, the identity gate
   authenticates to the payee's server with SEP-10, using a fresh ephemeral
   key.
-- **Operate a smart account**: for advanced setups, an on-chain
+- Operate a smart account: for advanced setups, an on-chain
   OpenZeppelin smart account with spending rules enforced by the network
   itself, passkey signers, multi-signer quorums, and timelocked upgrades.
 
 Two guardrail features frame all of it:
 
-- **Toolsets** are signed packages that declare a narrow set of capabilities
+- Toolsets are signed packages that declare a narrow set of capabilities
   (for example "read balances and propose payments") and narrow what the
   toolset dispatcher routes for an agent. They do not restrict the other tools
   the MCP server exposes; your operator policy and approvals do that.
-- **The approval inbox** is where held actions wait for you. Run it as a
+- The approval inbox is where held actions wait for you. Run it as a
   terminal command (`stellar-agent approve list`) or as a small local web
   page (`stellar-agent approve serve`) that updates live, notifies you when
   something arrives, and shows exactly what the agent wants to do. If the
@@ -88,7 +87,7 @@ Two guardrail features frame all of it:
 
 Nothing is asked of you on faith. The alpha is deliberately conservative:
 
-- **Testnet first.** Testnet is the default network, and you experiment with
+- Testnet first. Testnet is the default network, and you experiment with
   test funds from the free Friendbot faucet; nothing real is at stake while
   you learn. A mainnet write needs an explicit mainnet profile, operator
   setup, and a governing policy decision. CLI `allow` grants policy authority
@@ -97,15 +96,15 @@ Nothing is asked of you on faith. The alpha is deliberately conservative:
   operator approval under `require_approval`. [Mainnet configurations and
   scope](getting-started.md#mainnet-configurations-and-scope) lists the
   admitted operations.
-- **Guardrails scale with you.** Running without a profile on testnet is
+- Guardrails scale with you. Running without a profile on testnet is
   permissive, so you can experiment with faucet funds. A profile you mint
   yourself defaults to the V1 policy engine, which is first-match,
   default-deny: anything you have not explicitly allowed is refused, and
   rules can require your approval above a chosen amount.
-- **Approvals are unforgeable.** An approval is a cryptographic attestation
+- Approvals are unforgeable. An approval is a cryptographic attestation
   bound to the exact transaction bytes you saw and to your OS user account.
   If the transaction changes by one byte afterward, the approval is void.
-- **The audit log does not lie.** Each entry is chained to the previous one
+- The audit log does not lie. Each entry is chained to the previous one
   by hash. `stellar-agent audit verify` proves the record was not touched.
 
 ## Using it with Claude Code
@@ -113,21 +112,26 @@ Nothing is asked of you on faith. The alpha is deliberately conservative:
 The wallet speaks the Model Context Protocol (MCP), which is how Claude Code
 and other AI coding agents discover tools. A first session looks like this:
 
-1. **Build the wallet** (a Rust toolchain plus the native build tools in
+1. Build the wallet (a Rust toolchain plus the native build tools in
    [Prerequisites](getting-started.md#prerequisites)):
 
    ```bash
    git clone --branch v0.1.0-alpha.13 https://github.com/Soneso/stellar-agent-wallet
    cd stellar-agent-wallet && cargo build --release --locked
+   cp target/release/stellar-agent target/release/stellar-agent-mcp
    ```
 
-2. **Fund a test account**: Friendbot gives you free testnet XLM, and the
-   first-payment quickstart in [Getting started](getting-started.md) works
-   without any configuration. When you move past experimenting, a profile
-   stores your settings and puts the signing keys into your OS keyring;
-   the same page covers that setup.
+   The copy gives the executable the file name `stellar-agent-mcp`, under which
+   it runs the MCP server.
 
-3. **Connect Claude Code to the wallet's MCP server:**
+2. Fund a test account: Friendbot gives you free testnet XLM, and the
+   CLI first-payment quickstart in [Getting started](getting-started.md) works
+   without a profile. So do balance checks over MCP. Sending or claiming over
+   MCP needs a profile with its keys minted and a signer enrolled. Follow
+   [Set up a profile](getting-started.md#set-up-a-profile) before step 5. A
+   profile stores your settings and puts the signing keys into your OS keyring.
+
+3. Connect Claude Code to the wallet's MCP server:
 
    ```bash
    claude mcp add stellar-agent -- /absolute/path/to/target/release/stellar-agent-mcp
@@ -141,11 +145,11 @@ and other AI coding agents discover tools. A first session looks like this:
    claude mcp add stellar-agent -- /absolute/path/to/target/release/stellar-agent-mcp --profile alice
    ```
 
-4. **Optionally install the knowledge skill.** The [`skills/`](../skills/)
+4. Optionally install the knowledge skill. The [`skills/`](../skills/)
    directory ships a downloadable skill that teaches the agent how to
    operate the wallet well. It teaches which tools exist, the safe call patterns, and how approvals work, without the agent having to figure that out from scratch.
 
-5. **Talk to it.** In a Claude Code session:
+5. Talk to it. In a Claude Code session:
 
    > "Check my Stellar testnet balance."
    >
@@ -153,11 +157,11 @@ and other AI coding agents discover tools. A first session looks like this:
    >
    > "There is a claimable balance with ID BAAD... for my account. Claim it."
 
-6. **Approve when asked.** If your policy holds an action, the agent tells
+6. Approve when asked. If your policy holds an action, the agent tells
    you it needs approval. In another terminal, `stellar-agent approve serve`
    opens your approval inbox in the browser; you review what the wallet
    decoded: recipient, amount, asset. You click Approve or Reject. On
-   approval you hand the agent a base64 HMAC attestation string and it completes
+   approval you hand the agent a base64url HMAC attestation string and it completes
    the payment; on rejection it is told no, definitively.
 
 The same MCP server works with any MCP-capable agent runtime, and the skill

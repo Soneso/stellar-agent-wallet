@@ -74,4 +74,4 @@ describes.
 ---
 
 "Stellar" is a trademark of the Stellar Development Foundation.
-This is an independent project, not affiliated with, sponsored or endorsed by the Stellar Development Foundation.
+This is an independent project, not affiliated with, sponsored, or endorsed by the Stellar Development Foundation.

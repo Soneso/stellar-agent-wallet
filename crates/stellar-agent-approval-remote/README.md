@@ -18,7 +18,8 @@ Persistent serving uses `approve serve --remote --confirm-remote-exposure`.
 Signed-origin serving accepts `--no-open` and needs no display or browser opener.
 One-shot consent requires enabled remote configuration and prints the signed approval link without a token.
 It scopes every route to one entry and closes on completion, cancellation, expiry or interruption.
-An occupied socket reports `approval.listener_busy` and directs the operator to the running inbox.
+A one-shot consent or enrollment listener whose socket is occupied reports `approval.listener_busy` and directs the operator to the running inbox.
+Persistent serving reports the bind failure as `internal.unexpected_state`.
 See the repository's remote approval guide for setup and refusal codes.
 
 ## Status

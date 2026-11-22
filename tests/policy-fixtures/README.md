@@ -20,6 +20,9 @@ Each of the 28 pairs has a `<name>_v2` companion. Its policy is the same body
 as a version 2 document with `sequence = 1`, and its case keeps every
 expectation under the companion name. Both must reach the same outcome.
 
+`adversarial/k3_contract/` holds five contract cases, which the same driver runs:
+`native`, `issued`, `mixed_accounts`, `home_domain`, and `opaque_payment`.
+
 ## Version 2 additions
 
 `adversarial/extended_grammar/` covers the four additions, which only

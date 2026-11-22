@@ -2,12 +2,11 @@
 
 The Stellar Agent Wallet is a Stellar wallet built for AI agents. A policy
 engine evaluates actions, and an operator-approval spine records out-of-band
-approvals. A tamper-evident hash-chained audit log records transaction
-submissions, signed authorizations, approvals, and explicit key-management and
-lifecycle events. MCP balance reads and payment simulations produce no automatic
-invocation row. Under V1, payment simulations can reconcile overdue reservations
-and deliver owed accounting events.
-It ships two
+approvals. A tamper-evident
+[hash-chained audit log](concepts.md#the-hash-chained-audit-log) records
+transaction submissions, signed authorizations, approvals, and explicit
+key-management and lifecycle events.
+The wallet ships two
 surfaces over the same core: the `stellar-agent` command-line binary and the
 `stellar-agent-mcp` MCP stdio server.
 
@@ -23,7 +22,7 @@ reads secret keys from a named environment variable, not from the command line.
 
 - `stellar:testnet` is the default network.
   `accounts create --fund-with-friendbot` funds testnet accounts.
-  `stellar-agent friendbot --network futurenet --friendbot-url
+  `stellar-agent friendbot --account GABC...WXYZ --network futurenet --friendbot-url
   https://friendbot-futurenet.stellar.org` funds a futurenet account.
   The explicit URL is needed because the default Friendbot URL is the
   testnet one for every `--network`. Friendbot funding on mainnet is refused.
@@ -35,12 +34,16 @@ reads secret keys from a named environment variable, not from the command line.
   for signing and write admission. `tx` signs nothing.
   `pool init` is the only `pool` command that signs.
 - CLI commands print a JSON envelope on stdout by default. Exit code is `0` on
-  success and `1` on any error; the envelope's `error.code` carries the
-  diagnostic.
+  success and `1` on an error; the envelope's `error.code` carries the
+  diagnostic. Four commands use more exit codes; see
+  [Output envelope and exit codes](cli-reference/index.md#output-envelope-and-exit-codes).
 
 ## Prerequisites
 
-- A prebuilt binary needs no prerequisites.
+- A prebuilt binary needs no build tools. On Linux it loads `libudev.so.1`,
+  which the system's udev or systemd package provides, and the system glibc.
+  The `x86_64-unknown-linux-gnu` archive is built on Ubuntu 24.04, so it needs
+  glibc 2.39 or later.
 - `cargo install` and a build from source need a stable Rust toolchain with
   edition 2024 support. The repository pins the channel in
   `rust-toolchain.toml` (`channel = "stable"`).
@@ -75,7 +78,10 @@ cargo binstall --locked --disable-strategies quick-install,compile stellar-agent
 
 `cargo binstall` installs the canonical name `stellar-agent` only. The
 executable runs the MCP server as `stellar-agent mcp serve`, and also when it
-runs under the file name `stellar-agent-mcp`. For MCP clients configured with
+runs under the file name `stellar-agent-mcp`. Only the last component of the
+invoked path counts, and it must equal `stellar-agent-mcp` exactly. On Windows
+the comparison ignores ASCII case and also accepts `stellar-agent-mcp.exe`.
+Any other name, such as `stellar-agent-mcp-old`, runs the CLI. For MCP clients configured with
 `stellar-agent-mcp`,
 copy the installed executable:
 
@@ -281,7 +287,7 @@ Every program the shell starts while the variable is set inherits it, so unset
 it before you start anything else from that shell, such as an MCP client.
 
 Mainnet transaction signing never reads an exported seed: on a mainnet
-profile, `pay`, `claim` and `accounts create` refuse `--secret-env` with
+profile, `pay`, `claim`, and `accounts create` refuse `--secret-env` with
 `validation.mainnet_secret_env_refused` and sign with the enrolled seed in the
 keyring. On a mainnet host, export a seed only for `profile enroll-signer` and
 the owner ceremonies, such as `profile sign-policy` and `profile bind-signer`,
@@ -348,8 +354,10 @@ An interactive desktop logon may help. Such a failure reports
 `auth.keyring_platform_error` naming DPAPI and the numeric `CryptProtectData`
 error code when available. The `headless-env` backend has no such dependency and requires
 `STELLAR_AGENT_HEADLESS_KEYRING_KEY`, a 32-byte URL-safe-base64 key without padding.
-The wallet refuses a padded or standard-alphabet key with
-`auth.keyring_config_invalid`, and the message names the cause.
+The CLI refuses a padded or standard-alphabet key with
+`auth.keyring_config_invalid`, and the message names the cause. The MCP server
+logs the same cause as a warning and starts without a keyring store, so its
+signing tools refuse at call time and a V1 profile fails to start.
 Set these variables in the process environment before running any
 `stellar-agent` or `stellar-agent-mcp` command. The platform keyring remains
 the default when this variable is unset. See [security-internals.md's headless
@@ -395,7 +403,7 @@ Profiles live in the OS-conventional directory, one TOML file per profile name:
 
 | Platform | Path |
 |----------|------|
-| Linux    | `~/.local/share/stellar-agent/profiles/<name>.toml` |
+| Linux    | `${XDG_DATA_HOME:-$HOME/.local/share}/stellar-agent/profiles/<name>.toml` |
 | macOS    | `~/Library/Application Support/Soneso.stellar-agent/profiles/<name>.toml` |
 | Windows  | `%LOCALAPPDATA%\Soneso\stellar-agent\data\profiles\<name>.toml` |
 
@@ -632,7 +640,7 @@ Use a build whose version marker is `STELLAR_AGENT_BUILD_MAINNET_WRITE=on`.
 Create a dedicated mainnet profile with its HTTPS endpoint stored in the file.
 Initialize the audit, nonce, attestation, and policy-owner keys, then enroll the
 signer with `profile enroll-signer --secret-env` and unset the variable
-afterward. Mainnet `pay`, `claim` and `accounts create` take no signer flag,
+afterward. Mainnet `pay`, `claim`, and `accounts create` take no signer flag,
 which signs with the enrolled seed in the keyring, or `--sign-with-ledger`;
 they refuse `--secret-env`. Mainnet `pay`, `claim`, `trustline`, and sponsored
 `accounts create` require `--business-id`. A retry with the same id prints the
@@ -661,8 +669,9 @@ Review it before you sign it with `profile sign-policy`:
 - Caps: every payment rule allows the preset's asset alone, with a
   per-payment cap, 1d and 1w caps, and rate limits. A chosen
   `total_budget` bounds all spending under the signed policy's digest.
-  `profile sign-policy` assigns the next sequence, so each signing starts
-  another allocation; only identical canonical bytes keep it.
+  `profile sign-policy` gives the version 2 body the next sequence, so each
+  signing starts another allocation. Signing identical version 1 bytes keeps
+  the allocation.
 - Floor: `stellar_pay` and `stellar_pay_commit` carry a native balance floor.
   Mainnet `stellar-agent pay` reads the operating account for it and refuses
   `account.floor_refused` when the payment would breach the floor. A floor
@@ -694,7 +703,7 @@ configuration file. These versions are independent.
 ## Enroll the MCP signer
 
 The MCP fund-movement tools and the keyring-signing CLI verbs (`trustline`,
-`trade`, `vault`) resolve their signer from the profile's
+`trade`, `vault`, `pool init`) resolve their signer from the profile's
 `mcp_signer_default` keyring entry. On a fresh install those paths fail until
 you enroll a seed. The enrolled-signer loader reports
 `auth.enrolled_identity_unusable` (`missing`) when the identity record is
@@ -702,7 +711,7 @@ absent. After the record passes validation, a missing seed reports
 `auth.keyring_not_found`. Enrollment
 reads the `S...` secret from a named environment variable, derives its public
 address, and stores it in the platform keyring. The secret is never printed.
-These same three verbs also require the profile's audit chain-root key to be
+These same verbs also require the profile's audit chain-root key to be
 minted (`profile rotate-audit-key <name>`, step 2 of the flow in
 [Set up a profile](#set-up-a-profile)); before that they refuse
 `audit.chain_key_unavailable`.
@@ -809,7 +818,8 @@ Signer source (one of the following, mutually exclusive):
 
 Other common flags:
 
-- `<DESTINATION>` (positional), destination account G-strkey (required).
+- `<DESTINATION>` (positional), destination account G-strkey or M-strkey
+  (required).
 - `<AMOUNT>` (positional), `"10 XLM"` for native or the exact, case-sensitive
   asset code for issued assets, such as `"10.5 USDC"` with `USDC:<issuer>`.
 - `[ASSET]` (positional), `native`, `XLM`, or `CODE:ISSUER_GSTRKEY`; defaults to
@@ -841,7 +851,8 @@ Drop zeroizes before unlocking and freeing. The `--sign-with-ledger` path holds 
 The window covers the wallet's own copies only. The exported variable stays in
 the environment of the process and of every process the shell starts, for
 their whole life. Mainnet transaction signing therefore refuses `--secret-env` and signs
-with the enrolled seed in the keyring or with a Ledger. On Linux the CLI marks
+with the enrolled seed in the keyring or with a Ledger that holds the enrolled
+key. On Linux the CLI marks
 itself non-dumpable before it starts any thread, so other processes of the same
 user cannot read its memory or environment; the exporting shell is not
 protected. On macOS and Windows the CLI sets no such flag.
@@ -902,7 +913,9 @@ On an admitted mainnet MCP server, a classic commit signs without an approval
 when the rules of both the commit and its preparation allow the action, and
 needs a verified approval under RequireApproval. Both x402
 payment tools pay in one call under Allow without proof. RequireApproval queues the payment.
-A supplied proof verifies under either decision. The server
+A supplied proof verifies under either decision.
+Supply `approval_nonce` with `approval_attestation` when the policy requires approval, on either network.
+[x402](mcp.md#x402) describes the approval calls. The server
 loads the mainnet write context at startup when the selected profile has a
 verified enablement record. If enablement or policy fails startup checks, the
 server does not start.
@@ -940,7 +953,7 @@ Headless consent, `--yes`, `--no-open` on the local inbox, and remote mainnet ap
 Without a display, mainnet consent needs `--open-by-operator`, which prints the localhost URL for the operator to open.
 With a signed approval origin, the HTTPS listener serves consent using an owner-pinned credential.
 The CLI prints the signed approval link without opening a browser or requiring a display.
-Ledger signing also requires this passkey ceremony.
+Ledger signing also requires this passkey ceremony and the enrolled signer identity.
 
 See [Mainnet write behavior](cli-reference/index.md#mainnet-write-behavior),
 [Mainnet policy body](profiles.md#mainnet-policy-body), and
@@ -960,22 +973,41 @@ A mainnet write passes four states in this order: nothing sent or signed,
 unsigned requests sent, signed locally, signed material sent. The states refer
 to the transaction or payment signature. Authenticated x402 also signs and
 submits a SEP-10 challenge with an ephemeral key inside the second state. Each
-row names the checks that can refuse in that state, grouped by class, and the
-codes they report. Inside a row, the order of the checks differs by command and
+item names the checks that can refuse in that state, grouped by class, and the
+codes they report. Inside an item, the order of the checks differs by command and
 tool.
 
-| State when a check refuses | Checks, by class | Codes |
-|---|---|---|
-| Nothing sent or signed | Entry: the compiled feature, an explicit nondefault mainnet profile with matching stored configuration and an oracle, full mode and keyring access (CLI), the asset and amount (CLI, classic MCP), envelope and address decoding (classic MCP). Policy: the V1 engine; the CLI, classic MCP and x402 also check the verified policy and enablement here. URL: client construction and its credential (CLI, classic MCP, plain x402). x402 under RequireApproval: call 1 ends here, except the endpoint identity request for a W payee. Under Allow, call 1 is the signing call. Plain x402 call 2 sends nothing before the payment build. Its checks up to there: requirements, `chain_id`, the approval pair, enrollment and address, local policy evaluation, forced approval, the attestation, audit readiness, the signing handle. Authenticated x402 call 2 runs the same checks through the attestation, plus the home domain, the audit pre-flight, and identity audit readiness. It leaves this state at the identity exchange. | `network.mainnet_write_forbidden`, profile and validation codes, `policy.engine_unavailable` and `trustline.policy_engine_unavailable` (CLI), keyring codes, `network.rpc_unreachable`, `network.rpc_credential_refused`, `simulation.divergence` (classic MCP), JSON-RPC invalid params, `x402.*` requirement codes, `identity.home_domain_invalid`, `policy.approval_required`, `policy.approval_rejected`, `policy.approval_consumed`, `policy.deny.*`, `policy.engine_required`, `policy.unexpected_decision`, `auth.enrolled_*`, `audit.*`, approval-store codes |
-| Unsigned requests sent: the endpoint identity probe, the endpoint readiness reads, account and chain reads, the oracle simulation or latest-ledger read, the unsigned payment simulation (x402) | URL: endpoint identity, protocol version. Entry: the remaining input decoding (CLI, classic MCP). Policy: the engine rebuilt after the reconcile pass (CLI), the rebuilt envelope (classic MCP), the policy evaluation, and the fee cap and the operation conditions (CLI, classic MCP). Policy also checks the required witness, the oracle's ledger bound below the threshold on mainnet, and the health read (x402). Authorization: the attestation or the browser confirmation, audit readiness, the nonce, signer enrollment, the resolver's sealed checks (CLI, classic MCP); the payment intent authorization (x402). Authenticated x402: the bound SEP-10 authentication runs in this state, and its signed challenge reaches the web-auth server before the payment checks. Payment audit readiness, the signing handle, the payment asset, and client construction follow it. | `network.endpoint_network_mismatch`, `network.endpoint_identity_unavailable`, `network.unsupported_protocol_version`, `network.endpoint_not_ready` (CLI, classic MCP), `network.rpc_credential_refused`, `network.rpc_unreachable` (authenticated x402), read codes, keyring codes, `simulation.divergence`, `network.mainnet_write_forbidden` (CLI), `profile.mainnet_enablement_invalid`, `policy.engine_unavailable`, `trustline.policy_engine_unavailable`, `policy.deny.*`, `policy.engine_required`, `policy.unexpected_decision`, fee-cap codes, `trustline.*`, `network.witness_unavailable`, `approval.presence_*`, `policy.approval_required`, `policy.approval_rejected`, `policy.approval_consumed`, `audit.*`, `nonce.*`, `auth.enrolled_*`, `identity.*`, `x402.rpc_simulate_failed`, `x402.unexpected_auth_entries`, `x402.invalid_asset_address` (authenticated x402), `x402.payment_build_failed` (authenticated), `network.mainnet_authorization_refused` |
-| Signed locally, no signed material sent | Authorization: the signer and the signature check. Submission (CLI, classic MCP): the shared checks before the send: authorization, envelope shape, endpoint identity recheck, signature network binding, transaction hash, pre-send record, consumption proof. x402: the entry signature, the audit row, and the intent consumption before the re-simulation. | `network.mainnet_authorization_refused`, keyring and signer codes, `audit.*`, `protocol.xdr_codec_failed`, endpoint and protocol codes, `submission.record_unavailable`, `submission.tx_already_submitted`, `policy.deny.*`, `x402.transaction_build_failed`, `x402.payment_build_failed` (authenticated) |
-| Signed material sent | Submission (CLI, classic MCP): the send and the confirmation; reconcile an unknown outcome. x402: the signed re-simulation sends the signed authorization to the configured RPC. After it, the re-simulation answer checks, the release authorization, the payload encoding, the release consumption, and the pending-approval consumption withhold the payload. | `submission.*`, `x402.rpc_simulate_failed`, `x402.transaction_build_failed`, `x402.unexpected_auth_entries`, `x402.payment_build_failed` (authenticated), encoding codes, approval-store codes, `network.mainnet_authorization_refused` (payload withheld) |
+1. Nothing sent or signed.
+   - Entry: the compiled feature, an explicit nondefault mainnet profile with matching stored configuration and an oracle, full mode and keyring access (CLI), the asset and amount (CLI, classic MCP), envelope and address decoding (classic MCP).
+   - Policy: the V1 engine; the CLI, classic MCP, and x402 also check the verified policy and enablement here.
+   - URL: client construction and its credential (CLI, classic MCP, plain x402).
+   - x402 reads: Each call of both x402 tools can leave this state before policy evaluation through two unsigned reads. A W payee triggers the endpoint identity request. A first matching rule with `balance_floor` or `minimum_reserve` triggers the payer account read.
+   - x402 under RequireApproval: call 1 sends nothing else and ends here. Under Allow, call 1 is the signing call.
+   - Plain x402 call 2 sends nothing else before the payment build. Its checks up to there: requirements, `chain_id`, the approval pair, enrollment and address, local policy evaluation, forced approval, the attestation, audit readiness, the signing handle.
+   - Authenticated x402 call 2 runs the same checks through the attestation, plus the home domain, the audit pre-flight, and identity audit readiness. It leaves this state at the identity exchange.
+   - Codes: `network.mainnet_write_forbidden`, profile and validation codes, `policy.engine_unavailable` and `trustline.policy_engine_unavailable` (CLI), keyring codes, `network.rpc_unreachable`, `network.rpc_credential_refused`, `simulation.divergence` (classic MCP), JSON-RPC invalid params, `x402.*` requirement codes, `identity.home_domain_invalid`, `policy.approval_required`, `policy.approval_rejected`, `policy.approval_consumed`, `policy.deny.*`, `policy.engine_required`, `policy.unexpected_decision`, `auth.enrolled_*`, `audit.*`, approval-store codes.
+2. Unsigned requests sent: the endpoint identity probe, the endpoint readiness reads, account and chain reads, the oracle simulation or latest-ledger read, the unsigned payment simulation (x402).
+   - URL: endpoint identity, protocol version.
+   - Entry: the remaining input decoding (CLI, classic MCP).
+   - Policy: the engine rebuilt after the reconcile pass (CLI), the rebuilt envelope (classic MCP), the policy evaluation, and the fee cap and the operation conditions (CLI, classic MCP). Policy also checks the required witness, the oracle's ledger bound below the threshold on mainnet, and the health read (x402).
+   - Authorization: the attestation or the browser confirmation, audit readiness, the nonce, signer enrollment, the resolver's sealed checks (CLI, classic MCP); the payment intent authorization (x402).
+   - Authenticated x402: the bound SEP-10 authentication runs in this state, and its signed challenge reaches the web-auth server before the payment checks. Payment audit readiness, the signing handle, the payment asset, and client construction follow it.
+   - Codes: `network.endpoint_network_mismatch`, `network.endpoint_identity_unavailable`, `network.unsupported_protocol_version`, `network.endpoint_not_ready` (CLI, classic MCP), `network.rpc_credential_refused`, `network.rpc_unreachable` (authenticated x402), read codes, keyring codes, `simulation.divergence`, `network.mainnet_write_forbidden` (CLI), `profile.mainnet_enablement_invalid`, `policy.engine_unavailable`, `trustline.policy_engine_unavailable`, `policy.deny.*`, `policy.engine_required`, `policy.unexpected_decision`, fee-cap codes, `trustline.*`, `network.witness_unavailable`, `approval.presence_*`, `policy.approval_required`, `policy.approval_rejected`, `policy.approval_consumed`, `audit.*`, `nonce.*`, `auth.enrolled_*`, `identity.*`, `x402.rpc_simulate_failed`, `x402.unexpected_auth_entries`, `x402.invalid_asset_address` (authenticated x402), `x402.payment_build_failed` (authenticated), `network.mainnet_authorization_refused`.
+3. Signed locally, no signed material sent.
+   - Authorization: the signer and the signature check.
+   - Submission (CLI, classic MCP): the shared checks before the send: authorization, envelope shape, endpoint identity recheck, signature network binding, transaction hash, pre-send record, consumption proof.
+   - x402: the entry signature, the audit row, and the intent consumption before the re-simulation.
+   - Codes: `network.mainnet_authorization_refused`, keyring and signer codes, `audit.*`, `protocol.xdr_codec_failed`, endpoint and protocol codes, `submission.record_unavailable`, `submission.tx_already_submitted`, `policy.deny.*`, `x402.transaction_build_failed`, `x402.payment_build_failed` (authenticated).
+4. Signed material sent.
+   - Submission (CLI, classic MCP): the send and the confirmation; reconcile an unknown outcome.
+   - x402: the signed re-simulation sends the signed authorization to the configured RPC. After it, the re-simulation answer checks, the release authorization, the payload encoding, the release consumption, and the pending-approval consumption withhold the payload.
+   - Codes: `submission.*`, `x402.rpc_simulate_failed`, `x402.transaction_build_failed`, `x402.unexpected_auth_entries`, `x402.payment_build_failed` (authenticated), encoding codes, approval-store codes, `network.mainnet_authorization_refused` (payload withheld).
 
 Classic preparations check endpoint health and a ledger close time within 60
 seconds of the host clock before the account read. A failed check refuses with
-`network.endpoint_not_ready` in the row of unsigned requests.
+`network.endpoint_not_ready` in the state of unsigned requests.
 
-A code can appear in more than one row. For the plain x402 tool, the message
+A code can appear in more than one state. For the plain x402 tool, the message
 prefix names the stage: `payment withheld before signed transmission`,
 `at intent transmit gate`, `after intent authorization`, `at payload encoding`,
 `at payload release`, or `at terminal approval`. A withheld payment payload
@@ -1000,15 +1032,3 @@ payment settled, before paying again.
 - [MCP server](mcp.md): running `stellar-agent-mcp` as an MCP stdio server.
 - [Profiles](profiles.md): the full profile schema and the key-rotation
   ceremony.
-
-### x402 owner approval
-
-Supply `approval_nonce` with `approval_attestation` when the policy requires approval, on either network.
-On testnet, a clock reading before approval creation refuses the approval without consuming it.
-
-When the policy requires approval, the x402 tools queue the payment and return
-`data.approval`. The owner approves with `stellar-agent approve`.
-Repeat with `approval_nonce` and `approval_attestation` to pay once.
-On mainnet each x402 payment call also needs `business_id`.
-Queueing signs nothing, reads no key, and runs no SEP-10.
-On mainnet, Allow without proof pays in one call; a supplied proof must verify.

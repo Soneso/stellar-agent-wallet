@@ -119,11 +119,12 @@ sequenceDiagram
     P-->>M: Policy denial
     M-->>A: Refusal before nonce minting
   else Allow or require approval
-    M->>M: Build envelope and mint commit nonce
+    M->>M: Build envelope
     M->>P: Check commit approval requirement
     opt Approval required
       M->>S: Persist payment and envelope hash
     end
+    M->>M: Mint commit nonce
     M-->>A: Envelope, nonce, expiry, approval request
   end
   opt Approval required
@@ -177,7 +178,7 @@ sequenceDiagram
 1. The agent calls `stellar_pay` with the source, destination, amount, and asset.
 2. Before policy evaluation, keyring access, or network requests, the server checks the halt marker; the handler then identifies the primary endpoint and reads account state.
 3. A policy denial stops preparation before the wallet mints a commit nonce, a single-use token bound to this envelope, expiry, tool, and chain.
-4. Preparation builds the envelope, mints the commit nonce, checks commit approval requirements, stores any required consent request, and returns the envelope, nonce, expiry, and request.
+4. Preparation builds the envelope, checks commit approval requirements, stores any required consent request, mints the commit nonce, and returns the envelope, nonce, expiry, and request.
 5. The operator reviews the summary and approves, writing or queuing an audit consent row before persisting an HMAC attestation, a secret-key integrity tag binding consent to bytes.
 6. The agent calls `stellar_pay_commit` with the prepared artifact and any required approval proof.
 7. The server checks the halt marker again before dispatch; the handler checks mainnet authorization on a mainnet profile, evaluates decoded arguments against fresh reads, verifies required consent, and rejects an envelope that differs from its rebuild. On mainnet a direct commit of the intent that `stellar_pay` stored under the business id rebuilds the envelope from that intent with a fresh sequence and deadline instead of comparing a presented one. Its policy evaluation and consent check stay, and its arguments must name that intent. A toolset commit and a commit of an exact-envelope record take the envelope route.
@@ -205,13 +206,14 @@ Toolsets are manifests routed to trusted handlers, not executable sandboxes.
 | Audit rollback detection | Hash chain and keyring tip anchor detect truncation or replacement relative to the retained anchor. | `core` | [Tip anchor](maintainers/security-internals.md#keyring-held-tip-anchor) |
 | Signatures match the endpoint's network | Submit layer verifies signatures against the identified network. | `network` | [Network binding](maintainers/security-internals.md#submit-layer-network-binding) |
 | Mainnet writes need authorization | Only a typed authorization issued for the action satisfies the mainnet-write guard; a policy decision alone does not authorize signing, and ordinary submission refuses mainnet. | `cli`, `mcp`, `network` | [Network checks](#network-checks) |
-| Toolsets cannot expand authority | Installer verifies package pins; runtime intersects capabilities and allowed tools, with per-action approval for gated payments. | `toolsets-install`, `toolsets-runtime` | [Toolsets](toolsets.md) |
+| Toolsets cannot expand authority | Installer verifies package pins; runtime intersects capabilities and allowed tools. A gated payment needs a first-invoke grant and follows the composed payment policies. Rule creation needs approval of each proposal. | `toolsets-install`, `toolsets-runtime` | [Toolsets](toolsets.md) |
 | Per-profile emergency stop | `profile halt --profile <name> [--reason <text>]` renames a temporary marker into `<data_root>/profiles/<name>.halt`. Only MCP tools with `read_only_hint = true` and `value_kind = ReadOnly` skip the per-call check before policy evaluation, keyring access, or network requests. `stellar_toolset_invoke` applies the check to the tool its action routes to, so a read-only routed action skips it. Agent CLI verbs that sign or submit check it after profile loading and before those operations. A valid marker refuses with `profile.halted`; unreadable or malformed markers refuse with `profile.halt_unreadable`. Halt writes the marker before attempting a `profile_halted` audit row. On a halted profile, `profile resume --profile <name>` records `profile_resumed` before removing the marker. Operator ceremonies, approval surfaces, read-only commands, and CLI verbs that only record or reconcile local state stay usable. | `core`, `cli`, `mcp` | [Emergency stop](concepts.md#emergency-stop), [halt marker](profiles.md#halt-marker), and [profile reference](cli-reference/profile-and-governance.md) |
 
 V1 is the default policy engine for new persistent profiles.
-The zero-configuration testnet profile uses Noop, which allows every testnet call and refuses destructive mainnet actions with `policy.engine_required`.
+The zero-configuration testnet profile uses Noop. Noop allows every testnet call except `smart-account multicall`, and refuses that command on testnet and destructive mainnet actions with `policy.engine_required`.
 Quorum and session criteria, rule conditions for collective approval and authenticated sessions, deny because their live views, the required runtime evidence, are absent.
-`smart-account execute` relies on the contract's context rule and does not run wallet policy.
+`smart-account execute` relies on the contract's context rule and evaluates no rule decision.
+Under V1, a matching value rule without `allow_opaque_signing = true` refuses it with `policy.deny.unsizable_value_effect`, and count limits charge it.
 
 ## Key and signing custody
 
@@ -269,7 +271,7 @@ Network checks establish endpoint identity and signature binding and refuse main
 
 | Check | Enforcement and limit |
 | --- | --- |
-| CLI entry | Payment commands refuse a mainnet profile before signing unless policy authority (Allow) or approval authority (RequireApproval) covers the action; the `--build-only`, `--sign-only` and `--submit-only` stages always refuse it. |
+| CLI entry | Payment commands refuse a mainnet profile before signing unless policy authority (Allow) or approval authority (RequireApproval) covers the action; the `--build-only`, `--sign-only`, and `--submit-only` stages always refuse it. |
 | MCP entry | The four classic commit tools and the two x402 payment tools admit mainnet only under policy or approval authority for the action. `stellar_toolset_invoke` admits its exact `stellar_pay` and `stellar_pay_commit` actions under the same authority. Other commit and signing tools refuse mainnet before key access. MPP restricts its flow to testnet. |
 | Submit layer | Ordinary submission refuses a mainnet passphrase or a known mainnet host before decoding or RPC. Authorized submission binds each action to its endpoint, signer, policy, approval, audit state, and window reservation. |
 | Endpoint identity | `getNetwork` must match the configured passphrase before reads used for signing and again before sending. Unsupported protocol responses refuse on mainnet and warn on other networks. |

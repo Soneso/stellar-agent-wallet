@@ -3,27 +3,27 @@
 See [Mainnet configurations and scope](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/getting-started.md#mainnet-configurations-and-scope)
 for build configuration, admitted operations, and exclusions.
 
-The supported Stellar ecosystem protocols, the wallet surface for each, and the deliberate refusals that keep an autonomous agent safe. Every SEP/x402 capability listed here is exposed as an MCP tool on the `stellar-agent-mcp` stdio server. For the wider tool catalog see `./mcp-tools.md`; for keys, signers, and profiles see `./profiles-and-keys.md`.
+The supported Stellar ecosystem protocols, the wallet surface for each, and the deliberate refusals that keep an autonomous agent safe. The `stellar-agent-mcp` stdio server exposes these capabilities as MCP tools, with two exceptions: SEP-10 runs inside the x402 identity gate, and SEP-45 has no tool. For the wider tool catalog see `./mcp-tools.md`; for keys, signers, and profiles see `./profiles-and-keys.md`.
 
 ## Three invariants
 
-- **Privacy-first.** No SEP-9 KYC field is ever transmitted. The audit log records argument key names only, never argument values. Interactive flows are handed back to the operator, never scraped.
-- **Fail-closed.** Validation refuses on any failed check rather than guessing. Unknown discriminants, ambiguous tokens, missing floors, and stale reads are refused before signing.
-- **Never auto-submit untrusted requests.** Inbound requests (a SEP-7 URI, a contract invocation) are parsed into a preview for the operator and policy engine. The wallet does not sign or submit on a dApp's behalf without the policy engine and approval flow.
+- Privacy first. No SEP-9 KYC field is ever transmitted. The audit log records argument key names only, never argument values. Interactive flows are handed back to the operator, never scraped.
+- Fail closed. Validation refuses on any failed check rather than guessing. Unknown discriminants, ambiguous tokens, missing floors, and stale reads are refused before signing.
+- Never auto-submit untrusted requests. Inbound requests (a SEP-7 URI, a contract invocation) are parsed into a preview for the operator and policy engine. The wallet does not sign or submit on a dApp's behalf without the policy engine and approval flow.
 
 The scope table defines mainnet operation admission. Public SEP-43 signing,
 generic SEP-45 and SEP-53 signing, and MPP are excluded on mainnet in every build.
 Wallet entry guards use `network.mainnet_write_forbidden`; library refusals
-retain their namespaced codes. Read-only classification grants no signing
+retain their namespaced codes. MPP refuses with `mpp.network_forbidden`. Read-only classification grants no signing
 or transaction-write authority.
 
 ## Result envelope and conventions
 
-- MCP result envelope: `{ ok, data | error, request_id }`. On success `ok` is true and the payload is in `data`; on failure `error` carries a stable wire code. `stellar_toolset_list` and four DeFi tools return a bare success payload. Every tool on this page uses the envelope for business errors; invalid arguments and a `chain_id` mismatch use the JSON-RPC error channel.
-- `chain_id` is the CAIP-2 chain id (`"stellar:testnet"` or `"stellar:mainnet"`) and is **required** by most tools. SEP-43 `get_address`/`get_network` accept it as optional and fall back to the active profile's chain; the WalletConnect host passes `{}`. (Note: x402 uses the distinct wire-network string `stellar:pubnet` for mainnet in its `network` field; that is not a `chain_id` value.)
+- MCP result envelope: `{ ok, data | error, request_id }`. On success `ok` is true and the payload is in `data`; on failure `error` carries a stable wire code. `stellar_toolset_list` and four DeFi tools return a bare success payload. Every tool on this page uses the envelope for business errors. Arguments that do not match the tool's input schema (a missing or unknown field, or a field of the wrong type) return a tool result with `isError: true` and the text `<tool>: the arguments have a missing field or a field of the wrong type or value`. Arguments that match the schema but fail a value check, and a `chain_id` mismatch, return JSON-RPC error -32602.
+- `chain_id` is the CAIP-2 chain id (`"stellar:testnet"` or `"stellar:mainnet"`) and is **required** by most tools. SEP-43 `get_address`/`get_network` accept it as optional and fall back to the active profile's chain; the WalletConnect host passes `{}`. `stellar_x402_parse_receipt` and the five `stellar_mpp_*` tools take no `chain_id`; the MPP tools refuse it as an unknown field. (Note: x402 uses the distinct wire-network string `stellar:pubnet` for mainnet in its `network` field; that is not a `chain_id` value.)
 - Asset format: `"native"`/`"XLM"`, or `"CODE:GISSUER"`. Amounts are strings, never JSON numbers, encoded per protocol. Classic payment amounts carry a unit, e.g. `"10 XLM"`. An x402 requirement `amount` is an atomic-unit integer string. The SEP-24 `deposit_hint` is a unitless decimal string such as `"100.50"`.
 - A `chain_id` that does not match the active profile is rejected by the dispatch gate as a JSON-RPC-level error before any signing. The x402 payment tools decode and validate `payment_required` first, so an `x402.*` requirement error comes before a chain mismatch.
-- The SEP-43 auth-entry and message verbs and SEP-53 `sign_message` are single-shot. If the policy engine returns `RequireApproval`, the tool is fail-closed with wire code `policy.approval_required_unsupported` (message mentions "single-shot") and **no signature is produced**. The SEP-43 transaction tools approve one payment, path payment, account creation or trustline change in two calls. The first call returns `approval` and signs nothing. After `stellar-agent approve`, repeat the same `transaction_xdr` with `approval_nonce` and `approval_attestation`. Other transaction shapes refuse with `policy.approval_required_unsupported`. The x402 payment tools queue RequireApproval on both networks. Mainnet Allow without proof pays in one call.
+- The SEP-43 auth-entry and message verbs, SEP-53 `sign_message`, and the DeFi tools (`stellar_dex_trade`, `stellar_defindex_vault_deposit`, `stellar_defindex_vault_withdraw`) are single-shot. If the policy engine returns `RequireApproval`, the tool is fail-closed with wire code `policy.approval_required_unsupported` (message mentions "single-shot") and **no signature is produced**. The SEP-43 transaction tools approve one payment, path payment, account creation, or trustline change in two calls. The first call returns `approval` and signs nothing. After `stellar-agent approve`, repeat the same `transaction_xdr` with `approval_nonce` and `approval_attestation`. Other transaction shapes refuse with `policy.approval_required_unsupported`. The x402 payment tools queue RequireApproval on both networks. Mainnet Allow without proof pays in one call.
 
 ## SEP support matrix
 
@@ -33,6 +33,7 @@ or transaction-write authority.
 | SEP-10 | 3.4.1 | Client Web Auth (fetch, 13-point validate, submit) → JWT; ephemeral-key flow; authorized mainnet completion for bound x402 identity authentication | used by the x402 identity gate | n/a |
 | SEP-6 | 0006 | Discovery only, `GET /info` capability set | `stellar_sep6_deposit_info` | yes |
 | SEP-24 | 0024 | Interactive deposit/withdraw URL via `POST .../interactive`; returned for browser hand-off | `stellar_sep24_interactive_url` | no (uses JWT) |
+| SEP-29 | 0029 | Refuse a memo-less payment to a G account whose `config.memo_required` entry is `1` | `stellar_pay`, `stellar_pay_commit`, CLI `pay` | n/a |
 | SEP-43 | 1.2.1 | Wallet signing: address/network/sign tx/sign auth entry/sign message/sign+submit | six tools (below) | mixed |
 | SEP-45 | 0.1.1 | Client Web Auth for contract (C-) accounts (steps 1 to 12); ephemeral + persistent-signer | no workspace consumer; refuses mainnet signing | n/a |
 | SEP-47 | 0047 | Discover SEPs a contract claims via `contractmetav0` `sep` meta | `stellar_sep47_discover` | yes |
@@ -51,7 +52,7 @@ Tool `stellar_sep7_parse_uri`:
 | `uri` | string | yes | the `web+stellar:` URI |
 | `verify_origin` | bool | no (default `true`) | when `true`, fresh `stellar.toml` fetch + ed25519 verify if `origin_domain`+`signature` present; `false` = structural parse, no network I/O |
 
-Preview fields: `operation` (`"tx"`/`"pay"`), parsed operation fields, `callback` (authority host for SSRF inspection), `origin_domain`, `origin_verified`, `signature_status` (`verified`/`failed`/`missing_required`/`absent`), `will_auto_submit` (always `false`), `will_auto_post_callback` (always `false`).
+Preview fields: `operation` (`"tx"` or `"pay"`), parsed operation fields, `callback`, `origin_domain`, `origin_verified`, `signature_status`, `will_auto_submit` (always `false`), and `will_auto_post_callback` (always `false`). `callback` is `null` or `{ authority, is_https, is_private_or_loopback, is_dangerous_scheme, will_auto_post }`. `signature_status` is `verified`, `failed`, `missing_required`, `absent`, or `not_checked`. `not_checked` means `verify_origin` was `false` while `origin_domain` and `signature` were both present.
 
 A URI with any parameter after `signature`, a trailing `&` included, or with a percent-encoded `signature` name, refuses with `sep7.invalid_param_value`; the verified payload therefore covers every parameter the preview shows.
 
@@ -66,15 +67,12 @@ A mismatched SEP-10 challenge passphrase is reported as the public testnet or ma
 
 Ordinary ephemeral authentication refuses a mainnet passphrase before key generation. Mainnet challenge signing requires the authorized completion used by bound x402 identity authentication.
 
-- `auth_with_ephemeral_key` refuses mainnet before generating an ephemeral key with `sep10.mainnet_signing_forbidden`, the ordinary signing entry's refusal of a mainnet passphrase.
-- `sign_challenge_for_test` exists only with the `test-helpers` feature and signs with a caller-supplied key. It refuses mainnet before signing.
-- `prepare_ephemeral_auth` generates the ephemeral key, fetches and validates the challenge, and seals its digest and validated network before authorization. It does not sign.
-- `web_auth_domain_for_endpoint` derives the web-auth domain from the endpoint's host.
+- Ordinary SEP-10 signing refuses a mainnet passphrase with `sep10.mainnet_signing_forbidden` before it generates an ephemeral key.
+- `sep10.mainnet_authorization_refused` reports that the authorized completion refused before submitting a signed challenge.
+- The ordinary identity gate refuses mainnet with `identity.mainnet_signing_forbidden` before it fetches `stellar.toml`.
+- `identity.mainnet_authorization_refused` reports that the bound identity authentication refused before submitting a signed challenge.
 - In the authorized flow, the challenge must name the ephemeral account before message authorization and again before signing.
-- `complete_ephemeral_auth_authorized` consumes the prepared challenge and checks it against the message-use receipt before signing and submitting it. It exists only in builds with the `mainnet-write` feature. `sep10.mainnet_authorization_refused` reports that this completion refused before submitting a signed challenge.
-- The identity gate's ordinary entries, `resolve_and_verify_counterparty` and its `test-helpers` transport seam, refuse mainnet before fetching `stellar.toml` with `identity.mainnet_signing_forbidden`.
-- `resolve_and_verify_counterparty_authorized` takes `MainnetIdentityInputs` and returns `MainnetCounterpartySession`. Its `into_parts` method transfers the session and receipt to the payment caller. `identity.mainnet_authorization_refused` reports that the bound identity authentication refused before submitting a signed challenge.
-- The authorized gate, `MainnetIdentityInputs`, and `MainnetCounterpartySession` exist only in builds with the `mainnet-write` feature.
+- The authorized flow exists only in builds with the `mainnet-write` feature.
 
 ## SEP-6 and SEP-24: anchor deposit/withdraw
 
@@ -88,27 +86,31 @@ Tool `stellar_sep6_deposit_info` (read-only):
 | `anchor_domain` | string | one of these two | resolve `TRANSFER_SERVER` from `stellar.toml`; takes precedence if both given |
 | `transfer_server` | string | one of these two | direct URL; HTTPS + public FQDN required |
 | `asset_code` | string | no | passed as `?asset_code=` |
-| `lang` | string | no | RFC 4646; default `"en"` |
+| `lang` | string | no | RFC 4646; sent only when given |
 
 Tool `stellar_sep24_interactive_url`:
 
 | Arg | Type | Required | Notes |
 |---|---|---|---|
 | `chain_id` | string | yes | CAIP-2 |
-| `anchor_domain` | string | one of these two | resolve `TRANSFER_SERVER_SEP0024`; mutually exclusive with the direct URL |
-| `transfer_server_sep0024` | string | one of these two | direct URL; HTTPS required |
+| `anchor_domain` | string | one of these two | resolve `TRANSFER_SERVER_SEP0024` from `stellar.toml`; takes precedence if both given |
+| `transfer_server_sep0024` | string | one of these two | direct URL; HTTPS + public FQDN required |
 | `operation` | string | yes | `"deposit"` or `"withdraw"` |
 | `asset_code` | string | yes | Stellar asset code |
 | `asset_issuer` | string | no | issuer G-strkey |
 | `account` | string | no | classic, contract, or muxed account id |
 | `deposit_hint` | decimal string | no | maps to the wire param `amount`; positive decimal in `asset_code` units (e.g. `"100.50"`); rejects negatives, scientific notation, multiple/leading/trailing dots, zero, over-precision |
 | `lang` | string | no | RFC 4646 |
-| `claimable_balances_ok` | bool | no | sent on the wire as `claimable_balance_supported` |
+| `claimable_balances_ok` | bool | no | deposit only; sent as `claimable_balance_supported` with the string `"true"` or `"false"` |
 | `jwt` | string | yes | SEP-10 or SEP-45 Bearer JWT from web-auth; never logged |
 
-Returns: `interactive_url` (HTTPS, anchor-hosted), `transaction_id`, `handoff_note`.
+Returns: `interactive_url`, `transaction_id`, `handoff_note`, `will_auto_open` (always `false`), `operation`, and `asset_code`. The wallet returns `interactive_url` as the anchor sent it and checks neither its scheme nor its host.
 
 Both tools do NOT transmit any SEP-9 KYC field. The arg structs have none by design. SEP-6 is structurally incapable of calling `/deposit`, `/withdraw`, `/deposit-exchange`, `/withdraw-exchange`, `/customer` (SEP-12), `/fee`, or `/transaction(s)`. The wallet does not perform SEP-10/45 itself (the caller supplies the opaque JWT) and never opens, scrapes, or follows the interactive URL. Same-domain SSRF bind: the resolved transfer-server host must equal the operator-typed anchor domain or be a subdomain of it; the anchor domain is validated as a public FQDN first.
+
+## SEP-29: memo-required accounts
+
+Before a classic payment is signed, the wallet reads the destination account's `config.memo_required` data entry. A payment without a memo to a G account whose entry is `1` refuses with `validation.memo_required`. A payment with a memo, or to an M destination, reads nothing. A failed read refuses with the read's own code. When a cross-check witness is required, the oracle re-reads the flag, and a different answer refuses with `network.rpc_divergence`. See the `pay` section of `./cli-reference.md` for the stages.
 
 ## SEP-43: Wallet Protocol (signing)
 
@@ -147,7 +149,7 @@ address (W) with `sep43.invalid_xdr` before key access or storing a request.
 
 Every SEP-43 signing tool, the sign-and-submit tool included, refuses a mainnet profile before any key access. This structural refusal carries the canonical `network.mainnet_write_forbidden` code shared with every other signing surface, not a `sep43.*` code.
 
-`sign_message` refusals before key load (an overlaid or out-of-scope signer, an unavailable audit writer) carry `profile.*` and `audit.*` codes, not `sep43.*` codes.
+`sign_message` refusals before key load (an overlaid or out-of-scope signer, an unusable signer binding, or an unavailable audit writer) carry `profile.*`, `auth.*`, and `audit.*` codes, not `sep43.*` codes. An enrolled-signer mismatch at key load also keeps its `auth.*` code.
 
 SEP-43 opens no HTTP/HTTPS connections of its own (interop is stdio via MCP); `sign_and_submit` is the only path that submits, via the profile-configured RPC. The two MCP transaction tools and the auth-entry tool read accounts over that RPC for their payment decision.
 
@@ -161,7 +163,7 @@ Steps 1 through 12 of the 13-point validation are enforced; step 13 (footprint `
 
 Discovers the SEPs a contract claims to implement by reading the `sep` entry of its `contractmetav0` metadata (comma-separated, leading zeros stripped, e.g. `"41,40"`).
 
-Tool `stellar_sep47_discover` (read-only): args `contract_id` (C-strkey, required), `chain_id` (required, resolves the RPC endpoint). Returns `{ supported_seps: ["41", "40"] }`; returns `{ supported_seps: [] }` (not an error) when the contract has no `contractmetav0` section or no `sep` entry. Errors on invalid C-strkey, unreachable RPC, or unfetchable WASM. Submits nothing; modifies no chain state.
+Tool `stellar_sep47_discover` (read-only): args `contract_id` (C-strkey, required), `chain_id` (required, resolves the RPC endpoint). Returns `{ supported_seps: ["40", "41"] }`, sorted numerically without duplicates; returns `{ supported_seps: [] }` (not an error) when the contract has no `contractmetav0` section or no `sep` entry. Errors on invalid C-strkey, unreachable RPC, or unfetchable WASM. Submits nothing; modifies no chain state.
 
 ## SEP-48: Contract Interface Specification
 
@@ -200,7 +202,7 @@ SEP-43 `signMessage` signs the same prefixed digest, so both tools return the sa
 
 Payer-side construction and signing of a `PAYMENT-SIGNATURE` payload for the x402 v2 Exact Stellar scheme, wire-compatible with the published `@x402/stellar` package. The wallet is the **payer**; the MCP host performs the actual HTTP request/retry to the facilitator.
 
-`payment_required` may be a base64-encoded `PAYMENT-REQUIRED` header value or a raw JSON `PaymentRequirements` object (the tool tries base64-decode first, then raw JSON). Pass ONE selected `accepts[]` element, not a full 402 envelope. RPC URL and network passphrase always come from the active profile, never from the input.
+`payment_required` may be a base64-encoded `PAYMENT-REQUIRED` header value or a raw JSON `PaymentRequirements` object (the tool tries base64-decode first, then raw JSON). Pass ONE selected `accepts[]` element, not a full 402 envelope. Its fields are camelCase, and `areFeesSponsored` sits inside `extra`: `{"scheme": "exact", "network": "stellar:testnet", "asset": "<C-strkey>", "amount": "10000000", "payTo": "<G, C, M, or W strkey>", "maxTimeoutSeconds": 60, "extra": {"areFeesSponsored": true}}`. RPC URL and network passphrase always come from the active profile, never from the input.
 
 ### `stellar_x402_create_payment`
 
@@ -213,7 +215,7 @@ Payer-side construction and signing of a `PAYMENT-SIGNATURE` payload for the x40
 | `approval_nonce` | string | no | optional in the schema; omit it with `approval_attestation` for the queueing call; under RequireApproval, supply both for call 2 |
 | `approval_attestation` | string | no | optional in the schema; under RequireApproval, the repeated call requires the CLI-issued attestation alongside its approval nonce |
 
-Testnet flow: validate the requirements and check W eligibility, then admit the payment through the policy and the spending window. Before the signer load, the cross-check rule decides whether the payment needs the witness. It uses the amount in the asset's atomic units and the profile's thresholds and oracle. A required witness builds the oracle client without a request. Check the endpoint identity with `getNetwork`, the first request on the payment's primary client. Build the SAC transfer, simulate, and check restoration, fees, exactly one result, and the simulated authorization. When the witness is required, the oracle simulates the same unsigned transfer and the answers are compared. Read `getHealth` and check the ledger bounds. Sign the auth entry and write the `x402_payment_authorized` audit row, which records the signature expiration ledger. Re-simulate, check restoration, fees, the re-simulated authorization, and the ledger bounds, then serialize. The re-simulation sends the signed authorization to the profile's RPC, so the row is written first; if it cannot be written, the tool answers the `audit.*` code and the signature never leaves the wallet. A failure after the row adds an `x402_authorization_withheld` row with the same request id. Returns `{ paymentSignature, payer, asset, amount, payTo, network, cross_check }`. The `paymentSignature` is the standard-base64 `PAYMENT-SIGNATURE` header value, and `asset` is the SAC C-strkey. The `amount` is the atomic-unit string from `PaymentRequirements`, and `cross_check` is the witness outcome. The `x402_payment_authorized` row carries a passed witness when the payment required one. Errors carry per-variant codes `x402.<reason>` (for example `x402.invalid_payment_required`, `x402.unsupported_scheme`, `x402.rpc_simulate_failed`, `x402.unexpected_auth_entries`, `x402.transmit_gate_refused`) in the standard `{ok:false, error:{code, message}, request_id}` envelope with `is_error` set. A witness refusal keeps its own code: `simulation.divergence`, `network.witness_unavailable`, `network.rpc_credential_refused`, or the oracle credential read's keyring code (`auth.keyring_*`). Header fields named in an error are escaped and cut at 200 characters. A header that does not decode reports the JSON error class and position, not its values.
+Testnet flow: validate the requirements and check W eligibility, then evaluate the policy. Before the signer load, the cross-check rule decides whether the payment needs the witness. It uses the amount in the asset's atomic units and the profile's thresholds and oracle. A required witness builds the oracle client without a request. After the signer load, the spending window admits the payment. Check the endpoint identity with `getNetwork`, the first request on the payment's primary client. Build the SAC transfer, simulate, and check restoration, fees, exactly one result, and the simulated authorization. When the witness is required, the oracle simulates the same unsigned transfer and the answers are compared. Read `getHealth` and check the ledger bounds. Sign the auth entry and write the `x402_payment_authorized` audit row, which records the signature expiration ledger. Re-simulate, check restoration, fees, the re-simulated authorization, and the ledger bounds, then serialize. The re-simulation sends the signed authorization to the profile's RPC, so the row is written first; if it cannot be written, the tool answers the `audit.*` code and the signature never leaves the wallet. A failure after the row adds an `x402_authorization_withheld` row with the same request id. Returns `{ paymentSignature, payer, asset, amount, payTo, network, cross_check }`. The `paymentSignature` is the standard-base64 `PAYMENT-SIGNATURE` header value, and `asset` is the SAC C-strkey. The `amount` is the atomic-unit string from `PaymentRequirements`, and `cross_check` is the witness outcome. The `x402_payment_authorized` row carries a passed witness when the payment required one. Errors carry per-variant codes `x402.<reason>` (for example `x402.invalid_payment_required`, `x402.unsupported_scheme`, `x402.rpc_simulate_failed`, `x402.unexpected_auth_entries`, `x402.transmit_gate_refused`) in the standard `{ok:false, error:{code, message}, request_id}` envelope with `isError` set. A witness refusal keeps its own code: `simulation.divergence`, `network.witness_unavailable`, `network.rpc_credential_refused`, or the oracle credential read's keyring code (`auth.keyring_*`). Header fields named in an error are escaped and cut at 200 characters. A header that does not decode reports the JSON error class and position, not its values.
 
 Mainnet calls, on an admitted server: call 1 omits both approval arguments and names the payment with `business_id`. A call without an id refuses with `validation.business_id_required`. Supplying only one returns `policy.approval_required`. Call 1 validates the requirements and `chain_id`, loads the enrolled signer, and evaluates local policy. A matching `minimum_reserve` or `balance_floor` reads the enrolled payer first, and a breach refuses before any approval is stored. Under an Allow rule, call 1 checks startup freshness and pays as call 2 does, without an approval. Under RequireApproval, call 1 reads enrollment and local policy state. It checks W eligibility with `getNetwork`, sends no simulation or SEP-10 request, and performs no signing. It returns `data.approval` without a payment payload, with `approval_nonce`, `profile`, `chain_id`, `expires_at_unix_ms`, `reason`, `endpoint_host`, `signer`, `summary` (`payTo`, `amount`, `asset`), and `instructions`.
 
@@ -244,9 +246,9 @@ Runs the SEP-10 counterparty-identity gate BEFORE building the payment. Any iden
 | `approval_nonce` | string | no | as for `stellar_x402_create_payment` |
 | `approval_attestation` | string | no | as for `stellar_x402_create_payment` |
 
-Returns `{ paymentSignature, authorization, payer, asset, amount, payTo, home_domain, network, payto_anchored, cross_check }`. A witness refusal answers its own code, as for `stellar_x402_create_payment`; every other build failure answers `x402.payment_build_failed`. `authorization` is the `Bearer <jwt>` value for the HTTP `Authorization:` header. The JWT is an HTTP-layer companion only: the Soroban transaction XDR, the SAC auth entry, and the payment memo are NEVER mutated to carry it. The SEP-10 ephemeral key is unfunded, fresh per call, not persisted, and not the payment funding signer. `payto_anchored` is a display signal (`"anchored"`/`"not_anchored"`/`"unknown"`) of whether `payTo` appears in the verified domain's `stellar.toml` `ACCOUNTS` list; the tool does NOT hard-deny on `"not_anchored"`.
+Returns `{ paymentSignature, authorization, payer, asset, amount, payTo, home_domain, network, payto_anchored, cross_check }`. Approval, audit, endpoint, witness, and signer-load refusals answer their own codes, and so does `x402.muxed_contract_protocol_unsupported`. Any other build failure answers `x402.payment_build_failed`. `authorization` is the `Bearer <jwt>` value for the HTTP `Authorization:` header. The JWT is an HTTP-layer companion only: the Soroban transaction XDR, the SAC auth entry, and the payment memo are NEVER mutated to carry it. The SEP-10 ephemeral key is unfunded, fresh per call, not persisted, and not the payment funding signer. `payto_anchored` is a display signal (`"anchored"`/`"not_anchored"`/`"unknown"`) of whether `payTo` appears in the verified domain's `stellar.toml` `ACCOUNTS` list; the tool does NOT hard-deny on `"not_anchored"`.
 
-On an admitted mainnet server, the tool runs the same calls as `stellar_x402_create_payment`: one under Allow, two under RequireApproval. Call 1 validates `home_domain` as a lowercase LDH name before the approval names it; another value refuses with `identity.home_domain_invalid`. The authenticated approval subject binds the payment intent digest and home domain. Changing the home domain requires a matching approval, so keep the approved home domain unchanged. The signing call verifies any approval before the identity exchange. It prepares and validates the SEP-10 challenge, consumes its message authorization, and signs and submits the challenge. The returned message-use receipt continues into the payment, which then runs the endpoint check, witness, and payer signature. Authorization refusals identify the withheld payment payload. Policy, endpoint, and witness errors keep their codes. Other payment-build failures use `x402.payment_build_failed`. The tool maps `identity.mainnet_signing_forbidden` and `identity.mainnet_authorization_refused` to `network.mainnet_write_forbidden` and `network.mainnet_authorization_refused`, respectively.
+On an admitted mainnet server, the tool runs the same calls as `stellar_x402_create_payment`: one under Allow, two under RequireApproval. Call 1 validates `home_domain` as a lowercase LDH name before the approval names it; another value refuses with `identity.home_domain_invalid`. The authenticated approval subject binds the payment intent digest and home domain. Changing the home domain requires a matching approval, so keep the approved home domain unchanged. The signing call verifies any approval before the identity exchange. It prepares and validates the SEP-10 challenge, consumes its message authorization, and signs and submits the challenge. The returned message-use receipt continues into the payment, which then runs the endpoint check, witness, and payer signature. Authorization refusals identify the withheld payment payload. Policy, audit, endpoint, and witness errors keep their codes, and so does `x402.muxed_contract_protocol_unsupported`. Other payment-build failures use `x402.payment_build_failed`. The tool maps `identity.mainnet_signing_forbidden` and `identity.mainnet_authorization_refused` to `network.mainnet_write_forbidden` and `network.mainnet_authorization_refused`, respectively.
 
 A refused challenge or token answer reports the HTTP method, the status, and the web-auth endpoint's host; the wallet does not read the answer body. A stellar.toml syntax error reports its line and column. The token must be a compact JWT of at most 8192 bytes with base64url characters in every segment; any other token refuses.
 
@@ -256,10 +258,10 @@ Read-only. Arg `payment_response` (base64 `PAYMENT-RESPONSE` header value or raw
 
 ### x402 constraints
 
-Both tools preserve G, C, M and W payees in full. W requires protocol 30 or
+Both tools preserve G, C, M, and W payees in full. W requires protocol 30 or
 later and a facilitator that accepts W payees. The facilitator decides which
 payee kinds it accepts; the wallet does not check the facilitator's package version.
-The W check runs before records, approvals, spending admission and SEP-10.
+The W check runs before records, approvals, spending admission, and SEP-10.
 Endpoint identity and the mainnet range gate precede it. Simulation decides
 whether the asset accepts a muxed contract payee.
 Mainnet M and eligible W follow Allow or the two-call RequireApproval flow.
@@ -268,7 +270,7 @@ Testnet RequireApproval queues every supported address form. An unlisted
 excess requests per-payment approval and counts in full when approved;
 testnet excess denies. Hard caps, rate limits, and total allocations still
 apply. M anchoring compares its base G with
-SEP-1 `ACCOUNTS`; C, W and empty account lists give `unknown`.
+SEP-1 `ACCOUNTS`; C, W, and empty account lists give `unknown`.
 
 - Payer/client only, no payee or facilitator logic.
 - Stellar only, no EVM or other chains.
@@ -282,25 +284,6 @@ SEP-1 `ACCOUNTS`; C, W and empty account lists give `unknown`.
 - Both simulations' `minResourceFee` lies between 1 and 10,000,000 stroops, and the embedded resource fee lies between zero and that minimum. The ceiling is a local sanity bound, separate from facilitator fee policy.
 - A restore preamble, or archived entries in the transaction data, in either simulation refuses. On this path they come from an archived asset contract instance or the archived balance of a contract-address recipient. The wallet has no restore path; a restoration made elsewhere unblocks the payment. The reference client checks only the preamble.
 - Before signing, `create_payment` refuses a simulation whose authorization is not one unsigned legacy `Address` entry for the payer, with a root invocation equal to the built SAC `transfer` and no nested calls. After the signed re-simulation, it refuses authorization entries other than the signed entry, and a missing or undecodable result.
-
-## MPP sponsored Stellar charges
-
-MPP is a separate Payment challenge/credential protocol, validated against the
-released `@stellar/mpp` 0.7.1 behavior. The wallet supports only
-`method="stellar"`, `intent="charge"`, a classic G-account payer, testnet, and
-sponsored pull settlement. It uses one SEP-41 transfer authorization and SEP-43
-Ed25519 signing.
-
-Flow: prepare with the exact HTTP or native MCP request context, wait for
-operator approval when required, commit once, then give the returned credential
-to the trusted host. The host sends the exact bound paid request over TLS and the
-server sponsors/submits. Record its receipt separately and reconcile the final
-transaction for ledger proof.
-
-Unsupported: mainnet, unsponsored, push, smart-account payer, automatic
-transport/retry, channels, and toolset routing. The wallet never sends the paid
-request or submits the server-sponsored transaction. The configured RPC sees
-the signed authorization during mandatory re-simulation.
 
 ### x402 owner approval
 
@@ -335,11 +318,38 @@ Owner approval is required only when the policy requires it.
 Before testnet dispatch, a complete approval pair answers `policy.approval_required` for invalid network,
 asset, amount, or payee terms, including a W payee on an unsupported protocol.
 A later protocol refusal keeps `x402.muxed_contract_protocol_unsupported`.
-Without approval arguments, an address mismatch under RequireApproval answers
-`policy.approval_required_unsupported`. Nothing is queued or signed.
+On testnet, without approval arguments, an address mismatch under RequireApproval
+answers `policy.approval_required_unsupported`. Nothing is queued or signed.
+On mainnet, an address mismatch refuses with `x402.invalid_payment_required`
+before the policy decision.
 
 The CLI labels spent x402 approvals with `payment digest`.
 On mainnet, this hashes the final envelope's base64 text.
 On testnet, this hashes the XDR vector of signed authorization entries.
 Testnet spends approval inside the transmit gate before its authorized audit row and signed RPC request.
 Mainnet retains its consumption after payload release authorization.
+
+## MPP sponsored Stellar charges
+
+MPP is a separate Payment challenge/credential protocol, validated against the
+released `@stellar/mpp` 0.7.1 behavior. The wallet supports only
+`method="stellar"`, `intent="charge"`, a classic G-account payer, testnet, and
+sponsored pull settlement. It uses one SEP-41 transfer authorization and SEP-43
+Ed25519 signing.
+
+The surfaces are `stellar-agent mpp` and five MCP tools:
+`stellar_mpp_charge_prepare`, `stellar_mpp_charge_commit`,
+`stellar_mpp_record_receipt`, `stellar_mpp_reconcile_transaction`, and
+`stellar_mpp_authorization_status`. Each tool refuses a profile that is not on
+testnet with `mpp.network_forbidden`.
+
+Flow: prepare with the exact HTTP or native MCP request context, wait for
+operator approval when required, commit once, then give the returned credential
+to the trusted host. The host sends the exact bound paid request over TLS and the
+server sponsors/submits. Record its receipt separately and reconcile the final
+transaction for ledger proof.
+
+Unsupported: mainnet, unsponsored, push, smart-account payer, automatic
+transport/retry, channels, and toolset routing. The wallet never sends the paid
+request or submits the server-sponsored transaction. The configured RPC sees
+the signed authorization during mandatory re-simulation.

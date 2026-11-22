@@ -59,7 +59,7 @@ profile is a testnet profile throughout. The setup follows
 16. Approve with the CLI: `stellar-agent approve --id <approval_nonce> --profile default`.
 17. Commit through the server: the `stellar_pay_commit` call of the approved payment.
 18. Stop the server, and wait until no `stellar-agent-mcp` process remains.
-19. Pay with the CLI: a 10 XLM `stellar-agent pay` from the source to the destination.
+19. Pay with the CLI: `stellar-agent pay <destination> "10 XLM" --source <source> --secret-env WALLET_SK --profile default`.
 20. Start the server from the client.
 21. Read and commit through the server: a `stellar_balances` call, then a 10 XLM `stellar_pay` and its `stellar_pay_commit`.
 22. Stop the server, and wait until no `stellar-agent-mcp` process remains.
