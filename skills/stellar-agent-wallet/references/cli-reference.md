@@ -196,10 +196,11 @@ entry refusal with the prerequisite named. Resolver refusal uses
 `network.mainnet_authorization_refused`. Its core message is
 `the mainnet write was refused before submission; nothing was sent`.
 
-`network.mainnet_keyring_backend_unsupported` means the process uses a
-headless keyring backend (`STELLAR_AGENT_KEYRING_BACKEND` is set). Mainnet
-readiness and `profile enable-mainnet` refuse it before any keyring entry is
-read; mainnet needs the platform keyring. Testnet is unaffected.
+`network.mainnet_keyring_backend_unsupported` means
+`STELLAR_AGENT_KEYRING_BACKEND` selects a backend other than the platform
+keyring. Mainnet readiness and `profile enable-mainnet` refuse it before the
+keyring initializes; mainnet needs the platform keyring. Testnet is
+unaffected.
 
 CLI messages distinguish the withheld result:
 
@@ -366,7 +367,7 @@ Memo flags are a mutually exclusive group (at most one).
 
 Under `policy.engine = "v1"` `pay` evaluates operator policy before signing. The staged `--sign-only` / `--submit-only` stages gate too: they decode the supplied envelope and match rules under the `stellar_pay_commit` tool name, and deny `policy.deny.unsizable_value_effect` on an envelope the decoder cannot size unless the matched rule sets `allow_opaque_signing = true`. A staged envelope holding one `transfer(Account, Contract, I128)` invocation is a payment, never an unsizable envelope: it refuses before the keyring and any request, also under `allow_opaque_signing = true`. Without a valid `ASSET` the code is `validation.contract_payment_invalid`. Otherwise it is `validation.contract_payment_memo_unsupported` when the envelope carries a memo, `validation.contract_payment_unavailable` once proven for `ASSET`, and `validation.contract_payment_invalid` when not proven.
 
-A C contract destination refuses in the full pipeline and `--build-only` with `validation.contract_payment_unavailable` ("Contract payments are not available on this payment surface."), or with `validation.contract_payment_memo_unsupported` when any memo flag is set. On mainnet the mode refusal of `--build-only`, `--sign-only` and `--submit-only` and the mainnet-write feature refusal come first; the contract refusal follows them and precedes the keyring and any request.
+A C contract or W muxed contract destination refuses in the full pipeline and `--build-only` with `validation.contract_payment_unavailable` ("Contract payments are not available on this payment surface."), or with `validation.contract_payment_memo_unsupported` when any memo flag is set. On mainnet the mode refusal of `--build-only`, `--sign-only` and `--submit-only` and the mainnet-write feature refusal come first; the contract refusal follows them and precedes the keyring and any request.
 
 `--submit-only` runs the endpoint identity check before the policy gate and before the audit-key pre-flight, on the client that later reconciles, reads the gate's account views, and sends. An `--rpc-url` pointing at a different network than `--network` is therefore refused early. The check reads the endpoint's protocol version too and applies the same protocol rule as the submit layer, under its own pre-send budget; the submission then starts a fresh one. It also requires an already-signed envelope: handing it the unsigned XDR that `--build-only` emitted is refused with `network.envelope_unsigned` before anything is sent. `claim --submit-only` behaves the same way.
 
@@ -1079,6 +1080,7 @@ Exits `1` on refusal:
 - `profile.enable_mainnet_profile_flag_required`: supply `--profile`.
 - `profile.enable_mainnet_default_refused`: select a dedicated profile.
 - `profile.enable_mainnet_not_mainnet`: the selected chain is testnet.
+- `network.mainnet_keyring_backend_unsupported`: `STELLAR_AGENT_KEYRING_BACKEND` selects a backend other than the platform keyring.
 - `profile.enable_mainnet_precondition`: a named precondition or effect failed.
 - `profile.enable_mainnet_nonce_exists`: rerun with `--rotate` to replace the nonce.
 - `policy.pin_absent`: the installation holds a nonce but no pin; see the recovery above.
@@ -1572,7 +1574,7 @@ A `pruned_prefix` warning reports `first_file`, the oldest file walked, and
 entry and is authenticated when an audit key is supplied. Verification checks
 every retained entry and bridge, and the warning leaves the verdict successful.
 
-`outbox_pending` counts complete queued consent, halt, and resume lines. With `--profile` and the profile's log path, verification checks the keyring commitment under the outbox lock after the chain walk. A missing or changed committed prefix, or a complete line past it, fails with `audit.outbox_rows_missing`; a held lock fails with `audit.outbox_busy`. Verification authenticates tagged rows, owner state, and both evidence files under the stored key. An unusable row fails with `audit.outbox_unusable`. Unusable evidence fails with `audit.outbox_evidence_unusable`. The outbox lock is taken through the carrier record, so the check also fails with `audit.carrier_replaced`, `audit.carriers_unbound` or `audit.carrier_identity_unavailable` at the head of the detail, and with `audit.outbox_rows_missing` when the retired generation's commitment changed. Under owner state, a dropped tail of queued rows that carry no reference, such as halt and resume rows, passes this check. Without a profile, no commitment is checked. The separate count inspection can report `outbox_torn_tail`, `outbox_unparseable`, or `outbox_unreadable` warnings.
+`outbox_pending` counts complete queued consent, halt, and resume lines. With `--profile` and the profile's log path, verification checks the keyring commitment under the outbox lock after the chain walk. A missing or changed committed prefix, or a complete line past it, fails with `audit.outbox_rows_missing`; a held lock fails with `audit.outbox_busy`. Verification authenticates tagged rows, owner state, and both evidence files under the stored key. An unusable row fails with `audit.outbox_unusable`. Unusable evidence fails with `audit.outbox_evidence_unusable`. The outbox lock is taken through the carrier record, so the check also fails with `audit.carrier_replaced`, `audit.carriers_unbound`, or `audit.carrier_identity_unavailable`. It fails with `audit.outbox_rows_missing` when the retired generation's commitment changed. Under owner state, a dropped tail of queued rows that carry no reference, such as halt and resume rows, passes this check. Without a profile, no commitment is checked. The separate count inspection can report `outbox_torn_tail`, `outbox_unparseable`, or `outbox_unreadable` warnings.
 
 An `outbox_loss_acknowledged` warning names each loss acknowledgement's file, line, `expected_rows`, and `found_rows`. It leaves the chain verdict unchanged.
 

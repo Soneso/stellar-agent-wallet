@@ -144,13 +144,15 @@ reads as `profile_resource_unloadable`. Account enumeration skips that profile.
 
 On startup the process, in order:
 
-1. Parses the command line, resolves the profile name (`--profile`, then
+1. Applies process-isolation hardening on Linux (`PR_SET_DUMPABLE 0`,
+   `PR_SET_NO_NEW_PRIVS 1`) on the initial thread before spawning any other
+   thread, so every thread of the server process carries both. On macOS and
+   Windows it relies on the platform keyring's per-application access model
+   and operator policy instead.
+2. Parses the command line, resolves the profile name (`--profile`, then
    `STELLAR_AGENT_PROFILE`, then `default`), and validates that the name is
-   usable as a path component. An unrecognised argument or an unusable name is
+   usable as a path component. An unrecognized argument or an unusable name is
    refused here, before any of the steps below run.
-2. Applies process-isolation hardening on Linux (`PR_SET_DUMPABLE 0`,
-   `PR_SET_NO_NEW_PRIVS 1`). On macOS and Windows it relies on the platform
-   keyring's per-application access model and operator policy instead.
 3. Installs the redacting log subscriber on `stderr`.
 4. Initialises the platform keyring store. If the platform has no supported
    keyring backend, it logs a warning and continues: the read-only and simulate
@@ -931,9 +933,9 @@ For `stellar_pay` and `stellar_pay_commit`:
 | `amount` | Use `"10 XLM"` for native or the exact, case-sensitive asset code for issued assets, such as `"10.5 USDC"` with `USDC:<issuer>`. |
 | `amount_in_stroops` | Raw base units without a unit label; mutually exclusive with `amount`. |
 
-A C contract destination refuses with `validation.contract_payment_unavailable`
-before any request, approval, or nonce; with a memo it refuses with
-`validation.contract_payment_memo_unsupported`. A commit envelope holding one
+A C contract or W muxed contract destination refuses with
+`validation.contract_payment_unavailable` before any request, approval, or
+nonce; with a memo it refuses with `validation.contract_payment_memo_unsupported`. A commit envelope holding one
 `transfer(Account, Contract, I128)` invocation is a payment, not an unknown
 envelope. Without a valid `asset` argument it refuses with
 `validation.contract_payment_invalid`. Otherwise it refuses with

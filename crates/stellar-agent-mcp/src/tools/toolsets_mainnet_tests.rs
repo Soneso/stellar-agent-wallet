@@ -495,6 +495,118 @@ async fn mainnet_refusals_precede_the_contract_payment_refusal() {
     }
 }
 
+/// On an admitted mainnet profile both toolset payment actions refuse a W
+/// (muxed contract) recipient with and without a memo, after admission and
+/// before the outer gate, any approval, record, nonce read, or send.
+#[tokio::test]
+#[serial_test::serial(keyring, mainnet_clock)]
+#[serial_test::serial]
+async fn public_muxed_contract_payment_refuses_after_mainnet_admission() {
+    let run = Run::new("allow", "allow", &["propose-transaction", "sign-payment"]).await;
+    let destination =
+        stellar_agent_test_support::xdr_fixtures::muxed_contract_address().to_string();
+    let nonce_reads = run.f.nonce_reads.load(Ordering::SeqCst);
+    for (with_memo, expected) in [
+        (false, "\"validation.contract_payment_unavailable\""),
+        (true, "\"validation.contract_payment_memo_unsupported\""),
+    ] {
+        let mut prepare = Tool::Pay.prepare_args(&run.f);
+        prepare["destination"] = destination.clone().into();
+        if with_memo {
+            prepare["memo_text"] = "memo".into();
+        }
+        let mut commit = prepare.clone();
+        commit["nonce"] = "A".repeat(64).into();
+        commit["expires_at_unix_ms"] = 9_999_999_999_u64.into();
+        for (action, presented) in [("stellar_pay", prepare), ("stellar_pay_commit", commit)] {
+            let code = match run
+                .f
+                .server
+                .call_stellar_toolset_invoke(StellarToolsetInvokeArgs {
+                    toolset: TOOLSET.to_owned(),
+                    action: action.to_owned(),
+                    chain_id: Some("stellar:mainnet".to_owned()),
+                    args: presented,
+                })
+                .await
+            {
+                Ok(result) => wire(&result)["error"]["code"].to_string(),
+                Err(error) => format!("protocol error: {}", error.message),
+            };
+            assert_eq!(code, expected, "{action}, with_memo={with_memo}");
+        }
+    }
+    assert!(run.pending().is_empty(), "nothing is queued");
+    assert!(run.control.sent().is_empty(), "nothing is sent");
+    assert!(authorizations(&run.f).is_empty(), "no authorization");
+    assert_eq!(run.f.nonce_reads.load(Ordering::SeqCst), nonce_reads);
+}
+
+/// A mainnet server that is not admitted, or whose admission is stale,
+/// answers a W recipient with its mainnet refusal, not the contract code, on
+/// the toolset route and on direct commit.
+#[tokio::test]
+#[serial_test::serial(keyring, mainnet_clock)]
+#[serial_test::serial]
+async fn mainnet_refusals_precede_the_muxed_contract_payment_refusal() {
+    let destination =
+        stellar_agent_test_support::xdr_fixtures::muxed_contract_address().to_string();
+    for (case, expected) in [
+        (
+            "not admitted",
+            "network.mainnet_write_forbidden: mainnet writes require verified enablement",
+        ),
+        ("stale", "enablement or policy changed, restart the server"),
+    ] {
+        let mut run = Run::new("allow", "allow", &["propose-transaction", "sign-payment"]).await;
+        if case == "not admitted" {
+            run.f.server.enablement = None;
+        } else {
+            super::common::tests::mainnet::put(
+                &stellar_agent_core::profile::schema::mainnet_enablement_entry_ref(
+                    &run.f.server.profile.policy_window_state_key_id,
+                ),
+                "rotated-installation",
+            );
+        }
+        let mut commit = Tool::Pay.prepare_args(&run.f);
+        commit["destination"] = destination.clone().into();
+        commit["nonce"] = "A".repeat(64).into();
+        commit["expires_at_unix_ms"] = 9_999_999_999_u64.into();
+        let toolset = run
+            .f
+            .server
+            .call_stellar_toolset_invoke(StellarToolsetInvokeArgs {
+                toolset: TOOLSET.to_owned(),
+                action: "stellar_pay_commit".to_owned(),
+                chain_id: Some("stellar:mainnet".to_owned()),
+                args: commit.clone(),
+            })
+            .await;
+        commit["chain_id"] = "stellar:mainnet".into();
+        let direct = run
+            .f
+            .server
+            .call_stellar_pay_commit(serde_json::from_value(commit).unwrap())
+            .await;
+        for (route, result) in [("toolset", toolset), ("direct commit", direct)] {
+            let refusal = match result {
+                Ok(result) => {
+                    let body = wire(&result);
+                    format!("{} {}", body["error"]["code"], body["error"]["message"])
+                }
+                Err(error) => format!("protocol error: {}", error.message),
+            };
+            assert_eq!(
+                refusal,
+                format!("\"network.mainnet_write_forbidden\" \"{expected}\""),
+                "{case}, {route}"
+            );
+        }
+        assert!(run.control.sent().is_empty(), "{case}: nothing is sent");
+    }
+}
+
 /// A toolset payment commit on mainnet keeps the commit floor rule: a floor
 /// on `stellar_pay` alone refuses the commit with `account.unread`, nothing
 /// is sent or minted; equal floors on both names commit and submit once.

@@ -80,6 +80,23 @@ const NATIVE_RESERVE_STROOPS: i128 = 10_000_000;
 /// The preset that applies when the operator names none: the first preset.
 pub const DEFAULT_PRESET: &str = PRESETS[0].name;
 
+/// Allocation rule for `total_budget` across policy versions.
+pub const TOTAL_BUDGET_ALLOCATION_RULE: &str = "Signing identical version 1 bytes keeps the \
+    allocation; every signing of a version 2 body gives it a new sequence, a new digest, and a \
+    new allocation.";
+
+/// States the `total_budget` allocation rule for `policy_version`.
+fn total_budget_allocation_note(policy_version: Option<i64>) -> &'static str {
+    match policy_version {
+        Some(1) => "Signing identical version 1 bytes keeps its total_budget allocation.",
+        Some(2) => {
+            "Every signing of a version 2 body gives it a new sequence, a new digest, and a new \
+             total_budget allocation."
+        }
+        _ => TOTAL_BUDGET_ALLOCATION_RULE,
+    }
+}
+
 const MAINNET_CHAIN: &str = "stellar:mainnet";
 
 /// The rounding step of the floor: 0.1 XLM.
@@ -1597,8 +1614,8 @@ pub struct ToolLimits {
     pub period_caps: Vec<PeriodCap>,
     /// Every rate limit of the rule, shortest window first.
     pub rate_caps: Vec<RateCap>,
-    /// The non-renewing total of the signed policy digest. The same digest
-    /// keeps its charge; a new sequence changes the body digest.
+    /// The non-renewing total of the signed policy digest; see
+    /// `TOTAL_BUDGET_ALLOCATION_RULE`.
     pub total_budget: Option<String>,
     /// The amount above which a payment requests approval.
     pub approval_above: Option<String>,
@@ -1749,8 +1766,8 @@ pub struct AssetLimits {
     pub unlisted_largest_payment: Agreed<String>,
     /// Every window any tool caps, shortest first.
     pub period_caps: Vec<AgreedPeriodCap>,
-    /// The non-renewing total of the signed policy digest. The same digest
-    /// keeps its charge; a new sequence changes the body digest.
+    /// The non-renewing total of the signed policy digest; see
+    /// `TOTAL_BUDGET_ALLOCATION_RULE`.
     pub total_budget: Agreed<String>,
     /// The amount above which a payment requests approval.
     pub approval_above: Agreed<String>,
@@ -3453,6 +3470,7 @@ pub fn summarize(
         .partition(|tool| effective(&rules, tool, chain).is_some());
 
     let unlisted_exhaustion = Agreed::of(exhaustion);
+    let policy_version = body.get("version").and_then(Item::as_integer);
     let mut notes = vec![
         "Caps use rolling windows: 1d covers the last 86,400 seconds and 1w the last 604,800 seconds."
             .to_owned(),
@@ -3464,9 +3482,7 @@ pub fn summarize(
             "A payment beyond an exhausted cap, total budget, or unlisted budget is denied."
         }
         .to_owned(),
-        "Signing the same policy body again keeps its total_budget allocation; a different \
-         digest starts another."
-            .to_owned(),
+        total_budget_allocation_note(policy_version).to_owned(),
     ];
     let floor_free: Vec<&str> = x402_floors
         .iter()
@@ -3502,7 +3518,7 @@ pub fn summarize(
 
     SpendingSummary {
         authority_status: authority,
-        policy_version: body.get("version").and_then(Item::as_integer),
+        policy_version,
         sequence: body.get("sequence").and_then(Item::as_integer),
         limits,
         unlisted_exhaustion,
@@ -6185,8 +6201,8 @@ mod tests {
         let summary = summary_of(&policy_body(PROFILE, &derived("api-day", false, true)));
         for note in [
             "Rate limits count every tool in one shared bucket per window.",
-            "Signing the same policy body again keeps its total_budget allocation; a different \
-             digest starts another.",
+            "Every signing of a version 2 body gives it a new sequence, a new digest, and a new \
+             total_budget allocation.",
             "Caps use rolling windows: 1d covers the last 86,400 seconds and 1w the last 604,800 seconds.",
             "A payment beyond an exhausted cap or total budget is denied; one beyond the \
              unlisted budget needs a per-payment approval.",

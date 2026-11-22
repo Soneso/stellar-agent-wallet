@@ -403,3 +403,32 @@ fn init_once_per_route() {
         );
     }
 }
+
+#[test]
+#[serial]
+fn server_hardening_precedes_runtime() {
+    for (name, args) in [
+        ("stellar-agent-mcp", &[][..]),
+        ("wallet-x", &["mcp", "serve"][..]),
+    ] {
+        let binary = Binary::new(name);
+        let (_, stderr) = super::unified_protocol::session(&binary, args);
+        assert!(!stderr.contains("subscriber init failed"), "{stderr}");
+        let trace = std::fs::read_to_string(binary.home.path().join("trace"))
+            .expect("initialization trace");
+        let lines: Vec<&str> = trace.lines().collect();
+        let hardening = lines
+            .iter()
+            .position(|line| *line == "hardening")
+            .expect("hardening recorded");
+        let runtime = lines
+            .iter()
+            .position(|line| *line == "runtime")
+            .expect("runtime recorded");
+        assert!(
+            hardening < runtime,
+            "{name} {args:?}: hardening must precede runtime so every server thread inherits \
+             PR_SET_NO_NEW_PRIVS; trace={trace}"
+        );
+    }
+}

@@ -46,17 +46,32 @@ pub(crate) enum Classification {
 }
 
 /// Validates the body and its bootstrap origin/pin pair without reading authority.
+///
+/// An unsigned version 2 body may omit `sequence` (treated as zero, as signing
+/// does), and a `[mainnet]` table on a testnet profile is refused with
+/// `policy.mainnet_table_on_testnet`.
 pub(crate) fn classify(body: &str, name: &str, passphrase: &str) -> Classification {
-    let doc = match body.parse::<toml_edit::DocumentMut>() {
+    let mut doc = match body.parse::<toml_edit::DocumentMut>() {
         Ok(doc) => doc,
         Err(e) => return Classification::Invalid(PolicyError::toml_syntax(body, &e).wire_code()),
     };
-    if let Err(error) = validate_unsigned_policy(body, name, passphrase) {
+    let validated = if doc.get("version").and_then(toml_edit::Item::as_integer) == Some(2)
+        && doc.get("sequence").is_none()
+    {
+        doc["sequence"] = toml_edit::value(1);
+        std::borrow::Cow::Owned(doc.to_string())
+    } else {
+        std::borrow::Cow::Borrowed(body)
+    };
+    if let Err(error) = validate_unsigned_policy(&validated, name, passphrase) {
         return Classification::Invalid(error.wire_code());
     }
     let Some(table) = doc.get("mainnet").and_then(toml_edit::Item::as_table_like) else {
         return Classification::LocalOnly;
     };
+    if passphrase != stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE {
+        return Classification::Invalid(PolicyError::MainnetTableOnTestnet.wire_code());
+    }
     match validate_bootstrap(table) {
         Ok((Some(_), _)) => Classification::SignedOrigin,
         Ok((None, _)) => Classification::LocalOnly,
@@ -472,6 +487,154 @@ pub(crate) mod tests {
                 .unwrap()
                 .code,
             MAINNET_REQUIRED.0
+        );
+    }
+
+    /// `profile policy-check` accepts a version 2 body without `sequence`
+    /// (treating the absent sequence as zero, as `sign-policy` does) while
+    /// still refusing invalid explicit sequences and version 1 sequences.
+    #[test]
+    #[serial_test::serial]
+    fn policy_check_accepts_v2_body_without_sequence() {
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let testnet = Profile::builder_testnet_named("main", "s", "a", "n", "b").build();
+        let mainnet = Profile::builder_mainnet_named(
+            "main",
+            "https://rpc.example.invalid",
+            "s",
+            "a",
+            "n",
+            "b",
+        )
+        .build();
+
+        let v2_no_seq = "version = 2\nscope = \"profile:main\"\n[[rules]]\n\
+             match = { tool = \"stellar_balances\", chain = \"*\" }\n\
+             criteria = []\ndecision = \"allow\"\n";
+        assert_eq!(
+            classify(v2_no_seq, "main", &testnet.network_passphrase),
+            Classification::LocalOnly
+        );
+        take_rendered_for_test();
+        assert_eq!(
+            report(
+                v2_no_seq,
+                &PolicyCheckArgs {
+                    profile: "main".into(),
+                    origin: false
+                },
+                &testnet
+            ),
+            0
+        );
+        assert_eq!(take_rendered_for_test()[0]["ok"], true);
+
+        // Mainnet body with `[mainnet]` and approval origin omitting `sequence` exits 3 with `--origin`.
+        let mainnet_origin_no_seq = body(true)
+            .lines()
+            .filter(|line| !line.starts_with("sequence ="))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            classify(&mainnet_origin_no_seq, "main", &mainnet.network_passphrase),
+            Classification::SignedOrigin
+        );
+        take_rendered_for_test();
+        assert_eq!(
+            report(
+                &mainnet_origin_no_seq,
+                &PolicyCheckArgs {
+                    profile: "main".into(),
+                    origin: true
+                },
+                &mainnet
+            ),
+            3
+        );
+        let rendered = take_rendered_for_test();
+        assert_eq!(rendered[0]["ok"], true);
+        assert_eq!(rendered[0]["data"]["signed_origin"], true);
+
+        // Explicit invalid sequences on v2 and any sequence on v1 stay refused.
+        let v2_zero_seq = format!("sequence = 0\n{v2_no_seq}");
+        let v2_str_seq = format!("sequence = \"1\"\n{v2_no_seq}");
+        let v1_with_seq = v2_no_seq.replace("version = 2", "version = 1\nsequence = 1");
+        for invalid in [v2_zero_seq, v2_str_seq, v1_with_seq] {
+            take_rendered_for_test();
+            assert_eq!(
+                report(
+                    &invalid,
+                    &PolicyCheckArgs {
+                        profile: "main".into(),
+                        origin: false
+                    },
+                    &testnet
+                ),
+                65,
+                "invalid sequence must be refused: {invalid}"
+            );
+        }
+    }
+
+    /// `profile policy-check` refuses a `[mainnet]` table on a testnet profile
+    /// with `policy.mainnet_table_on_testnet`, matching signing.
+    #[test]
+    #[serial_test::serial]
+    fn policy_check_refuses_mainnet_table_on_testnet() {
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let testnet = Profile::builder_testnet_named("main", "s", "a", "n", "b").build();
+        let mainnet = Profile::builder_mainnet_named(
+            "main",
+            "https://rpc.example.invalid",
+            "s",
+            "a",
+            "n",
+            "b",
+        )
+        .build();
+
+        let plain_mainnet_table = "version = 2\nsequence = 1\nscope = \"profile:main\"\n\
+             [[rules]]\nmatch = { tool = \"stellar_balances\", chain = \"*\" }\n\
+             criteria = []\ndecision = \"allow\"\n\n[mainnet]\n\
+             classic_max_fee_per_op_stroops = 10000\n";
+        let origin_mainnet_table = body(true);
+
+        for text in [plain_mainnet_table, origin_mainnet_table.as_str()] {
+            assert_eq!(
+                classify(text, "main", &testnet.network_passphrase),
+                Classification::Invalid("policy.mainnet_table_on_testnet")
+            );
+            for origin in [false, true] {
+                take_rendered_for_test();
+                assert_eq!(
+                    report(
+                        text,
+                        &PolicyCheckArgs {
+                            profile: "main".into(),
+                            origin
+                        },
+                        &testnet
+                    ),
+                    65
+                );
+                let rendered = take_rendered_for_test();
+                assert_eq!(
+                    rendered[0]["error"]["code"], "policy.mainnet_table_on_testnet",
+                    "origin={origin}: {rendered:?}"
+                );
+            }
+        }
+
+        // Control: the same bodies pass on a mainnet profile.
+        assert_eq!(
+            classify(plain_mainnet_table, "main", &mainnet.network_passphrase),
+            Classification::LocalOnly
+        );
+        assert_eq!(
+            classify(&origin_mainnet_table, "main", &mainnet.network_passphrase),
+            Classification::SignedOrigin
         );
     }
 }

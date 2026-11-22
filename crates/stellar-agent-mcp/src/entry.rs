@@ -15,9 +15,11 @@
 //!
 //! # Process isolation
 //!
-//! On Linux the process sets `PR_SET_DUMPABLE 0` and `PR_SET_NO_NEW_PRIVS 1`
-//! via raw `libc::prctl` at startup.  Details and the macOS / Windows operator
-//! discipline are documented in `docs/mcp.md#launching-the-server`.
+//! On Linux the server role calls [`harden_process`](crate::entry::harden_process) on the initial thread
+//! before spawning any other thread, setting `PR_SET_DUMPABLE 0` and
+//! `PR_SET_NO_NEW_PRIVS 1` via raw `libc::prctl` so every thread of the
+//! process inherits both.  Details and the macOS / Windows operator discipline
+//! are documented in `docs/mcp.md#launching-the-server`.
 //!
 //! # Transport safety
 //!
@@ -56,10 +58,12 @@ pub const INVOKED_NAME_ROUTE: &str = "stellar-agent-mcp";
 /// Usage name for the CLI's server subcommand.
 pub const SUBCOMMAND_ROUTE: &str = "stellar-agent mcp serve";
 
-/// Linux-only process-isolation hardening.
+/// Linux-only process-isolation hardening for the MCP server role.
 ///
 /// Sets `PR_SET_DUMPABLE 0` to block `ptrace`-attach by non-root processes and
-/// `PR_SET_NO_NEW_PRIVS 1` to block setuid escalation paths.
+/// `PR_SET_NO_NEW_PRIVS 1` to block setuid escalation paths. Call this on the
+/// initial thread before any other thread exists so every thread of the server
+/// process inherits both flags.
 ///
 /// Both flags are compatible with the supported Linux keyring backends (GNOME
 /// Keyring / Secret Service and KWallet run as user-space D-Bus IPC and do not
@@ -69,7 +73,7 @@ pub const SUBCOMMAND_ROUTE: &str = "stellar-agent mcp serve";
 /// macOS / Windows: operator discipline described in
 /// `docs/mcp.md#launching-the-server`.
 #[cfg(target_os = "linux")]
-fn harden_process() {
+pub fn harden_process() {
     stellar_agent_core::test_trace::record("hardening");
     // SAFETY: prctl is a pure syscall that modifies only process-level kernel
     // attributes.  The three trailing `0` arguments are unused for the flags
@@ -106,8 +110,12 @@ fn harden_process() {
     }
 }
 
+/// Linux-only process-isolation hardening for the MCP server role.
+///
+/// No-op on macOS and Windows; operator discipline is documented in
+/// `docs/mcp.md#launching-the-server`.
 #[cfg(not(target_os = "linux"))]
-fn harden_process() {
+pub fn harden_process() {
     stellar_agent_core::test_trace::record("hardening");
     // macOS / Windows: operator discipline documented in
     // docs/mcp.md#launching-the-server.  Neither platform provides a
@@ -633,6 +641,9 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 
 /// Runs the MCP server on its own multi-thread runtime and exits the process.
 ///
+/// Call [`harden_process`] on the initial thread before any thread exists;
+/// this function does not harden.
+///
 /// `args` contains only server options, without the executable or subcommand.
 /// `display_name` identifies the invocation route in usage text.
 ///
@@ -665,10 +676,8 @@ async fn serve<I: IntoIterator<Item = String>>(display_name: &'static str, args:
         requested_profile_from_argv(display_name, args).as_deref(),
     );
 
-    // ── 1. Process isolation (Linux prctl) ──────────────────────────────────
-    // Runs before subscriber installation: even the subscriber startup itself
-    // executes in the hardened process context.
-    harden_process();
+    // ── 1. Process isolation ──────────────────────────────────────────────────
+    // Process isolation is the caller's step; see [`run_server_process`].
 
     // ── 2. Tracing subscriber + RedactingLayer ───────────────────────────────
     // MUST be installed before rmcp transport startup so that rmcp's internal

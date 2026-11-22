@@ -2054,4 +2054,68 @@ mod tests {
             "profile access refused for audit verify",
         );
     }
+
+    /// `audit verify --profile` reports carrier refusals under their own
+    /// documented `audit.*` envelope codes, never `internal.*`.
+    #[test]
+    #[serial]
+    fn verify_reports_carrier_refusals_under_their_own_audit_codes() {
+        use stellar_agent_core::audit_log::TipAnchorStore as _;
+
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+
+        // 1. Upgraded keyed log with a tip anchor and no carrier record -> `audit.carriers_unbound`.
+        let unbound_name = "verify-carriers-unbound";
+        let mut unbound = Profile::builder_testnet(unbound_name, "acct", "n-svc", "n-acct").build();
+        unbound.audit_log_path = dir.path().join("unbound.jsonl");
+        let coord = unbound.audit_log_hash_chain_key_id.clone();
+        stellar_agent_network::keyring::rotate_keyring_secret_32(&coord.service, &coord.account)
+            .unwrap();
+        let key = load_audit_hmac_key(&unbound, unbound_name).unwrap();
+        make_writer_and_entries(unbound.audit_log_path.clone(), 1, Some(&key));
+        let tip = verify_log(&unbound.audit_log_path, Some(&key))
+            .unwrap()
+            .active_tip
+            .unwrap();
+        let unbound_store = KeyringTipAnchorStore::new(&coord, &unbound.audit_log_path);
+        unbound_store
+            .store_anchor(&TipAnchor::new(
+                tip.entry_count,
+                tip.tip_hash,
+                tip.end_offset,
+            ))
+            .unwrap();
+        let error = verify_profile_log(&unbound, unbound_name).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                VerifyFailure::Wallet(ref e)
+                    if e.code() == "audit.carriers_unbound"
+                        && e.message().starts_with("audit.carriers_unbound:")
+            ),
+            "{error:?}"
+        );
+
+        // 2. Replaced outbox carrier lock file -> `audit.carrier_replaced`.
+        let replaced_name = "verify-carrier-replaced";
+        let replaced = keyed_unanchored_profile(replaced_name, dir.path(), 0);
+        let outbox_lock = dir.path().join("audit.jsonl.outbox.lock");
+        let retired = dir.path().join("audit.jsonl.outbox.lock.moved");
+        std::fs::rename(&outbox_lock, &retired).unwrap();
+        std::fs::write(&outbox_lock, b"").unwrap();
+        let error = verify_profile_log(&replaced, replaced_name).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                VerifyFailure::Wallet(ref e)
+                    if e.code() == "audit.carrier_replaced"
+                        && e.message().starts_with("audit.carrier_replaced:")
+            ),
+            "{error:?}"
+        );
+    }
 }

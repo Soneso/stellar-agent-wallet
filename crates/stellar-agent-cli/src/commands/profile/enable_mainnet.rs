@@ -18,8 +18,9 @@
 //! step returns its `policy.*` verification error, such as
 //! `policy.owner_signature_invalid` or `policy.state_lock_busy`.
 //! Strict audit errors retain their own codes.
-//! A process on a headless keyring backend is refused with
-//! `network.mainnet_keyring_backend_unsupported` in every mode before any keyring read.
+//! A process whose keyring backend selection is not the platform keyring is
+//! refused with `network.mainnet_keyring_backend_unsupported` in every mode
+//! before keyring initialization.
 //! The ceremony requires a usable oracle before it reads keyring entries.
 //! `--state` reads only nonce presence after profile and backend checks.
 //! It exits 0 for enabled, 3 for absent, and 1 for unreadable.
@@ -239,6 +240,30 @@ fn read_owner_key(coordinate: &KeyringEntryRef) -> Result<[u8; 32], String> {
     })
 }
 
+const PROFILE_FLAG_REQUIRED: (&str, &str) = (
+    "profile.enable_mainnet_profile_flag_required",
+    "profile selection requires an explicit --profile <name> flag",
+);
+const DEFAULT_PROFILE_REFUSED: (&str, &str) = (
+    "profile.enable_mainnet_default_refused",
+    "profile 'default' cannot be enabled for mainnet; pass a dedicated named profile with \
+     --profile <name>",
+);
+const NOT_MAINNET: (&str, &str) = (
+    "profile.enable_mainnet_not_mainnet",
+    "the profile's chain_id must be stellar:mainnet",
+);
+
+/// Checks that `profile` targets mainnet and that the selected keyring
+/// backend is the platform keyring, before any keyring initialization.
+fn check_mainnet_and_keyring_backend(profile: &Profile) -> Result<(), Failure> {
+    if !profile.chain_id.is_mainnet() {
+        return Err((NOT_MAINNET.0, NOT_MAINNET.1.into()));
+    }
+    stellar_agent_network::mainnet::audit_readiness::refuse_headless_keyring_backend()
+        .map_err(|e| (e.code(), e.to_string()))
+}
+
 /// Runs the ceremony or its read-only inspection and renders a JSON envelope.
 pub(crate) fn run(args: &EnableMainnetArgs) -> i32 {
     run_with_keyring(
@@ -255,17 +280,12 @@ fn run_with_keyring(
     let mut stderr = std::io::stderr();
     let mut preview = SpendingPreview::new(&mut stderr);
     let result = (|| {
-        let name = args.profile.as_deref().ok_or_else(|| {
-            (
-                "profile.enable_mainnet_profile_flag_required",
-                "supply --profile".into(),
-            )
-        })?;
+        let name = args
+            .profile
+            .as_deref()
+            .ok_or_else(|| (PROFILE_FLAG_REQUIRED.0, PROFILE_FLAG_REQUIRED.1.into()))?;
         if name == "default" {
-            return Err((
-                "profile.enable_mainnet_default_refused",
-                "use a dedicated profile".into(),
-            ));
+            return Err((DEFAULT_PROFILE_REFUSED.0, DEFAULT_PROFILE_REFUSED.1.into()));
         }
         let profile = load_profile_reconciled(
             &stellar_agent_core::profile::ResolvedProfileName::from_flag(name),
@@ -280,6 +300,7 @@ fn run_with_keyring(
             "policy_window_state_key_id",
         )
         .map_err(|e| (e.code(), e.to_string()))?;
+        check_mainnet_and_keyring_backend(&profile)?;
         init_keyring().map_err(|e| precondition(e.to_string()))?;
         execute(
             args,
@@ -352,22 +373,12 @@ pub(super) fn execute(
     preview: &mut SpendingPreview<'_>,
 ) -> Result<serde_json::Value, Failure> {
     if args.profile.as_deref() != Some(name) {
-        return Err((
-            "profile.enable_mainnet_profile_flag_required",
-            "supply --profile".into(),
-        ));
+        return Err((PROFILE_FLAG_REQUIRED.0, PROFILE_FLAG_REQUIRED.1.into()));
     }
     if name == "default" {
-        return Err((
-            "profile.enable_mainnet_default_refused",
-            "use a dedicated profile".into(),
-        ));
+        return Err((DEFAULT_PROFILE_REFUSED.0, DEFAULT_PROFILE_REFUSED.1.into()));
     }
-    if !profile.chain_id.is_mainnet() {
-        return Err(("profile.enable_mainnet_not_mainnet", "chain_id".into()));
-    }
-    stellar_agent_network::mainnet::audit_readiness::refuse_headless_keyring_backend()
-        .map_err(|e| (e.code(), e.to_string()))?;
+    check_mainnet_and_keyring_backend(profile)?;
     if args.state {
         let coordinate = mainnet_enablement_entry_ref(&profile.policy_window_state_key_id);
         let (state, code) = match has_enablement_nonce(profile) {
@@ -539,8 +550,10 @@ pub(super) fn execute(
         .map_err(|e| precondition(format!("policy_file: {e}")))?;
     let body = parse_policy_body(&raw)?;
     let coordinate = mainnet_enablement_entry_ref(&profile.policy_window_state_key_id);
-    let entry = keyring_core::Entry::new(&coordinate.service, &coordinate.account)
-        .map_err(|_| precondition("nonce"))?;
+    let entry =
+        keyring_core::Entry::new(&coordinate.service, &coordinate.account).map_err(|_| {
+            precondition("nonce: the installation nonce keyring entry cannot be opened")
+        })?;
     let exists = has_enablement_nonce(profile).map_err(|_| precondition("nonce unreadable"))?;
     if exists {
         refuse_absent_pin(name, profile, window.path(), &coordinate)?;
@@ -1073,13 +1086,15 @@ fn rewrite_policy(
         body.get("version").and_then(toml_edit::Item::as_integer),
         Some(1 | 2)
     ) {
-        return Err(precondition("body_version"));
+        return Err(precondition("body_version: policy version must be 1 or 2"));
     }
     use stellar_agent_core::policy::v1::schema::{
         DEFAULT_CONTRACT_TRANSFER_MAX_FEE_STROOPS, contract_transfer_max_fee_stroops,
     };
     if contract_transfer_max_fee_stroops(&body)
-        .map_err(|_| precondition("contract_transfer_max_fee_stroops"))?
+        .map_err(|_| {
+            precondition("contract_transfer_max_fee_stroops: must be an integer in 0..=4294967295")
+        })?
         .is_none()
     {
         body["contract_transfer_max_fee_stroops"] =
@@ -1097,20 +1112,27 @@ fn rewrite_policy(
         let table = body
             .get_mut("mainnet")
             .and_then(toml_edit::Item::as_table_like_mut)
-            .ok_or_else(|| precondition("mainnet_table"))?;
+            .ok_or_else(|| {
+                precondition("mainnet_table: the policy [mainnet] entry must be a TOML table")
+            })?;
         table.insert("profile", toml_edit::value(name));
         table.insert("endpoint_host", toml_edit::value(host));
         table.insert("oracle_host", toml_edit::value(oracle_host));
         if !table.contains_key("classic_max_fee_per_op_stroops") {
-            let fee = i64::try_from(PRESET_FEE_PER_OPERATION_STROOPS)
-                .map_err(|_| precondition("classic_max_fee_per_op_stroops"))?;
+            let fee = i64::try_from(PRESET_FEE_PER_OPERATION_STROOPS).map_err(|_| {
+                precondition(
+                    "classic_max_fee_per_op_stroops: the preset fee must fit a TOML integer",
+                )
+            })?;
             table.insert("classic_max_fee_per_op_stroops", toml_edit::value(fee));
         }
     }
     let table = body
         .get_mut("mainnet")
         .and_then(toml_edit::Item::as_table_like_mut)
-        .ok_or_else(|| precondition("mainnet_table"))?;
+        .ok_or_else(|| {
+            precondition("mainnet_table: the policy [mainnet] entry must be a TOML table")
+        })?;
     table.insert("installation_nonce_sha256", toml_edit::value(digest));
     Ok(body.to_string())
 }
@@ -3055,11 +3077,8 @@ mod tests {
             }
             let (code, detail) = fixture.run().unwrap_err();
             let (expected_code, expected_detail) = match defect {
-                "flag" => (
-                    "profile.enable_mainnet_profile_flag_required",
-                    "supply --profile",
-                ),
-                "chain_id" => ("profile.enable_mainnet_not_mainnet", "chain_id"),
+                "flag" => PROFILE_FLAG_REQUIRED,
+                "chain_id" => NOT_MAINNET,
                 "disk_chain" => (
                     "profile.enable_mainnet_precondition",
                     "chain_id: on-disk and merged chain_id differ",
@@ -3118,6 +3137,200 @@ mod tests {
             .unwrap_err()
             .0,
             "profile.enable_mainnet_default_refused"
+        );
+    }
+
+    /// A wrapper store that fails `Entry::new` for one keyring coordinate and
+    /// delegates every other entry to the inner store.
+    struct FailingEntryBuildStore {
+        inner: Arc<keyring_core::CredentialStore>,
+        service: String,
+        account: String,
+    }
+
+    impl std::fmt::Debug for FailingEntryBuildStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("FailingEntryBuildStore")
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl keyring_core::api::CredentialStoreApi for FailingEntryBuildStore {
+        fn vendor(&self) -> String {
+            "test failing-build store".to_owned()
+        }
+
+        fn id(&self) -> String {
+            self.inner.id()
+        }
+
+        fn build(
+            &self,
+            service: &str,
+            user: &str,
+            modifiers: Option<&std::collections::HashMap<&str, &str>>,
+        ) -> keyring_core::Result<keyring_core::Entry> {
+            if service == self.service && user == self.account {
+                return Err(keyring_core::Error::NoStorageAccess(Box::new(
+                    std::io::Error::other("injected entry build failure"),
+                )));
+            }
+            self.inner.build(service, user, modifiers)
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Each `enable-mainnet` precondition message names the check and accepted
+    /// form through `run_with_keyring`, `execute`, and `rewrite_policy`.
+    #[test]
+    #[serial]
+    fn enable_mainnet_precondition_messages_name_check_and_accepted_form() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        keyring_mock::install().unwrap();
+        let profiles_dir = storage_sandbox.path().join("profiles");
+        let testnet = Profile::builder_testnet_named(
+            "testnet-msg",
+            "stellar-agent-signer-testnet-msg",
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+            "stellar-agent-nonce-testnet-msg",
+            "default",
+        )
+        .build();
+        loader::save_to_dir("testnet-msg", &testnet, &profiles_dir).unwrap();
+
+        let cases = [
+            (
+                None,
+                "profile.enable_mainnet_profile_flag_required",
+                "profile selection requires an explicit --profile <name> flag",
+            ),
+            (
+                Some("default".to_owned()),
+                "profile.enable_mainnet_default_refused",
+                "profile 'default' cannot be enabled for mainnet; pass a dedicated named profile \
+                 with --profile <name>",
+            ),
+            (
+                Some("testnet-msg".to_owned()),
+                "profile.enable_mainnet_not_mainnet",
+                "the profile's chain_id must be stellar:mainnet",
+            ),
+        ];
+        for (profile, expected_code, expected_message) in cases {
+            let args = EnableMainnetArgs {
+                profile,
+                check: false,
+                state: false,
+                rotate: false,
+            };
+            render::take_rendered_for_test();
+            let exit = run_with_keyring(&args, || Ok(()));
+            let rendered = render::take_rendered_for_test();
+            assert_eq!(exit, 1, "{expected_code}: {rendered:?}");
+            assert_eq!(rendered.len(), 1, "{expected_code}");
+            assert_eq!(rendered[0]["error"]["code"], expected_code);
+            assert_eq!(rendered[0]["error"]["message"], expected_message);
+        }
+
+        // Direct `execute` path shares the same descriptive messages.
+        let mut fixture = Fixture::new();
+        fixture.args.profile = None;
+        assert_eq!(
+            fixture.run().unwrap_err(),
+            (
+                "profile.enable_mainnet_profile_flag_required",
+                "profile selection requires an explicit --profile <name> flag".to_owned()
+            )
+        );
+        let default_err = execute(
+            &EnableMainnetArgs {
+                profile: Some("default".into()),
+                check: false,
+                state: false,
+                rotate: false,
+            },
+            "default",
+            &fixture.profile,
+            fixture.dir.path(),
+            &fixture.path(),
+            &PersistedWindowStore::at_path(fixture.window.clone()),
+            |_| Ok(()),
+            atomic_write_string,
+            &mut SpendingPreview::new(&mut std::io::sink()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            default_err,
+            (
+                "profile.enable_mainnet_default_refused",
+                "profile 'default' cannot be enabled for mainnet; pass a dedicated named profile \
+                 with --profile <name>"
+                    .to_owned()
+            )
+        );
+        fixture.args.profile = Some("operator".into());
+        fixture.profile.chain_id = testnet.chain_id;
+        assert_eq!(
+            fixture.run().unwrap_err(),
+            (
+                "profile.enable_mainnet_not_mainnet",
+                "the profile's chain_id must be stellar:mainnet".to_owned()
+            )
+        );
+
+        // `rewrite_policy` precondition messages also name the check and accepted form.
+        let digest = "0".repeat(64);
+        let rewrite_cases = [
+            (
+                "version = 3\nscope = \"profile:operator\"\n",
+                "body_version: policy version must be 1 or 2",
+            ),
+            (
+                "version = 2\nscope = \"profile:operator\"\ncontract_transfer_max_fee_stroops = -1\n",
+                "contract_transfer_max_fee_stroops: must be an integer in 0..=4294967295",
+            ),
+            (
+                "version = 2\nscope = \"profile:operator\"\nmainnet = \"not-a-table\"\n",
+                "mainnet_table: the policy [mainnet] entry must be a TOML table",
+            ),
+        ];
+        for (raw, expected) in rewrite_cases {
+            let doc = raw.parse().unwrap();
+            let err = rewrite_policy(
+                &doc,
+                "operator",
+                "rpc.example.invalid",
+                ORACLE,
+                &digest,
+                false,
+            )
+            .unwrap_err();
+            assert_eq!(err.0, "profile.enable_mainnet_precondition");
+            assert_eq!(err.1, expected);
+        }
+
+        // A keyring backend that cannot build the installation nonce entry
+        // refuses with the `nonce` check and its cause.
+        let nonce_fixture = Fixture::new();
+        let nonce_coord = nonce_fixture.nonce_ref();
+        let inner = keyring_core::get_default_store().unwrap();
+        let _store_guard =
+            keyring_mock::DefaultStoreGuard::install(Arc::new(FailingEntryBuildStore {
+                inner,
+                service: nonce_coord.service,
+                account: nonce_coord.account,
+            }));
+        assert_eq!(
+            nonce_fixture.run().unwrap_err(),
+            (
+                "profile.enable_mainnet_precondition",
+                "nonce: the installation nonce keyring entry cannot be opened".to_owned(),
+            )
         );
     }
     /// An unreadable owner entry is reported as unreadable, never as an
@@ -3182,6 +3395,241 @@ mod tests {
             rotate: true,
         };
         fixture.assert_rendered_refusal(run_with_keyring(&args, || fixture.init()));
+    }
+
+    /// Guards `STELLAR_AGENT_KEYRING_BACKEND` and
+    /// `STELLAR_AGENT_HEADLESS_KEYRING_KEY` using the crate's `EnvGuard`.
+    fn keyring_backend_env(
+        backend: Option<&str>,
+        key: Option<&str>,
+    ) -> (
+        crate::common::test_support::EnvGuard,
+        crate::common::test_support::EnvGuard,
+    ) {
+        let backend_guard = match backend {
+            Some(v) => crate::common::test_support::EnvGuard::set(
+                stellar_agent_headless_keyring::BACKEND_ENV_VAR.to_owned(),
+                v,
+            ),
+            None => crate::common::test_support::EnvGuard::cleared(
+                stellar_agent_headless_keyring::BACKEND_ENV_VAR.to_owned(),
+            ),
+        };
+        let key_guard = match key {
+            Some(v) => crate::common::test_support::EnvGuard::set(
+                stellar_agent_headless_keyring::ENV_KEY_VAR.to_owned(),
+                v,
+            ),
+            None => crate::common::test_support::EnvGuard::cleared(
+                stellar_agent_headless_keyring::ENV_KEY_VAR.to_owned(),
+            ),
+        };
+        (backend_guard, key_guard)
+    }
+
+    /// `profile enable-mainnet` refuses any non-platform
+    /// `STELLAR_AGENT_KEYRING_BACKEND` with
+    /// `network.mainnet_keyring_backend_unsupported` before initializing the
+    /// keyring, in every mode and whether or not the headless key is valid.
+    #[test]
+    #[serial]
+    fn enable_mainnet_refuses_non_platform_backend_before_keyring_init() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        keyring_mock::install().unwrap();
+        let profile = Fixture::profile();
+        loader::save_to_dir(
+            "operator",
+            &profile,
+            &storage_sandbox.path().join("profiles"),
+        )
+        .unwrap();
+
+        let valid_key = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            [0x42_u8; 32],
+        );
+        let backend_cases: [(&str, &str, Option<&str>, &str); 7] = [
+            (
+                "headless-env with valid key",
+                "headless-env",
+                Some(valid_key.as_str()),
+                "headless-env",
+            ),
+            (
+                "headless-env with missing key",
+                "headless-env",
+                None,
+                "headless-env",
+            ),
+            (
+                "headless-env with malformed key",
+                "headless-env",
+                Some("not-valid-base64!!!"),
+                "headless-env",
+            ),
+            ("headless-dpapi", "headless-dpapi", None, "headless-dpapi"),
+            ("unknown backend", "unknown-backend", None, "unrecognized"),
+            ("empty backend", "", None, "unrecognized"),
+            ("literal platform value", "platform", None, "unrecognized"),
+        ];
+
+        for (label, backend, key, expected_backend_label) in backend_cases {
+            let _env = keyring_backend_env(Some(backend), key);
+            for (mode_label, check, state, rotate) in [
+                ("ceremony", false, false, false),
+                ("check", true, false, false),
+                ("state", false, true, false),
+                ("rotate", false, false, true),
+            ] {
+                let args = EnableMainnetArgs {
+                    profile: Some("operator".to_owned()),
+                    check,
+                    state,
+                    rotate,
+                };
+                let calls = Arc::new(AtomicUsize::new(0));
+                let calls_spy = Arc::clone(&calls);
+                render::take_rendered_for_test();
+                let exit = run_with_keyring(&args, move || {
+                    calls_spy.fetch_add(1, Ordering::SeqCst);
+                    Err(stellar_agent_core::error::WalletError::Auth(
+                        stellar_agent_core::error::AuthError::KeyringConfigInvalid {
+                            detail: "keyring init must not run".to_owned(),
+                        },
+                    ))
+                });
+                let rendered = render::take_rendered_for_test();
+                assert_eq!(exit, 1, "{label}, {mode_label}: {rendered:?}");
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    0,
+                    "{label}, {mode_label}: keyring must not be initialized"
+                );
+                assert_eq!(rendered.len(), 1, "{label}, {mode_label}");
+                assert_eq!(
+                    rendered[0]["error"]["code"], "network.mainnet_keyring_backend_unsupported",
+                    "{label}, {mode_label}: {}",
+                    rendered[0]
+                );
+                assert!(
+                    rendered[0]["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains(expected_backend_label),
+                    "{label}, {mode_label}: {}",
+                    rendered[0]
+                );
+
+                // The real `run()` entrypoint (using `init_platform_keyring_store`)
+                // refuses with `network.mainnet_keyring_backend_unsupported`.
+                render::take_rendered_for_test();
+                let real_exit = run(&args);
+                let real_rendered = render::take_rendered_for_test();
+                assert_eq!(real_exit, 1, "real run {label}, {mode_label}");
+                assert_eq!(
+                    real_rendered[0]["error"]["code"],
+                    "network.mainnet_keyring_backend_unsupported",
+                    "real run {label}, {mode_label}: {}",
+                    real_rendered[0]
+                );
+            }
+        }
+    }
+
+    /// Preserves the documented refusal order: `--state` on a testnet profile
+    /// refuses `profile.enable_mainnet_not_mainnet` before checking the
+    /// keyring backend or initializing the keyring, while an unset
+    /// `STELLAR_AGENT_KEYRING_BACKEND` (platform keyring) keeps working.
+    #[test]
+    #[serial]
+    fn enable_mainnet_preserves_refusal_order_and_platform_backend() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        keyring_mock::install().unwrap();
+        let profiles_dir = storage_sandbox.path().join("profiles");
+        let testnet = Profile::builder_testnet_named(
+            "testnet-op",
+            "stellar-agent-signer-testnet-op",
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+            "stellar-agent-nonce-testnet-op",
+            "default",
+        )
+        .build();
+        loader::save_to_dir("testnet-op", &testnet, &profiles_dir).unwrap();
+
+        for (label, backend) in [
+            ("platform unset", None),
+            ("headless-env", Some("headless-env")),
+            ("unknown", Some("unknown")),
+        ] {
+            let _env = keyring_backend_env(backend, None);
+            for (mode_label, state, check) in [
+                ("state", true, false),
+                ("ceremony", false, false),
+                ("check", false, true),
+            ] {
+                let args = EnableMainnetArgs {
+                    profile: Some("testnet-op".to_owned()),
+                    check,
+                    state,
+                    rotate: false,
+                };
+                let calls = Arc::new(AtomicUsize::new(0));
+                let calls_spy = Arc::clone(&calls);
+                render::take_rendered_for_test();
+                let exit = run_with_keyring(&args, move || {
+                    calls_spy.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                });
+                let rendered = render::take_rendered_for_test();
+                assert_eq!(exit, 1, "{label}, {mode_label}: {rendered:?}");
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    0,
+                    "{label}, {mode_label}: keyring must not be initialized for testnet profile"
+                );
+                assert_eq!(
+                    rendered[0]["error"]["code"], "profile.enable_mainnet_not_mainnet",
+                    "{label}, {mode_label}: {}",
+                    rendered[0]
+                );
+            }
+        }
+
+        // Unset backend (platform keyring) proceeds to keyring initialization
+        // and `--state` succeeds on a mainnet profile.
+        let mainnet = Fixture::profile();
+        loader::save_to_dir("operator", &mainnet, &profiles_dir).unwrap();
+        let _env = keyring_backend_env(None, None);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_spy = Arc::clone(&calls);
+        let args = EnableMainnetArgs {
+            profile: Some("operator".to_owned()),
+            check: false,
+            state: true,
+            rotate: false,
+        };
+        render::take_rendered_for_test();
+        let exit = run_with_keyring(&args, move || {
+            calls_spy.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        let rendered = render::take_rendered_for_test();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "platform keyring init runs"
+        );
+        assert_eq!(exit, 3, "absent nonce exits 3: {rendered:?}");
+        assert_eq!(rendered[0]["ok"], true, "{}", rendered[0]);
+        assert_eq!(rendered[0]["data"]["state"], "absent", "{}", rendered[0]);
     }
 
     #[test]

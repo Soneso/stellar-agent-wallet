@@ -14,7 +14,7 @@
     reason = "test assertions"
 )]
 
-use std::io::{Read as _, Write as _};
+use std::io::{BufRead as _, Read as _, Write as _};
 use std::process::Stdio;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
@@ -224,4 +224,162 @@ fn a_same_user_process_cannot_read_the_cli_environment() {
     assert_eq!(status.code(), Some(1), "stdout={stdout}; stderr={stderr}");
     let json: serde_json::Value = serde_json::from_str(&stdout).expect("JSON envelope");
     assert_eq!(json["error"]["code"], "approval.denied", "{stdout}");
+}
+
+/// Reaps a child server even when an assertion panics while it awaits input.
+struct ServerChild(std::process::Child);
+
+impl Drop for ServerChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// On Linux the MCP server sets `PR_SET_NO_NEW_PRIVS 1` and `PR_SET_DUMPABLE 0`
+/// on the initial thread before spawning its body thread or Tokio runtime, so
+/// every task under `/proc/<pid>/task/*/status` reports `NoNewPrivs: 1` and
+/// `/proc/<pid>/environ` is unreadable by a same-user process.
+#[test]
+#[serial]
+fn server_role_hardens_every_thread_with_no_new_privs_and_non_dumpable() {
+    assert_ne!(
+        process_uid_for_attestation().unwrap(),
+        "0",
+        "the test runs as root, which reads every environment; run the test as a user \
+         without CAP_SYS_PTRACE"
+    );
+
+    let dir = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let home = dir.path();
+    let mut child = ServerChild(
+        stellar_agent_test_support::cli_child::cli_command(
+            env!("CARGO_BIN_EXE_stellar-agent"),
+            home,
+        )
+        .expect("isolated server child")
+        .args(["mcp", "serve"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("STELLAR_AGENT_HOME", home)
+        .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+        .env(
+            "STELLAR_AGENT_HEADLESS_KEYRING_KEY",
+            URL_SAFE_NO_PAD.encode([7_u8; 32]),
+        )
+        .env_remove("STELLAR_AGENT_PROFILE")
+        .spawn()
+        .expect("the server starts"),
+    );
+    let pid = child.0.id();
+    let mut stdin = child.0.stdin.take().unwrap();
+    let stdout = child.0.stdout.take().unwrap();
+    let mut stderr = child.0.stderr.take().unwrap();
+    let (send_line, lines) = mpsc::channel();
+    let stdout_reader = std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            if send_line.send(line.expect("stdout line")).is_err() {
+                break;
+            }
+        }
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        stderr.read_to_string(&mut text).expect("stderr read");
+        text
+    });
+
+    // Complete MCP initialize so the body thread and multi-thread runtime are live.
+    let init_request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "hardening-test", "version": "1"}
+        }
+    });
+    writeln!(stdin, "{init_request}").unwrap();
+    stdin.flush().unwrap();
+    let response_line = lines
+        .recv_timeout(PROMPT_TIMEOUT)
+        .expect("initialize response before timeout");
+    let response: serde_json::Value =
+        serde_json::from_str(&response_line).expect("JSON-RPC initialize response");
+    assert_eq!(response["id"], 1, "{response_line}");
+    assert!(response.get("result").is_some(), "{response_line}");
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    )
+    .unwrap();
+    let list_request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/list",
+        "params": {}
+    });
+    writeln!(stdin, "{list_request}").unwrap();
+    stdin.flush().unwrap();
+    let list_line = lines
+        .recv_timeout(PROMPT_TIMEOUT)
+        .expect("tools/list response before timeout");
+    let list_response: serde_json::Value =
+        serde_json::from_str(&list_line).expect("JSON-RPC tools/list response");
+    assert_eq!(list_response["id"], 2, "{list_line}");
+    assert!(list_response.get("result").is_some(), "{list_line}");
+
+    // Read NoNewPrivs from every task of the running server process.
+    let tids: Vec<String> = std::fs::read_dir(format!("/proc/{pid}/task"))
+        .expect("read /proc/<pid>/task")
+        .map(|entry| {
+            entry
+                .expect("task entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert!(
+        tids.len() > 1,
+        "server process must have multiple threads (leader + body + Tokio workers); saw {tids:?}"
+    );
+    for tid in &tids {
+        let status_path = format!("/proc/{pid}/task/{tid}/status");
+        let status_text = std::fs::read_to_string(&status_path)
+            .unwrap_or_else(|e| panic!("failed reading {status_path}: {e}"));
+        let no_new_privs = status_text
+            .lines()
+            .find_map(|line| line.strip_prefix("NoNewPrivs:"))
+            .map(str::trim);
+        assert_eq!(
+            no_new_privs,
+            Some("1"),
+            "task {tid} of server pid {pid} must have NoNewPrivs: 1; status:\n{status_text}"
+        );
+    }
+
+    // Verify Dumpable=0 behavior as today: same-user read of /proc/<pid>/environ is denied.
+    let environ_read = std::fs::read(format!("/proc/{pid}/environ"));
+
+    drop(stdin);
+    let status = child.0.wait().unwrap();
+    stdout_reader.join().unwrap();
+    let stderr = stderr_reader.join().unwrap();
+
+    match environ_read {
+        Ok(bytes) => panic!(
+            "a same-user process read {} bytes of the running server's environment",
+            bytes.len()
+        ),
+        Err(error) => assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "{error}"
+        ),
+    }
+    assert!(status.success(), "server exit {status}; stderr={stderr}");
 }

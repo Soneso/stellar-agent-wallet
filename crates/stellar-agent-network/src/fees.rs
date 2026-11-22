@@ -341,6 +341,22 @@ pub fn classic_fee_source(choice: ClassicFeeChoice, default_source: FeeSource) -
     }
 }
 
+/// Like [`classic_fee_source`], naming `explicit_argument` when the caller
+/// passed an explicit per-operation fee (for example `"fee"` over MCP).
+#[must_use]
+pub fn classic_fee_source_for_argument(
+    choice: ClassicFeeChoice,
+    default_source: FeeSource,
+    explicit_argument: &'static str,
+) -> FeeSource {
+    match classic_fee_source(choice, default_source) {
+        FeeSource::Explicit => FeeSource::ExplicitArgument {
+            argument: explicit_argument,
+        },
+        other => other,
+    }
+}
+
 /// Checks a built CLI envelope's resolved fee against the profile cap.
 ///
 /// A [`ClassicFeeChoice::ProfileDefault`] choice is reported as
@@ -816,6 +832,59 @@ mod tests {
         assert_eq!(
             classic_fee_source(ClassicFeeChoice::ProfileDefault, FeeSource::ProfileDefault),
             FeeSource::ProfileDefault
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn fee_source_for_argument_names_explicit_surface_argument() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        assert_eq!(
+            classic_fee_source_for_argument(
+                ClassicFeeChoice::Explicit(200),
+                FeeSource::ProfileDefault,
+                "fee",
+            ),
+            FeeSource::ExplicitArgument { argument: "fee" }
+        );
+        assert_eq!(
+            classic_fee_source_for_argument(
+                ClassicFeeChoice::Auto(FeePercentile::P95),
+                FeeSource::ProfileDefault,
+                "fee",
+            ),
+            FeeSource::Selected {
+                percentile: "p95".to_owned(),
+            }
+        );
+        assert_eq!(
+            classic_fee_source_for_argument(
+                ClassicFeeChoice::ProfileDefault,
+                FeeSource::ProfileDefault,
+                "fee",
+            ),
+            FeeSource::ProfileDefault
+        );
+
+        let profile = testnet(Some(500));
+        let err = check_classic_fee_cap(
+            501,
+            FeeSource::ExplicitArgument { argument: "fee" },
+            &profile,
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "fees.percentile_exceeds_cap");
+        assert_eq!(
+            err.to_string(),
+            "fee must be a per-operation stroop amount within classic_max_fee_per_op_stroops; \
+             lower fee or raise classic_max_fee_per_op_stroops."
+        );
+        stellar_agent_test_support::rejected_value::assert_no_marker(&err, "501");
+        assert_eq!(
+            DerivedFee::new(424_242, &FeeSource::ExplicitArgument { argument: "fee" }).stroops(),
+            None
         );
     }
     #[test]

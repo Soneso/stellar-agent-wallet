@@ -1717,7 +1717,7 @@ async fn checked_client_and_build_inputs<'a>(
     Ok((client, inputs))
 }
 
-/// Refuses a payment to a canonical C contract: an invalid asset or amount
+/// Refuses a payment to a canonical C or W contract: an invalid asset or amount
 /// with its own code, then `validation.contract_payment_memo_unsupported`
 /// with a memo, otherwise `validation.contract_payment_unavailable`.
 fn contract_destination_refusal(args: &PayArgs) -> Result<(), WalletError> {
@@ -3863,6 +3863,114 @@ pub(crate) mod tests {
             1
         );
         assert_eq!(accesses.get(), 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn muxed_contract_pay_refuses_before_keyring_and_network() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let server = MockServer::start().await;
+        let destination =
+            stellar_agent_test_support::xdr_fixtures::muxed_contract_address().to_string();
+        let keyring_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let cases: Vec<(&str, bool, Option<&str>, &str)> = vec![
+            (
+                "full without memo",
+                false,
+                None,
+                "validation.contract_payment_unavailable",
+            ),
+            (
+                "build-only without memo",
+                true,
+                None,
+                "validation.contract_payment_unavailable",
+            ),
+            (
+                "full with memo_text",
+                false,
+                Some("text"),
+                "validation.contract_payment_memo_unsupported",
+            ),
+            (
+                "full with memo_id",
+                false,
+                Some("id"),
+                "validation.contract_payment_memo_unsupported",
+            ),
+            (
+                "full with memo_hash",
+                false,
+                Some("hash"),
+                "validation.contract_payment_memo_unsupported",
+            ),
+            (
+                "full with memo_return",
+                false,
+                Some("return"),
+                "validation.contract_payment_memo_unsupported",
+            ),
+            (
+                "build-only with memo_text",
+                true,
+                Some("text"),
+                "validation.contract_payment_memo_unsupported",
+            ),
+        ];
+
+        for (label, build_only, memo_kind, expected_code) in cases {
+            let mut args = minimal_args();
+            args.source = Some(SOURCE_G.to_owned());
+            args.destination = destination.clone();
+            args.build_only = build_only;
+            args.rpc_url = Some(server.uri());
+            match memo_kind {
+                Some("text") => args.memo_text = Some("invoice-1".to_owned()),
+                Some("id") => args.memo_id = Some(42),
+                Some("hash") => args.memo_hash_hex = Some("ab".repeat(32)),
+                Some("return") => args.memo_return_hex = Some("cd".repeat(32)),
+                _ => {}
+            }
+            crate::common::render::take_rendered_for_test();
+            let calls = std::sync::Arc::clone(&keyring_calls);
+            let exit = run_with_dependencies(
+                &args,
+                |name| {
+                    Ok(Profile::builder_testnet_named(
+                        name,
+                        "stellar-agent-signer",
+                        name,
+                        "stellar-agent-nonce",
+                        name,
+                    )
+                    .policy_engine(PolicyEngineKind::V1)
+                    .build())
+                },
+                move || {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    panic!("keyring must not be initialized for W destination");
+                },
+            )
+            .await;
+            assert_eq!(exit, 1, "{label}");
+            let rendered = crate::test_rpc::last_rendered();
+            assert_eq!(
+                rendered["error"]["code"], expected_code,
+                "{label}: {rendered}"
+            );
+        }
+        assert_eq!(
+            keyring_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "keyring must never be initialized"
+        );
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "no network request may be sent for W destination"
+        );
     }
 
     // ── --use-oz-relayer opt-in gate ──────────────────────────────────────────
@@ -10069,6 +10177,74 @@ pub(crate) mod tests {
             .await;
 
             assert_build_only_reserve_refusal(&run);
+        }
+
+        /// Mainnet `pay` refuses a canonical W destination with and without a
+        /// memo before initializing the keyring or contacting any RPC endpoint.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn muxed_contract_mainnet_pay_refuses_before_keyring_and_network() {
+            let destination =
+                stellar_agent_test_support::xdr_fixtures::muxed_contract_address().to_string();
+            let fixture = Spec::new("mainnet-pay-muxed-contract")
+                .rules(vec![pay_rule("allow", "")])
+                .build()
+                .await;
+            let keyring_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            for (label, with_memo, expected_code) in [
+                (
+                    "mainnet without memo",
+                    false,
+                    "validation.contract_payment_unavailable",
+                ),
+                (
+                    "mainnet with memo",
+                    true,
+                    "validation.contract_payment_memo_unsupported",
+                ),
+            ] {
+                let mut args = mainnet_args(&fixture);
+                args.destination = destination.clone();
+                if with_memo {
+                    args.memo_text = Some("memo".to_owned());
+                }
+                crate::common::render::take_rendered_for_test();
+                let profile = fixture.profile().clone();
+                let calls = std::sync::Arc::clone(&keyring_calls);
+                let exit = run_with_dependencies(
+                    &args,
+                    move |_| Ok(profile.clone()),
+                    move || {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        panic!("keyring must not be initialized for W destination");
+                    },
+                )
+                .await;
+                assert_eq!(exit, 1, "{label}");
+                let rendered = crate::test_rpc::last_rendered();
+                assert_eq!(
+                    rendered["error"]["code"], expected_code,
+                    "{label}: {rendered}"
+                );
+            }
+            assert_eq!(
+                keyring_calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "keyring must never be initialized"
+            );
+            assert!(
+                fixture
+                    .primary
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "no request may reach the primary fixture for W destination"
+            );
+            assert!(
+                fixture.oracle.received_requests().await.unwrap().is_empty(),
+                "no request may reach the oracle fixture for W destination"
+            );
         }
     }
     #[tokio::test(flavor = "current_thread")]

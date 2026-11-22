@@ -1319,3 +1319,48 @@ fn payment_surfaces_refuse_contract_payments() {
         "undecodable keeps its classic error"
     );
 }
+
+#[test]
+fn muxed_contract_destination_is_refused() {
+    let zero = format!(
+        "{}",
+        stellar_strkey::MuxedContract {
+            contract_id: [2; 32],
+            id: 0,
+        }
+    );
+    let max = format!(
+        "{}",
+        stellar_strkey::MuxedContract {
+            contract_id: [2; 32],
+            id: u64::MAX,
+        }
+    );
+    for address in [&zero, &max] {
+        assert_eq!(
+            refuse_contract_destination(address, false),
+            Err(SacPaymentError::Unavailable),
+            "{address} without memo"
+        );
+        assert_eq!(
+            refuse_contract_destination(address, true),
+            Err(SacPaymentError::MemoUnsupported),
+            "{address} with memo"
+        );
+    }
+    let mut bad_checksum = zero.clone();
+    let replacement = if bad_checksum.ends_with('A') {
+        'B'
+    } else {
+        'A'
+    };
+    bad_checksum.pop();
+    bad_checksum.push(replacement);
+    for other in [zero.to_lowercase(), bad_checksum, "W".to_owned()] {
+        assert_eq!(
+            refuse_contract_destination(&other, true),
+            Ok(()),
+            "{other:?} keeps its own checks"
+        );
+    }
+}

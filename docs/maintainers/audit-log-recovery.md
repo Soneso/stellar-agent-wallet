@@ -438,7 +438,7 @@ commitment with the keyring. A changed retired commitment refuses with
 `audit.outbox_rows_missing` (section 8.3, "Retired-watch refusal"), so a holder
 of an earlier file cannot silently change the active generation.
 
-| Detail code | Meaning and action |
+| Code | Meaning and action |
 | --- | --- |
 | `audit.carrier_replaced` | A held lock file is not the one the keyring records, or the outbox generation changed while a holder waited. Stop every wallet process and bind the carriers; a generation change needs only a retry. |
 | `audit.carriers_unbound` | A log with keyed history has no carrier record. Stop every wallet process and bind the carriers. |
@@ -446,7 +446,7 @@ of an earlier file cannot silently change the active generation.
 | `audit.carriers_busy` | A recovery verb or an enrollment cannot take all three carriers immediately. Stop every wallet process and retry. |
 | `audit.carrier_binding_incomplete` | A staged generation exists. Rerun carrier binding with every wallet process stopped. |
 
-The queue check in `audit verify --profile` can report `audit.carrier_replaced`, `audit.carriers_unbound`, or `audit.carrier_identity_unavailable` in the detail.
+The audit verbs report these codes directly as their envelope codes; value verbs report `audit.chain_key_unavailable` with the carrier code at the head of the message. The queue check in `audit verify --profile` can fail with `audit.carrier_replaced`, `audit.carriers_unbound`, or `audit.carrier_identity_unavailable`.
 A held outbox returns `audit.outbox_busy`; a changed retired commitment returns `audit.outbox_rows_missing`.
 
 ### 8.5 Bind carriers

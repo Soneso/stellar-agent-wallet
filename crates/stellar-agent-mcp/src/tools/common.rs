@@ -3929,9 +3929,10 @@ impl WalletServer {
         })?;
         self.check_write_fee(
             selection.per_op_stroops,
-            stellar_agent_network::classic_fee_source(
+            stellar_agent_network::classic_fee_source_for_argument(
                 choice,
                 stellar_agent_core::error::FeeSource::ProfileDefault,
+                "fee",
             ),
         )
         .map_err(|error| ToolError::Business(ledger_err_result(&error)))?;

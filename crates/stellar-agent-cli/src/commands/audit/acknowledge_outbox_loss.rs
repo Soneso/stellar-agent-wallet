@@ -958,9 +958,37 @@ mod tests {
             &dir.path().join("grants.toml"),
         )
         .unwrap_err();
+        assert_eq!(error.code(), "audit.carriers_busy", "{error}");
         assert!(
-            matches!(error, WalletError::Internal(InternalError::UnexpectedState { ref detail })
-            if detail.starts_with("audit.carriers_busy")),
+            error.message().starts_with("audit.carriers_busy:"),
+            "{error}"
+        );
+        assert!(!dir.path().join("approvals.toml").exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn acknowledge_outbox_loss_reports_carrier_binding_incomplete_under_its_own_code() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (args, profile) = fixture(dir.path());
+        queue_and_lose(&profile);
+        std::fs::write(dir.path().join("audit.jsonl.outbox.g1"), b"").unwrap();
+        let error = acknowledge(
+            &args,
+            &profile,
+            &dir.path().join("approvals.toml"),
+            &dir.path().join("grants.toml"),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "audit.carrier_binding_incomplete", "{error}");
+        assert!(
+            error
+                .message()
+                .starts_with("audit.carrier_binding_incomplete:"),
             "{error}"
         );
         assert!(!dir.path().join("approvals.toml").exists());

@@ -375,7 +375,8 @@ authorization leaves the operation authorized and unsent. Retries and repeats
 then refuse `network.mainnet_authorization_refused` and send nothing until the
 authorization expires.
 
-A payment action to a C contract recipient refuses before the outer gate, the
+A payment action to a C contract or W muxed contract recipient refuses before
+the outer gate, the
 first-invoke grant, and any approval, nonce, or request. Its code is
 `validation.contract_payment_unavailable`, or
 `validation.contract_payment_memo_unsupported` when a memo is present. A

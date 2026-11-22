@@ -1671,6 +1671,62 @@ pub enum ValidationError {
         detail: String,
     },
 
+    /// A held audit carrier lock file is not the recorded file, or the outbox
+    /// moved to a new generation while a holder waited.
+    ///
+    /// # Wire code
+    ///
+    /// `"audit.carrier_replaced"`.
+    #[error("{detail}")]
+    AuditCarrierReplaced {
+        /// Diagnostic led by `audit.carrier_replaced`.
+        detail: String,
+    },
+
+    /// A keyed audit log has no recorded carrier identities.
+    ///
+    /// # Wire code
+    ///
+    /// `"audit.carriers_unbound"`.
+    #[error("{detail}")]
+    AuditCarriersUnbound {
+        /// Diagnostic led by `audit.carriers_unbound`.
+        detail: String,
+    },
+
+    /// The platform cannot identify a held audit carrier lock file.
+    ///
+    /// # Wire code
+    ///
+    /// `"audit.carrier_identity_unavailable"`.
+    #[error("{detail}")]
+    AuditCarrierIdentityUnavailable {
+        /// Diagnostic led by `audit.carrier_identity_unavailable`.
+        detail: String,
+    },
+
+    /// Another process holds an audit carrier lock file required for recovery.
+    ///
+    /// # Wire code
+    ///
+    /// `"audit.carriers_busy"`.
+    #[error("{detail}")]
+    AuditCarriersBusy {
+        /// Diagnostic led by `audit.carriers_busy`.
+        detail: String,
+    },
+
+    /// A staged outbox generation remains from an unfinished carrier binding.
+    ///
+    /// # Wire code
+    ///
+    /// `"audit.carrier_binding_incomplete"`.
+    #[error("{detail}")]
+    AuditCarrierBindingIncomplete {
+        /// Diagnostic led by `audit.carrier_binding_incomplete`.
+        detail: String,
+    },
+
     /// A verb that writes audit rows refused because the profile's audit
     /// chain-root HMAC key could not be loaded from the platform keyring.
     ///
@@ -2388,8 +2444,14 @@ pub enum FeeSource {
         /// Percentile label, such as `p95`.
         percentile: String,
     },
-    /// Given explicitly by the caller.
+    /// Given explicitly by the caller through the CLI `--fee` flag.
     Explicit,
+    /// Given explicitly by the caller through a named surface argument
+    /// (for example `fee` over MCP).
+    ExplicitArgument {
+        /// Surface argument name (for example `"fee"`).
+        argument: &'static str,
+    },
     /// The profile's `classic_fee_per_op_stroops`, or the wallet default when
     /// the profile sets none.
     ProfileDefault,
@@ -2414,7 +2476,9 @@ impl DerivedFee {
     #[must_use]
     pub fn new(per_op: u32, fee_source: &FeeSource) -> Self {
         match fee_source {
-            FeeSource::Explicit | FeeSource::ProfileDefault => Self(None),
+            FeeSource::Explicit
+            | FeeSource::ExplicitArgument { .. }
+            | FeeSource::ProfileDefault => Self(None),
             FeeSource::Selected { .. } | FeeSource::CommandDefault | FeeSource::Envelope => {
                 Self(Some(per_op))
             }
@@ -2428,6 +2492,14 @@ impl DerivedFee {
     }
 }
 
+fn explicit_fee_above_cap_text(argument: &str) -> String {
+    format!(
+        "{argument} must be a per-operation stroop amount within \
+         classic_max_fee_per_op_stroops; lower {argument} or raise \
+         classic_max_fee_per_op_stroops."
+    )
+}
+
 fn fee_above_cap_text(per_op: DerivedFee, cap: u32, fee_source: &FeeSource) -> String {
     let per_op = per_op.stroops().unwrap_or_default();
     match fee_source {
@@ -2436,10 +2508,8 @@ fn fee_above_cap_text(per_op: DerivedFee, cap: u32, fee_source: &FeeSource) -> S
              the profile cap of {cap} stroops; raise classic_max_fee_per_op_stroops or accept a \
              lower fee percentile"
         ),
-        FeeSource::Explicit => "--fee must be a per-operation stroop amount within \
-             classic_max_fee_per_op_stroops; lower --fee or raise \
-             classic_max_fee_per_op_stroops."
-            .to_owned(),
+        FeeSource::Explicit => explicit_fee_above_cap_text("--fee"),
+        FeeSource::ExplicitArgument { argument } => explicit_fee_above_cap_text(argument),
         FeeSource::ProfileDefault => "classic_fee_per_op_stroops must not exceed \
              classic_max_fee_per_op_stroops; lower classic_fee_per_op_stroops or raise \
              classic_max_fee_per_op_stroops."
@@ -2552,6 +2622,11 @@ impl ValidationError {
             Self::AuditOutboxRowTooLarge { .. } => "audit.outbox_row_too_large",
             Self::AuditOutboxEvidenceUnusable { .. } => "audit.outbox_evidence_unusable",
             Self::AuditOutboxLossNotFound { .. } => "audit.outbox_loss_not_found",
+            Self::AuditCarrierReplaced { .. } => "audit.carrier_replaced",
+            Self::AuditCarriersUnbound { .. } => "audit.carriers_unbound",
+            Self::AuditCarrierIdentityUnavailable { .. } => "audit.carrier_identity_unavailable",
+            Self::AuditCarriersBusy { .. } => "audit.carriers_busy",
+            Self::AuditCarrierBindingIncomplete { .. } => "audit.carrier_binding_incomplete",
             // Same wire code as the two variants above by design — see this
             // variant's doc comment for why the code stays unified while the
             // remedy in the message differs.
@@ -4707,6 +4782,36 @@ mod tests {
                 "audit.outbox_loss_not_found",
             ),
             (
+                ValidationError::AuditCarrierReplaced {
+                    detail: "audit.carrier_replaced: lock replaced".to_owned(),
+                },
+                "audit.carrier_replaced",
+            ),
+            (
+                ValidationError::AuditCarriersUnbound {
+                    detail: "audit.carriers_unbound: bind carriers".to_owned(),
+                },
+                "audit.carriers_unbound",
+            ),
+            (
+                ValidationError::AuditCarrierIdentityUnavailable {
+                    detail: "audit.carrier_identity_unavailable: no file id".to_owned(),
+                },
+                "audit.carrier_identity_unavailable",
+            ),
+            (
+                ValidationError::AuditCarriersBusy {
+                    detail: "audit.carriers_busy: stop wallet processes".to_owned(),
+                },
+                "audit.carriers_busy",
+            ),
+            (
+                ValidationError::AuditCarrierBindingIncomplete {
+                    detail: "audit.carrier_binding_incomplete: rerun bind-carriers".to_owned(),
+                },
+                "audit.carrier_binding_incomplete",
+            ),
+            (
                 ValidationError::AuditLogUnusable {
                     profile: "default".to_owned(),
                     detail: "audit.writer_locked: the lock is held".to_owned(),
@@ -5100,6 +5205,31 @@ mod tests {
                         detail: detail.clone(),
                     }
                 }
+                ValidationError::AuditCarrierReplaced { detail } => {
+                    ValidationError::AuditCarrierReplaced {
+                        detail: detail.clone(),
+                    }
+                }
+                ValidationError::AuditCarriersUnbound { detail } => {
+                    ValidationError::AuditCarriersUnbound {
+                        detail: detail.clone(),
+                    }
+                }
+                ValidationError::AuditCarrierIdentityUnavailable { detail } => {
+                    ValidationError::AuditCarrierIdentityUnavailable {
+                        detail: detail.clone(),
+                    }
+                }
+                ValidationError::AuditCarriersBusy { detail } => {
+                    ValidationError::AuditCarriersBusy {
+                        detail: detail.clone(),
+                    }
+                }
+                ValidationError::AuditCarrierBindingIncomplete { detail } => {
+                    ValidationError::AuditCarrierBindingIncomplete {
+                        detail: detail.clone(),
+                    }
+                }
                 ValidationError::AuditLogUnusable { profile, detail } => {
                     ValidationError::AuditLogUnusable {
                         profile: profile.clone(),
@@ -5254,9 +5384,15 @@ mod tests {
     /// the cap and overflow refusals; a derived fee stays in the diagnostic.
     #[test]
     fn chosen_fees_stay_out_of_cap_refusals() {
-        for fee_source in [FeeSource::Explicit, FeeSource::ProfileDefault] {
+        for fee_source in [
+            FeeSource::Explicit,
+            FeeSource::ExplicitArgument { argument: "fee" },
+            FeeSource::ProfileDefault,
+        ] {
+            let per_op = DerivedFee::new(424_242, &fee_source);
+            assert_eq!(per_op.stroops(), None, "{fee_source:?}");
             let error = ValidationError::FeeAboveCap {
-                per_op: DerivedFee::new(424_242, &fee_source),
+                per_op,
                 cap: 100,
                 fee_source,
             };
@@ -5294,6 +5430,11 @@ mod tests {
             text(FeeSource::Explicit),
             "--fee must be a per-operation stroop amount within classic_max_fee_per_op_stroops; \
              lower --fee or raise classic_max_fee_per_op_stroops."
+        );
+        assert_eq!(
+            text(FeeSource::ExplicitArgument { argument: "fee" }),
+            "fee must be a per-operation stroop amount within classic_max_fee_per_op_stroops; \
+             lower fee or raise classic_max_fee_per_op_stroops."
         );
         assert_eq!(
             text(FeeSource::ProfileDefault),

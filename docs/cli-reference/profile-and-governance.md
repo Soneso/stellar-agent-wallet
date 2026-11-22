@@ -653,10 +653,10 @@ per-call freshness check verifies the enablement against the stored profile
 again. A removed or moved oracle therefore refuses its value tools, its status
 tool and its gate pass with `network.mainnet_write_forbidden`. Its next start
 refuses the enablement with `profile.mainnet_enablement_invalid:
-on_disk_oracle_host`. A process on a headless keyring backend
-(`STELLAR_AGENT_KEYRING_BACKEND` set to `headless-env` or `headless-dpapi`)
-is refused in every mode with `network.mainnet_keyring_backend_unsupported`
-before any keyring entry is read: mainnet needs the platform keyring.
+on_disk_oracle_host`. A process with `STELLAR_AGENT_KEYRING_BACKEND` set to
+any value is refused in every mode with
+`network.mainnet_keyring_backend_unsupported` before the keyring initializes:
+mainnet needs the platform keyring.
 Before the first nonce is written, a signed v2 policy
 establishes the pin with its verified sequence, digest, and owner.
 Create and sign that policy before running the ceremony.
@@ -1880,7 +1880,7 @@ The tip anchor is checked only when `--profile` is supplied AND `<LOG_PATH>` is 
 
 When no anchor is stored for the profile's own log, the command checks for evidence of prior anchoring. Each of these shows the log was anchored: an audit binding recorded for the profile, a chain-root sidecar beside the active file, or an `audit_tip_anchored` row in it. With any of them the command fails with `audit.tip_anchor_missing`, and the message says `anchor: missing` and names the evidence. For an empty active file, only the sidecar counts as evidence. Profile verification checks the hash chain and HMAC sidecars before reporting anchor agreement, unless this missing-anchor rule applies. The missing-anchor check follows an unkeyed chain walk and precedes HMAC verification. Without evidence, a log reports `anchor.status` as `"not_checked"` only if its chain and HMAC checks pass.
 
-Verifier failures use `audit.chain_broken`, `audit.rotation_gap`, `audit.hmac_mismatch`, `audit.hmac_sidecar_missing`, `audit.entry_tag_invalid`, `audit.too_many_rotated_files`, `audit.non_regular_file_log_path`, `audit.parse_error`, `audit.path_contract`, `audit.log_not_found`, `audit.io_error`, `audit.signer_set_canonical_body`, `audit.partial_rotation`, `audit.tip_anchor_mismatch`, `audit.tip_anchor_missing`, `audit.outbox_rows_missing`, `audit.outbox_busy`, `audit.outbox_unusable`, `audit.outbox_evidence_unusable`, `audit.carrier_binding_incomplete`, `audit.tip_anchor_unavailable`; see [security internals](../maintainers/security-internals.md#audit-hash-chain).
+Verifier failures use `audit.chain_broken`, `audit.rotation_gap`, `audit.hmac_mismatch`, `audit.hmac_sidecar_missing`, `audit.entry_tag_invalid`, `audit.too_many_rotated_files`, `audit.non_regular_file_log_path`, `audit.parse_error`, `audit.path_contract`, `audit.log_not_found`, `audit.io_error`, `audit.signer_set_canonical_body`, `audit.partial_rotation`, `audit.tip_anchor_mismatch`, `audit.tip_anchor_missing`, `audit.outbox_rows_missing`, `audit.outbox_busy`, `audit.outbox_unusable`, `audit.outbox_evidence_unusable`, `audit.carrier_replaced`, `audit.carriers_unbound`, `audit.carrier_identity_unavailable`, `audit.carrier_binding_incomplete`, `audit.tip_anchor_unavailable`; see [security internals](../maintainers/security-internals.md#audit-hash-chain).
 Profile and ownership pre-checks carry their own codes.
 
 - `<LOG_PATH>` (positional, required): path to the audit log file. By default this is `~/.local/share/stellar-agent/audit/<profile>.jsonl` on Linux, `~/Library/Application Support/Soneso.stellar-agent/audit/<profile>.jsonl` on macOS, and `%LOCALAPPDATA%\Soneso\stellar-agent\data\audit\<profile>.jsonl` on Windows.
@@ -1894,7 +1894,7 @@ A `pruned_prefix` warning reports `first_file`, the oldest file walked, and
 entry and is authenticated when an audit key is supplied. Verification checks
 every retained entry and bridge, and the warning leaves the verdict successful.
 
-`outbox_pending` counts complete queued consent, halt, and resume lines. With `--profile` and the profile's log path, verification checks the keyring commitment under the outbox lock after the chain walk. A missing or changed committed prefix, or a complete line past it, fails with `audit.outbox_rows_missing`; a held lock fails with `audit.outbox_busy`. Verification authenticates tagged rows, owner state, and both evidence files under the stored key. An unusable row fails with `audit.outbox_unusable`, and unusable evidence fails with `audit.outbox_evidence_unusable`. The outbox lock is taken through the carrier record, so the check also fails with `audit.carrier_replaced`, `audit.carriers_unbound` or `audit.carrier_identity_unavailable` at the head of the detail, and with `audit.outbox_rows_missing` when the retired generation's commitment changed. Under owner state, a dropped tail of queued rows that carry no reference, such as halt and resume rows, passes this check. Without a profile, no commitment is checked. The separate count inspection can report `outbox_torn_tail`, `outbox_unparseable`, or `outbox_unreadable` warnings.
+`outbox_pending` counts complete queued consent, halt, and resume lines. With `--profile` and the profile's log path, verification checks the keyring commitment under the outbox lock after the chain walk. A missing or changed committed prefix, or a complete line past it, fails with `audit.outbox_rows_missing`; a held lock fails with `audit.outbox_busy`. Verification authenticates tagged rows, owner state, and both evidence files under the stored key. An unusable row fails with `audit.outbox_unusable`, and unusable evidence fails with `audit.outbox_evidence_unusable`. The outbox lock is taken through the carrier record, so the check also fails with `audit.carrier_replaced`, `audit.carriers_unbound`, or `audit.carrier_identity_unavailable`. It fails with `audit.outbox_rows_missing` when the retired generation's commitment changed. Under owner state, a dropped tail of queued rows that carry no reference, such as halt and resume rows, passes this check. Without a profile, no commitment is checked. The separate count inspection can report `outbox_torn_tail`, `outbox_unparseable`, or `outbox_unreadable` warnings.
 
 An `outbox_loss_acknowledged` warning names each loss acknowledgement's file, line, `expected_rows`, and `found_rows`. It leaves the chain verdict unchanged.
 

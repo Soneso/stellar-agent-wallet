@@ -18,16 +18,45 @@ pub(super) struct AuthoringGuard {
     _lock: HeldFileLock,
 }
 
-/// Holds the policy's sibling lock until the author returns.
+/// How the policy file path was chosen, so unreadable-file refusals name
+/// `--file` only when the caller passed it.
+#[derive(Clone, Copy)]
+pub(super) enum PolicyPathSource {
+    /// The profile's default policy path in the state directory.
+    ProfileDefault,
+    /// An explicit path supplied through `--file`.
+    ExplicitFile,
+}
+
+/// Renders `sign_policy.policy_file_unreadable`, naming `--file` only when the
+/// caller passed it.
+pub(super) fn unreadable_policy_file(source: PolicyPathSource, error: &std::io::Error) -> Failure {
+    let subject = match source {
+        PolicyPathSource::ProfileDefault => "the profile's policy file",
+        PolicyPathSource::ExplicitFile => "the policy file --file names",
+    };
+    (
+        "sign_policy.policy_file_unreadable",
+        format!("could not read {subject}: {error}"),
+    )
+}
+
+/// Holds the profile policy's sibling lock until the author returns.
 pub(super) fn acquire(policy_path: &Path) -> Result<AuthoringGuard, Failure> {
+    acquire_for(policy_path, PolicyPathSource::ProfileDefault)
+}
+
+/// Holds the policy's sibling lock until the author returns, attributing a
+/// missing parent directory to `source`.
+pub(super) fn acquire_for(
+    policy_path: &Path,
+    source: PolicyPathSource,
+) -> Result<AuthoringGuard, Failure> {
     let mut path = policy_path.as_os_str().to_owned();
     path.push(".authoring.lock");
     let io_failure = |error: std::io::Error| {
         if error.kind() == std::io::ErrorKind::NotFound {
-            return (
-                "sign_policy.policy_file_unreadable",
-                format!("could not read the policy file --file names: {error}"),
-            );
+            return unreadable_policy_file(source, &error);
         }
         (
             "sign_policy.authoring_lock_io",
@@ -166,6 +195,34 @@ mod tests {
                 .mode()
                 & 0o777,
             0o600
+        );
+    }
+
+    #[test]
+    fn guard_not_found_names_flag_only_for_explicit_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing-dir/policy.toml");
+        let default_err = acquire(&missing).err().unwrap();
+        assert_eq!(default_err.0, "sign_policy.policy_file_unreadable");
+        assert!(
+            default_err
+                .1
+                .starts_with("could not read the profile's policy file: "),
+            "{}",
+            default_err.1
+        );
+        assert!(!default_err.1.contains("--file"), "{}", default_err.1);
+
+        let explicit_err = acquire_for(&missing, PolicyPathSource::ExplicitFile)
+            .err()
+            .unwrap();
+        assert_eq!(explicit_err.0, "sign_policy.policy_file_unreadable");
+        assert!(
+            explicit_err
+                .1
+                .starts_with("could not read the policy file --file names: "),
+            "{}",
+            explicit_err.1
         );
     }
 }

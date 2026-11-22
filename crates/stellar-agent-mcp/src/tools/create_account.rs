@@ -1696,4 +1696,107 @@ mod tests {
         absent.approval_attestation = None;
         assert!(format!("{absent:?}").contains("approval_attestation: None"));
     }
+
+    /// An explicit `fee` above `classic_max_fee_per_op_stroops` on
+    /// `stellar_create_account` refuses naming `fee` (not `--fee`).
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
+    #[allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        reason = "test fixtures and assertions"
+    )]
+    async fn create_account_explicit_fee_above_cap_names_mcp_fee_argument() {
+        let home = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+
+        let source = stellar_agent_test_support::signed_envelope::account_id_for_seed([0x23; 32]);
+        let dest = stellar_agent_test_support::signed_envelope::account_id_for_seed([0x24; 32]);
+        let now_s = stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1_000;
+        let rpc = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_partial_json(
+                json!({ "method": "getNetwork" }),
+            ))
+            .respond_with(stellar_agent_test_support::EchoIdResponder::new(
+                stellar_agent_test_support::signed_envelope::get_network_result(
+                    stellar_agent_test_support::signed_envelope::TESTNET_PASSPHRASE,
+                ),
+            ))
+            .mount(&rpc)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_partial_json(
+                json!({ "method": "getHealth" }),
+            ))
+            .respond_with(stellar_agent_test_support::EchoIdResponder::new(json!({
+                "status": "healthy",
+                "latestLedger": 100,
+                "oldestLedger": 1,
+                "ledgerRetentionWindow": 99,
+                "oldestLedgerCloseTime": 1,
+                "latestLedgerCloseTime": now_s,
+            })))
+            .mount(&rpc)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_partial_json(
+                json!({ "method": "getLedgers" }),
+            ))
+            .respond_with(stellar_agent_test_support::EchoIdResponder::new(json!({
+                "latestLedger": 100,
+                "oldestLedger": 1,
+                "latestLedgerCloseTime": now_s.to_string(),
+                "oldestLedgerCloseTime": 1,
+                "cursor": "100",
+                "ledgers": [],
+            })))
+            .mount(&rpc)
+            .await;
+        let mut ledger = stellar_agent_test_support::KeyedLedgerEntriesResponder::new();
+        for entry in stellar_agent_test_support::signed_envelope::ledger_entries_result_for(&[
+            source.as_str(),
+        ])["entries"]
+            .as_array()
+            .unwrap()
+        {
+            ledger = ledger.with_entry(entry.clone());
+        }
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_partial_json(
+                json!({ "method": "getLedgerEntries" }),
+            ))
+            .respond_with(ledger)
+            .mount(&rpc)
+            .await;
+
+        let profile = stellar_agent_core::profile::schema::Profile::builder_testnet(
+            "svc", "acct", "n-svc", "n-acct",
+        )
+        .with_noop_engine()
+        .rpc_url(rpc.uri())
+        .classic_max_fee_per_op_stroops(Some(150))
+        .build();
+        let server = WalletServer::new(profile).unwrap();
+        let args: StellarCreateAccountArgs = serde_json::from_value(json!({
+            "chain_id": "stellar:testnet",
+            "source": source,
+            "destination": dest,
+            "starting_balance": "1 XLM",
+            "fee": "200",
+        }))
+        .unwrap();
+
+        let result = server.call_stellar_create_account(args).await.unwrap();
+        let (code, message, _) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "fees.percentile_exceeds_cap");
+        assert_eq!(
+            message,
+            "fee must be a per-operation stroop amount within classic_max_fee_per_op_stroops; \
+             lower fee or raise classic_max_fee_per_op_stroops."
+        );
+        assert!(!message.contains("--fee"), "{message}");
+    }
 }
