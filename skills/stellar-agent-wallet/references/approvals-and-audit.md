@@ -974,12 +974,17 @@ each acquisition. Any listing change outside the writer discards the index,
 and a missing, replaced, or shortened active file refuses through the walk.
 The eleventh rotation deletes the oldest archive. Callers hold the writer guard
 during settlement and clear lookups. Accounting delivery retains it through
-append and acknowledgement. `tx status` and `stellar_transaction_status`
-acquire the writer only to deliver an unacknowledged accounting event. A
-receipt projection that is owed alone completes without the writer. When the
-writer cannot be acquired or the retained history does not verify, both still
-render their answer. The refusal is logged at WARN, and the obligation stays
-owed. Where the profile has an audit writer, `tx receipt clear` refuses with the verifier's
+append and acknowledgement. On testnet, `tx status` and
+`stellar_transaction_status` acquire the writer only to deliver an
+unacknowledged accounting event. On mainnet the recovery decision and the
+receipt repair take it as well. A receipt projection that is owed alone
+completes without the writer. When the writer cannot be acquired or the
+retained history does not verify, both still render their answer. The refusal
+is logged at WARN, and the obligation stays owed. On mainnet no recovery
+decision runs then: an attempt without a checked decision answers
+`chain_status: UNKNOWN` and `record.reservation_open: true`, and
+`recovery.refusal.code` names the writer refusal, such as
+`audit.chain_key_unavailable` for a writer another process holds. Where the profile has an audit writer, `tx receipt clear` refuses with the verifier's
 code, such as `audit.chain_broken` for a broken chain, and keeps the receipt.
 
 The anchor is written after the entry it covers is fsynced, so it is not
