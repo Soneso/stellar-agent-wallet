@@ -270,9 +270,18 @@ Keep `CHANGELOG.md` and the fragment README unchanged in contributing pull
 requests. Move any direct changelog entries into fragments.
 Remove the `CHANGELOG.md` edits from the branch history; a later revert commit
 still fails the integration guard.
+An eligible sync merge has exactly two parents and brings new ancestry from
+`main` through its second parent.
+Its `CHANGELOG.md` equals the clean three-way merge over the parents' merge
+base, preserving both sides' lines.
+The guard refuses conflicts; a maintainer resolves and merges them.
+The guard never accepts hand-resolved changelog bytes.
 Never edit an existing fragment. Add a new file for a further entry.
-The fragment README states the rules the guard applies to branch history, sync
-merges, and filename conflicts.
+Each fragment file belongs to one pull request and is never reused.
+A sync merge deletes fragments that `main` folds and deletes.
+It never deletes a fragment that holds an unreleased entry under this rule.
+The fragment README states the rules the guard applies to branch history and
+filename conflicts.
 
 Run `python3 .github/scripts/changelog.py check` to validate your fragments.
 Run `python3 .github/scripts/changelog.py preview` to read the folded

@@ -51,9 +51,12 @@ This alpha does not offer an HTTP or SSE transport. stdio is the only transport.
 
 ### Availability
 
-Install the `stellar-agent-cli` package with `cargo binstall`, with
-`cargo install`, or from source. [Install](./getting-started.md#install) gives
-the commands and the version to spell out.
+Install the one package with
+`cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.13`
+(prebuilt binary from the tagged GitHub release, resolved through crates.io),
+with `cargo install --locked stellar-agent-cli@0.1.0-alpha.13` (built from the
+published sources and their `Cargo.lock`), or build from source.
+[Install](./getting-started.md#install) states when to spell out the version.
 
 Each of these installs `stellar-agent` only, which also runs the server. The
 stanzas below start

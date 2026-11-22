@@ -28,9 +28,11 @@ dispatch.
    preparation pull request.
    Rerun release mode when pending fragments remain, including fragments that
    arrive during preparation.
-   The fragment rules are in the
-   [fragment README](../../changelog.d/README.md).
-   If a fragment violates them, preserve every unreleased item in a new
+   Never edit an existing fragment. Add a new file for a further entry.
+   Each fragment file belongs to one pull request and is never reused.
+   A sync merge deletes fragments that `main` folds and deletes.
+   It never deletes a fragment that holds an unreleased entry under this rule.
+   If a fragment violates this rule, preserve every unreleased item in a new
    file before accepting deletion.
 2. Wait for CI to pass on that `main` commit.
 3. From a checkout of that commit, check the workspace members on crates.io:
@@ -59,8 +61,12 @@ same script with `--warn`, annotates the run with one warning per missing
 member, and the release proceeds.
 
 The changelog guard checks pull requests into `mainnet-write`.
-The [fragment README](../../changelog.d/README.md) states which sync merges it
-accepts.
+An eligible sync merge there has exactly two parents and brings new ancestry
+from `main` through its second parent.
+Its `CHANGELOG.md` equals the clean three-way merge over the parents' merge
+base, preserving both sides' lines.
+The guard refuses conflicts; a maintainer resolves and merges them.
+The guard never accepts hand-resolved changelog bytes.
 
 ## What the release preflight refuses
 
