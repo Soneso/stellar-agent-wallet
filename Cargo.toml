@@ -48,7 +48,7 @@ tracing-log = "0.2.0"
 uuid = { version = "1.23.3", default-features = false, features = ["std", "v4"] }
 figment = { version = "=0.10.19", features = ["toml", "env"] }
 toml = { version = "=1.1.2", default-features = false, features = ["display", "parse", "serde"] }
-url = { version = "=2.5.8", default-features = false, features = ["serde"] }
+url = { version = "=2.5.9", default-features = false, features = ["serde"] }
 time = { version = "=0.3.49", default-features = false, features = ["formatting", "parsing"] }
 directories = "=6.0.0"
 subtle = { version = "=2.6.1", default-features = false }
