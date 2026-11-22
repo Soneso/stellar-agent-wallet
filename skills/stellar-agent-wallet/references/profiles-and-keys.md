@@ -519,8 +519,9 @@ A key the endpoint re-encodes, truncates, or splits is not caught.
 
 ### Channel-pool state
 
-`pool init` writes these three fields, patching only the pool keys. They hold
-public data; the pool master seed stays in the keyring.
+`pool init` writes these three fields and changes no other key. It writes the
+whole file again, with keys sorted within each table and comments dropped.
+They hold public data; the pool master seed stays in the keyring.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
@@ -670,6 +671,60 @@ Consequences:
 - `stellar-agent profile show <name>` prints the resolved configuration as a JSON
   envelope; keyring references appear as opaque `{service, account}` objects,
   never the secret.
+
+## Retire a profile
+
+No wallet command deletes a profile; the operator removes its files and its
+keyring entries by hand, in this order:
+
+1. Secure what the deletion destroys. Move the funds the operator keeps out of
+   the signer account, and keep a copy of the signer seed if the account stays
+   in use. Copy the audit log and every file whose name begins with it out of
+   the data directory if its records are needed.
+2. Stop every process that uses the profile, such as its `stellar-agent-mcp`
+   server and `stellar-agent approve serve`.
+3. Read `stellar-agent profile show <name>` for `audit_log_path`, the key
+   references, and the provider credentials. A reference the file sets
+   replaces the default coordinate.
+4. Delete the files: in the data directory, `profiles/<name>.toml` and
+   `<name>.halt`, `policies/<name>.toml`, `policy/<name>.window`, the audit
+   log and every file whose name begins with it, `receipts/<name>.json`,
+   `approvals/<name>.toml` and `<name>.toolset_grants.toml`,
+   `passkeys/<name>.toml`, `operator-approval-credentials/<name>.toml`,
+   `counterparty/<name>/`, `remote-approval-tls/<name>-cert.pem` and
+   `<name>-key.pem`, and `mpp/<sha256 hex of the name>.state`. In each of
+   these directories, delete every lock file whose name begins with `<name>.`
+   too, such as `profiles/<name>.pool-init.lock` and
+   `approvals/<name>.producer.lock`.
+5. With the platform keyring tool, delete every entry of the default services
+   `stellar-agent-signer-<name>`, `-nonce-`, `-audit-`, `-auditbinding-`,
+   `-owner-`, `-attestation-`, `-counterparty-`, `-policy-window-`,
+   `-mpp-state-`, `-pool-`, and `-rpc-`, each followed by the name. Delete
+   them even when the file configures other references. For a configured
+   reference, also delete the entries of its service whose accounts begin with
+   its account. The signer identity is always the `enrolled-identity` account
+   of the signer reference's service.
+
+The keyring holds the only copy of the pool master seed
+(`stellar-agent-pool-<name>` / `master`). The channel accounts start with a
+zero balance, and the signer account sponsors their reserves. No `pool`
+command recovers those reserves. Deleting the seed gives up the channel
+accounts and the reserves the signer account sponsors for them.
+
+With `STELLAR_AGENT_KEYRING_BACKEND` set, the entries of every profile live in
+one file, `headless-keyring/store.keyring` in the data directory. No wallet
+command deletes one entry of that store, and deleting the file removes the
+keys of every profile. Leave that file in place and give the next profile a
+new name.
+
+Delete the policy pin (`default-policy-pin`) and the mainnet enablement nonce
+(`default-mainnet-enablement`) together. A pin left behind binds a new profile
+of the same name to the old owner and sequence. A policy of another owner then
+refuses with `policy.owner_rotation_required`, and a policy below the old
+sequence with `policy.sequence_rollback`. A nonce left behind without its pin
+refuses every mainnet write with `policy.pin_absent`. A profile whose window
+key reference names another entry can still hold a nonce at the default
+entry, and the wallet checks both.
 
 ## Halt marker
 
@@ -872,8 +927,12 @@ derives to it), `--force` (replace an already-enrolled entry), and
 enrollment; excludes `--secret-env` and `--force`).
 Enrollment derives the seed's public address. A profile fresh from
 `profile init` (and a v1-migrated profile that still carries it) holds the placeholder `"default"` in
-`mcp_signer_default.account`; enrollment overwrites it in place with the
-derived address. A profile whose `account` already pins a G-strkey, from a
+`mcp_signer_default.account`; enrollment replaces it with the derived address
+before it writes the keyring entry. That write changes only `account` and
+writes the whole profile file again, with keys sorted within each table and
+comments dropped. A refused keyring write leaves `account` set to the new
+address; once the keyring is reachable, a re-run with the same seed completes
+the enrollment. A profile whose `account` already pins a G-strkey, from a
 prior enrollment or set by hand, is left untouched, and enrollment refuses if
 the seed does not derive to that exact address, printing the address to set
 `account` to.
@@ -1011,7 +1070,7 @@ reason = "review"
 | Policy-body element | Meaning |
 |---|---|
 | `version`, `scope`, `sequence`, `[[rules]]` | `version = 2`, profile-specific scope, a positive sequence, and explicit rules. This policy is separate from the profile document. |
-| Sequence allocation | Signing assigns `max(pin, body) + 1`. Signing does not advance the pin. A verified load can advance it. |
+| Sequence allocation | Signing assigns `max(pin, body) + 1`. Signing does not advance the pin. The first CLI value verb or MCP server start on the new body advances it; `profile enable-mainnet --check` does not. |
 | Pin comparison | A pin refuses v1 or a lower sequence. Equal sequence with another digest or owner is a fork. |
 | `[mainnet].profile` | Dedicated profile name. |
 | `[mainnet].endpoint_host` | Ceremony-normalized endpoint host. This policy field remains named `endpoint_host`. |

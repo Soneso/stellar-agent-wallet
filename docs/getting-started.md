@@ -691,8 +691,11 @@ Run `profile bind-signer --profile <NAME> --owner-secret-env <VAR>` with the
 policy owner's seed to bind the enrolled signer to this profile and owner.
 Then run `profile enable-mainnet --profile <NAME>` to bind this installation.
 Complete the [v2 policy body](profiles.md#mainnet-policy-body), including rules
-for each prepare and commit name. Run `profile sign-policy`, then
-`profile enable-mainnet --check`, and restart the MCP server.
+for each prepare and commit name. Run `profile sign-policy`, restart the MCP
+server, and then run `profile enable-mainnet --check`. Signing leaves the
+installation pin at the old sequence until a CLI value verb or the server
+start moves it. A check before that reports `total_budget_usage: null` with
+`policy.total_epoch_stale`.
 [The command reference](cli-reference/profile-and-governance.md#profile-enable-mainnet)
 owns ceremony flags and recovery.
 
@@ -718,8 +721,11 @@ minted (`profile rotate-audit-key <name>`, step 2 of the flow in
 
 On a profile fresh from `profile init`, `mcp_signer_default.account` is still
 the placeholder `"default"`; enrollment populates it automatically with the
-enrolled seed's derived address. Run this line on its own, paste the seed when
-prompted, and press Enter:
+enrolled seed's derived address. It writes the profile file before the
+keyring entry, and that write sorts the file's keys and drops its comments. If
+the keyring refuses the write, `account` already holds the new address: run
+the same command with the same seed again once the keyring is reachable. Run
+this line on its own, paste the seed when prompted, and press Enter:
 
 ```bash
 printf 'WALLET_SK seed: ' && read -rs WALLET_SK && echo && export WALLET_SK

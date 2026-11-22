@@ -208,7 +208,7 @@ The seed is never printed, logged, or returned.
 - `--force`: replace an already-enrolled entry (refused without it when one exists).
 - `--repair-identity`: write only the signer identity record of an existing enrollment; see below. Excludes `--secret-env` and `--force`.
 
-The coordinate's `account` field is the signer identity: `signer_from_keyring` verifies the loaded seed derives to it, so `account` must equal the seed's public address. Enrollment classifies the field from its raw on-disk value (environment overlays never influence what gets persisted) and resolves three cases. A profile fresh from `profile init`, or a v1-migrated profile, can hold the literal placeholder `"default"`. Enrollment pins the derived address into `account`, patching only that key in the profile TOML before writing the keyring entry. Once `account` holds a G-strkey, enrollment refuses on a mismatch and prints the address to set `account` to. The profile TOML is left untouched. Any other value (a mistyped or truncated pin) is refused with `enroll_signer.account_malformed` rather than replaced. Every refusal, including an unset secret variable, leaves the file unmodified. A keyring write that fails after the pin leaves the pinned address; a re-run retries the write. On success the data object reports the derived `public_address`, the `keyring_service`/`keyring_account` written, `replaced` (with `previous_address` when an entry was replaced), and `account_populated` (`true` when the placeholder was just pinned):
+The coordinate's `account` field is the signer identity: `signer_from_keyring` verifies the loaded seed derives to it, so `account` must equal the seed's public address. Enrollment classifies the field from its raw on-disk value (environment overlays never influence what gets persisted) and resolves three cases. A profile fresh from `profile init`, or a v1-migrated profile, can hold the literal placeholder `"default"`. Enrollment pins the derived address into `account` before it writes the keyring entry. The pin changes only that value, and it writes the whole profile file again: keys come out sorted within each table, and comments are dropped. Once `account` holds a G-strkey, enrollment refuses on a mismatch and prints the address to set `account` to. The profile TOML is left untouched. Any other value (a mistyped or truncated pin) is refused with `enroll_signer.account_malformed` rather than replaced. Every refusal, including an unset secret variable, leaves the file unmodified. A refused keyring write after the pin leaves `[mcp_signer_default].account` set to the new address and no seed stored. Once the keyring is reachable, run the command again with the same seed to complete the enrollment; another seed refuses on the mismatch. On success the data object reports the derived `public_address`, the `keyring_service`/`keyring_account` written, `replaced` (with `previous_address` when an entry was replaced), and `account_populated` (`true` when the placeholder was just pinned):
 
 ```json
 {"ok":true,"data":{"profile":"default","enrolled":true,"public_address":"G...","keyring_service":"stellar-agent-signer-default","keyring_account":"G...","replaced":false,"account_populated":true,"identity_keyring_account":"enrolled-identity"},"request_id":"..."}
@@ -709,7 +709,8 @@ that hold's capacity. The member is `[]` when the current pinned body has no
 total bound and the usage read succeeds. It is `null` when the use is
 unknown, including a failed usage read; the `total_budget_usage` check
 explains the reason in `detail` and includes `code` when available.
-Unknown use comes from a body that is not the pinned authority, a pin that
+Unknown use comes from a body that is not the pinned authority, such as a
+freshly signed body before the pin moves to it, a pin that
 changes during the read, an absent pin or lock file, history from a build
 before version 12, a retired digest, or an amount that cannot be summed. Those cases leave `valid` unchanged.
 An authenticated state read that fails is a failed check with its code, such
@@ -719,7 +720,16 @@ intent legs; usage adds no format version.
 
 See [the policy schema and minimum](../profiles.md#mainnet-policy-body) for
 required signed fields and rules. After enablement, complete and sign the
-policy, run `--check`, and restart the MCP server.
+policy, restart the MCP server, and then run `--check`.
+
+Signing leaves the pin at its sequence. The first CLI value verb or MCP
+server start on the new body moves the pin to it, and `--check` never moves
+it. A check before that move reports `valid: true` and the `pin` check at the
+old sequence. It also reports `total_budget_usage: null`, with that check
+`not_evaluated` and code `policy.total_epoch_stale`. A CLI value verb moves
+the pin and runs. An MCP server started before the signing refuses mainnet
+commits with `network.mainnet_write_forbidden` and the detail
+`enablement or policy changed, restart the server`.
 
 Binding failures name `mainnet_table`, `profile`, `source`, `default`, `on_disk`,
 `chain_id`, `on_disk_host`, `merged_host`, `on_disk_oracle_host`,
@@ -965,8 +975,11 @@ that wrote it. A `v0.1.0-alpha.13` build cannot read a store this build has
 written. It refuses the file, as not valid JSON or as a newer wire version,
 and advises `profile reset-window-state`. Do not run that reset with the alpha.13 build.
 It discards the spending state, and this build then refuses the profile with
-`policy.window_chain_unverifiable`, which no verb recovers. The reset releases expired authorizations in memory before it
-writes the row.
+`policy.window_chain_unverifiable`, which no verb recovers.
+Once this build has written to the profile's audit log, `audit bind-carriers`
+included, the alpha.13 build cannot open that log either. The log then holds
+row kinds alpha.13 does not know.
+The reset releases expired authorizations in memory before it writes the row.
 
 An MCP server acquires the profile's audit writer at the first operation that
 needs it, such as a commit preflight. It normally holds the writer until the
@@ -2016,6 +2029,10 @@ again: it advances `generation`, retires the current outbox under the next
 carriers refuse with `audit.carrier_replaced`. A staged
 generation refuses with `audit.carrier_binding_incomplete`; rerun this command
 to finish it.
+A `v0.1.0-alpha.13` build cannot open the log after this command, because it
+does not know the `audit_carriers_bound` row. The first keyed open of this
+build writes an `audit_entry_tags_started` row, which alpha.13 does not know
+either.
 
 ## The governance loop
 

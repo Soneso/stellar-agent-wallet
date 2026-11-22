@@ -22,9 +22,11 @@ A feature-enabled server admits `stellar_pay_commit`, `stellar_claim_commit`,
 `stellar_create_account_commit`, and `stellar_trustline_commit` after setup.
 Both prepare and commit policy names need matching rules. Under Allow, a
 mainnet commit signs without an approval. Under RequireApproval, it needs a
-verified approval. A commit evaluates both its own name and its preparation's
-name, and the stricter decision governs.
-A pending approval uses the shorter lifetime from the two evaluations. Allow
+verified approval. On mainnet a commit evaluates both its own name and its
+preparation's name, and the stricter decision governs.
+On testnet the commit's own rule alone decides, so a commit rule needs its own
+`decision = "require_approval"` to require an approval.
+On mainnet a pending approval uses the shorter lifetime from the two evaluations. Allow
 contributes 600 seconds; RequireApproval supplies its configured lifetime.
 Authorization defaults to 120 seconds and cannot outlive the governing
 decision.
@@ -32,8 +34,8 @@ decision.
 Paired preparation refuses an undecodable envelope with `simulation.divergence`.
 A denied rule retains `policy.deny.*`; an unknown decision uses
 `policy.unexpected_decision`. None of these refusals persists an approval.
-Each commit evaluates both names before attestation validation. On mainnet, a
-proof supplied under Allow to a classic commit or an x402 payment tool verifies
+On mainnet, each commit evaluates both names before attestation validation. A
+proof supplied there under Allow to a classic commit or an x402 payment tool verifies
 against its approval's durable record and is spent like a required one. A proof
 without a durable record refuses and stays unspent. Off mainnet, Allow neither
 verifies nor spends a proof supplied to `stellar_pay_commit`,
@@ -119,7 +121,7 @@ Fetches the native XLM balance and trustlines for a Stellar account.
 
 - `assets` (array, optional): Non-native trustlines to include. Each element is `{ "code": "USDC", "issuer": "GA5Z..." }`. Returns the native XLM balance plus any trustlines listed in the optional `assets` argument. Up to 100 trustline assets may be queried per call; assets the account does not currently trust are omitted from the returned `balances` list.
 
-**Returns:** JSON envelope identical to `stellar-agent balances --account <G>`.
+**Returns:** JSON envelope identical to `stellar-agent balances --account <G>`. In each `balances` entry, `asset.asset_type` is `native` for XLM or the asset code, such as `USDC`, and a trustline adds `asset.issuer`.
 
 **Annotations:** `readOnlyHint=true`, `destructiveHint=false`.
 
@@ -473,7 +475,7 @@ Three error codes describe a submission whose outcome the wallet cannot settle o
 
 **Recovery protocol.** Call `stellar_transaction_status` with `details.tx_hash`. Do not re-simulate, rebuild, or resubmit the payment: the transaction may still apply, and the sequence number it consumes may already be spent by it. A second submission at that sequence is refused with `submission.tx_already_submitted` while the first one's receipt remains pending. `stellar_transaction_status` reports what the endpoint says and records a success as a report. A reported failure or missing transaction does not release possible spending:
 
-- `SUCCESS`: the endpoint reports that the transaction applied. The receipt records `success`, unless it belongs to an untimed reservation and already records another network answer, which it keeps. The reservation keeps counting through its accounting horizon. No submitted row is written, and the pending row stays open.
+- `SUCCESS`: the endpoint reports that the transaction applied. The receipt records `success`, unless it belongs to an untimed reservation and already records another network answer, which it keeps. A time-bounded reservation keeps counting through its accounting horizon. An untimed one has no horizon, and a testnet classic commit that reserved spending makes one: it stays open, with `record.reservation_open: true`, until the operator runs `stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge --acknowledge-unbounded`. A commit whose policy produced no window entries holds nothing and answers `record.reservation_open: false`. No submitted row is written, and the pending row stays open.
 - `FAILED`: the endpoint reports that the transaction applied and failed. The report changes neither the reservation nor the receipt, and no `value_action_failed` row is owed.
 - `NOT_FOUND`: the endpoint has no record of it. Within the retention window, an observed ledger close time strictly past its time bound, or a source account sequence that has reached the transaction's, is followed by a second transaction lookup. Neither observation proves that the transaction can no longer apply. A second `NOT_FOUND` keeps the reservation, and a `SUCCESS` is recorded as above. Without such an observation the record stands: call again later.
 

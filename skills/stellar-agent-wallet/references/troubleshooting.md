@@ -547,8 +547,12 @@ What `stellar_transaction_status` reports, and what it means:
 A reported failure or missing transaction does not release possible spending.
 
 - `chain_status: "SUCCESS"`: the endpoint reports that the payment went
-  through. Report it as done. The spend keeps counting through the
-  transaction's accounting horizon, and no submitted row is written.
+  through. Report it as done. A time-bounded spend keeps counting through the
+  transaction's accounting horizon, and no submitted row is written. A testnet
+  classic envelope carries no time bound, so the hold of a testnet commit that
+  reserved spending stays open, with `record.reservation_open: true`, until the
+  operator clears it with both acknowledgement flags. A commit that reserved
+  nothing answers `record.reservation_open: false`.
 - `chain_status: "FAILED"`: the endpoint reports that the transaction applied
   and failed. The record keeps its status, and the reservation keeps counting
   through its accounting horizon. Without a time bound it counts until the
@@ -558,7 +562,10 @@ A reported failure or missing transaction does not release possible spending.
 - On a mainnet profile, an authenticated classic attempt reports `chain_status`
   from cached recovery evidence, or `UNKNOWN` without it, and sends no
   additional transaction lookup. Its `recovery` field carries each attempt's
-  typed result: `Included`, `NeverApplicable`, or `NeedsEvidence`. An unmanaged
+  typed result: `Included`, `NeverApplicable`, or `NeedsEvidence`. A checked
+  recovery decision settles it once this host's clock is at least six seconds
+  past the envelope's maxTime. The decision needs identical answers from the
+  primary endpoint and the oracle, and the profile's audit writer. An unmanaged
   record keeps its primary lookup; that answer's `FAILED` or `NOT_FOUND` decides
   nothing alone, and the oracle the enablement binds is asked as well.
   Reconciliation runs only after the

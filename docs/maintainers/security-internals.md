@@ -564,11 +564,16 @@ Committed appends, rotations, and prunes of the holding writer update the
 index. Any other listing or tip change, a quarantine row, or a pending row
 that fails to read back discards it. An obligation in the oldest retained
 archive keeps answering until the writer prunes that archive. Content edits
-under unchanged names are refused by the next keyed acquisition. `tx status` and `stellar_transaction_status` acquire the writer
-only to deliver an unacknowledged accounting event. A receipt projection that
+under unchanged names are refused by the next keyed acquisition. On testnet, `tx status` and `stellar_transaction_status` acquire the writer
+only to deliver an unacknowledged accounting event. On mainnet the recovery
+decision and the receipt repair take it as well. A receipt projection that
 is owed alone completes without the writer. When the writer cannot be acquired
 or the retained history does not verify, both still render their answer. The
-refusal is logged at WARN, and the obligation stays owed.
+refusal is logged at WARN, and the obligation stays owed. On mainnet no
+recovery decision runs then: an attempt without a checked decision answers
+`chain_status: UNKNOWN` and `record.reservation_open: true`, and
+`recovery.refusal.code` names the writer refusal, such as
+`audit.chain_key_unavailable` for a writer another process holds.
 Where the profile has an audit writer,
 `tx receipt clear` refuses with the verifier's code, such as
 `audit.chain_broken` for a broken chain, and keeps the receipt.

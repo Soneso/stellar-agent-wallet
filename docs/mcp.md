@@ -98,6 +98,9 @@ A mainnet profile loads only through `--profile <name>`. `STELLAR_AGENT_PROFILE`
 Implicit mainnet selection exits with `profile.mainnet_requires_explicit_profile`.
 The message names the selection source and the recovery command:
 `stellar-agent-mcp --profile <name>`.
+The message leaves out the requested name, which may be a value typed into the
+wrong place; the CLI message for this refusal names the profile. The server's
+refusal of a named profile without a file leaves the name out too.
 An environment or programmatic overlay may set only operational fields.
 `submit_timeout_seconds` is overlayable on every chain, and `mcp_disabled`
 accepts only `true`. [Loader source order](profiles.md#loader-source-order)
@@ -506,9 +509,11 @@ Default builds enable the `mainnet-write` feature. The MCP server in these build
 `stellar_trustline_commit` after setup.
 Both prepare and commit policy names need matching rules. Under Allow, a
 mainnet commit signs without an approval. Under RequireApproval, it needs a
-verified approval. A commit evaluates both its own name and its preparation's
-name, and the stricter decision governs.
-A pending approval uses the shorter lifetime from the two evaluations. Allow
+verified approval. On mainnet a commit evaluates both its own name and its
+preparation's name, and the stricter decision governs.
+On testnet the commit's own rule alone decides, so a commit rule needs its own
+`decision = "require_approval"` to require an approval.
+On mainnet a pending approval uses the shorter lifetime from the two evaluations. Allow
 contributes 600 seconds; RequireApproval supplies its configured lifetime.
 Authorization defaults to 120 seconds and cannot outlive the governing
 decision.
@@ -541,8 +546,8 @@ both.
 Paired preparation refuses an undecodable envelope with `simulation.divergence`.
 A denied rule retains `policy.deny.*`; an unknown decision uses
 `policy.unexpected_decision`. None of these refusals persists an approval.
-Each commit evaluates both names before attestation validation. On mainnet, a
-proof supplied under Allow to a classic commit or an x402 payment tool verifies
+On mainnet, each commit evaluates both names before attestation validation. A
+proof supplied there under Allow to a classic commit or an x402 payment tool verifies
 against its approval's durable record and is spent like a required one. A proof
 without a durable record refuses and stays unspent. Off mainnet, Allow neither
 verifies nor spends a proof supplied to `stellar_pay_commit`,
@@ -1008,6 +1013,23 @@ starts one new bounded evidence run for a stopped attempt, as
 authorizes no successor. Unknown-submission errors carry
 the shared [recovery guidance](agents.md), including a checked retry
 time or the typed reason that the time is unavailable.
+
+The classic envelopes the wallet builds on testnet carry no time bound, so the
+hold of a testnet commit that reserved spending has no accounting horizon.
+After a reported `SUCCESS` the call answers `chain_status: SUCCESS` with
+`record.reservation_open: true`. The hold stays open until the operator runs
+`stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge --acknowledge-unbounded`.
+A commit whose policy produced no window entries holds nothing and answers
+`record.reservation_open: false`.
+
+On mainnet only a checked recovery decision settles a managed attempt. The
+decision runs once this host's clock is at least six seconds past the
+envelope's maxTime. It needs the oracle the enablement binds and identical
+answers from the primary endpoint and the oracle. It also takes the profile's
+audit writer. While this server holds that writer, a CLI `tx status` for the
+profile answers `chain_status: UNKNOWN`, `record.reservation_open: true` and
+`recovery.refusal.code: audit.chain_key_unavailable`. Run it again after the
+server stops to settle the attempt.
 
 `stellar_transaction_status` refuses with `submission.record_unavailable` when the spending-window file cannot be read.
 

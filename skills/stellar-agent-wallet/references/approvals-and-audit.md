@@ -114,11 +114,13 @@ passkey ceremony. RequireApproval runs a ceremony with its rule lifetime.
 A mainnet RequireApproval rule sets `ttl_secs` from 1 through 86,400 seconds;
 an unlisted approval escalation uses the default one-day lifetime.
 The presence challenge retains its separate 120-second bound.
-Classic MCP approvals expire at the shorter prepare/commit
+On mainnet, classic MCP approvals expire at the shorter prepare/commit
 lifetime, with Allow contributing 600 seconds. Both names need matching rules.
 On a mainnet MCP server, Allow signs without an approval, and RequireApproval
-needs a verified approval. A commit evaluates both names, and the stricter
-decision governs.
+needs a verified approval. On mainnet a commit evaluates both names, and the
+stricter decision governs. On testnet the commit's own rule alone decides, so
+a commit rule needs its own `decision = "require_approval"` to require an
+approval.
 
 Authorization defaults to 120 seconds, bounded by approval expiry.
 Minted authorization holds count against window headroom. Consumption,
@@ -972,12 +974,17 @@ each acquisition. Any listing change outside the writer discards the index,
 and a missing, replaced, or shortened active file refuses through the walk.
 The eleventh rotation deletes the oldest archive. Callers hold the writer guard
 during settlement and clear lookups. Accounting delivery retains it through
-append and acknowledgement. `tx status` and `stellar_transaction_status`
-acquire the writer only to deliver an unacknowledged accounting event. A
-receipt projection that is owed alone completes without the writer. When the
-writer cannot be acquired or the retained history does not verify, both still
-render their answer. The refusal is logged at WARN, and the obligation stays
-owed. Where the profile has an audit writer, `tx receipt clear` refuses with the verifier's
+append and acknowledgement. On testnet, `tx status` and
+`stellar_transaction_status` acquire the writer only to deliver an
+unacknowledged accounting event. On mainnet the recovery decision and the
+receipt repair take it as well. A receipt projection that is owed alone
+completes without the writer. When the writer cannot be acquired or the
+retained history does not verify, both still render their answer. The refusal
+is logged at WARN, and the obligation stays owed. On mainnet no recovery
+decision runs then: an attempt without a checked decision answers
+`chain_status: UNKNOWN` and `record.reservation_open: true`, and
+`recovery.refusal.code` names the writer refusal, such as
+`audit.chain_key_unavailable` for a writer another process holds. Where the profile has an audit writer, `tx receipt clear` refuses with the verifier's
 code, such as `audit.chain_broken` for a broken chain, and keeps the receipt.
 
 The anchor is written after the entry it covers is fsynced, so it is not
@@ -1220,6 +1227,10 @@ again: it advances `generation`, retires the current outbox under the next
 carriers refuse with `audit.carrier_replaced`. A staged
 generation refuses with `audit.carrier_binding_incomplete`; rerun this command
 to finish it.
+A `v0.1.0-alpha.13` build cannot open the log after this command, because it
+does not know the `audit_carriers_bound` row. The first keyed open of this
+build writes an `audit_entry_tags_started` row, which alpha.13 does not know
+either.
 
 ## The governance loop end to end
 
