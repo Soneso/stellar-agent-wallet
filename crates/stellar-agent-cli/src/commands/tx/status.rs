@@ -70,6 +70,12 @@
 //! For a managed mainnet attempt, `recovery` carries each attempt's typed
 //! result (`Included`, `NeverApplicable` or `NeedsEvidence`), its retry
 //! class, earliest retry time and next action, plus any refusal code.
+//! Recovery runs from maxTime + 6 s, the reported earliest retry time;
+//! before it the verb sends no recovery request. An inclusion decision needs
+//! the primary and the oracle to report the same inclusion. It ends the hold
+//! and writes
+//! one `operation_transition` audit row with the evidence digest and both
+//! ledgers. A disagreement decides nothing and keeps the hold.
 //! `--retry-recovery` starts one new bounded evidence run for a stopped
 //! attempt, also before its retry time or after `RetriesExhausted`. That run
 //! resets the attempt's run count to one, so at most 15 automatic runs
@@ -91,13 +97,17 @@
 //!
 //! # Concurrency
 //!
-//! Delivering an accounting audit event needs the audit writer's exclusive
-//! lock, and the verb acquires the writer only for an unacknowledged event.
-//! While an MCP server holds that profile's writer, the verb still reconciles
-//! and reports. The event stays owed, and the refusal is logged at WARN. Stop
-//! that server and run the verb again to deliver it. The server acquires its
-//! writer when needed, including for V1 reservation reconciliation during
-//! simulation. The registry normally retains it until exit. A replaced-file
+//! Mainnet recovery and the delivery of an unacknowledged accounting audit
+//! event each need the audit writer's exclusive lock, and the verb acquires
+//! the writer only for them. While another process, such as an MCP server,
+//! holds that profile's writer, the verb still reconciles, reports and exits
+//! 0. It skips recovery, reports `recovery.refusal.code`
+//! `audit.chain_key_unavailable` and keeps the hold. An owed event stays
+//! owed, and the refusal is logged at WARN with `audit.writer_locked`. Stop
+//! that server and run the verb again to settle and deliver. The server
+//! acquires its writer when needed, including for V1 reservation
+//! reconciliation during simulation. The registry normally retains it until
+//! exit. A replaced-file
 //! refusal during acquisition marks it for eviction; a later acquisition
 //! drops it once callers release it.
 //!
@@ -609,6 +619,11 @@ mod tests {
         );
     }
 
+    /// The policy rule that allows `stellar_transaction_status` on mainnet.
+    #[cfg(feature = "mainnet-write")]
+    const STATUS_RULE: &str = "[[rules]]\nmatch = { tool = \"stellar_transaction_status\", \
+                               chain = \"stellar:mainnet\" }\ncriteria = []\ndecision = \"allow\"\n";
+
     /// The real `tx status` handler and the real MCP tool on one managed
     /// mainnet attempt that recovery stopped: the default replays the stop
     /// with no request, the explicit flag starts one bounded run, nothing is
@@ -631,12 +646,10 @@ mod tests {
             ClassicRpc::mainnet(&[&agent, DESTINATION, ISSUER]),
             ClassicRpc::mainnet(&[&agent, DESTINATION, ISSUER]),
         ];
-        let status_rule = "[[rules]]\nmatch = { tool = \"stellar_transaction_status\", \
-                           chain = \"stellar:mainnet\" }\ncriteria = []\ndecision = \"allow\"\n";
         let fixture = Spec::new("status-retry-handlers")
             .rules(vec![
                 pay_rule("require_approval", ""),
-                status_rule.to_owned(),
+                STATUS_RULE.to_owned(),
             ])
             .primary(endpoints[0].clone())
             .oracle(endpoints[1].clone())
@@ -846,11 +859,9 @@ mod tests {
     async fn status_selector_matrix_testnet() {
         use crate::common::mainnet_write_fixture::{DESTINATION, ISSUER, Spec, pay_rule};
         use crate::test_rpc::ClassicRpc;
-        let status_rule = "[[rules]]\nmatch = { tool = \"stellar_transaction_status\", \
-                           chain = \"stellar:mainnet\" }\ncriteria = []\ndecision = \"allow\"\n";
         let fixture = Spec::new("status-selectors-testnet")
             .testnet()
-            .rules(vec![pay_rule("allow", ""), status_rule.to_owned()])
+            .rules(vec![pay_rule("allow", ""), STATUS_RULE.to_owned()])
             .primary(ClassicRpc::testnet(&[DESTINATION, ISSUER]))
             .build()
             .await;
@@ -925,12 +936,10 @@ mod tests {
         };
         use crate::test_rpc::ClassicRpc;
         let agent = stellar_agent_test_support::signed_envelope::account_id_for_seed(AGENT_SEED);
-        let status_rule = "[[rules]]\nmatch = { tool = \"stellar_transaction_status\", \
-                           chain = \"stellar:mainnet\" }\ncriteria = []\ndecision = \"allow\"\n";
         let fixture = Spec::new("status-selectors-mainnet")
             .rules(vec![
                 pay_rule("require_approval", ""),
-                status_rule.to_owned(),
+                STATUS_RULE.to_owned(),
             ])
             .primary(ClassicRpc::mainnet(&[&agent, DESTINATION, ISSUER]))
             .oracle(ClassicRpc::mainnet(&[&agent, DESTINATION, ISSUER]))
@@ -1045,12 +1054,10 @@ mod tests {
         };
         use crate::test_rpc::ClassicRpc;
         let agent = stellar_agent_test_support::signed_envelope::account_id_for_seed(AGENT_SEED);
-        let status_rule = "[[rules]]\nmatch = { tool = \"stellar_transaction_status\", \
-                           chain = \"stellar:mainnet\" }\ncriteria = []\ndecision = \"allow\"\n";
         let mut spec = Spec::new(name)
             .rules(vec![
                 pay_rule("require_approval", ""),
-                status_rule.to_owned(),
+                STATUS_RULE.to_owned(),
             ])
             .primary(ClassicRpc::mainnet(&[&agent, DESTINATION, ISSUER]))
             .oracle(ClassicRpc::mainnet(&[&agent, DESTINATION, ISSUER]));
@@ -1108,9 +1115,18 @@ mod tests {
     async fn cli_status(
         fixture: &crate::common::mainnet_write_fixture::MainnetFixture,
     ) -> (i32, serde_json::Value) {
+        cli_status_of(fixture, SEEDED_TX).await
+    }
+
+    /// Runs `tx status` on `tx_hash`.
+    #[cfg(feature = "mainnet-write")]
+    async fn cli_status_of(
+        fixture: &crate::common::mainnet_write_fixture::MainnetFixture,
+        tx_hash: &str,
+    ) -> (i32, serde_json::Value) {
         crate::common::render::take_rendered_for_test();
         let code = super::run(&super::StatusArgs {
-            tx_hash: Some(SEEDED_TX.to_owned()),
+            tx_hash: Some(tx_hash.to_owned()),
             business_id: None,
             profile: Some(fixture.name.to_owned()),
             output: stellar_agent_core::envelope::OutputFormat::Json,
@@ -1388,13 +1404,11 @@ mod tests {
         };
         use crate::test_rpc::ClassicRpc;
         let agent = stellar_agent_test_support::signed_envelope::account_id_for_seed(AGENT_SEED);
-        let status_rule = "[[rules]]\nmatch = { tool = \"stellar_transaction_status\", \
-                           chain = \"stellar:mainnet\" }\ncriteria = []\ndecision = \"allow\"\n";
         let fixture = Spec::new(name)
             .testnet()
             .rules(vec![
                 pay_rule("require_approval", ""),
-                status_rule.to_owned(),
+                STATUS_RULE.to_owned(),
             ])
             .primary(ClassicRpc::testnet(&[&agent, DESTINATION, ISSUER]))
             .build()
@@ -1483,6 +1497,480 @@ mod tests {
                     assert!(value.get("destination").is_none());
                 }
             }
+        }
+    }
+
+    /// The settle path of a committed mainnet payment: a verified policy, a
+    /// mainnet enablement, fresh provider hosts, a configured oracle, and a
+    /// rule that allows `stellar_transaction_status`. Both endpoints answer
+    /// `getTransaction` through a script the test arms after the payment,
+    /// and report their latest ledger closed at the wallet clock.
+    #[cfg(feature = "mainnet-write")]
+    mod settle_path {
+        use std::sync::{Arc, Mutex};
+
+        use serde_json::{Value, json};
+        use sha2::{Digest as _, Sha256};
+
+        use crate::commands::pay::tests::mainnet_full as pay;
+        use crate::common::mainnet_write_fixture::{
+            AGENT_SEED, DESTINATION, ISSUER, MainnetFixture, Spec, pay_rule,
+        };
+        use crate::test_rpc::ClassicRpc;
+
+        /// The `getTransaction` answers of `[primary, oracle]`; `None` keeps
+        /// the endpoint's own answer.
+        type Answers = Arc<Mutex<[Option<Value>; 2]>>;
+
+        /// The latest ledger the primary reports in its transaction answer.
+        const PRIMARY_LATEST: u32 = 2001;
+        /// The latest ledger the oracle reports in its transaction answer.
+        const ORACLE_LATEST: u32 = 2002;
+        /// The including ledger both endpoints report.
+        const INCLUDED_LEDGER: u32 = 1005;
+        /// The fee the result charges, equal to the envelope's cap.
+        const FEE_CHARGED: i64 = 100;
+        /// How many seconds before maxTime the including ledger closes.
+        const INCLUSION_LEAD_SECS: u64 = 5;
+
+        /// The wallet clock in seconds, fixed or not, as the close time of
+        /// each endpoint's latest ledger.
+        fn wallet_close_secs() -> u64 {
+            stellar_agent_network::mainnet::clock::now_ms().expect("clock") / 1_000
+        }
+
+        /// A mainnet endpoint funding the payment's accounts, with its
+        /// latest ledger closed at the wallet clock, answering
+        /// `getTransaction` with the armed answer of `role`.
+        fn scripted(answers: &Answers, role: usize) -> ClassicRpc {
+            let agent =
+                stellar_agent_test_support::signed_envelope::account_id_for_seed(AGENT_SEED);
+            let answers = Arc::clone(answers);
+            ClassicRpc::mainnet(&[&agent, DESTINATION, ISSUER])
+                .with_close_clock(wallet_close_secs)
+                .with_script(move |method, _, _| {
+                    if method == "getTransaction" {
+                        answers.lock().expect("answers")[role].clone()
+                    } else {
+                        None
+                    }
+                })
+        }
+
+        /// The canonical transaction answer in the order the recovery
+        /// evidence digest serializes it.
+        #[derive(serde::Serialize)]
+        struct Canonical<'a> {
+            status: &'a str,
+            ledger: Option<u32>,
+            created_at: Option<u64>,
+            tx_hash: &'a str,
+            envelope_xdr: Option<&'a str>,
+            result_xdr: Option<&'a str>,
+            latest_ledger: u32,
+            oldest_ledger: u32,
+        }
+
+        /// A committed mainnet payment whose outcome is unknown, with its
+        /// hold open and both endpoint scripts unarmed.
+        struct Paid {
+            fixture: MainnetFixture,
+            answers: Answers,
+            tx_hash: String,
+            hold: String,
+            envelope: String,
+            max_time: u64,
+        }
+
+        impl Paid {
+            async fn new(name: &'static str) -> Self {
+                let answers = Answers::default();
+                let endpoints = [scripted(&answers, 0), scripted(&answers, 1)];
+                let fixture = Spec::new(name)
+                    .rules(vec![
+                        pay_rule("require_approval", ""),
+                        super::STATUS_RULE.to_owned(),
+                    ])
+                    .primary(endpoints[0].clone())
+                    .oracle(endpoints[1].clone())
+                    .build()
+                    .await;
+                let paid = pay::run(&fixture, &pay::mainnet_args(&fixture)).await;
+                assert_eq!(paid.code, 0, "{}", paid.envelope);
+                let tx_hash = paid.envelope["data"]["tx_hash"]
+                    .as_str()
+                    .expect("hash")
+                    .to_owned();
+                let record = fixture.window_body()["operations"]["records"][0].clone();
+                assert_eq!(record["state"], "sent_outcome_unknown", "{record}");
+                let max_time = record["attempts"][0]["exposure"]["identity"]["classic"]["max_time"]
+                    .as_u64()
+                    .expect("max time");
+                let sent = fixture.sent_envelopes().await;
+                assert_eq!(sent.len(), 1, "one send: {sent:?}");
+                let holds = super::super::PersistedWindowStore::for_profile(fixture.name)
+                    .pending_reservations(&fixture.profile())
+                    .expect("window");
+                let held: Vec<_> = holds.iter().filter(|h| h.tx_hash == tx_hash).collect();
+                assert_eq!(
+                    held.len(),
+                    1,
+                    "the payment holds one reservation: {holds:?}"
+                );
+                let hold = held[0].id.clone();
+                Self {
+                    fixture,
+                    answers,
+                    tx_hash,
+                    hold,
+                    envelope: sent[0].clone(),
+                    max_time,
+                }
+            }
+
+            /// The first time recovery may decide, maxTime + 6 s, in ms.
+            fn due_ms(&self) -> u64 {
+                (self.max_time + 6) * 1_000
+            }
+
+            /// The close time of the including ledger, in seconds.
+            fn included_close_secs(&self) -> u64 {
+                self.max_time - INCLUSION_LEAD_SECS
+            }
+
+            /// The `getTransaction` requests the oracle has received.
+            async fn oracle_reads(&self) -> usize {
+                self.fixture
+                    .oracle_methods()
+                    .await
+                    .iter()
+                    .filter(|method| *method == "getTransaction")
+                    .count()
+            }
+
+            /// The requests both endpoints have received.
+            async fn requests(&self) -> (usize, usize) {
+                (
+                    self.fixture.primary_methods().await.len(),
+                    self.fixture.oracle_methods().await.len(),
+                )
+            }
+
+            /// The SUCCESS answer an endpoint reporting `latest` gives.
+            fn success(&self, latest: u32) -> Value {
+                json!({
+                    "status": "SUCCESS",
+                    "txHash": self.tx_hash,
+                    "ledger": INCLUDED_LEDGER,
+                    "createdAt": self.included_close_secs().to_string(),
+                    "envelopeXdr": self.envelope,
+                    "resultXdr": success_result(),
+                    "latestLedger": latest,
+                    "oldestLedger": 1,
+                })
+            }
+
+            /// Arms both endpoints with the same inclusion, differing only in
+            /// the latest ledger, and returns the expected evidence digest.
+            fn arm_agreeing_success(&self) -> String {
+                *self.answers.lock().expect("answers") = [
+                    Some(self.success(PRIMARY_LATEST)),
+                    Some(self.success(ORACLE_LATEST)),
+                ];
+                let result = success_result();
+                let canonical = |latest_ledger| Canonical {
+                    status: "SUCCESS",
+                    ledger: Some(INCLUDED_LEDGER),
+                    created_at: Some(self.included_close_secs()),
+                    tx_hash: &self.tx_hash,
+                    envelope_xdr: Some(&self.envelope),
+                    result_xdr: Some(&result),
+                    latest_ledger,
+                    oldest_ledger: 1,
+                };
+                let bytes =
+                    serde_json::to_vec(&[canonical(PRIMARY_LATEST), canonical(ORACLE_LATEST)])
+                        .expect("canonical answers");
+                stellar_agent_core::hex::encode(&<[u8; 32]>::from(Sha256::digest(bytes)))
+            }
+
+            /// Arms the primary with SUCCESS and the oracle with a well-formed
+            /// NOT_FOUND whose retained range covers the including ledger.
+            fn arm_oracle_not_found(&self) {
+                *self.answers.lock().expect("answers") = [
+                    Some(self.success(PRIMARY_LATEST)),
+                    Some(json!({
+                        "status": "NOT_FOUND",
+                        "txHash": self.tx_hash,
+                        "latestLedger": ORACLE_LATEST,
+                        "oldestLedger": 1,
+                        "latestLedgerCloseTime": (self.due_ms() / 1_000).to_string(),
+                        "oldestLedgerCloseTime": "1",
+                    })),
+                ];
+            }
+
+            /// Whether the pending list still holds the payment's hold.
+            fn holds(&self) -> bool {
+                super::holds(&self.fixture, &self.hold)
+            }
+
+            /// The `operation_transition` rows into `succeeded`.
+            fn succeeded_rows(&self) -> Vec<Value> {
+                self.fixture
+                    .audit_rows("operation_transition")
+                    .into_iter()
+                    .filter(|row| row["step"] == "succeeded")
+                    .collect()
+            }
+
+            /// Runs `tx status` on the payment's hash.
+            async fn cli(&self) -> (i32, Value) {
+                super::cli_status_of(&self.fixture, &self.tx_hash).await
+            }
+
+            /// Asserts the settled answer, the one `succeeded` row with the
+            /// digest and both ledgers, and the hold's removal.
+            fn assert_settled(&self, view: &Value, digest: &str, surface: &str) {
+                assert_eq!(view["tx_hash"], self.tx_hash.as_str(), "{surface}: {view}");
+                assert_eq!(view["chain_status"], "SUCCESS", "{surface}: {view}");
+                assert_eq!(view["ledger"], INCLUDED_LEDGER, "{surface}: {view}");
+                assert_eq!(
+                    view["record"]["reservation_open"], false,
+                    "{surface}: {view}"
+                );
+                assert_eq!(
+                    view["record"]["envelope_hash"],
+                    self.hold.as_str(),
+                    "{surface}: {view}"
+                );
+                assert_eq!(view["reservation"], Value::Null, "{surface}: {view}");
+                let attempt = &view["recovery"]["attempts"][0];
+                assert_eq!(attempt["result"], "Included", "{surface}: {view}");
+                assert_eq!(attempt["status"], "Success", "{surface}: {view}");
+                let rows = self.succeeded_rows();
+                assert_eq!(rows.len(), 1, "{surface}: one succeeded row: {rows:?}");
+                let row = &rows[0];
+                assert_eq!(row["from_state"], "sent_outcome_unknown", "{row}");
+                assert_eq!(row["evidence_digest"], digest, "{row}");
+                assert_eq!(row["primary_ledger"], PRIMARY_LATEST, "{row}");
+                assert_eq!(row["witness_ledger"], ORACLE_LATEST, "{row}");
+                let record = self.fixture.window_body()["operations"]["records"][0].clone();
+                assert_eq!(record["state"], "succeeded", "{surface}: {record}");
+                assert!(!self.holds(), "{surface}: the hold leaves the pending list");
+            }
+
+            /// Asserts an open hold, no `succeeded` row and an answer that
+            /// still reports the hold and names `reason` as the cause.
+            fn assert_open(&self, view: &Value, surface: &str, reason: &str) {
+                assert_eq!(view["chain_status"], "UNKNOWN", "{surface}: {view}");
+                assert_eq!(
+                    view["record"]["reservation_open"], true,
+                    "{surface}: {view}"
+                );
+                assert_eq!(
+                    view["reservation"]["envelope_hash"],
+                    self.hold.as_str(),
+                    "{surface}: {view}"
+                );
+                assert_eq!(
+                    view["recovery"]["attempts"][0]["result"], "NeedsEvidence",
+                    "{surface}: {view}"
+                );
+                assert_eq!(
+                    view["recovery"]["attempts"][0]["reason"], reason,
+                    "{surface}: {view}"
+                );
+                assert!(
+                    self.succeeded_rows().is_empty(),
+                    "{surface}: no succeeded row"
+                );
+                let record = self.fixture.window_body()["operations"]["records"][0].clone();
+                assert_eq!(
+                    record["state"], "sent_outcome_unknown",
+                    "{surface}: {record}"
+                );
+                assert!(self.holds(), "{surface}: the hold stays open");
+            }
+        }
+
+        /// A successful transaction result charging [`FEE_CHARGED`].
+        fn success_result() -> String {
+            use stellar_xdr::WriteXdr as _;
+            stellar_xdr::TransactionResult {
+                fee_charged: FEE_CHARGED,
+                result: stellar_xdr::TransactionResultResult::TxSuccess(
+                    stellar_xdr::VecM::default(),
+                ),
+                ext: stellar_xdr::TransactionResultExt::V0,
+            }
+            .to_xdr_base64(stellar_xdr::Limits::none())
+            .expect("result XDR")
+        }
+
+        /// After the payment, both endpoints answer the same SUCCESS and
+        /// `stellar_transaction_status` at maxTime + 6 s settles it: SUCCESS,
+        /// `reservation_open: false`, `reservation: null`, one `succeeded`
+        /// transition row with the evidence digest and both ledgers, and the
+        /// hold gone from the pending list.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial(mainnet_clock)]
+        #[serial_test::serial]
+        async fn mcp_status_settles_an_agreed_success_at_the_due_time() {
+            let paid = Paid::new("settle-mcp").await;
+            let server = super::status_server(&paid.fixture);
+            let digest = paid.arm_agreeing_success();
+            let _clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(paid.due_ms());
+
+            let (failed, mcp) = super::mcp_status(&server, &paid.tx_hash).await;
+
+            assert!(!failed, "{mcp}");
+            assert_eq!(mcp["ok"], true, "{mcp}");
+            assert_eq!(mcp["data"].get("reservation"), Some(&Value::Null), "{mcp}");
+            paid.assert_settled(&mcp["data"], &digest, "mcp");
+        }
+
+        /// The same settlement through `tx status` with no server.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial(mainnet_clock)]
+        #[serial_test::serial]
+        async fn cli_status_settles_an_agreed_success_at_the_due_time() {
+            let paid = Paid::new("settle-cli").await;
+            let digest = paid.arm_agreeing_success();
+            let _clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(paid.due_ms());
+
+            let (code, cli) = paid.cli().await;
+
+            assert_eq!(code, 0, "{cli}");
+            assert_eq!(cli["ok"], true, "{cli}");
+            assert!(cli["data"].get("reservation").is_none(), "{cli}");
+            paid.assert_settled(&cli["data"], &digest, "cli");
+        }
+
+        /// While another writer holds the profile's audit log, `tx status`
+        /// at maxTime + 6 s refuses recovery with
+        /// `audit.chain_key_unavailable`, logged with `audit.writer_locked`,
+        /// exits 0 with UNKNOWN and keeps the hold. After the holder
+        /// releases the log, the same command settles it.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial(mainnet_clock)]
+        #[serial_test::serial]
+        async fn cli_status_with_a_held_audit_writer_refuses_then_settles() {
+            let paid = Paid::new("settle-cli-locked").await;
+            let digest = paid.arm_agreeing_success();
+            let _clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(paid.due_ms());
+            stellar_agent_core::audit_log::AuditWriterRegistry::remove_for_test(paid.fixture.name);
+            let holder = crate::commands::value_audit::open_best_effort_audit_writer(
+                &paid.fixture.profile(),
+                paid.fixture.name,
+                crate::common::profile_access::ProfileOrigin::Persisted,
+            )
+            .expect("the holder opens the audit writer");
+
+            let (capture, guard) = stellar_agent_test_support::WarningCapture::capture(None);
+            let (code, cli) = paid.cli().await;
+            drop(guard);
+
+            assert_eq!(code, 0, "{cli}");
+            assert_eq!(cli["ok"], true, "{cli}");
+            assert_eq!(
+                cli["data"]["recovery"]["refusal"]["code"], "audit.chain_key_unavailable",
+                "{cli}"
+            );
+            paid.assert_open(&cli["data"], "locked", "RecoveryRequired");
+            let seen = capture.seen();
+            assert!(
+                seen.iter()
+                    .any(|fields| fields.values().any(|v| v.contains("audit.writer_locked"))),
+                "the refusal names the held lock: {seen:?}"
+            );
+
+            drop(holder);
+            let (code, cli) = paid.cli().await;
+            assert_eq!(code, 0, "{cli}");
+            assert_eq!(cli["data"]["recovery"]["refusal"], Value::Null, "{cli}");
+            assert!(cli["data"].get("reservation").is_none(), "{cli}");
+            paid.assert_settled(&cli["data"], &digest, "released");
+        }
+
+        /// One second before maxTime + 6 s neither surface sends a request:
+        /// each answers UNKNOWN with `RecoveryRequired`, a targeted status
+        /// and maxTime + 6 s as `earliest_retry_ms`, keeps the hold and
+        /// writes no `succeeded` row.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial(mainnet_clock)]
+        #[serial_test::serial]
+        async fn status_before_the_due_time_keeps_the_hold() {
+            let paid = Paid::new("settle-early").await;
+            let server = super::status_server(&paid.fixture);
+            paid.arm_agreeing_success();
+            let _clock =
+                stellar_agent_network::mainnet::clock::set_now_ms_for_test(paid.due_ms() - 1_000);
+            let requests = paid.requests().await;
+
+            let (code, cli) = paid.cli().await;
+            assert_eq!(code, 0, "{cli}");
+            let (failed, mcp) = super::mcp_status(&server, &paid.tx_hash).await;
+            assert!(!failed, "{mcp}");
+
+            assert_eq!(
+                paid.requests().await,
+                requests,
+                "no request before the due time"
+            );
+            for (surface, view) in [("cli", &cli["data"]), ("mcp", &mcp["data"])] {
+                paid.assert_open(view, surface, "RecoveryRequired");
+                let attempt = &view["recovery"]["attempts"][0];
+                assert_eq!(
+                    attempt["next_action"], "TargetedStatus",
+                    "{surface}: {view}"
+                );
+                assert_eq!(
+                    attempt["earliest_retry_ms"],
+                    paid.due_ms(),
+                    "{surface}: {view}"
+                );
+            }
+        }
+
+        /// The primary answers SUCCESS and the oracle a NOT_FOUND whose
+        /// retained range covers the including ledger: at maxTime + 6 s `tx
+        /// status` reads the oracle's answer once, stops on `Disagreement`,
+        /// writes no `succeeded` row and keeps the hold.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial(mainnet_clock)]
+        #[serial_test::serial]
+        async fn cli_status_with_an_absent_oracle_answer_keeps_the_hold() {
+            let paid = Paid::new("settle-oracle-absent-cli").await;
+            paid.arm_oracle_not_found();
+            let _clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(paid.due_ms());
+            let reads = paid.oracle_reads().await;
+
+            let (code, cli) = paid.cli().await;
+
+            assert_eq!(code, 0, "{cli}");
+            assert_eq!(paid.oracle_reads().await, reads + 1, "one oracle read");
+            paid.assert_open(&cli["data"], "cli", "Disagreement");
+        }
+
+        /// The same disagreement through `stellar_transaction_status` on its
+        /// own payment: the tool reads the oracle's answer once, stops on
+        /// `Disagreement`, writes no `succeeded` row and keeps the hold.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial(mainnet_clock)]
+        #[serial_test::serial]
+        async fn mcp_status_with_an_absent_oracle_answer_keeps_the_hold() {
+            let paid = Paid::new("settle-oracle-absent-mcp").await;
+            let server = super::status_server(&paid.fixture);
+            paid.arm_oracle_not_found();
+            let _clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(paid.due_ms());
+            let reads = paid.oracle_reads().await;
+
+            let (failed, mcp) = super::mcp_status(&server, &paid.tx_hash).await;
+
+            assert!(!failed, "{mcp}");
+            assert_eq!(paid.oracle_reads().await, reads + 1, "one oracle read");
+            paid.assert_open(&mcp["data"], "mcp", "Disagreement");
         }
     }
 }
