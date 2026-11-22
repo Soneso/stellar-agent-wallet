@@ -116,9 +116,9 @@ for the two recovery paths. `profile show` remains available for diagnosis.
 
 ## Output envelope and exit codes
 
-By default every command prints one JSON envelope on stdout. Exit code `0` means success; exit code `1` means any error. Scripts can branch on the exit code and parse the JSON for details.
+By default every command prints one JSON envelope on stdout. Exit code `0` means success, and exit code `1` means an error. `profile policy-check`, `profile apply-fragment`, and `profile enable-mainnet --state` use more exit codes; see [profile-and-governance](profile-and-governance.md). `mcp serve` exits `2` on a usage refusal and `3` on a second shutdown event; see [MCP server](../mcp.md). Scripts can branch on the exit code and parse the JSON for details.
 
-An argument the parser refuses, such as an unknown flag or a missing required one, also prints one envelope: `validation.usage_error` with the parser's message, exit code `1`, and nothing on stderr. `--help` and `--version` print their text and exit `0`.
+An argument the parser refuses, such as an unknown flag or a missing required one, also prints one envelope: `validation.usage_error`, exit code `1`, and nothing on stderr. The message names the error class and the schema-defined argument, never the rejected text. `--help` and `--version` print their text and exit `0`.
 
 Before it parses the arguments, the CLI on Linux marks its process non-dumpable. When it cannot, it prints one `wallet.process_hardening_failed` envelope, exits `1` and runs no command. A CLI that cannot start its async runtime prints `wallet.runtime_unavailable` the same way.
 
@@ -185,8 +185,8 @@ entry refusal with the prerequisite named. Resolver refusal uses
 `the mainnet write was refused before submission; nothing was sent`.
 
 `network.mainnet_keyring_backend_unsupported` means
-`STELLAR_AGENT_KEYRING_BACKEND` selects a backend other than the platform
-keyring. Mainnet readiness and `profile enable-mainnet` refuse it before the
+`STELLAR_AGENT_KEYRING_BACKEND` is set to any value. Mainnet readiness and
+`profile enable-mainnet` refuse such a process before the
 keyring initializes; mainnet needs the platform keyring. Testnet is
 unaffected.
 
@@ -337,11 +337,11 @@ Signing under a rule pinned to a revoked or retired verifier refuses with `sa.ve
 | `counterparty` | Manage the cached `stellar.toml` bindings that back the counterparty allowlist policy. | [stellar-ops](stellar-ops.md) |
 | `vault` | Deposit into or withdraw from a DeFindex vault via the smart-account (signing). | [defi-and-pool](defi-and-pool.md) |
 | `trade` | Swap tokens via the Soroswap router-direct path via the smart-account (signing). | [defi-and-pool](defi-and-pool.md) |
-| `pool` | Initialise and inspect a channel-account pool for parallel transaction submission. | [defi-and-pool](defi-and-pool.md) |
-| `profile` | Create, list, show, migrate, and rotate the keyring-backed keys of a profile; halt and resume its agent actions. | [profile-and-governance](profile-and-governance.md) |
+| `pool` | Initialize and inspect a channel-account pool for parallel transaction submission. | [defi-and-pool](defi-and-pool.md) |
+| `profile` | Create, list, show, and migrate profiles; enroll and rotate their keys; sign and check policies; enable mainnet; reset window and MPP state; halt and resume agent actions. | [profile-and-governance](profile-and-governance.md) |
 | `credentials` | Register, list, show, and delete WebAuthn passkeys in the per-profile registry. | [profile-and-governance](profile-and-governance.md) |
 | `approve` | Approve a pending request by terminal prompt on testnet or by passkey ceremony on mainnet. Subcommands list, inspect, revoke, serve, and collect approvals and manage approval credentials. | [profile-and-governance](profile-and-governance.md) |
-| `audit` | Walk and verify the integrity of a hash-chained audit log, and repair its tip anchor. | [profile-and-governance](profile-and-governance.md) |
+| `audit` | Verify a hash-chained audit log, repair its tip anchor, acknowledge outbox loss, and bind the audit carriers. | [profile-and-governance](profile-and-governance.md) |
 | `toolsets` | Install, list, run, and uninstall agent toolsets with cryptographic provenance verification. | [toolsets](../toolsets.md) |
 | `mcp` | Run the MCP stdio server with `stellar-agent mcp serve`. | [MCP server](../mcp.md) |
 | `mpp` | Authorize a sponsored testnet MPP charge, inspect durable state, record a host receipt, reconcile settlement, and prune old terminal replay markers. | [agent payments](../agent-payments.md) |

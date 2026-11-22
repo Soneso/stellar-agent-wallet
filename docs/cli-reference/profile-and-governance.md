@@ -7,7 +7,7 @@ This page documents four `stellar-agent` command groups: `profile`, `credentials
 
 For the conventions shared by every command (profile and network resolution, the signer-source flags, the JSON output envelope, exit codes, and mainnet write behavior), see the [CLI reference index](index.md). For the underlying concepts (the policy engine, the approval spine, attestations, the audit log, and toolset gating), see [concepts](../concepts.md). For profile file structure, see [profiles](../profiles.md), and for toolset gating see [toolsets](../toolsets.md).
 
-All four groups operate on local state (TOML files and platform-keyring entries). None of them submits a Stellar transaction. Profile selection and enablement enforce their mainnet-specific prerequisites. Only `profile init` takes `--network` and `--rpc-url`, which set the chain and endpoint of the new profile. By default each command prints the standard `{ok, data, request_id}` JSON envelope on stdout and exits `0` on success or `1` on any error. `--output table` on `profile halt`, `profile resume`, `approve list`, and `approve revoke` prints text rows instead. `approve serve` prints its inbox URL and runs until interrupted. The `credentials add-passkey` warning and the `credentials delete` prompt also print on stdout.
+All four groups operate on local state (TOML files and platform-keyring entries). None of them submits a Stellar transaction. Profile selection and enablement enforce their mainnet-specific prerequisites. Only `profile init` takes `--network` and `--rpc-url`, which set the chain and endpoint of the new profile. By default each command prints the standard `{ok, data, request_id}` JSON envelope on stdout and exits `0` on success or `1` on an error. `profile policy-check`, `profile apply-fragment`, and `profile enable-mainnet --state` use more exit codes, which their sections state. `--output table` on `profile halt`, `profile resume`, `approve list`, and `approve revoke` prints text rows instead. `approve serve` prints its inbox URL and runs until interrupted. The `credentials add-passkey` warning and the `credentials delete` prompt also print on stdout.
 
 ## Profile selection and refused overlays
 
@@ -25,19 +25,19 @@ The loader still applies the overlay classes on that read.
 | `auth.enrolled_identity_unusable` | The identity is missing, malformed, inconsistent with the pin or stored profile, or fails its binding. `missing` means no record beside the seed, as an interrupted enrollment leaves it; `bound_elsewhere` means another profile or chain; `unbound` means no mainnet owner binding; `owner_required` means the mainnet check ran without an established owner; `owner_mismatch` means another owner; `binding_signature_invalid` means the owner signature does not verify. Use the original profile for a foreign binding. Run `stellar-agent profile enroll-signer --profile <NAME> --repair-identity` for a missing or malformed record, or `stellar-agent profile bind-signer --profile <NAME> --owner-secret-env <VAR>` with the established owner for an unbound signer or a rotated owner. |
 | `profile.mainnet_requires_explicit_profile` | A mainnet profile was selected by the environment or the default source. Supply `--profile <name>`. |
 
-Unset the `STELLAR_AGENT_*` variable the refusal names. On every chain that covers `STELLAR_AGENT_CHAIN_ID`, `STELLAR_AGENT_AUDIT_LOG_PATH`, every `*_KEY_ID` variable, and every other key outside the overlay classes. On mainnet it also covers `STELLAR_AGENT_RPC_URL`, `STELLAR_AGENT_SECONDARY_RPC_URL`, `STELLAR_AGENT_ORACLE_PROVIDER_URL`, `STELLAR_AGENT_MCP_SIGNER_DEFAULT`, and the other testnet-only keys. Remove refused keys from programmatic overlays too, and set needed values in the profile file. Then run `stellar-agent profile show --profile <name>` to confirm the file's chain and endpoint. Correct the profile file if either value differs from the intended configuration.
+To recover from `profile.non_overlayable_field`, remove the variable or overlay key the refusal names, then run `stellar-agent profile show --profile <name>` to confirm the file. [Loader source order](../profiles.md#loader-source-order) lists the refused keys on each chain.
 
 ## `profile`
 
-The `profile` group creates, lists, shows, and migrates profiles, rotates the keyring-backed keys a profile names, and halts and resumes a profile's agent actions. A profile is a per-environment TOML config (schema version 2) binding a CAIP-2 chain id, an RPC endpoint, keyring entry references, thresholds, and the active policy engine. Wallet secrets are stored in the keyring, and profiles reference their entries. An endpoint URL can still embed a credential.
+The `profile` group creates, lists, shows, and migrates profiles. It also enrolls and rotates the keyring-backed keys a profile names, signs and checks policies, enables mainnet, resets window and MPP state, and halts and resumes a profile's agent actions. A profile is a per-environment TOML config (schema version 2) binding a CAIP-2 chain id, an RPC endpoint, keyring entry references, thresholds, and the active policy engine. Wallet secrets are stored in the keyring, and profiles reference their entries. An endpoint URL can still embed a credential.
 
-The eight key-writing commands (`enroll-signer`, `enroll-owner-key`, `enroll-rpc-credential`, and the five key-rotation subcommands) each write a `keyring_key_written` audit row recording the key purpose and, where applicable, the redacted public address. `enroll-signer` also writes a `signer_identity_enrolled` row, with the record's keyring coordinate, the redacted public address, and the role, after it writes the signer identity record; `enroll-signer --repair-identity` writes that row alone. `bind-signer` writes it with tool `profile_bind_signer` when the owner signs a binding. `reset-window-state` writes the `keyring_key_written` row when the reset mints the window-state key on first use. `init` mints no key material and emits no audit row.
+The eight key-writing commands (`enroll-signer`, `enroll-owner-key`, `enroll-rpc-credential`, and the five key-rotation subcommands) each write a `keyring_key_written` audit row recording the key purpose and, where applicable, the redacted public address, when the profile's audit key exists. Without the audit key the command keeps the key it wrote, logs a warning, and writes no row. `enroll-signer` also writes a `signer_identity_enrolled` row, with the record's keyring coordinate, the redacted public address, and the role, after it writes the signer identity record; `enroll-signer --repair-identity` writes that row alone. `bind-signer` writes it with tool `profile_bind_signer` when the owner signs a binding. `reset-window-state` writes the `keyring_key_written` row when the reset mints the window-state key on first use. `init` mints no key material and emits no audit row.
 
-`profile list` lists all profile names and takes no profile selector. Every other `profile` subcommand accepts `--profile <NAME>`. `enable-mainnet` requires an explicit nondefault mainnet profile. `bind-signer` and `policy add-counterparty` require `--profile <NAME>`. For `init`, `enroll-signer`, `enroll-owner-key`, `enroll-rpc-credential`, and `sign-policy` it is the only form and resolves in the order the index documents: the flag, then `STELLAR_AGENT_PROFILE`, then `"default"`. For `show`, `migrate`, the `rotate-*` subcommands, `reset-window-state`, `reset-mpp-state`, `halt`, and `resume`, supply exactly one positional `<NAME>` or `--profile <NAME>`. These commands require an explicit selection. `reset-mpp-state` requires `--acknowledge`; the other profile verbs have no confirmation flag.
+`profile list` lists all profile names and takes no profile selector. Every other `profile` subcommand accepts `--profile <NAME>`. `enable-mainnet` requires an explicit nondefault mainnet profile. `bind-signer`, `policy-check`, `policy add-counterparty`, and `apply-fragment` require `--profile <NAME>`. For `init`, `enroll-signer`, `enroll-owner-key`, `enroll-rpc-credential`, and `sign-policy` it is the only form and resolves in the order the index documents: the flag, then `STELLAR_AGENT_PROFILE`, then `"default"`. For `show`, `migrate`, the `rotate-*` subcommands, `reset-window-state`, `reset-mpp-state`, `halt`, and `resume`, supply exactly one positional `<NAME>` or `--profile <NAME>`. These commands require an explicit selection. `reset-mpp-state` requires `--acknowledge`; the other profile verbs have no confirmation flag.
 
 The name itself becomes a path component and is validated before any path is built: charset, length, no leading `-`, and no Windows reserved device name. The rules and the recovery path for a file that already carries a refused name are in [Profile names](../profiles.md#profile-names).
 
-Every subcommand except `init`, `list`, `migrate`, and `show` also reconciles the selected name against the one the loaded file carries, refusing with `profile.name_mismatch` when the two disagree (see the [index](index.md#profile)). The key-writing commands are not exempt: `sign-policy` writes `<policy_dir>/<derived>.toml` and `enroll-owner-key` writes the `stellar-agent-owner-<derived>` keyring entry, so running either against a copied profile file would replace a DIFFERENT profile's root of trust. Neither is needed to repair a mismatch: the refusal names the recovery path, and `profile show <name>` still displays the file so the offending field can be read. `init` and `list` load no profile at all. `migrate` builds the v2 profile from the v1 file and the requested name, deriving the security-substrate key references from the name, not from the file's contents.
+Every subcommand except `init`, `list`, `migrate`, and `show` also reconciles the selected name against the one the loaded file carries, refusing with `profile.name_mismatch` when the two disagree (see the [index](index.md#profile)). The key-writing commands are not exempt: `sign-policy` writes `<policy_dir>/<derived>.toml` and `enroll-owner-key` writes the `stellar-agent-owner-<derived>` keyring entry, so running either against a copied profile file would replace a different profile's root of trust. Neither is needed to repair a mismatch: the refusal names the recovery path, and `profile show <name>` still displays the file so the offending field can be read. `init` and `list` load no profile at all. `migrate` builds the v2 profile from the v1 file and the requested name, deriving the security-substrate key references from the name, not from the file's contents.
 
 ### `profile init`
 
@@ -50,12 +50,12 @@ State-changing (writes the profile file; no network, no keyring). Creates and pe
 - `--profile <NAME>`: profile name to create (default: `STELLAR_AGENT_PROFILE`, else `default`). Loading a mainnet profile requires an explicit `--profile <NAME>`.
 - `--network <testnet|mainnet>`: target network (default `testnet`).
 - `--rpc-url <URL>`: optional on testnet, where an omitted value takes the testnet endpoint; required with `--network mainnet`, which has no default endpoint. The URL must use `http` or `https`, and `https` on mainnet. The flag parser refuses credentials.
-- `--engine <v1|noop>`: policy engine (default `v1`). See the `[policy]` block in [profiles.md](../profiles.md). On a V1 profile, the MCP server starts once the owner key is enrolled and the owner-signed policy loads; the rest of the [V1 setup](../profiles.md#opt-in-to-v1) gates approvals and signing. For V1, `next_steps` adds `profile enroll-owner-key`, `profile rotate-attestation-key`, a step to [create the policy file](../profiles.md#create-the-v1-policy-file) `policies/<name>.toml`, then `profile sign-policy`. On mainnet, `next_steps` also ends with `profile bind-signer` and with setting `oracle_provider_url` and its provider records. A testnet `noop` profile supports server startup and read access immediately. Mint the audit key with `profile rotate-audit-key` before `profile enroll-signer` so enrollment writes its audit row. Then run `profile rotate-nonce-key` before MCP payment simulation.
+- `--engine <v1|noop>`: policy engine (default `v1`). See the `[policy]` block in [profiles.md](../profiles.md). On a V1 profile, the MCP server starts once the owner key is enrolled and the owner-signed policy loads; the rest of the [V1 setup](../profiles.md#opt-in-to-v1) gates approvals and signing. For V1, `next_steps` adds `profile enroll-owner-key`, `profile rotate-attestation-key`, a step to [create the policy file](../profiles.md#create-the-v1-policy-file) `policies/<name>.toml`, then `profile sign-policy`. On mainnet `init` has already written that file, so the step asks to review the generated `version = 2` body instead. On mainnet, `next_steps` also ends with `profile bind-signer` and with setting `oracle_provider_url` and its provider records. A testnet `noop` profile supports server startup and read access immediately. Mint the audit key with `profile rotate-audit-key` before `profile enroll-signer` so enrollment writes its audit row. Then run `profile rotate-nonce-key` before MCP payment simulation.
 - `--preset <NAME>`: spending preset of the generated policy body (default `api-day`). Each `-week` preset fits an agent left unattended for a week. The presets are listed in [Mainnet policy body](../profiles.md#mainnet-policy-body).
 - `--asset <USDC|XLM>`: asset of the caps (default `USDC`).
 - `--tolerated-loss <AMOUNT>` and `--typical-payment <AMOUNT>`: the XLM amounts the caps derive from. USDC presets carry their own amounts and refuse these flags.
 - `--unlisted-budget <yes|no>`: whether the payment tools pay recipients outside the list from one shared unattended budget. Api presets only; they ask when the flag is absent. Beyond either bound, mainnet requests per-payment approval. Approved spending counts in full, and hard limits still apply.
-- `--total-budget <yes|no>`: whether a total budget bounds spending under the signed policy's digest (default `yes`). Signing the same policy body again keeps the allocation; a different digest starts another.
+- `--total-budget <yes|no>`: whether a total budget bounds spending under the signed policy's digest (default `yes`). A different digest starts another allocation. Signing identical version 1 bytes keeps the allocation. Every `sign-policy` run gives a version 2 body a new `sequence`, so signing the same body again yields a new digest and a new allocation.
 - `--output <FORMAT>`: format of the stderr preview, `json` (default) or `table`. The stdout envelope stays JSON.
 
 The seven preset flags apply to `--network mainnet --engine v1` only. Elsewhere, any of them refuses with `validation.usage_error` and the message `<flags>: these flags apply only to --network mainnet --engine v1`, naming the given flags but never their values. Nothing is written.
@@ -68,7 +68,7 @@ At a terminal, where stdin and stderr are both terminals, `init` asks for each m
 
 - `Tolerated loss in XLM: ` and `Typical payment in XLM: ` for an XLM preset without the amount flags.
 - `Allow payments to unlisted recipients up to <U> <asset> per rolling day, shared by all payment tools, at most <P/2> <asset> per payment? [yes/no]: ` for an api preset without `--unlisted-budget`. Only `yes` or `no` is accepted, in any case.
-- `Limit total spending to <L> <asset> for this policy? Signing the same policy body again keeps the allocation; a different digest starts another. [Y/n]: ` without `--total-budget`. An empty answer, `y`, or `yes` means yes; `n` or `no` means no.
+- `Limit total spending to <L> <asset> for this policy? Signing identical version 1 bytes keeps the allocation; every signing of a version 2 body gives it a new sequence, a new digest, and a new allocation. [Y/n]: ` without `--total-budget`. An empty answer, `y`, or `yes` means yes; `n` or `no` means no.
 
 Without a terminal, the total budget is chosen, and a missing XLM amount or a missing api answer refuses with `profile.preset_input_required`. The message names the flag that supplies the answer.
 
@@ -84,22 +84,7 @@ The policy file is written without replacing a file. An existing policy file wit
 A mainnet profile is written with `classic_max_fee_per_op_stroops = 10000`.
 A testnet profile is written without a cap.
 
-CLI `pay` and `claim` check the cap in the full pipeline, `--build-only`,
-`--sign-only`, and `--submit-only`. MCP pay, create-account, trustline, and
-claim check it in both prepare and commit. CLI sponsored `accounts create`,
-`trustline`, and every sending `pool init` path also check the cap.
-Opaque, fee-bump, and multi-operation staged envelopes are outside this coverage.
-The two SEP-43 transaction tools check a fee the wallet account pays, rounded
-up per operation, against the cap.
-
-The classic witness covers CLI `pay`, `claim`, sponsored `accounts create`,
-`trustline`, and every sending `pool init` path. It also covers MCP
-`stellar_pay_commit`, `stellar_create_account_commit`, `stellar_trustline_commit`,
-and `stellar_claim_commit`. The x402 payment tools `stellar_x402_create_payment`
-and `stellar_x402_authenticated_payment` are covered by a second simulation on
-the oracle: before the payer signs, the oracle simulates the same unsigned
-transfer, and the answers are compared. Opaque staged envelopes and the SEP-43
-signing tools remain uncovered.
+See [Thresholds and fees](../profiles.md#thresholds-and-fees) for the commands the fee cap and the classic witness cover.
 
 The signer and nonce keyring coordinates are named `stellar-agent-signer-<name>` / `stellar-agent-nonce-<name>`, each seeded with the placeholder account `"default"`. The signer's eventual G-strkey is not known until a seed is enrolled (see `profile enroll-signer` below). The five security-substrate references (`audit_log_hash_chain_key_id`, `policy_owner_key_id`, `attestation_key_id`, `counterparty_cache_key_id`, `policy_window_state_key_id`) are derived from the profile name the same way `profile migrate` derives them.
 
@@ -108,7 +93,7 @@ The signer and nonce keyring coordinates are named `stellar-agent-signer-<name>`
 `init` refuses, without writing or modifying anything, if `<name>.toml` already exists; the write itself is no-clobber, so a file appearing concurrently is never overwritten either.
 
 ```json
-{"ok":true,"data":{"profile":"default","path":"/home/user/.local/share/stellar-agent/profiles/default.toml","chain_id":"stellar:testnet","rpc_url":"https://soroban-testnet.stellar.org","engine":"v1","next_steps":["Run `stellar-agent profile rotate-audit-key default` to mint the audit-log hash-chain key (required before any signing verb will proceed).","Run `stellar-agent profile enroll-signer --profile default --secret-env <VAR>` to register the MCP signer seed.","Run `stellar-agent profile rotate-nonce-key default` to mint the commit-nonce key (required before MCP payment simulation).","Run `stellar-agent profile enroll-owner-key --profile default --secret-env <VAR>` to enroll the policy-file owner key.","Run `stellar-agent profile rotate-attestation-key default` to mint the approval-attestation key.","Create the V1 policy file `policies/default.toml` in the wallet's state directory, with `version = 1` and `scope = \"profile:default\"` (see \"Create the V1 policy file\" in the getting-started guide).","Run `stellar-agent profile sign-policy --profile default --secret-env <VAR>` to sign the V1 policy file."]},"request_id":"..."}
+{"ok":true,"data":{"profile":"default","path":"/home/user/.local/share/stellar-agent/profiles/default.toml","chain_id":"stellar:testnet","rpc_url":"https://soroban-testnet.stellar.org","engine":"v1","next_steps":["Run `stellar-agent profile rotate-audit-key default` to mint the audit-log hash-chain key (required before any signing verb will proceed).","Run `stellar-agent profile enroll-signer --profile default --secret-env <VAR>` to register the MCP signer seed.","Run `stellar-agent profile rotate-nonce-key default` to mint the commit-nonce key (required before MCP payment simulation).","Run `stellar-agent profile enroll-owner-key --profile default --secret-env <VAR>` to enroll the policy-file owner key.","Run `stellar-agent profile rotate-attestation-key default` to mint the approval-attestation key.","Create the V1 policy file `policies/default.toml` in the wallet's state directory, with `version = 1` and `scope = \"profile:default\"` (see \"Create the V1 policy file\" in the getting-started guide).","Run `stellar-agent profile sign-policy --profile default --secret-env <VAR>` to sign `policies/default.toml`."]},"request_id":"..."}
 ```
 
 The flag parser refuses a malformed `--rpc-url`, or one that carries credentials, before the command runs: exit `1` with a `validation.usage_error` envelope whose message never repeats the rejected value. After the arguments parse, the refusals apply in this order:
@@ -148,9 +133,9 @@ Read-only. Reads the OS-conventional profile directory and returns the known pro
 stellar-agent profile show default
 ```
 
-URL fields (`rpc_url`, `secondary_rpc_url`, `oracle_provider_url`) are printed as scheme, host, and port only.
-
 Read-only. Loads the named profile (applying any environment-variable overlays) and prints its resolved configuration as a JSON envelope. Keyring entry references appear as opaque `{service, account}` objects; the secret material they name is never read or printed. Provider records print in full, including `credential` references and `placement`; the credential value is never read.
+
+URL fields (`rpc_url`, `secondary_rpc_url`, `oracle_provider_url`) are printed as scheme, host, and port only.
 
 - `<NAME>` (positional) or `--profile <NAME>`: the profile to display. Supply exactly one; supplying both, or neither, is a usage error.
 
@@ -204,7 +189,7 @@ unset WALLET_SK
 
 Imports an operator-held ed25519 seed into the profile's `mcp_signer_default`
 keyring entry. MCP fund-movement tools and keyring-signing CLI verbs
-(`trustline`, `trade`, `vault`) resolve this signer. On a clean install those
+(`trustline`, `trade`, `vault`, `pool init`) resolve this signer. On a clean install those
 paths fail. The enrolled-signer loader reports `auth.enrolled_identity_unusable`
 (`missing`) when the identity record is absent. After the record passes
 validation, a missing seed reports `auth.keyring_not_found`.
@@ -223,7 +208,7 @@ The seed is never printed, logged, or returned.
 - `--force`: replace an already-enrolled entry (refused without it when one exists).
 - `--repair-identity`: write only the signer identity record of an existing enrollment; see below. Excludes `--secret-env` and `--force`.
 
-The coordinate's `account` field is the signer identity: `signer_from_keyring` verifies the loaded seed derives to it, so `account` must equal the seed's public address. Enrollment classifies the field from its raw on-disk value (environment overlays never influence what gets persisted) and resolves three cases. A profile fresh from `profile init`, or a v1-migrated profile, can hold the literal placeholder `"default"`. Enrollment pins the derived address into `account`, patching only that key in the profile TOML before writing the keyring entry. Once `account` holds a G-strkey, enrollment refuses on a mismatch and prints the address to set `account` to. The profile TOML is left untouched. Any other value (a typo'd or truncated pin) is refused with `enroll_signer.account_malformed` rather than replaced. Every refusal, including an unset secret variable, leaves the file unmodified. A keyring write that fails after the pin leaves the pinned address; a re-run retries the write. On success the data object reports the derived `public_address`, the `keyring_service`/`keyring_account` written, `replaced` (with `previous_address` when an entry was replaced), and `account_populated` (`true` when the placeholder was just pinned):
+The coordinate's `account` field is the signer identity: `signer_from_keyring` verifies the loaded seed derives to it, so `account` must equal the seed's public address. Enrollment classifies the field from its raw on-disk value (environment overlays never influence what gets persisted) and resolves three cases. A profile fresh from `profile init`, or a v1-migrated profile, can hold the literal placeholder `"default"`. Enrollment pins the derived address into `account`, patching only that key in the profile TOML before writing the keyring entry. Once `account` holds a G-strkey, enrollment refuses on a mismatch and prints the address to set `account` to. The profile TOML is left untouched. Any other value (a mistyped or truncated pin) is refused with `enroll_signer.account_malformed` rather than replaced. Every refusal, including an unset secret variable, leaves the file unmodified. A keyring write that fails after the pin leaves the pinned address; a re-run retries the write. On success the data object reports the derived `public_address`, the `keyring_service`/`keyring_account` written, `replaced` (with `previous_address` when an entry was replaced), and `account_populated` (`true` when the placeholder was just pinned):
 
 ```json
 {"ok":true,"data":{"profile":"default","enrolled":true,"public_address":"G...","keyring_service":"stellar-agent-signer-default","keyring_account":"G...","replaced":false,"account_populated":true,"identity_keyring_account":"enrolled-identity"},"request_id":"..."}
@@ -298,8 +283,11 @@ the new owner's seed to rebind. The old owner's seed refuses. The
 `signer_identity_enrolled` audit row uses tool `profile_bind_signer`.
 
 Mainnet setup runs `enroll-signer`, `enroll-owner-key`, `sign-policy`,
-`bind-signer`, then `enable-mainnet`. Existing mainnet enrollments need
-`bind-signer` once before signing or starting an enabled MCP server.
+`bind-signer`, then `enable-mainnet`. `bind-signer` comes first because
+`enable-mainnet` checks the signer binding: an unbound signer fails its
+`enrolled_signer` check, which names the `bind-signer` command. Existing
+mainnet enrollments need `bind-signer` once before signing or starting an
+enabled MCP server.
 
 ### `profile enroll-rpc-credential`
 
@@ -346,7 +334,7 @@ stellar-agent profile enroll-owner-key --profile default --secret-env WALLET_OWN
 unset WALLET_OWNER_SK
 ```
 
-Enrolls the policy-file owner PUBLIC key into the profile's `policy_owner_key_id` keyring entry, the key the V1 policy engine verifies every policy file against. The owner key is the root of trust for policy: whoever can sign a policy file can authorize any action the policy permits. `enroll-owner-key` and `sign-policy` read the owner seed from the environment of the shell that runs them. Supply it with the read line only for those commands, as [Pass a secret seed](../getting-started.md#pass-a-secret-seed) describes, and unset it afterward. Of the policy owner key, the MCP server holds only the enrolled public key. It reads no seed from its environment. State-changing (keyring), no network. The command passes the seed through the shared owner-seed ceremony, which keeps the seed and its signing key in one memory-locked page when the lock succeeds. It stores only the derived public key and never prints, logs, or returns the seed.
+Enrolls the policy-file owner public key into the profile's `policy_owner_key_id` keyring entry, the key the V1 policy engine verifies every policy file against. The owner key is the root of trust for policy: whoever can sign a policy file can authorize any action the policy permits. `enroll-owner-key` and `sign-policy` read the owner seed from the environment of the shell that runs them. Supply it with the read line only for those commands, as [Pass a secret seed](../getting-started.md#pass-a-secret-seed) describes, and unset it afterward. Of the policy owner key, the MCP server holds only the enrolled public key. It reads no seed from its environment. State-changing (keyring), no network. The command passes the seed through the shared owner-seed ceremony, which keeps the seed and its signing key in one memory-locked page when the lock succeeds. It stores only the derived public key and never prints, logs, or returns the seed.
 
 - `--secret-env <VAR>` (required): name of the environment variable holding the owner `S...` strkey. The flag takes the variable name, never the secret.
 - `--profile <NAME>`: profile whose owner coordinate is written (default: `STELLAR_AGENT_PROFILE`, else `default`). Loading a mainnet profile requires an explicit `--profile <NAME>`.
@@ -373,6 +361,8 @@ Exits `1` on refusal:
 Each refusal writes no owner entry.
 
 ### `profile sign-policy`
+
+Signs a v1 or v2 policy file with the enrolled owner key.
 
 The authoring guard serializes writers from the policy read through atomic replacement.
 Its persistent lock file is `<policy_path>.authoring.lock`, beside the policy selected by `--file` or the default path.
@@ -418,7 +408,6 @@ stellar-agent profile sign-policy --profile default --secret-env WALLET_OWNER_SK
 unset WALLET_OWNER_SK
 ```
 
-Signs a v1 or v2 policy file with the enrolled owner key.
 The engine loads `<state_dir>/policies/<profile>.toml` and recomputes the
 canonical form, excluding `[signature]`. It verifies the signature against
 the enrolled owner public key.
@@ -541,11 +530,13 @@ stellar-agent profile policy-check --origin --profile mainnet < policy.toml
 Reads stdin and validates schema, scope, and network against the reconciled profile.
 It verifies no signature, reads no policy pin or keyring entry, and writes nothing.
 A present mainnet table receives bootstrap validation: origin and pin must appear together.
-Stdout carries one JSON envelope. Valid input exits 0.
+Stdout carries one JSON envelope. Valid input exits 0 and returns `valid: true`, `signed_origin`, and `contract_transfer_fee_cap`.
 With `--origin`, valid input declaring an origin exits 3, signed or unsigned.
 Invalid input exits 65 with its policy code. Profile access and input errors exit 1.
+A version 2 body may omit `sequence`. The check then validates the body with `sequence = 1`.
+A `[mainnet]` table on a testnet profile exits 65 with `policy.mainnet_table_on_testnet`.
 
-Valid output also includes `contract_transfer_fee_cap`, with `configured_stroops`,
+The `contract_transfer_fee_cap` object carries `configured_stroops`,
 `effective_stroops`, and `status`. A declared cap is `requires_signature`, even
 when input carries a signature table. An absent cap is `testnet_default` on
 testnet and `required` on mainnet. This status does not reject G/M-only policies.
@@ -567,6 +558,8 @@ Adds one payment recipient to `<state_dir>/policies/<profile>.toml`. It makes no
 
 The recipient is classified before any profile, keyring, or file read. Another form refuses with `profile.policy_recipient_invalid`, and the message never repeats the input.
 
+A policy file that is not valid TOML refuses with `profile.policy_body_invalid` and the message `the policy body does not parse at byte <n>`, before any keyring read, and the file is unchanged.
+
 A body without a root `signature` key is a draft. Any present `signature` value selects the signed path, whatever its type, and a malformed signature is never stripped to obtain a draft.
 
 **Targeting.** Each selected tool targets its first rule that matches the tool and the profile's network. A tool whose first match is `deny`, or that has no match, is reported in `denied_tools`. With `--tool`, such a tool refuses with `profile.policy_recipient_list_missing`. An address list is a `counterparty_allowlist` that selects `G_ACCOUNT` or `C_ACCOUNT`. A target rule without one is reported in `ungated_tools`, and no target with a list refuses with `profile.policy_recipient_list_missing`. Every address list of every target rule gains the recipient. An entry admits the address under the policy; it does not change which destination forms a payment command accepts.
@@ -579,7 +572,7 @@ A body without a root `signature` key is a draft. Any present `signature` value 
 
 **W recipients.** A W address is listed under `C_ACCOUNT`. The wallet does not pay W destinations yet, so stderr carries `Note: the wallet does not pay W destinations yet; this entry takes effect when it does.` The envelope repeats the text in `destination_note`.
 
-**Preview.** Before the guard, the prompt, and any write, the command writes one JSON line to stderr. It holds `phase = "before_write"`, the `spending_summary` of the body it signs or writes, and `edit_scope`. `edit_scope` lists each edited rule as `{"rule", "tools", "wildcard"}` with every tool the rule governs, payment or not. A preview that cannot be written refuses with `profile.spending_preview_unwritable`, and nothing is written. Every later refusal carries the preview at `error.details.preview`.
+**Preview.** Before the guard, the prompt, and any write, the command writes one JSON line to stderr. It holds `phase = "before_write"`, the `spending_summary` of the body it signs or writes, and `edit_scope`. `edit_scope` lists each target rule as `{"rule", "tools", "wildcard"}` with every tool the rule governs, payment or not. A target rule without an address list is listed too, although it gains nothing; the selected tools that target it appear in `ungated_tools`. A preview that cannot be written refuses with `profile.spending_preview_unwritable`, and nothing is written. Every later refusal carries the preview at `error.details.preview`.
 
 **Signed path.** The body must verify against the enrolled owner key; a failure keeps its `policy.*` code. A signature that does not verify means the enrolled owner's signature does not cover this body. Re-signing would adopt the difference unseen, so the message names a review followed by `profile sign-policy`. After the edit, the checks run in this order:
 
@@ -621,12 +614,7 @@ Loader refusals retain their validation codes. Protected keys use
 
 ### `profile enable-mainnet`
 
-After the spending preview, the ceremony takes the policy authoring guard and rechecks the file, nonce presence, and preview pin.
-A changed body refuses with `profile.enable_mainnet_precondition` and `policy_file: changed during enablement`.
-A changed authority state uses that code with `policy_state: changed during enablement`.
-These refusals carry the preview, as do later pin-step refusals.
-The guard stays through pinning, the audit row, nonce storage, and policy replacement.
-`--check` and `--state` take no authoring guard.
+The ceremony stores an installation nonce and binds the signed policy to the profile, its endpoint host, and its oracle host.
 
 ```bash
 stellar-agent profile enable-mainnet --profile operator
@@ -644,16 +632,9 @@ read, and no nonce, pin, policy change, or audit row is written. A profile
 that sets `oracle_provider_url` without its `providers.oracle` record does not
 load, and the ceremony refuses it with `profile.enable_mainnet_precondition`
 and the loader's message.
-An enabled profile whose oracle is removed refuses every CLI mainnet write
-with `profile.mainnet_oracle_required` before any signature, until the oracle
-is set again. `tx status` and `tx receipt clear` refuse it with
-`profile.mainnet_enablement_invalid: on_disk_oracle_host` before any endpoint
-is asked. A running MCP server keeps the profile it loaded at startup, and its
-per-call freshness check verifies the enablement against the stored profile
-again. A removed or moved oracle therefore refuses its value tools, its status
-tool and its gate pass with `network.mainnet_write_forbidden`. Its next start
-refuses the enablement with `profile.mainnet_enablement_invalid:
-on_disk_oracle_host`. A process with `STELLAR_AGENT_KEYRING_BACKEND` set to
+See [Oracle witness endpoint](../profiles.md#oracle-witness-endpoint) for the
+refusals after an enabled profile's oracle is removed or moved.
+A process with `STELLAR_AGENT_KEYRING_BACKEND` set to
 any value is refused in every mode with
 `network.mainnet_keyring_backend_unsupported` before the keyring initializes:
 mainnet needs the platform keyring.
@@ -701,6 +682,13 @@ from the written file, with the sequence signing assigns. A preview that cannot 
 refusal carries the preview at `error.details.preview`, and the result
 repeats the summary as `spending_summary`.
 
+After the spending preview, the ceremony takes the policy authoring guard and rechecks the file, nonce presence, and preview pin.
+A changed body refuses with `profile.enable_mainnet_precondition` and `policy_file: changed during enablement`.
+A changed authority state uses that code with `policy_state: changed during enablement`.
+These refusals carry the preview, as do later pin-step refusals.
+The guard stays through pinning, the audit row, nonce storage, and policy replacement.
+`--check` and `--state` take no authoring guard.
+
 `--check` adds `spending_summary` for the installed signed policy. Its
 `authority_status` is `verified` when the verified load passed and
 `unavailable` otherwise. The summary is `null` when no signed policy was
@@ -742,13 +730,9 @@ signed `oracle_host`.
 
 The signed policy binds both endpoints a mainnet signature trusts. A
 cross-check witness passes only when its host equals the signed
-`oracle_host` and differs from the primary host. Of the witness inputs, the
-owner signs the oracle host and the per-asset `cross_check_thresholds`. For
-an asset the signed table names, a profile threshold can only lower the
-amount that requires a witness. For an asset the signed table does not name,
-XLM and its SAC use at most 1000 XLM, and a token has no threshold and
-refuses. The scheme, path, and credentials of `oracle_provider_url` and
-the `providers.oracle` record are profile fields that the owner does not sign.
+`oracle_host` and differs from the primary host. See
+[Oracle witness endpoint](../profiles.md#oracle-witness-endpoint) for the
+signed thresholds and the unsigned oracle fields.
 A mainnet write builds its post-send oracle client only when the stored
 `oracle_provider_url` names the signed `oracle_host`, and refuses another
 with `network.mainnet_authorization_refused` before any signature.
@@ -803,16 +787,19 @@ Sign the bound policy, then require a passing `--check`.
 `--check` reports every check with the status `passed`, `failed`, or
 `not_evaluated` and a detail, and exits `1` when any check failed. The checks
 are the preconditions, `verified_policy`, `pin`, `enablement`, every minimum
-restriction in either build, and `oracle_provider_url`. A policy without
-approval credentials fails `verified_policy` with
-`requirement=approval_credentials`. The last fails when
+restriction in either build, `oracle_provider_url`, and `total_budget_usage`.
+A policy without approval credentials fails `verified_policy` with
+`requirement=approval_credentials`, and its `approval_credentials` check fails.
+The `oracle_provider_url` check fails when
 the profile names no oracle, and its detail names what is missing. `--check`
 reads the prerequisite state, keyring entries included, and writes no nonce,
 pin, policy change, or audit row.
-The restrictions are evaluated on the
-document the verified load read. Without a `[mainnet]` table the fee cap and
-every table restriction fail. When the policy does not verify, the
-restrictions and `enablement` are `not_evaluated`. The `enablement` check
+The restrictions are evaluated on the signed
+document the load read, also when the verified load then fails. Without a
+`[mainnet]` table the fee cap and every table restriction fail. When the
+verified load fails, `enablement` is `not_evaluated`. When no signed policy
+was read, the restrictions are `not_evaluated`, except a failed
+`approval_credentials`. The `enablement` check
 fails with `profile.mainnet_enablement_invalid` and the name of the binding
 that does not match, such as `on_disk_host`, `merged_oracle_host`, or
 `nonce_digest`. The `pin`
@@ -833,7 +820,8 @@ Exits `1` on refusal:
 - `profile.enable_mainnet_profile_flag_required`: supply `--profile`.
 - `profile.enable_mainnet_default_refused`: select a dedicated profile.
 - `profile.enable_mainnet_not_mainnet`: the selected chain is testnet.
-- `profile.enable_mainnet_precondition`: a named precondition or effect failed.
+- `network.mainnet_keyring_backend_unsupported`: `STELLAR_AGENT_KEYRING_BACKEND` is set to any value.
+- `profile.enable_mainnet_precondition`: a precondition or effect failed. The message names the failed check with its accepted form or cause, or carries the underlying error text.
 - `profile.enable_mainnet_nonce_exists`: rerun with `--rotate` to replace the nonce.
 - `policy.pin_absent`: the installation holds a nonce but no pin; see the recovery above.
 - `policy.pin_unusable`: the pin cannot be read or is malformed, and nothing is written. Rerun once the keyring is reachable if it was unavailable. No command repairs a malformed pin in this release, since a replacement could lower its recorded sequence; create a profile under a new name.
@@ -853,11 +841,15 @@ Each rotation subcommand generates a fresh 32-byte secret from the OS CSPRNG, en
 | Subcommand | Keyring entry rotated | Key kind | Effect on outstanding material |
 |---|---|---|---|
 | `rotate-attestation-key` | approval-spine attestation HMAC key (`attestation_key_id`) | 32-byte HMAC | Attestations minted under the old key fail verification. Unattested pending requests can still be approved under the new key. |
-| `rotate-audit-key` | audit-log chain-root HMAC key (`audit_log_hash_chain_key_id`) | 32-byte HMAC | Before any key write, rotation checks the log's entry tags under the old key and refuses with that check's code (`audit.entry_tag_invalid` among them). Before the key write, rotation fences the drained outbox. A queue that still holds a row refuses with `internal.unexpected_state` (`audit.outbox_unusable`), and unusable consent evidence refuses with `audit.outbox_evidence_unusable`. It then persists the new key, switches the held writer to it, and appends `audit_entry_tags_rekeyed` (cause `rotation`) once entry tags are in force, then its `keyring_key_written` row, both tagged under the new key. No log file is rewritten; an interrupted rotation is repaired at the next keyed open with an `open_repair` rekey row. Rotation re-signs every existing per-file chain-root sidecar with the new key. A failed re-sign reports `internal.unexpected_state` (`audit.resign_incomplete`); rerun the command. `audit verify` passes under the new key, and the old key stops verifying. Takes the audit writer's exclusive lock, so it refuses while an MCP server holds that writer, and checks the tip anchor before touching the key. Checks the audit binding before it opens the writer: a changed binding refuses with `audit.log_binding_changed` and creates nothing at the path the profile names; an absent one is recorded. Mints a key only where no entry exists: a stored key it cannot read or decode refuses before anything is written, with the read failure's code or `internal.unexpected_state` (`audit.key_decode_failed`, `audit.key_length_error`). Investigate; if the stored audit key is corrupt, restore it from a copy of that keyring entry. A first mint applies only to a log without entry tags: on a log whose entry tags are in force or whose active file holds a tagged row, a rotation without the key refuses with `audit.chain_key_unavailable` and writes no key. A tagged log without a copy of its key is moved aside as evidence before a new key is minted (see [Audit-log recovery](../maintainers/audit-log-recovery.md#10-unreadable-or-undecodable-audit-key)). |
+| `rotate-audit-key` | audit-log chain-root HMAC key (`audit_log_hash_chain_key_id`) | 32-byte HMAC | Every existing per-file chain-root sidecar is re-signed with the new key, and the old key stops verifying. The checks and refusals are listed below the table. |
 | `rotate-nonce-key` | HMAC nonce key (`mcp_nonce_key_alias`) | 32-byte HMAC | All outstanding nonces minted with the old key are invalidated. |
 | `rotate-policy-state-key` | policy-window-state HMAC key (`policy_window_state_key_id`) | 32-byte HMAC | The persisted window-state store is re-signed under the new key, so accumulated `per_period_cap` / `rate_limit` history and unlisted and total-budget usage are preserved. Rotation refuses if the store file does not verify under the current key. Integrity failures and missing authenticated network provenance have no recovery verb; create a profile under a new name. Before rotation, file I/O failures refuse without changing state; retry after access is restored. |
 
 All of the above mint raw 32-byte HMAC keys.
+
+`rotate-audit-key` runs these checks. Before any key write, rotation checks the log's entry tags under the old key and refuses with that check's code (`audit.entry_tag_invalid` among them). Before the key write, rotation fences the drained outbox. A queue that still holds a row refuses with `internal.unexpected_state` (`audit.outbox_unusable`), and unusable consent evidence refuses with `audit.outbox_evidence_unusable`. It then persists the new key, switches the held writer to it, and appends `audit_entry_tags_rekeyed` (cause `rotation`) once entry tags are in force, then its `keyring_key_written` row, both tagged under the new key. No log file is rewritten; an interrupted rotation is repaired at the next keyed open with an `open_repair` rekey row. Rotation re-signs every existing per-file chain-root sidecar with the new key. A failed re-sign reports `internal.unexpected_state` (`audit.resign_incomplete`); rerun the command. `audit verify` passes under the new key, and the old key stops verifying.
+
+It takes the audit writer's exclusive lock, so it refuses while an MCP server holds that writer, and checks the tip anchor before touching the key. It checks the audit binding before it opens the writer: a changed binding refuses with `audit.log_binding_changed` and creates nothing at the path the profile names; an absent one is recorded. It mints a key only where no entry exists: a stored key it cannot read or decode refuses before anything is written, with the read failure's code or `internal.unexpected_state` (`audit.key_decode_failed`, `audit.key_length_error`). Investigate; if the stored audit key is corrupt, restore it from a copy of that keyring entry. A first mint applies only to a log without entry tags: on a log whose entry tags are in force or whose active file holds a tagged row, a rotation without the key refuses with `audit.chain_key_unavailable` and writes no key. A tagged log without a copy of its key is moved aside as evidence before a new key is minted (see [Audit-log recovery](../maintainers/audit-log-recovery.md#10-unreadable-or-undecodable-audit-key)).
 
 ```bash
 stellar-agent profile rotate-attestation-key default
@@ -880,17 +872,10 @@ A further rotation subcommand, `profile rotate-counterparty-key <NAME>`, rotates
 
 Each rotation exits `1` with `validation.profile_not_found` if the profile does not exist, or with a keyring error if the platform keyring is unavailable.
 
-The counterparty cache reads and mints its HMAC key at
-`counterparty_cache_key_id`, the entry `profile rotate-counterparty-key` writes.
-With an explicit reference, previously cached entries read as absent until
-a refresh rewrites them. `counterparty refresh <domain>` rewrites the entry
-for that domain. `counterparty warm-up` refreshes only the `HOME_DOMAIN`
-entries of the policy allowlist.
-
 Keyring references also pass the [profile key-scope check](../profiles.md#file-location-and-selection).
 It refuses mainnet conflicts with `profile.key_scope_conflict` and warns on testnet.
 
-### `reset-window-state <NAME> --reason <REASON>`
+### `profile reset-window-state <NAME> --reason <REASON>`
 
 `profile reset-window-state` clears verified ordinary accrual and preserves stored total-budget entries.
 Stop the MCP server and repair the audit log first. The command requires a usable keyed audit writer on every network,
@@ -976,7 +961,11 @@ No verb recovers missing provenance; create a profile under a new name.
 File I/O failures refuse without changing state; retry after access is restored.
 An authenticated newer format version refuses on every chain with
 `profile.reset_window_state_newer_version` and changes nothing; use the build
-that wrote it. The reset releases expired authorizations in memory before it
+that wrote it. A `v0.1.0-alpha.13` build cannot read a store this build has
+written. It refuses the file, as not valid JSON or as a newer wire version,
+and advises `profile reset-window-state`. Do not run that reset with the alpha.13 build.
+It discards the spending state, and this build then refuses the profile with
+`policy.window_chain_unverifiable`, which no verb recovers. The reset releases expired authorizations in memory before it
 writes the row.
 
 An MCP server acquires the profile's audit writer at the first operation that
@@ -999,6 +988,8 @@ the successor at `generation_after`. On a V1 profile, a value-moving command
 and the MCP server's start open it. Generation equality alone does not establish
 completion.
 A blank `--reason` refuses with `validation.reason_empty` before anything changes.
+Reset refuses while a smart-account intent remains open or retained; see
+[Retained smart-account charges](../concepts.md#retained-smart-account-charges).
 
 A reset row without `wiped` or `owner_authorization` retains its serialized form
 and verifies unchanged. A reset row with either field verifies only with a
@@ -1011,11 +1002,13 @@ A `wiped` record without `retained_authorizations` keeps its serialized form.
 A binary that drops that field from the row hash has the same consequences.
 
 ```bash
-stellar-agent profile reset-window-state default --reason "clear verified window history"
-stellar-agent profile reset-window-state operator --reason "clear verified window history" --owner-secret-env WALLET_OWNER_SK
+# A profile with a policy pin or an enrolled owner:
+stellar-agent profile reset-window-state default --reason "clear verified window history" --owner-secret-env WALLET_OWNER_SK
+# A profile with neither:
+stellar-agent profile reset-window-state scratch --reason "clear verified window history"
 ```
 
-### `reset-mpp-state <NAME> --acknowledge --reason <REASON>`
+### `profile reset-mpp-state <NAME> --acknowledge --reason <REASON>`
 
 Recovers MPP authorization state after rollback or an unrecoverable generation
 mismatch. Supply exactly one of positional `<NAME>` or
@@ -1157,7 +1150,13 @@ Two flags are common to every subcommand:
 
 `credential_id` values are redacted to first-five-last-five base64url everywhere they are printed.
 
-Each subcommand fails with the verb-specific codes noted under it below or with the codes shared across the whole group. Any subcommand given a malformed `--profile` fails with `credentials.invalid_profile_name`. The underlying `CredentialsError` contributes `credentials.not_found`, `credentials.duplicate_name`, `credentials.invalid_name`, `credentials.io_error`, `credentials.registry_parse_failed`, `credentials.registry_serialise_failed`, `credentials.state_dir_unavailable`, `credentials.approval_store_error`, and `credentials.approval_store_unavailable`. It also contributes `credentials.bridge_start_failed`, `credentials.bridge_shutdown_failed`, `credentials.atomic_write_failed`, `credentials.signing_failed`, `credentials.missing_public_key`, `credentials.malformed_public_key`, and a generic `credentials.error` fallback for any other internal variant. It also contributes `credentials.registration_confirmation_mismatch`, `credentials.registration_confirmation_expired`, and `credentials.audit_write_failed`. `add-passkey` additionally emits `credentials.registration_tty_required`, `credentials.registration_confirmation_canceled`, `credentials.approval_store_dir_unavailable`, `credentials.approval_store_open_failed`, and `credentials.unknown_registration_outcome`. `add-passkey` also emits the audit refusals `audit.chain_key_unavailable`, `audit.log_binding_changed`, `audit.tip_anchor_mismatch`, and `audit.tip_anchor_missing`. `add-passkey` also refuses a profile it cannot use, with one of these codes: `profile.name_mismatch`, `profile.key_scope_conflict`, `profile.non_overlayable_field`, `profile.mainnet_requires_explicit_profile`, `validation.mainnet_rpc_url_required`, `validation.config_invalid`, or `validation.provider_attestation_invalid`. An agent can switch on `error.code` alone; `error.message` carries the human-readable detail only.
+Each subcommand fails with the verb-specific codes noted under it below or with the codes shared across the whole group. An agent can switch on `error.code` alone; `error.message` carries the human-readable detail only.
+
+- Any subcommand given a malformed `--profile`: `credentials.invalid_profile_name`.
+- Any subcommand, from the underlying `CredentialsError`: `credentials.not_found`, `credentials.duplicate_name`, `credentials.invalid_name`, `credentials.io_error`, `credentials.registry_parse_failed`, `credentials.registry_serialise_failed`, `credentials.state_dir_unavailable`, `credentials.approval_store_error`, `credentials.approval_store_unavailable`, `credentials.bridge_start_failed`, `credentials.bridge_shutdown_failed`, `credentials.atomic_write_failed`, `credentials.signing_failed`, `credentials.missing_public_key`, `credentials.malformed_public_key`, `credentials.registration_confirmation_mismatch`, `credentials.registration_confirmation_expired`, `credentials.audit_write_failed`, and `credentials.error` for any other internal variant.
+- `add-passkey` only: `credentials.registration_tty_required`, `credentials.registration_confirmation_canceled`, `credentials.approval_store_dir_unavailable`, `credentials.approval_store_open_failed`, and `credentials.unknown_registration_outcome`.
+- `add-passkey` audit refusals: `audit.chain_key_unavailable`, `audit.log_binding_changed`, `audit.tip_anchor_mismatch`, and `audit.tip_anchor_missing`.
+- `add-passkey` on a profile it cannot load: that load's code. Those codes include `profile.name_mismatch`, `profile.key_scope_conflict`, `profile.non_overlayable_field`, `profile.mainnet_requires_explicit_profile`, `validation.mainnet_rpc_url_required`, `validation.config_invalid`, and `validation.provider_attestation_invalid`. Other load failures keep the loader's own validation code.
 
 ### `credentials add-passkey <NAME>`
 
@@ -1295,7 +1294,7 @@ Both inboxes label it `INCONSISTENT` and offer only Reject.
 Nothing is attested for it on any surface.
 
 Every `approve` subcommand, `approve status` and `approve revoke` included, returns failures with `error.code` and a plain diagnostic message.
-These failures carry `approval.*` codes: `approval.not_found`, `approval.expired`, `approval.already_attested`, `approval.user_mismatch`, `approval.clock_error`, `approval.sha256_hex_error`, `approval.key_decode_failed`, `approval.key_length_error`, `approval.binding_mismatch`, `approval.grant_persist`, `approval.wrong_kind`, `approval.rejected`, `approval.consumed`, `approval.record_failed`, `approval.uid_unavailable`, `approval.denied`, `approval.store_dir_error`, `approval.permission_denied`, `approval.invalid_nonce_length`.
+These failures carry `approval.*` codes: `approval.unknown`, `approval.not_found`, `approval.revoked`, `approval.expired`, `approval.already_attested`, `approval.user_mismatch`, `approval.clock_error`, `approval.sha256_hex_error`, `approval.key_decode_failed`, `approval.key_length_error`, `approval.binding_mismatch`, `approval.grant_persist`, `approval.wrong_kind`, `approval.rejected`, `approval.consumed`, `approval.record_failed`, `approval.uid_unavailable`, `approval.denied`, `approval.store_dir_error`, `approval.permission_denied`, `approval.invalid_nonce_length`.
 Other codes include `approval.writer_locked`, `approval.store_open_failed`, `approval.gc_failed`, `approval.entry_inconsistent`, `approval.operator_credential_revoked`, `approval.remote_authorization_unavailable`, `approval.presence_required`, `approval.presence_policy_unavailable`, `approval.presence_policy_busy`, `approval.mainnet_remote_unsupported`, `approval.origin_signed_remote`.
 `approval.presence_invalid`: The passkey assertion fails verification; start a fresh consent.
 `approval.presence_changed`: The pending request or policy differs from the displayed consent; reload it.
@@ -1311,6 +1310,10 @@ Other codes include `approval.writer_locked`, `approval.store_open_failed`, `app
 `approval.spent_record_unavailable` reports, from `stellar_rule_create_commit`, that the platform keyring record of spent rule approvals cannot be read or written, does not parse, is busy, holds 16 live approvals, or is past this approval's expiry. The commit installs nothing.
 `approval.entry_inconsistent` reports a payment, claim, or trustline request whose stored digest is not the digest of its stored envelope, or whose envelope does not decode; a rule proposal whose stored digest is not the digest of what it shows; and an MPP charge request whose shown terms do not match what it would authorize.
 Authentication, validation, and audit failures on approval paths carry their own codes.
+A nonce the store does not hold gets a different answer on each path:
+`approve --id` and `approve revoke` refuse with `approval.not_found`,
+`approve status` and MCP `stellar_approval_status` return `approval.unknown`,
+and an MCP commit that presents it refuses with `policy.approval_required`.
 
 ### `approve --id <NONCE> --profile <name>`
 
@@ -1337,7 +1340,7 @@ A rerun commits an attested entry's open consent, then reports `approval.already
 
 `approve --id` refuses while a running MCP server or `approve serve` that does not drain the outbox holds the writer.
 
-For a payment-style approval the response also returns `approval_attestation`: the HMAC blob the agent surface must present as the `approval_attestation` argument to the matching `*_commit` tool, or to the repeat call of an x402 or SEP-43 transaction tool. The operator relays it to the agent over a trusted channel; the attestation binds the specific envelope, so it authorises only that one transaction. The field is omitted for approval kinds whose gate reads the recorded consent from the store directly (toolset first-invoke grants, trustline clawback opt-ins).
+For a payment-style approval the response also returns `approval_attestation`: the HMAC blob the agent surface must present as the `approval_attestation` argument to the matching `*_commit` tool, or to the repeat call of an x402 or SEP-43 transaction tool. The operator relays it to the agent over a trusted channel; the attestation binds the specific envelope, so it authorizes only that one transaction. The field is omitted for approval kinds whose gate reads the recorded consent from the store directly (toolset first-invoke grants, trustline clawback opt-ins).
 
 ```bash
 stellar-agent approve --id ABCxyzNonce --profile <name>
@@ -1385,11 +1388,16 @@ Payment, claim, trustline, and x402 approvals expose `verification` with
 `supported`, `valid`, and `reason`. Consent presence determines `attested`;
 only cryptographic verification determines validity. Other pending kinds report
 `verification: {"supported":false}` and top-level `valid:null`.
+A supported entry that is still pending holds no attestation yet, so it
+reports `valid: false` with `reason: "attestation_invalid"` until consent is
+recorded.
 Key or policy unavailability reports `verification_unavailable`.
 Proof bytes, assertions, credential IDs, and link tokens are excluded.
 
 Envelope approvals use `binding: "legacy-envelope"`; durable intent approvals
-use `binding: "canonical-intent"`. Status grants no signing or retry authority
+use `binding: "canonical-intent"`. A canonical intent exists only for a
+mainnet payment, account creation, claim, or trustline prepared under a business id, so every
+testnet approval reports `legacy-envelope`. Status grants no signing or retry authority
 and reports `reusable:false` with `reuse_kind:"none"`.
 It consumes, repairs, collects, and extends nothing.
 Expiry is a read-only view at the supplied time, so clock rollback can revive
@@ -1414,9 +1422,11 @@ stellar-agent approve revoke --id <nonce> --profile default --output table
 Revokes an existing authenticated durable approval selected by its inbox nonce.
 Mainnet approval preparation in the CLI and MCP opens a durable pending record.
 The command acts only on existing durable records.
+Testnet preparation opens none, so on a testnet profile every nonce returns
+`approval.not_found`.
 The profile owner can revoke a pending record at any time, also after its waiting expiry,
 and a consumed record inside its active window, also after inbox collection.
-The inbox's distinct "Revoke approval" action covers eligible pending, unconsented records only.
+The inbox's distinct "Revoke approval" action requires an eligible pending entry and a live, unconsented pending durable record.
 Local actions require the session, per-entry CSRF, session proof and matching entry identity.
 Signed-origin actions also require a fresh assertion from a current-policy passkey.
 
@@ -1431,10 +1441,10 @@ Both windows exclude their expiry boundary. Revocation sets the record's closure
 After a revocation, a consent commit under the record refuses with `approval.revoked`.
 Revocation prevents every later mint under the record: first mints, unused-carrier remints, the payment mint under a used SEP-10 message authorization, and the x402 payload-release mint under a used Soroban intent authorization.
 It does not affect an authorization minted before it, which keeps its lifetime, or submissions already sent.
-After revocation commits, `approval.revoked` appends an `approval_revoked` audit event.
+After a revocation commits, the wallet appends an `approval_revoked` audit event with tool `approval.revoked`.
 It carries the durable record's approval kind, eight-character nonce prefix and origin, also after inbox collection.
 Only signed-origin rows carry a credential pseudonym.
-An append failure returns exit 1 and this message:
+An append failure returns `audit.append_failed`, exit 1, and this message:
 "The approval record is revoked, but its audit row cannot be appended. Retrying does not repair the audit row."
 The state remains revoked. Retrying returns the view without another revocation or append.
 
@@ -1465,14 +1475,23 @@ The report names `profile` only when the name resolves to a saved profile.
 stellar-agent approve list --profile default
 ```
 
-Read-only. Enumerates the profile's pending approvals with their
-wallet-controlled summaries and expiry, so the operator does not depend on the
-agent relaying a nonce.
+Read-only. Lists every unexpired entry of the profile's pending-approval store
+under `pending`, with its wallet-controlled summary and expiry, so the operator
+does not depend on the agent relaying a nonce. Consumed and rejected tombstones
+are included (`kind_name` `Consumed` or `Rejected`) until their TTL ends;
+`approve gc --include-consumed` removes consumed ones earlier. Only an entry
+with a request `kind_name`, such as `PaymentSimulated` or
+`TrustlineSimulated`, awaits a decision.
 
 - `--include-expired`: also show entries whose TTL has elapsed (they are
   counted in `expired_count` either way).
 - `--output json|table`: envelope JSON (default) or one sanitized row per
   entry with an expires-in countdown.
+
+For a muxed destination the payment summary carries `to` (the M address) and
+`to_base` (its G account); the table row reads `to <M> (base account <G>)`,
+and `approve` prints `Base account:` below `To:`. The MCP `approval.summary`
+carries `to` only.
 
 The report names `profile` only when the name resolves to a saved profile.
 
@@ -1481,8 +1500,8 @@ The report names `profile` only when the name resolves to a saved profile.
 ```
 
 Trustline table rows read
-`trustline CODE:ISSUER_REDACTED limit LIMIT for HOLDER`.
-`LIMIT` is `unlimited`, `n stroops`, or `0 stroops (remove)`.
+`trustline CODE:ISSUER_REDACTED limit LIMIT for HOLDER, memo MEMO`.
+`LIMIT` is `unlimited`, `n stroops`, or `0 stroops (removes the trustline)`.
 JSON uses `summary.kind: "trustline"` with the full holder and issuer.
 Its `limit_stroops` is a decimal string, or `null` for unlimited.
 
@@ -1520,6 +1539,7 @@ every later decision until the inbox restarts. `approve serve` itself refuses
 to start while another process, such as a running MCP server, holds the audit
 writer (`audit.writer_locked`).
 
+On a mainnet profile, `approve serve` needs a V1 profile that `profile enable-mainnet` has enabled. Without an enablement record the local inbox exits `1` with `approval.presence_policy_unavailable` before it binds a port.
 On a mainnet profile, Approve with passkey requests a fresh verified assertion.
 The terminal-style approve route refuses with `approval.presence_required`.
 Reject works. Default mainnet mode refuses `--no-open` and browser-launch failures, and
@@ -1568,7 +1588,7 @@ bound to the user that parked them, and a different user's consent is
 refused (`approval.user_mismatch`).
 
 Remote operation (agent on a remote or headless host): keep the server
-loopback-bound and reach it through an SSH local port-forward with the SAME
+loopback-bound and reach it through an SSH local port-forward with the same
 port on both ends, then open the printed `127.0.0.1` URL in the local
 browser:
 
@@ -1593,7 +1613,7 @@ stellar-agent approve serve --remote --confirm-remote-exposure --profile default
 Binds a TLS-protected, passkey-authenticated listener beyond loopback instead
 of the local inbox above, for approving from a device other than the wallet
 host, without an SSH tunnel. Requires the profile's `[remote_approval]` block
-with `enabled = true` AND `--confirm-remote-exposure` as a separate, explicit
+with `enabled = true` and `--confirm-remote-exposure` as a separate, explicit
 consent flag; either alone refuses to start. See
 [Remote approval](../remote-approval.md) for the full setup, trust model, and
 walkthrough. Mainnet requires an origin and SPKI pin in the verified policy.
@@ -1620,7 +1640,7 @@ touches the network.
 A WebAuthn credential is bound to its `rp.id` at creation time, and that
 binding is what decides which of the two modes applies:
 
-- **`--interactive`**: for a loopback or SSH-tunnelled `approve serve
+- `--interactive`: for a loopback or SSH-tunneled `approve serve
   --remote` listener. Needs a terminal on stdin and stderr, and refuses with
   `approve.operator_enroll_tty_required` otherwise. Starts a one-shot local
   server and prints (and by default opens) an enrollment page. The printed
@@ -1683,7 +1703,7 @@ binding is what decides which of the two modes applies:
   `rp_id: "localhost"`, the only effective domain a loopback origin can
   claim. The stored sign count comes from the authenticator data the server
   verified.
-- **`--credential-id` / `--public-key` / `--rp-id` / `--label`** (all four
+- `--credential-id` / `--public-key` / `--rp-id` / `--label` (all four
   together): for a domain-configured remote listener. Imports the id and
   public key from a WebAuthn ceremony run elsewhere: normally the remote
   listener's own `GET /enroll` page, which has to be served from
@@ -1693,7 +1713,7 @@ binding is what decides which of the two modes applies:
   vouches that they came from their own ceremony.
 
 ```bash
-# Local or SSH-tunnelled listener
+# Local or SSH-tunneled listener
 stellar-agent approve operator enroll --interactive --label laptop
 
 # Domain-configured remote listener: import a credential enrolled via its
@@ -1866,9 +1886,9 @@ the policy at a higher sequence.
 
 ## `audit`
 
-The `audit` group verifies the per-profile audit log, an append-only, hash-chained JSONL record of transaction submissions, signed authorizations, approvals, and explicit key-management and lifecycle events, and repairs its tip anchor. MCP balance reads and payment simulations produce no automatic invocation row. Under V1, payment simulations can reconcile overdue reservations and deliver owed accounting events. Raw argument values are never logged; only argument key names are recorded. Typed value events retain each leg's amount, asset, and redacted destination, and a payment leg also retains the SHA-256 of its complete destination. The chain links each entry to the SHA-256 of the prior entry's canonical body, so any external modification breaks verification.
+The `audit` group verifies the per-profile audit log, an append-only, hash-chained JSONL record of transaction submissions, signed authorizations, approvals, and explicit key-management and lifecycle events. It also repairs the log's tip anchor, acknowledges outbox loss, and binds the audit carriers. MCP balance reads and payment simulations produce no automatic invocation row. Under V1, payment simulations can reconcile overdue reservations and deliver owed accounting events. Raw argument values are never logged; only argument key names are recorded. Typed value events retain each leg's amount, asset, and redacted destination, and a payment leg also retains the SHA-256 of its complete destination. The chain links each entry to the SHA-256 of the prior entry's canonical body, so any external modification breaks verification.
 
-The chain and the per-file chain-root signatures verify a PREFIX of the log, so an older copy of the active file, or a truncated one, passes both. What pins the END of the chain is the tip anchor: the active file's entry count, last-entry hash, and byte offset, held in the platform keyring per log path. Every value-moving verb checks it before signing, and `audit verify --profile` checks it too.
+The chain and the per-file chain-root signatures verify a prefix of the log, so an older copy of the active file, or a truncated one, passes both. What pins the end of the chain is the tip anchor: the active file's entry count, last-entry hash, and byte offset, held in the platform keyring per log path. Every value-moving verb checks it before signing, and `audit verify --profile` checks it too.
 
 ### `audit verify <LOG_PATH>`
 
@@ -1876,18 +1896,18 @@ Read-only. Walks the log at `<LOG_PATH>`, following rotation manifests across ro
 
 `hmac_verified` is `true` when `--profile` supplies the audit key and every walked file's chain-root sidecar verifies over that file's first entry; it covers no later entry. `entry_tags_verified` is `true` when entry tags are in force and every entry past the boundary carries a valid tag. `entry_tags_boundary` names the newest `audit_entry_tags_started` or `audit_entry_tags_rekeyed` row with a valid tag as `{file, line, kind}`, or is `null`. An entry past the boundary with a missing or wrong tag exits `1` with `audit.entry_tag_invalid`, naming the line and `missing` or `mismatch`. An `entry_tags_absorbed` warning reports rows the boundary row absorbed without a tag check, `entries_quarantined` rows a repair quarantined, and `entry_tags_rekeyed_at_open` a rekey a keyed open appended.
 
-The tip anchor is checked only when `--profile` is supplied AND `<LOG_PATH>` is the log that profile configures. The anchor names a path, not a profile, so comparing it against a file it does not describe would report a mismatch that means nothing. Every other case reports `anchor.status` as `"not_checked"` with the reason and still verifies the chain in full. `anchor.status` `"verified"` means the anchored entry is intact at the anchored offset and the active file ends at or past it. A log that moved forward past its anchor passes the anchor check; entries past the anchor are authenticated only when `entry_tags_verified` is `true`. A log behind it, or one whose tip is not the anchored tip, fails with `audit.tip_anchor_mismatch`.
+The tip anchor is checked only when `--profile` is supplied and `<LOG_PATH>` is the log that profile configures. The anchor names a path, not a profile, so comparing it against a file it does not describe would report a mismatch that means nothing. Every other case reports `anchor.status` as `"not_checked"` with the reason and still verifies the chain in full. `anchor.status` `"verified"` means the anchored entry is intact at the anchored offset and the active file ends at or past it. A log that moved forward past its anchor passes the anchor check; entries past the anchor are authenticated only when `entry_tags_verified` is `true`. A log behind it, or one whose tip is not the anchored tip, fails with `audit.tip_anchor_mismatch`.
 
-When no anchor is stored for the profile's own log, the command checks for evidence of prior anchoring. Each of these shows the log was anchored: an audit binding recorded for the profile, a chain-root sidecar beside the active file, or an `audit_tip_anchored` row in it. With any of them the command fails with `audit.tip_anchor_missing`, and the message says `anchor: missing` and names the evidence. For an empty active file, only the sidecar counts as evidence. Profile verification checks the hash chain and HMAC sidecars before reporting anchor agreement, unless this missing-anchor rule applies. The missing-anchor check follows an unkeyed chain walk and precedes HMAC verification. Without evidence, a log reports `anchor.status` as `"not_checked"` only if its chain and HMAC checks pass.
+When no anchor is stored for the profile's own log, the command checks for evidence of prior anchoring. Each of these shows the log was anchored: an audit binding recorded for the profile, a chain-root sidecar beside the active file, or an anchoring row or a sign of entry tags in it. That last is an `audit_tip_anchored` row of any reason, an entry-tag row, a row that carries an `entry_tag`, or `entry_tags: true` on the rotation handoff the file chains from. The entry-tag rows are `audit_entry_tags_started`, `audit_entry_tags_rekeyed`, and `audit_entries_quarantined`. With any of them the command fails with `audit.tip_anchor_missing`, and the message says `anchor: missing` and names the evidence. For an empty active file, only the sidecar counts as evidence. Profile verification checks the hash chain and HMAC sidecars before reporting anchor agreement, unless this missing-anchor rule applies. The missing-anchor check follows an unkeyed chain walk and precedes HMAC verification. Without evidence, a log reports `anchor.status` as `"not_checked"` only if its chain and HMAC checks pass.
 
 Verifier failures use `audit.chain_broken`, `audit.rotation_gap`, `audit.hmac_mismatch`, `audit.hmac_sidecar_missing`, `audit.entry_tag_invalid`, `audit.too_many_rotated_files`, `audit.non_regular_file_log_path`, `audit.parse_error`, `audit.path_contract`, `audit.log_not_found`, `audit.io_error`, `audit.signer_set_canonical_body`, `audit.partial_rotation`, `audit.tip_anchor_mismatch`, `audit.tip_anchor_missing`, `audit.outbox_rows_missing`, `audit.outbox_busy`, `audit.outbox_unusable`, `audit.outbox_evidence_unusable`, `audit.carrier_replaced`, `audit.carriers_unbound`, `audit.carrier_identity_unavailable`, `audit.carrier_binding_incomplete`, `audit.tip_anchor_unavailable`; see [security internals](../maintainers/security-internals.md#audit-hash-chain).
 Profile and ownership pre-checks carry their own codes.
 
-- `<LOG_PATH>` (positional, required): path to the audit log file. By default this is `~/.local/share/stellar-agent/audit/<profile>.jsonl` on Linux, `~/Library/Application Support/Soneso.stellar-agent/audit/<profile>.jsonl` on macOS, and `%LOCALAPPDATA%\Soneso\stellar-agent\data\audit\<profile>.jsonl` on Windows.
+- `<LOG_PATH>` (positional, required): path to the audit log file. By default this is `${XDG_DATA_HOME:-$HOME/.local/share}/stellar-agent/audit/<profile>.jsonl` on Linux, `~/Library/Application Support/Soneso.stellar-agent/audit/<profile>.jsonl` on macOS, and `%LOCALAPPDATA%\Soneso\stellar-agent\data\audit\<profile>.jsonl` on Windows.
 - `--profile <NAME>`: the profile whose chain-root HMAC key verifies the sidecars. Optional; when omitted, only the hash chain is verified. The profile's audit binding is read and never written: a changed or unparseable binding exits `1` with `audit.log_binding_changed`.
 - `--output <FORMAT>`: output format. `json` is the default and only stable format.
 
-On Unix, the command refuses to verify a log whose parent directory is owned by a different user, since such a directory would let its owner substitute log files or sidecars. It exits `0` when the chain is intact and `1` on any integrity violation (a broken chain, a rotation gap, an HMAC mismatch, a missing sidecar, an invalid entry tag, an unparseable line, a tip-anchor mismatch, or a missing tip anchor), a path-contract failure, or an I/O error.
+On Unix, the command refuses to verify a log whose parent directory is owned by a different user, since such a directory would let its owner substitute log files or sidecars. That refusal exits `1` with `internal.invariant_violated`, and the message starts with `audit.path_owner_mismatch:` and names both user ids. It runs before any other check. It exits `0` when the chain is intact and `1` on any integrity violation (a broken chain, a rotation gap, an HMAC mismatch, a missing sidecar, an invalid entry tag, an unparseable line, a tip-anchor mismatch, or a missing tip anchor), a path-contract failure, or an I/O error.
 
 A `pruned_prefix` warning reports `first_file`, the oldest file walked, and
 `pruned_files`, the count in `<log>.pruned`. The marker seeds that file's first
@@ -1921,11 +1941,11 @@ State-changing (writes the keyring anchor, appends one to three audit rows, then
 | Changed or unreadable | Agrees, or absent without prior anchoring evidence | `--acknowledge-binding-change` | `binding_changed` |
 | Changed or unreadable | Disagrees, cannot be parsed, or absent with prior anchoring evidence | Both | `rollback_acknowledged`, then `binding_changed` |
 
-In every row, an unauthenticated tail also requires `--acknowledge-unauthenticated-tail`. The command then appends `audit_entries_quarantined` with the tail's count directly after those entries, before its other rows, lists `unauthenticated_tail` first in `acknowledged`, and reports `quarantined_rows`. Readers skip quarantined entries. Without such a tail the flag is ignored. A tail that ends on a rotation handoff without a valid tag refuses with `audit.reanchor_failed` and names the line to remove.
+In every row, an unauthenticated tail also requires `--acknowledge-unauthenticated-tail`. The command then appends `audit_entries_quarantined` with the tail's count directly after those entries, before its other rows, lists `unauthenticated_tail` first in `acknowledged`, and reports `quarantined_rows`. Readers skip quarantined entries. Without such a tail the flag is ignored. A tail that ends on a rotation handoff without a valid tag refuses with `internal.unexpected_state`, whose detail begins `audit.reanchor_failed` and names the line to remove.
 
-The first row covers both anchor refusals: an anchor that disagrees with the log (`audit.tip_anchor_mismatch`), and an absent anchor on a log that shows it was anchored before (`audit.tip_anchor_missing`). In the binding-changed rows, an absent anchor disagrees when a chain-root sidecar or an `audit_tip_anchored` row shows prior anchoring. Without evidence it agrees.
+The first row covers both anchor refusals: an anchor that disagrees with the log (`audit.tip_anchor_mismatch`), and an absent anchor on a log that shows it was anchored before (`audit.tip_anchor_missing`). In the binding-changed rows, an absent anchor disagrees when a chain-root sidecar or the row evidence of the missing-anchor rule shows prior anchoring. Without evidence it agrees.
 
-A flag the matrix does not require is ignored. The binding is checked before the repair writer opens, and the anchor's disagreement is decided again under the writer's lock. A missing flag changes nothing and exits `1` with `validation.acknowledgement_required`, naming the flag. Without `--acknowledge-rollback` on an equal or absent binding the command reports the anchor in force and the anchor it would write, both as `<entry count>:<byte offset>`, changes nothing, and exits `1` with `validation.acknowledgement_required`. Moving the anchor forgives whatever made the log disagree with it, and the command cannot tell a restored backup from tampering. That judgement is the operator's, and it wants to be made before the evidence moves.
+A flag the matrix does not require is ignored. The binding is checked before the repair writer opens, and the anchor's disagreement is decided again under the writer's lock. A missing flag changes nothing and exits `1` with `validation.acknowledgement_required`, naming the flag. Without `--acknowledge-rollback` on an equal or absent binding the command reports the anchor in force and the anchor it would write, both as `<entry count>:<byte offset>`, changes nothing, and exits `1` with `validation.acknowledgement_required`. Moving the anchor forgives whatever made the log disagree with it, and the command cannot tell a restored backup from tampering. That judgment is the operator's, and the operator makes it before the anchor moves.
 
 After the operator investigates, reanchor accepts an intact prefix with the required flags. It replays the whole log first and refuses a broken chain. It writes the current tip as the anchor, bumps the current path's re-anchor counter held in the keyring once, and appends the rows, each carrying that count. `rollback_acknowledged` names the superseded anchor. `binding_changed` names the anchor of the log path the previous binding named, or none when the record was unreadable. The rows are permanent: the log carries its own record that a rollback or a binding change was accepted. The new binding is stored last, so a run that stops earlier leaves the refusal in place, and an absent binding is recorded after a rollback repair. The envelope lists the conditions acknowledged and how the recorded binding compared.
 
@@ -1990,7 +2010,10 @@ The result contains `profile`, `generation`, `carried_rows` and `retired_file`.
 file. When a retired file exists, keep it while investigating stale holders.
 A log with keyed history refuses keyed use with `audit.carriers_unbound` until
 this command runs once; a log without keyed evidence enrolls at its first keyed
-open. Replaced carriers refuse with `audit.carrier_replaced`. A staged
+open. One run per keyed log is enough. Every later run on a bound log binds
+again: it advances `generation`, retires the current outbox under the next
+`retired-g<G>` name, and appends another `audit_carriers_bound` row. Replaced
+carriers refuse with `audit.carrier_replaced`. A staged
 generation refuses with `audit.carrier_binding_incomplete`; rerun this command
 to finish it.
 
@@ -2005,23 +2028,7 @@ to finish it.
 
 Key rotation backs this loop. After `rotate-attestation-key`, attestations minted under the old key fail verification, and unattested pending requests can still be approved under the new key. `rotate-audit-key` re-keys the chain root and re-signs every existing per-file sidecar. See [concepts](../concepts.md) for the full model.
 
-## Retained smart-account charges
-
-Reset refuses while an intent remains open or retained. A closed and pruned intent does not block reset.
-
-An open intent without an authenticated purpose permanently blocks reset for this profile. Continue with a new profile.
-
-When an intent is open and the profile stores no `secondary_rpc_url`, the intent view reports that retained intents cannot close and asks for one.
-
-When an intent is open and the stored endpoint configuration cannot load, the intent view reports that only stored endpoints that load close retained intents.
-
-Only the endpoints stored in the profile authorize charge closure. Endpoint overrides can bound signatures but cannot close charges.
-
-Environment variables and programmatic overlays do not change which endpoints authorize charge closure.
-
-Snapshots containing signed intents or intent links use version 9. Records missing required intent fields refuse as unreadable. Readers that cannot account for the format refuse current and prepared snapshots.
-
-### x402 owner approval
+## x402 owner approval
 
 Supply `approval_nonce` with `approval_attestation` when the policy requires approval, on either network.
 On testnet, a clock reading before approval creation refuses the approval without consuming it.

@@ -12,10 +12,10 @@ are reading right now.
 | Execution | You read and act on it | The wallet never executes its body; it is data |
 
 A wallet toolset declares a narrow capability set that the toolset dispatcher
-(`stellar_toolset_invoke`) routes; the wallet treats the toolset as data (a
-manifest plus a capability declaration), never executes toolset-supplied code, and
-never routes a toolset to a signing, key, or policy tool through its ungated
-capabilities. The only signing tools a toolset reaches are `stellar_pay_commit`
+(`stellar_toolset_invoke`) routes. The wallet treats the toolset as data: a
+manifest plus a capability declaration. It never executes toolset-supplied code.
+Its ungated capabilities never route a toolset to a signing, key, or policy
+tool. The only signing tools a toolset reaches are `stellar_pay_commit`
 and `stellar_rule_create_commit`, through the gated `sign-payment` and
 `sign-rule-create` capabilities, each behind a first-invoke grant. Payment
 consent follows the composed policies; rule creation requires approval.
@@ -24,10 +24,10 @@ What a toolset does not do: it does not narrow the native tools the same MCP
 server registers, which an agent connected to the server can call directly. The
 `toolset` argument of an invocation is chosen by the caller, and the server binds
 no session to a toolset. The operator policy and the approvals bound native and
-routed calls alike. The install record a toolset's capabilities come from is
+routed calls alike. The pin record a toolset's capabilities come from is
 authenticated by an HMAC under an installation key in the platform keyring and
-carries the `TOOLSET.md` digest that both resolver tiers check. This FEATURE
-narrows the dispatcher's routes. It is NOT a way to teach an agent.
+carries the `TOOLSET.md` digest that both resolver tiers check. This feature
+narrows the dispatcher's routes. It does not teach an agent.
 
 For the broader MCP tool surface used to invoke actions, see `./mcp-tools.md`
 (ships alongside this file).
@@ -57,11 +57,11 @@ Frontmatter fields read by the parser:
 
 | Field | Rule |
 |---|---|
-| `name` | Required. ASCII `[a-z0-9-]`, 1-64 chars; no leading/trailing hyphen; no `--`. Must equal the containing directory name (byte-exact, homoglyph-spoof defence). |
+| `name` | Required. ASCII `[a-z0-9-]`, 1-64 chars; no leading/trailing hyphen; no `--`. Must equal the containing directory name (byte-exact, homoglyph-spoof defense). |
 | `description` | Required. Non-empty after trim; <= 1024 Unicode scalar values. |
 | `license` | Optional. SPDX identifier or reference to a bundled license file. |
 | `compatibility` | Optional. <= 500 Unicode scalar values. |
-| `allowed-tools` | Optional. Whitespace-tokenised list of tool names; an intersective narrowing list. |
+| `allowed-tools` | Optional. Whitespace-tokenized list of tool names; an intersective narrowing list. |
 | `metadata` | Optional string->string map. May carry `stellar-agent-capabilities`. |
 
 The capability manifest is the space-separated value of
@@ -152,10 +152,10 @@ check:
 
 - 256 KiB file-size cap before parse; non-UTF-8 is rejected, never a panic.
 - YAML anchors and aliases are refused at the event level before any tree is
-  built (billion-laughs / alias-bomb defence).
+  built (billion-laughs / alias-bomb defense).
 - Nesting depth is bounded at 8 for both block and flow styles via an iterative
   event pull loop.
-- Duplicate mapping keys are refused (viewer-vs-parser confusion defence).
+- Duplicate mapping keys are refused (viewer-vs-parser confusion defense).
 - A `metadata` value that is a list or mapping rather than a string is refused.
 - Any other `metadata` key beginning with the reserved prefix `stellar-agent-`
   (other than `stellar-agent-capabilities`) is refused.
@@ -194,7 +194,7 @@ The first install mints the pin key in the platform keyring.
 
 Verification proves origin and integrity, not content safety. The extractor and
 parser are safe on adversarial input on their own merits; signature verification
-is defence-in-depth layered before them.
+is defense-in-depth layered before them.
 
 The publisher and auditor trust sets (`trust.txt`, `auditor-trust.txt`) default to
 plain operator-held files in the toolsets directory, read at install time only and
@@ -242,14 +242,16 @@ refuses with `toolset.pin_unverifiable`; the operator uninstalls the toolset and
 installs it again.
 
 The capability-source invariant: the install gate and the attestation preimage
-read capabilities from the parse of the signature-verified package, and every
+read capabilities from the parse of the signature-verified package. Every
 runtime capability decision reads them from the authenticated pin record, never
 from a re-parse of the on-disk `TOOLSET.md`. A toolset installed with no declared
 capability whose on-disk `TOOLSET.md` is later edited to add `sign-payment` is
 still refused at the signing path, because the runtime reads the pin, not the
 file. As additional tamper-evidence, both resolver tiers re-read the on-disk
-`TOOLSET.md`, recompute its digest, and refuse dispatch with
-`toolset.content_digest_mismatch` on a mismatch or an unreadable file.
+`TOOLSET.md` and recompute its digest. A mismatch or an unreadable file refuses
+dispatch. CLI `toolsets run` answers `toolset.content_digest_mismatch`. MCP
+`stellar_toolset_invoke` answers a JSON-RPC internal error whose message starts
+`toolset.enforcement_error: toolset.content_digest_mismatch:`.
 
 ## First-invoke grants and payment policy
 
@@ -259,11 +261,14 @@ resolver, never the ungated path. The gated resolver enforces, in order:
 1. A call without `args.envelope_xdr` refuses with `toolset.gated_missing_envelope`.
    The caller's `asset` and its `amount` or `amount_in_stroops` are then
    validated; an invalid or missing value refuses before any approval is queued.
-2. The install record verifies, and the on-disk `TOOLSET.md` matches its digest.
-3. The four-part check against the gated matrix: the toolset declares
+2. The handler decodes `envelope_xdr` and requires one payment to a G or M
+   destination; another envelope refuses with `simulation.divergence`. It then
+   loads the profile's attestation key and the installation's pin key.
+3. The pin record verifies, and the on-disk `TOOLSET.md` matches its digest.
+4. The four-part check against the gated matrix: the toolset declares
    `sign-payment`, the action maps to the gated `stellar_pay_commit` constant,
    and the tool is within `allowed_tools`.
-4. The first-invoke gate: it looks for a current matching grant in the
+5. The first-invoke gate: it looks for a current matching grant in the
    per-profile grant store. Matching is computed from the authoritative
    destination, asset, and amount decoded from the transaction envelope, never
    from toolset-supplied arguments. A non-positive authoritative amount is refused
@@ -506,9 +511,14 @@ stellar-agent toolsets uninstall balance-reporter
 | Code | Cause |
 |---|---|
 | `toolset.not_installed` | Named toolset has no pin record. |
-| `toolset.pin_unverifiable` | The install record does not verify under the installation's pin key (edited, written under another key, or carrying no authentication tag), or no pin key exists. Uninstall the toolset and install it again. |
-| `toolset.content_digest_mismatch` | The on-disk `TOOLSET.md` differs from the digest in the install record, or cannot be read. Reinstall the toolset. |
+| `toolset.pin_unverifiable` | The pin record does not verify under the installation's pin key (edited, written under another key, or carrying no authentication tag), or no pin key exists. Uninstall the toolset and install it again. |
+| `toolset.content_digest_mismatch` | The on-disk `TOOLSET.md` differs from the digest in the pin record, or cannot be read. Through MCP it arrives inside a `toolset.enforcement_error:` internal error. Reinstall the toolset. |
 | `toolset.unknown_action` | Action does not resolve through the matrix (includes any signing tool named directly other than the two gated tools). |
 | `toolset.capability_not_declared` | Resolved tool's capability is not in the toolset's declared set. |
 | `toolset.tool_not_allowed` | Resolved tool is excluded by the toolset's `allowed_tools` narrowing. |
 | `toolset.first_invoke_approval_required` | Gated payment or rule-create commit has no current matching grant; returns an approval nonce for `stellar-agent approve --id <nonce> --profile <name>`. |
+| `toolset.coordination_busy` | An install, uninstall, or grant writer holds a lock. Retry once that write ends. |
+| `toolset.grant_invocation_mismatch` | The invocation differs from the one the grant was verified for. |
+| `toolset.grant_changed` | The installation changed, or the grant was revoked, replaced, or no longer verifies. |
+| `toolset.grant_expired` | The clock reads at or after the grant's stored expiry. |
+| `toolsets.install_failed` | CLI `toolsets install` refused; the detail is in `error.message`. |

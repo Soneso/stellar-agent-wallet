@@ -28,8 +28,8 @@ the gate-tool installation, the build commands, and the test tiers.
 Every change must be production-ready. There is no separate "good enough for alpha"
 standard.
 
-The workspace lints are declared in the root `Cargo.toml` and denied across the
-workspace. In particular:
+The workspace lints are declared in the root `Cargo.toml`. Every crate except
+`stellar-agent-sep7` inherits them. In particular:
 
 - No `unsafe` code (`unsafe_code` is denied).
 - No `unwrap`, `expect`, or `panic` in library code unless a path is provably
@@ -81,17 +81,12 @@ coverage requires the `coverage` label; live acceptance uses its separate
 workflow. The exact commands, gate-tool installation, and test tiers are in
 [docs/maintainers/building.md](docs/maintainers/building.md).
 
-A CLI preflight retains 3,756,896 KiB (about 3.6 GiB) with a 30-second sampled
-peak of 3,756,896 KiB, at 0.43 and 0.43 times the baseline sizes, respectively.
-A full preflight retains 21,188,348 KiB (about 20.2 GiB) with a 30-second
-sampled peak of 21,188,348 KiB, at 0.51 and 0.51 times the baseline sizes,
-respectively.
-See [Disk use](docs/maintainers/building.md#disk-use) for the measurements and
-cleanup guidance.
+See [Disk use](docs/maintainers/building.md#disk-use) for the disk space a preflight
+retains and for cleanup guidance.
 
 ## Review process
 
-Your first pull request or issue gets an automatic welcome comment that names the next step.
+Your first contribution, whether an issue or a pull request, gets an automatic welcome comment that names the next step.
 
 A maintainer acknowledges a new pull request within one working day (Monday to
 Friday, Central European Time). The review follows within three working days for
@@ -128,7 +123,7 @@ maintainer merges next. An issue or pull request loses both labels when a person
 closes it.
 
 A pull request that waits on its author for 14 days gets a reminder, and it
-closes after 21 days. You can reopen it at any time.
+closes after 21 days. Draft pull requests are exempt. You can reopen it at any time.
 
 ## Contributing with a coding agent
 
@@ -273,10 +268,8 @@ For example, `changelog.d/account-timeouts.fixed.md` contains:
 
 Keep `CHANGELOG.md` and the fragment README unchanged in contributing pull
 requests. Move any direct changelog entries into fragments.
-Remove the `CHANGELOG.md` edits from the branch history.
-For example, use an interactive rebase that drops or amends those commits.
-A later revert commit still fails the integration guard.
-Commits that `main` holds are exempt.
+Remove the `CHANGELOG.md` edits from the branch history; a later revert commit
+still fails the integration guard.
 An eligible sync merge has exactly two parents and brings new ancestry from
 `main` through its second parent.
 Its `CHANGELOG.md` equals the clean three-way merge over the parents' merge
@@ -287,9 +280,8 @@ Never edit an existing fragment. Add a new file for a further entry.
 Each fragment file belongs to one pull request and is never reused.
 A sync merge deletes fragments that `main` folds and deletes.
 It never deletes a fragment that holds an unreleased entry under this rule.
-Distinct fragment filenames avoid changelog conflicts between pull requests.
-Rename one fragment when two files share a filename and produce an add/add
-conflict.
+The fragment README states the rules the guard applies to branch history and
+filename conflicts.
 
 Run `python3 .github/scripts/changelog.py check` to validate your fragments.
 Run `python3 .github/scripts/changelog.py preview` to read the folded

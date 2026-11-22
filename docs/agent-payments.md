@@ -32,20 +32,11 @@ MPP is separate from the wallet's x402 v2 support. x402 accepts an x402
 Payment challenge bound to the request context and returns an HTTP or native MCP
 Payment credential. Neither path sends the merchant request.
 
-The classic payment tools are separate from both. `stellar_pay`,
-`stellar_pay_commit`, the toolset payment actions, and CLI `pay` refuse a C
-contract recipient with `validation.contract_payment_unavailable`, or with
-`validation.contract_payment_memo_unsupported` when a memo is set. An envelope
-holding one contract transfer refuses on CLI `--sign-only` and
-`--submit-only`, MCP and toolset commit, the paired commit evaluation, and the
-mainnet resolver. Without a valid asset its code is
-`validation.contract_payment_invalid`. Otherwise its code is
-`validation.contract_payment_memo_unsupported` when it carries a memo,
-`validation.contract_payment_unavailable` once proven for the asset, and
-`validation.contract_payment_invalid` when not proven. The paired evaluation
-has no asset, so it answers `validation.contract_payment_invalid`. On mainnet the mode, feature,
-admission, and freshness refusals come first; the contract refusal follows
-them and precedes any account read, approval, nonce, signing, or request.
+The classic payment tools are separate from both. CLI `pay`, the MCP payment
+tools, and the toolset payment actions refuse a C contract or W muxed
+contract recipient. The refusal codes are in
+[CLI reference: pay](cli-reference/stellar-ops.md#stellar-agent-pay-destination-amount-asset-flags)
+and [MCP: payments and accounts](mcp.md#payments-and-accounts).
 
 ## Request binding
 
@@ -98,8 +89,10 @@ audits, and returns one credential. If the prepare policy requires consent, it
 creates pending approval and returns `mpp.approval_required`, an authorization
 ID, and an approval ID. When only the commit rule requires approval, CLI MPP
 refuses with `mpp.approval_invalid` and creates no pending approval entry.
-When policy denies the charge, CLI MPP also refuses with `mpp.approval_invalid`.
-Its message says operator policy denied the authorization.
+When the policy decision denies the charge, CLI MPP also refuses with
+`mpp.approval_invalid`. Its message says operator policy denied the
+authorization. A spending-window or total-budget refusal at commit keeps its
+own `policy.deny.*` or `policy.total_epoch_*` code.
 
 The operator reviews and approves a pending request through the normal
 `approve` command or approval inbox; then resume only the stored authorization:
@@ -131,9 +124,12 @@ printf '%s' 'scheduled retention cleanup' | \
   stellar-agent mpp state prune --profile default --reason-stdin
 ```
 
+`mpp state prune` requires `--profile <NAME>`; it has no environment or
+`default` fallback.
 Select exactly one reason source: `--reason-stdin` or `--reason-file <PATH>`.
 The reason must contain 1 to 4096 bytes. A reason file must be a regular file;
-the command refuses a symlink. For a file-based reason:
+the command refuses a symlink. An empty or oversize reason, or a reason file
+that is not a regular file, refuses with `mpp.state_unavailable`. For a file-based reason:
 
 ```bash
 stellar-agent mpp state prune --profile default --reason-file reason.txt
@@ -163,9 +159,11 @@ the durable state retains only their digests.
 
 ## Credential delivery
 
-An HTTP result contains an `authorization` value beginning with `Payment`; use
-it as the exact `Authorization` field value on the request that was bound during
-prepare. A native MCP result contains the `org.paymentauth/credential` object for
+The CLI and MCP results carry the credential in a `credential` member, tagged
+by `transport`. With `"transport": "http"`, its `authorization` member holds a
+value beginning with `Payment`. Use it as the exact `Authorization` field value
+on the request that was bound during prepare. With `"transport": "mcp"`, its
+nested `credential` member holds the `org.paymentauth/credential` object for
 the bound operation. Do not translate a credential between transports.
 
 The trusted host is responsible for all transport behavior:
@@ -216,7 +214,7 @@ with `approval.entry_inconsistent`, the approval code every approval surface
 uses for such a request, and commits nothing.
 
 The verbs that record an audit row before they return (charge commit, record
-receipt, reconcile, prune) answer a problem with the audit LOG under its own
+receipt, reconcile, prune) answer a problem with the audit log under its own
 `audit.*` code instead. They answer with `audit.chain_key_unavailable` when the profile's
 chain-root key is not acquirable. They answer with `audit.tip_anchor_mismatch` when the log no longer holds the chain tip its keyring-held anchor names, and with `audit.tip_anchor_missing` when the anchor is gone from a log that shows it was anchored. They answer with `audit.log_binding_changed` when the profile names a log path or audit key other than its recorded audit binding. Those name a different
 thing to fix from the MPP state file, and each has its own recovery in

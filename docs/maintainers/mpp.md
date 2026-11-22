@@ -40,13 +40,15 @@ bash .github/scripts/test-publish-crates-check.sh
 | `sponsored` | Zero-source prepare simulation, auth-entry inspection, signing, mandatory re-simulation, final envelope inspection. |
 | `credential` | HTTP `Payment` or native MCP credential encoding. |
 | `state` | Authorization fingerprint, record invariants, lifecycle graph. |
-| `store` | Per-profile HMAC file, locking, atomic replace, replay lookup and retention. |
-| `service` | Shared CLI/MCP prepare, approval, commit and delivery gates. |
+| `store` | Per-profile HMAC file, locking, atomic replace, replay lookup, and retention. |
+| `service` | Shared CLI/MCP prepare, approval, commit, and delivery gates. |
 | `receipt` | Strict trusted-host receipt parsing and digesting. |
 | `reconcile` | Final RPC lookup and independent direct/fee-bump envelope and signature verification. |
+| `error` | Stable, redacted error codes for the CLI and MCP adapters. |
+| `limits` | Named limits for untrusted inputs and outputs. |
 
-CLI adaptation is `stellar-agent-cli/src/commands/mpp.rs`. MCP schemas and tools
-are in `stellar-agent-mcp/src/tools/mpp.rs`. Do not duplicate parser, policy,
+CLI adaptation is `crates/stellar-agent-cli/src/commands/mpp.rs`. MCP schemas and tools
+are in `crates/stellar-agent-mcp/src/tools/mpp.rs`. Do not duplicate parser, policy,
 fingerprint, signing, or state-machine logic in either binary.
 
 ## Supported flow
@@ -71,7 +73,7 @@ result values, and transaction data; the wallet decodes those fields with
 the encoded input size.
 
 Reconciliation reads `getTransaction` raw through the wallet's
-`StellarRpcClient::get_transaction_raw`. Status, ledger and transaction hash
+`StellarRpcClient::get_transaction_raw`. Status, ledger, and transaction hash
 are taken as received, and the wallet decodes the envelope itself with
 `untrusted_decode_limits(encoded.len())`, bounding depth to 500 and length to
 the encoded input size. An envelope that does not decode is refused as
@@ -103,17 +105,24 @@ otherwise it returns the most recently created match. Consumed matches refuse
 insertion. Repeated prepare reuses the stored authorization and pending approval.
 
 `MppChargeSimulated` binds the full authorization fingerprint and prepared
-artifact hash plus operator-visible profile, network, payer, transport,
-authority, target, amount, token, recipient, challenge expiry and simulated fee.
-Its attestation uses the prepared artifact hash and the normal approval nonce
-and process-identity binding. Its lifetime is capped at five minutes and by the
-challenge expiry. Local and remote approval views redact payer and recipient and
-never render XDR, credentials, challenge bodies, or raw context parameters.
+artifact hash. The entry also stores three digests: the request context, the
+network passphrase, and the exact challenge. Every surface uses them to check
+the displayed profile, payer, amount, token, recipient, and expiry against the
+fingerprint. An entry without them refuses with `approval.entry_inconsistent`.
+The operator-visible terms are profile, network, payer, transport,
+authority, target, amount, token, recipient, challenge expiry, and simulated fee.
+Its attestation covers the SHA-256 of the domain `stellar-agent-mpp-approval:v1\0`,
+the authorization fingerprint, and the prepared artifact hash. It also carries
+the normal approval nonce and process-identity binding. Its lifetime is capped at five minutes and by the
+challenge expiry. The `approve list` output and the local and
+remote inbox pages redact payer and recipient. The `approve --id` prompt prints
+both in full, with the token contract. No approval view renders XDR,
+credentials, challenge bodies, or raw context parameters.
 
 ## Durable state
 
 The per-profile file is below the canonical data root in `mpp/`; its filename is
-the SHA-256 of the profile name. A dedicated 32-byte HMAC key occupies keyring
+the hex SHA-256 of the profile name plus `.state`. A dedicated 32-byte HMAC key occupies keyring
 service `stellar-agent-mpp-state-<profile>`, account `default`. The monotonic
 committed counter occupies the same service, account `default-generation`.
 The intent counter occupies `default-generation-intent` and records the highest
@@ -132,7 +141,7 @@ the state key is also missing.
 Every read checks non-symlink regular-file shape, size, HMAC in constant time,
 schema version, equality with the keyring generation, record count,
 reconstructed prepared-artifact semantics, lifecycle invariants, and uniqueness
-of authorization IDs, fingerprints and approval nonces. When the counter is
+of authorization IDs, fingerprints, and approval nonces. When the counter is
 proven absent by the keyring, opening adopts a verifying snapshot under the
 store lock. It records `mpp_state_adopted` with the profile and generation before
 anchoring. Only version 1, which has no generation, is adopted; it is rewritten
@@ -313,8 +322,11 @@ authorizing -> refused|failed|indeterminate
 delivery_pending -> authorized_withheld
 ```
 
-Prepare records a pending approval when policy requires approval for either
-`stellar_mpp_charge_prepare` or `stellar_mpp_charge_commit`. Its lifetime stays
+MCP prepare records a pending approval when policy requires approval for either
+`stellar_mpp_charge_prepare` or `stellar_mpp_charge_commit`. CLI
+`mpp charge authorize` records one only when the prepare rule requires approval.
+When only the commit rule requires it, the CLI refuses with
+`mpp.approval_invalid` and records none. The approval's lifetime stays
 bounded by the challenge expiry. Commit re-evaluates its own tool name against
 current state and can still deny an approved request. An exhausted cap returns
 `policy.deny.per_period_cap_exceeded`. The loaded policy document stays fixed
@@ -340,9 +352,9 @@ correct clock admission already refuses an expired challenge, so on the prune
 route this watermark covers a host clock that stepped back. A payee can issue
 a fresh challenge at any time.
 
-A failure after signer access begins becomes `indeterminate` unless the
-credential is known to exist, in which case a final-gate failure becomes
-`authorized_withheld`. Policy accounting ambiguity is also conservative:
+A failure after signer access begins and before `delivery_pending` is stored
+becomes `indeterminate`, a credential encoding failure included. A final-gate
+failure after `delivery_pending` becomes `authorized_withheld`. Policy accounting ambiguity is also conservative:
 budget is treated as consumed and signing does not proceed. A typed policy
 refusal writes no window usage: the authorization becomes `refused`, and its
 withheld row records `policy_refusal` with the budget unconsumed. When the
@@ -369,9 +381,9 @@ happened.
 
 ## Audit and redaction
 
-The four typed charge events are `MppChargeAuthorized`,
-`MppAuthorizationWithheld`, `MppReceiptObserved`, and
-`MppSettlementReconciled`. State adoption and reset write `mpp_state_adopted`
+The four typed charge events are `mpp_charge_authorized`,
+`mpp_authorization_withheld`, `mpp_receipt_observed`, and
+`mpp_settlement_reconciled`. State adoption and reset write `mpp_state_adopted`
 and `mpp_state_reset`. Authorization audit append is a mandatory delivery
 gate. Withheld audit is best-effort after the primary failure: the primary
 error is returned unchanged, and a withheld row that cannot be written is
@@ -383,7 +395,7 @@ the bounded reason SHA-256.
 Never place raw challenges, request bodies, credentials, receipts, prepared or
 signed XDR, signatures, full transaction hashes, key values, or sensitive URLs
 in `Debug`, errors, logs, metrics, snapshots, or audit fields. The operator-
-facing approval summary, prepare preview, and status views display the HTTP
+facing approval summary and prepare preview display the HTTP
 target as origin plus path only; the query and fragment are stripped for
 display while the full canonical resource stays bound in the context digest
 and the authorization fingerprint.
@@ -430,12 +442,12 @@ The serialized acceptance driver owns registration and reports any skip marker.
 
 Apply the general [review checklist](review-checklist.md), then verify:
 
-- all mainnet paths fail before state, RPC, keyring and signing;
+- all mainnet paths fail before state, RPC, keyring, and signing;
 - prepare has no signer capability and commit accepts no replacement terms;
 - every post-claim failure has an unambiguous no-retry state;
-- value effects are identical at policy preview, accounting and audit;
+- value effects are identical at policy preview, accounting, and audit;
 - no credential can be returned twice, including concurrent CLI/MCP commits;
 - host receipt observation remains independent from verified ledger outcome;
 - all public docs and skill references retain the testnet, sponsored-pull,
-  G-account and credential-only boundary; and
+  G-account, and credential-only boundary; and
 - MPP remains absent from toolset routing.

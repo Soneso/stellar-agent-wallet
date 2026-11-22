@@ -3,7 +3,7 @@
 See [Mainnet configurations and scope](docs/getting-started.md#mainnet-configurations-and-scope)
 for build configuration, admitted operations, and exclusions.
 
-This is the security policy for the Stellar Agent Wallet — a Stellar wallet for AI agents,
+This is the security policy for the Stellar Agent Wallet, a Stellar wallet for AI agents,
 shipping the `stellar-agent` CLI binary and the `stellar-agent-mcp` MCP stdio server.
 It covers which versions are supported, how to report a vulnerability, the scope of the
 current public alpha, and a high-level summary of the security model.
@@ -35,7 +35,7 @@ Please include:
 - A description of the vulnerability and its impact.
 - Steps to reproduce, including any required profile configuration or environment.
 - The affected version or commit (the `0.1.x` build, or the source commit you built from).
-- Any proof-of-concept input, log excerpt, or transaction envelope — with secrets redacted.
+- Any proof-of-concept input, log excerpt, or transaction envelope, with secrets redacted.
 
 Do not include real secret seeds, private keys, or keyring secrets in a report. The
 wallet never logs secret material or raw argument values, and reports should follow the same
@@ -50,7 +50,7 @@ errors. A profile name that resolves to no profile and a policy key outside the
 policy schema are rejected values too: the refusal and its log event name the
 failure class, or the key's location and the keys accepted there. A seed or
 credential typed into the wrong place stays out of diagnostics.
-A profile, policy, halt-marker or registry syntax error reports its line and column.
+A profile, policy, halt-marker, or credential-registry syntax error reports its line and column.
 
 We handle reports under coordinated disclosure and aim to acknowledge and triage valid
 reports in good faith as promptly as we can. We will keep you informed as we
@@ -67,7 +67,9 @@ Keep the following properties of the current alpha in mind when assessing impact
   has the feature off, and no code path in it can satisfy the guard.
   The guarantee has one precondition: the claim holds only under the dependency
   set pinned and verified by the release.
-  Feature-enabled builds admit only configured operations with per-action approval.
+  Feature-enabled builds admit only configured operations. An `allow` rule signs
+  under policy authority, and a `require_approval` rule needs a verified
+  per-action approval.
   Policy evaluation alone grants no signing authority. Signing, submission, and
   x402 payload release independently check sealed authorization.
   Signing first claims the authorization in the window state. An authorization
@@ -86,16 +88,16 @@ Keep the following properties of the current alpha in mind when assessing impact
   The endpoint's network binds each envelope signature.
   Read-only commands accept both `stellar:testnet` and `stellar:mainnet`.
   Every MPP tool refuses mainnet with `mpp.network_forbidden`.
-  `smart-account rules verify-pins`, `signers list`, and `signers refresh` retain
+  `smart-account rules verify-pins`, `smart-account signers list`, and `smart-account signers refresh` retain
   local audit writes without signing or writing on chain. Friendbot funding is
   scoped to testnet and futurenet and refuses mainnet with
   `network.friendbot_mainnet_forbidden`.
 
 - The threat model centers on an autonomous agent transacting under wallet guardrails:
   a policy engine, an out-of-band operator-approval spine, and a tamper-evident audit
-  log. Reports that demonstrate an agent escaping or bypassing these guardrails — for
-  example, executing a signing action that should have been denied, forced to approval,
-  or recorded — are in scope and of high interest.
+  log. Reports that demonstrate an agent escaping or bypassing these guardrails are in
+  scope and of high interest. An example is a signing action that runs when it should
+  have been denied, forced to approval, or recorded.
 - Unauthorized mainnet signing, payload release, or submission is a reportable
   violation.
 
@@ -104,7 +106,7 @@ anchor; and issues that require already holding the wallet's keyring secrets (th
 nonce key, or HMAC keys), since custody of those secrets is the security boundary. On
 mainnet the attestation HMAC key alone mints no consent: a mainnet approval also needs
 a verified passkey assertion from an approval credential in the owner-signed policy.
-Two residues remain. A same-user process that holds the HMAC key can wrap a version 5
+Two residues remain. A same-user process that holds the HMAC key can wrap a version 5 or version 6
 record around a user-verified assertion that its own localhost page obtained, so a
 misleading local page is a residue.
 Signed-origin receipts instead bind the verified policy, HTTPS origin and served leaf SPKI pin. The owner seed admits approval credentials, so
@@ -138,7 +140,7 @@ owner's signature. Of the witness inputs, the
 owner signs the oracle host and the per-asset cross-check thresholds. For an
 asset the signed thresholds name, a profile threshold can only lower the
 amount that requires a witness. On mainnet, for an asset the signed thresholds
-do not name, XLM and its SAC use at most 1000 XLM, and a token has no
+do not name, XLM and its SAC use 1000 XLM, and every other asset has no
 threshold and refuses. The
 oracle URL's scheme, path, and credentials and the oracle provider record are
 unsigned profile fields.
@@ -155,8 +157,10 @@ exact consent, request, profile, chain and policy. The wallet verifies it before
 recording consent and again before mainnet authorization. Terminal input and a
 same-user process identity provide no mainnet presence proof.
 
-A classic mainnet envelope carries an on-chain deadline chosen before the consent
-and covered by it. The authorization expires no later than that deadline, and the
+A classic mainnet envelope carries an on-chain deadline. Consent to a payment,
+claim, trustline, or account creation covers the operation's stored intent, and
+the wallet then rebuilds the envelope with a deadline at most 120 seconds ahead.
+Consent to a stored envelope covers the deadline that envelope carries. The authorization expires no later than that deadline, and the
 network refuses the signed transaction after it. The authorization lifetime bounds
 when the wallet sends; the deadline bounds when the chain applies.
 
@@ -181,9 +185,11 @@ operating-system security boundary against all same-user code.
 
 Without a signed approval origin, mainnet consent uses the localhost passkey page.
 Headless consent, `--yes`, `--no-open` on the local inbox, and remote mainnet approval then refuse.
+Without a display, mainnet consent needs `--open-by-operator`, which prints the localhost URL for the operator to open.
 With a signed approval origin, the HTTPS listener serves consent using an owner-pinned credential.
 The CLI prints the signed approval link without opening a browser or requiring a display.
-Ledger signing also requires this passkey ceremony.
+Ledger signing also requires this passkey ceremony and the enrolled signer identity.
+`profile enroll-signer` takes `--secret-env` only, so it cannot enroll a key that exists only on a Ledger.
 
 A localhost ceremony binds `127.0.0.1` and `[::1]` on one port before it
 creates any token, serves the same session on both, and closes both together.
@@ -192,8 +198,8 @@ When either family cannot be held, the ceremony does not start.
 ## Security model summary
 
 For the full design see [docs/concepts.md](docs/concepts.md) and
-[docs/maintainers/security-internals.md](docs/maintainers/security-internals.md). Key
-properties:
+[docs/maintainers/security-internals.md](docs/maintainers/security-internals.md). The model has
+these properties:
 
 - Keyring custody. The signing seed, the nonce key, and the HMAC keys live in the
   platform keyring. A profile is a per-environment TOML config that names keyring entries
@@ -218,7 +224,7 @@ properties:
   An exported seed stays in the environment of the process and of every process
   the shell starts, for their whole life; copying and dropping it inside the wallet
   does not erase it. Mainnet transaction signing refuses `--secret-env` and signs with the
-  enrolled seed in the keyring or with a Ledger. On Linux the CLI marks itself
+  enrolled seed in the keyring or with a Ledger that holds the enrolled key. On Linux the CLI marks itself
   non-dumpable before it starts any thread, so other processes of the same user
   cannot read its memory or environment or attach to it; the shell that exported
   the variable is not protected. On macOS and Windows the CLI sets no such flag.
@@ -227,15 +233,16 @@ properties:
   memory lock.
 - Policy engine plus operator approval. The MCP dispatch gate and the CLI value-moving
   verbs evaluate each action to Allow, Deny, or RequireApproval. Read-only CLI commands
-  such as `balances` evaluate no policy. The Noop engine allows everything on testnet, allows read-only on
-  mainnet, and refuses mainnet destructive actions (`policy.engine_required`); the V1
+  such as `balances` evaluate no policy. The Noop engine allows every testnet action except `smart-account multicall`, allows read-only
+  actions on mainnet, and refuses that command and mainnet destructive actions (`policy.engine_required`); the V1
   engine evaluates signature-verified typed criteria with first-match default-deny.
   A verified policy alone does not confer mainnet authorization. When
   approval is required, the action is recorded in a per-profile pending-approval store and
   released only when the operator runs `approve`, which mints an HMAC-SHA256 attestation
   proving the keyring holder approved it. The attestation is constant-time verified and
-  binds the approval nonce, the envelope SHA-256, and the OS process uid. A mainnet
-  approval is a version 5 attestation that also binds a verified passkey assertion from
+  binds the profile, the chain, the approval nonce, the envelope SHA-256, and the OS
+  process uid. A mainnet approval is a version 5 attestation over the envelope, or a
+  version 6 attestation over the canonical intent digest. Both also bind a verified passkey assertion from
   an approval credential in the owner-signed policy; terminal input and the HMAC key
   alone record no mainnet consent.
 - Conservative submission accounting. Signed exposure occupies capacity through
@@ -258,7 +265,7 @@ properties:
   `pay`, `claim`, and `accounts create` fall back to the zero-config synthesized profile
   when no profile was named and no `default.toml` file exists. That profile stays
   fail-open for this check, matching its documented no-profile-required posture. The SEP-43 sign-only pair (`signTransaction`,
-  `signAuthEntry`) runs the same pre-flight and records an
+  `signAuthEntry`) and the SEP-43 and SEP-53 message-signing tools run the same pre-flight and record an
   `opaque_payload_signed` audit row when the signature is produced. The x402 tools
   write `x402_payment_authorized` before the signed authorization leaves the wallet in
   the RPC re-simulation, and withhold it when that row cannot be written. An approval or
@@ -332,4 +339,4 @@ Each queried window counts a closed charge through the later of its observation 
 
 A closed intent record remains until more than one week has passed since its observation.
 
-Snapshots containing signed intents or intent links use version 9. Records missing required intent fields refuse as unreadable. Readers that cannot account for the format refuse current and prepared snapshots.
+Snapshots containing signed intents or intent links require version 9 or later, and every committed write uses version 18. Records missing required intent fields refuse as unreadable. Readers that cannot account for the format refuse current and prepared snapshots.

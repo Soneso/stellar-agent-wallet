@@ -62,13 +62,13 @@ pub struct Sep24InteractiveUrlArgs {
     /// The anchor domain to resolve `TRANSFER_SERVER_SEP0024` from (e.g.
     /// `"testanchor.stellar.org"`).
     ///
-    /// Mutually exclusive with `transfer_server_sep0024`.
+    /// Takes precedence if `transfer_server_sep0024` is also given.
     #[serde(default)]
     pub anchor_domain: Option<String>,
 
     /// A directly-supplied `TRANSFER_SERVER_SEP0024` URL (HTTPS required).
     ///
-    /// Mutually exclusive with `anchor_domain`.
+    /// Used when `anchor_domain` is omitted.
     #[serde(default)]
     pub transfer_server_sep0024: Option<String>,
 

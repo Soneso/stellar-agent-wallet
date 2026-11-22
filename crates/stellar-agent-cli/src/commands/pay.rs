@@ -342,8 +342,9 @@ pub struct PayArgs {
     pub profile: Option<String>,
 
     /// Destination G account or M address. An M address keeps its mux ID in
-    /// the payment. The full payment and `--build-only` refuse a C contract
-    /// destination after the mainnet mode and feature refusals:
+    /// the payment. The full payment and `--build-only` refuse a canonical C
+    /// contract or W muxed contract destination after the mainnet mode and
+    /// feature refusals:
     /// `validation.contract_payment_memo_unsupported`
     /// with a memo flag, otherwise `validation.contract_payment_unavailable`.
     /// `--sign-only` and `--submit-only` skip this check, and the supplied

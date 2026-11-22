@@ -26,8 +26,11 @@
 //!
 //! The command acquires the audit writer, then the store lock. It records the
 //! live wiped accrual before minting a key or replacing the store. A reset whose
-//! row cannot be written refuses on every chain. A running MCP server holds the
-//! audit writer, so the operator stops it before resetting.
+//! row cannot be written refuses on every chain. An MCP server acquires the
+//! audit writer at the first operation that needs it, such as a commit
+//! preflight, and normally holds it until it exits. While a server holds it,
+//! the reset refuses with `audit.chain_key_unavailable` carrying
+//! `audit.writer_locked`, so the operator stops the server before resetting.
 //!
 //! The row records intent and the generation pair. Completion requires loading
 //! the successor at the recorded generation after the mutation.

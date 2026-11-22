@@ -3,15 +3,15 @@
 See [Mainnet configurations and scope](../../docs/getting-started.md#mainnet-configurations-and-scope)
 for build configuration, admitted operations, and exclusions.
 
-Core library for the stellar-agent-wallet: signing, policy engine, smart accounts, and a hash-chained audit log.
+Core library for the stellar-agent-wallet: the unlock window, the policy engine, the approval spine, smart-account helpers, and a hash-chained audit log.
 
 This is the primary public API of the workspace and the wallet's mostly synchronous layer; it creates no async runtime of its own. It provides typed amounts (`StellarAmount`), the error taxonomy (`WalletError`), the JSON envelope (`Envelope`), observability primitives, smart-account auth-digest and context-rule-ID helpers, per-profile configuration, and the policy and proof types for mainnet authorization. Wallet unlock and seed access are synchronous. `rpc_budget::bound_stage` is async and requires a Tokio runtime.
 
-`payment_accounts::PaymentAccount` parses the canonical G account or M address a classic payment pays. An M address keeps its ID, including ID zero. A `sign-payment` grant for a G account covers that account and its M addresses, and a grant for an M address covers only that address. Grant attestations bind the stored destination bytes exactly. Consent views carry the complete validated destination. `ValueLegRecord::from_payment_leg` adds an optional SHA-256 of the payment destination to an audit leg, and rows without it read and serialize unchanged.
+`payment_accounts::PaymentAccount` parses the canonical G account or M address a classic payment pays. An M address keeps its ID, including ID zero. A `sign-payment` grant for a G account covers that account and its M addresses, and a grant for an M address covers only that address. Grant attestations bind the stored destination bytes exactly. Consent views carry the complete validated destination. `audit_log::ValueLegRecord::from_payment_leg` adds an optional SHA-256 of the payment destination to an audit leg, and rows without it read and serialize unchanged.
 
-External consumers embed this crate alongside `stellar-agent-network` to sign and submit transactions without spawning the CLI subprocess; see `examples/embed/` in the repository for a complete walkthrough. Network transport, transaction assembly, and signing live in `stellar-agent-network`.
+External consumers embed this crate alongside `stellar-agent-network` to sign and submit transactions without spawning the CLI subprocess. Network transport, transaction assembly, and signing live in `stellar-agent-network`.
 
-It is part of the stellar-agent-wallet workspace and backs the `stellar-agent-cli` and `stellar-agent-mcp` binaries.
+It is part of the stellar-agent-wallet workspace and backs the `stellar-agent` executable, which holds the CLI and the MCP server.
 
 Core verifies policy and provides sealed proof facts. Network consumers
 independently check authorization at signing and submission. A verified policy

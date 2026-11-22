@@ -31,9 +31,9 @@ Each pending approval records who approved it: the local operator, or the operat
 Mainnet remote consent requires an approval origin and leaf SPKI pin in the current verified owner-signed policy.
 Without them, startup refuses with `approval.mainnet_remote_unsupported` before binding.
 Ordinary remote authorization never supplies mainnet presence.
-Signed-origin consent records attestation version 5 with a version 2 presence receipt and a mainnet passkey approver.
+Signed-origin consent records attestation version 5 for an envelope and version 6 for a canonical intent digest. Each carries a version 2 presence receipt and a mainnet passkey approver.
 The receipt binds the signed origin, policy digest and served leaf pin.
-The audit log distinguishes remote `ApprovalAttestedRemote` / `ApprovalRejectedRemote` events from loopback `ApprovalAttested` / `ApprovalRejected` events.
+The audit log distinguishes remote `approval_attested_remote` / `approval_rejected_remote` events from loopback `approval_attested` / `approval_rejected` events.
 Each row is written before the decision takes effect; a decision whose row cannot be written is refused and the entry stays pending.
 
 On testnet, two independent layers must hold for an approve or reject to take effect:
@@ -66,22 +66,22 @@ rp_id = "wallet.example.internal"
 allowed_credentials = ["c9k3JGxPq1c_..."]
 ```
 
-- **`enabled`**: must be `true`, together with the CLI's
+- `enabled`: must be `true`, together with the CLI's
   `--confirm-remote-exposure` flag, for `--remote` to actually start the
   listener. The block alone is not consent; both are required.
-- **`bind`**: the socket address to bind, e.g. `"0.0.0.0:8443"` to listen on
+- `bind`: the socket address to bind, e.g. `"0.0.0.0:8443"` to listen on
   all interfaces, or a specific interface address. Validated as a real socket
   address before anything else happens; a malformed value refuses to start.
-- **`rp_id`**: the WebAuthn Relying Party ID. This MUST be a DNS hostname
+- `rp_id`: the WebAuthn Relying Party ID. This must be a DNS hostname
   that resolves to the wallet host from the device you will approve from. An
   IP address is not a valid Relying Party ID per WebAuthn Level 2 §5.1.2 and
   is refused outright, not silently accepted. See the worked example below.
-- **`cert_path` and `key_path`**: explicit PEM files, both required on mainnet.
+- `cert_path` and `key_path`: explicit PEM files, both required on mainnet.
   Use absolute paths for both files.
   Relative values resolve against the process working directory.
   Testnet loads an explicit pair or provisions its default pair when both fields are absent.
   An incomplete pair refuses on every network; configured files never trigger generation.
-- **`allowed_credentials`** (testnet only): the base64url WebAuthn credential IDs permitted
+- `allowed_credentials` (testnet only): the base64url WebAuthn credential IDs permitted
   to approve or reject. A credential enrolled (see below) but absent from
   this list is refused exactly like an unrecognized credential. Enrollment
   and authorization are two separate, both-required steps. The running
@@ -98,8 +98,8 @@ allowed_credentials = ["c9k3JGxPq1c_..."]
 The approving device needs to resolve `rp_id` to the wallet host. Two common
 ways, depending on your setup:
 
-- **Internal DNS**: if the wallet host already has an internal name, use that name as `rp_id` and skip straight to enrollment. Examples include a home network with a local DNS resolver, or a company VPN with split-horizon DNS.
-- **A hosts-file entry on the approving device**: if there is no internal
+- Internal DNS: if the wallet host already has an internal name, use that name as `rp_id` and skip straight to enrollment. Examples include a home network with a local DNS resolver, or a company VPN with split-horizon DNS.
+- A hosts-file entry on the approving device: if there is no internal
   DNS, add a line to the approving device's hosts file mapping the chosen
   hostname to the wallet host's IP address:
 
@@ -150,18 +150,16 @@ Restart after policy signing, including a same-pin re-sign.
 Fresh challenges and persistence reject a stale policy identity with `approval.listener_policy_stale`.
 
 Missing, unreadable, malformed or mismatched PEM files report `approve.remote_tls_unavailable`, naming the field.
-A loose private-key permission keeps the existing TLS provisioning refusal.
+On Unix, a private key with permissions looser than `0600` refuses startup with `internal.unexpected_state`; the message names `approve.remote_tls_provision_failed`.
 A different leaf key reports `approval.cert_pin_mismatch`.
 A profile RP mismatch reports `approval.origin_profile_mismatch`.
 Foreign Host or Origin headers refuse; forwarded headers supply no authority.
 
-Signed-origin serving requires explicit `cert_path` and `key_path`, enabled remote configuration, and a profile RP matching the signed host.
-The listener trusts current policy credentials and enforces their counters once per login or decision.
-Restart it after policy signing or TLS replacement.
 Persistent serve requires `--confirm-remote-exposure`, accepts `--no-open`, and uses no display or browser opener.
 One-shot consent needs no exposure flag and prints `<signed-origin>/approvals/<id>` to stderr without a token.
 Login continues to that id; completion, cancellation, expiry and interruption close the listener.
-An occupied configured socket reports `approval.listener_busy`; use the running inbox.
+A one-shot consent or enrollment listener whose configured socket is occupied reports `approval.listener_busy`; use the running inbox.
+Persistent serve reports the bind failure as `internal.unexpected_state`.
 
 ### Enrolling a mainnet approval credential at the signed origin
 
@@ -277,7 +275,8 @@ you are about to hand to a CLI command over a channel you already trust.
   the displayed command.
 - `--public-key`: the base64url-encoded 65-byte uncompressed SEC1 public key
   (`0x04 || X || Y`), prefilled in the displayed command.
-- `--rp-id`: must match the profile's `rp_id` exactly; prefilled.
+- `--rp-id`: prefilled. The command stores it unchecked; set it to the profile's
+  `rp_id` exactly, because an assertion verifies only under that ID.
 - `--label`: a name you choose, so `credentials list`-style tooling can show
   which device a credential belongs to (e.g. `"laptop"`, `"phone"`). Replace
   the placeholder in the displayed command before running it.
@@ -318,18 +317,18 @@ approval, names another `rp_id` or another chain, or cannot be read.
 
 ## Operational notes
 
-- **Session TTL is 30 minutes, absolute.** There is no idle-timeout renewal;
+- Session TTL is 30 minutes, absolute. There is no idle-timeout renewal;
   after 30 minutes from login you must sign in again, regardless of activity.
   An expired session is refused exactly like no session at all.
-- **A passkey prompt on every approve or reject is intentional**, not a bug to
+- A passkey prompt on every approve or reject is intentional, not a bug to
   route around. The per-action ceremony is what makes what-you-see-is-what-you-sign
   real for a network-exposed surface: the challenge is bound to the entry you
   are looking at and to the terms the page shows, so an assertion produced for
   one entry can never be replayed to authorize a different one or other terms.
-- **The pre-authentication login endpoint is rate-limited** by an in-process
+- The pre-authentication login endpoint is rate-limited by an in-process
   token bucket, to bound how fast an unauthenticated caller can mint login
   challenges. This is not a substitute for network-level protection.
-- **Firewalling the listener is your responsibility.** Binding `0.0.0.0` (or
+- Firewalling the listener is your responsibility. Binding `0.0.0.0` (or
   any non-loopback address) makes the port reachable from wherever your
   network routes to it; restrict access with your host or network firewall to
   the addresses that should reach it, the same discipline as any other

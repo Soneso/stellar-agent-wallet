@@ -12,8 +12,8 @@ allowed-tools: Bash(git:*) Read
 
 ## Instructions
 
-1. Call `stellar_get_balance` to get the current XLM balance.
-2. Call `stellar_observe_event` to list recent transactions from the last 24 hours.
+1. Call `stellar_balances` to get the current XLM balance.
+2. List recent transactions from the last 24 hours.
 3. Format the results as a human-readable summary.
 
 ## Example output

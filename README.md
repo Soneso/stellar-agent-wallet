@@ -41,8 +41,9 @@ Public alpha, under active development. The
 [milestones](https://github.com/Soneso/stellar-agent-wallet/milestones) list
 the planned work per release.
 
-- testnet (`stellar:testnet`) is the default network: a command with no
-  named profile and no `default.toml` runs on the zero-config testnet profile.
+- testnet (`stellar:testnet`) is the default network: with no named profile and
+  no `default.toml`, `stellar-agent-mcp` and commands such as `pay`, `claim`, and
+  `accounts create` run on an in-memory zero-config testnet profile.
 - Default builds enable the `mainnet-write` feature. Configured CLI actions sign `Allow` without a passkey
   ceremony; `RequireApproval` runs one. Setup, policy minimums, and sealed
   authorization remain required. Configured MCP operations sign under
@@ -198,7 +199,8 @@ unset WALLET_SK
 PowerShell and the cleanup of a seed typed into a command line.
 
 By default, commands print one JSON envelope on stdout and exit `0` on success
-or `1` on any error. `stellar-agent profile init` creates a persistent profile,
+or `1` on an error. Four commands use more exit codes; see
+[Output envelope and exit codes](docs/cli-reference/index.md#output-envelope-and-exit-codes). `stellar-agent profile init` creates a persistent profile,
 which policies and MCP signing need, as
 [Set up a profile](docs/getting-started.md#set-up-a-profile) describes.
 
@@ -259,4 +261,4 @@ Apache-2.0. See [LICENSE](LICENSE).
 ---
 
 "Stellar" is a trademark of the Stellar Development Foundation.
-This is an independent project, not affiliated with, sponsored or endorsed by the Stellar Development Foundation.
+This is an independent project, not affiliated with, sponsored, or endorsed by the Stellar Development Foundation.

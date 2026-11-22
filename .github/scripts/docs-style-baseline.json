@@ -65,21 +65,11 @@
   "examples/toolsets/payment-sender/TOOLSET.md": {
     "em-dash": 4
   },
-  "skills/stellar-agent-wallet/SKILL.md": {
-    "em-dash": 27
-  },
   "skills/stellar-agent-wallet/references/approvals-and-audit.md": {
     "british-authoris": 1
   },
-  "skills/stellar-agent-wallet/references/cli-reference.md": {
-    "british-initialis": 3,
-    "em-dash": 54
-  },
   "skills/stellar-agent-wallet/references/defi.md": {
     "british-initialis": 1
-  },
-  "skills/stellar-agent-wallet/references/mcp-tools.md": {
-    "em-dash": 22
   },
   "skills/stellar-agent-wallet/references/profiles-and-keys.md": {
     "british-behaviour": 1,

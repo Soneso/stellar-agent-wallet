@@ -116,7 +116,7 @@ default`; `STELLAR_AGENT_PROFILE` never selects one. The selected profile binds 
 platform keyring that profile names. After connecting, the client issues
 `initialize`, then
 `tools/list` and `resources/list`. The schemas returned by `tools/list` are the
-authoritative argument contract — prefer them over any example here.
+authoritative argument contract. Prefer them over any example here.
 
 ## 1. Core conventions
 
@@ -133,8 +133,14 @@ Every tool returns the same JSON envelope, with five success-path exceptions:
 `stellar_defindex_vault_withdraw` return a bare object carrying a `status`
 field on success; their business errors use the envelope.
 
-Some refusals use the JSON-RPC error channel instead of the envelope: invalid
-arguments, a `chain_id` mismatch, and the toolset capability refusals.
+Arguments that do not match the tool's input schema (a missing or unknown
+field, or a field of the wrong type) return a tool result with
+`isError: true` and the text
+`<tool>: the arguments have a missing field or a field of the wrong type or value`.
+Some refusals use the JSON-RPC error channel instead of the envelope.
+Arguments that match the schema but fail a value check, and a `chain_id`
+mismatch, return JSON-RPC error -32602. The toolset capability refusals are
+JSON-RPC errors too.
 `toolset.first_invoke_approval_required` is a JSON-RPC error too, and its error
 data carries the `approval_nonce`.
 
@@ -142,7 +148,7 @@ On failure, `ok` is `false` and `error` carries a stable wire `code` (such as
 `policy.deny.<reason>`, `policy.approval_required`, or `policy.engine_required`)
 instead of `data`. Branch on `ok`; use `code` for control flow, never the human
 message. `request_id` correlates the call with the audit log. Every business
-error uses this envelope — domain refusals, policy and approval outcomes,
+error uses this envelope: domain refusals, policy and approval outcomes,
 keyring and signing failures, submit failures, and the SEP-53, x402, and DeFi
 verbs alike; codes follow a `<family>.<reason>` convention (for example
 `sep53.sign_failed`, `nonce.mint_failed`).
@@ -159,8 +165,8 @@ wire-code table.
 
 ### chain_id
 
-Every tool requires a `chain_id` argument — the CAIP-2 chain id (`stellar:testnet`
-or `stellar:mainnet`) — that must match the active profile. Exceptions:
+Every tool requires a `chain_id` argument, the CAIP-2 chain id (`stellar:testnet`
+or `stellar:mainnet`), that must match the active profile. Exceptions:
 `stellar_x402_parse_receipt` and `stellar_toolset_list` take none.
 `stellar_signed_intents_list` and `stellar_approval_status` take none and refuse
 one as an unknown field. The two SEP-43
@@ -194,13 +200,13 @@ Read budget fields before transfers near a cap. `in_window_spent` and
 make submission fail `SpendingLimitExceeded`. See
 [references/smart-accounts.md](references/smart-accounts.md).
 
-## 3. Sending a payment — the two-phase pattern
+## 3. Sending a payment: the two-phase pattern
 
-Fund-moving classic verbs split into a **build** call and a **commit** call. This
+Fund-moving classic verbs split into a **simulate** call and a **commit** call. This
 is the core safe pattern; it also applies to `stellar_create_account` and
 `stellar_trustline` (each paired with a `*_commit`).
 
-**Step 1 — build.** `stellar_pay` builds an unsigned envelope, runs the SEP-29
+**Step 1: simulate.** `stellar_pay` builds an unsigned envelope, runs the SEP-29
 memo check, and mints a single-use nonce. Nothing is signed.
 
 ```json
@@ -215,7 +221,7 @@ memo check, and mints a single-use nonce. Nothing is signed.
 
 It returns `envelope_xdr`, `nonce`, and `expires_at_unix_ms`.
 
-**Step 2 — commit.** `stellar_pay_commit` re-derives the authoritative
+**Step 2: commit.** `stellar_pay_commit` re-derives the authoritative
 destination, asset, and amount from the envelope, verifies the nonce, signs from
 the keyring, and submits.
 
@@ -253,7 +259,7 @@ handshake:
    link, and remote approval runs only at that origin. The operator reviews the
    wallet-rendered summary before consenting. See
    `references/approvals-and-audit.md` for all three surfaces.
-2. That step returns an `approval_attestation` — an HMAC blob bound to that
+2. That step returns an `approval_attestation`, an HMAC blob bound to that
    exact envelope. The operator relays it to you.
 3. Re-invoke `stellar_pay_commit` with `approval_nonce` and `approval_attestation`
    added. The wallet verifies the attestation, then signs and submits.
@@ -274,7 +280,7 @@ MPP prepare records a request when policy requires approval for prepare or
 account; `stellar_trustline` / `stellar_trustline_commit` add or change a
 trustline. `stellar_claim` / `stellar_claim_commit` claim a Stellar claimable
 balance the agent already holds the id of, behind claimant/predicate/trustline
-guards. All three pairs follow the same two-phase build-then-commit pattern as
+guards. All three pairs follow the same two-phase simulate-then-commit pattern as
 payments. See `references/cli-reference.md` and `references/mcp-tools.md`.
 
 ## 5. Smart-account governance
@@ -295,8 +301,8 @@ the smart account. See
 `references/smart-accounts.md`.
 
 You can also PROPOSE a new rule yourself via `stellar_rule_create` /
-`stellar_rule_create_commit` instead of asking the operator to run the CLI —
-you resolve and simulate the definition, but the rule installs only after the
+`stellar_rule_create_commit` instead of asking the operator to run the CLI.
+You resolve and simulate the definition, but the rule installs only after the
 operator attests to the exact definition you proposed. See
 `references/mcp-tools.md#agent-proposed-context-rules`.
 
@@ -402,10 +408,9 @@ commit actions. See `references/toolsets-feature.md`.
   witness for all four classic MCP commits and CLI `pay`, `claim`, sponsored
   `accounts create`, `trustline`, and sending `pool init` paths. The x402
   payment tools are covered by a second simulation on the oracle, which
-  simulates the same unsigned transfer before the payer signs. Mainnet x402
-  witnesses use the signed policy's threshold, which a profile threshold can
-  only lower. The oracle compares
-  the unsigned transfer before the payer signs.
+  simulates and compares the same unsigned transfer before the payer signs.
+  Mainnet x402 witnesses use the signed policy's threshold, which a profile
+  threshold can only lower.
   Opaque staged envelopes and the SEP-43 signing tools remain uncovered.
   `fees.percentile_exceeds_cap` and
   `validation.mainnet_fee_cap_required` report the classic fee cap.
@@ -424,7 +429,9 @@ commit actions. See `references/toolsets-feature.md`.
   Builds with the feature on admit them after setup, as
   [classic MCP authorization](references/mcp-tools.md#classic-mainnet-authorization)
   describes. Enabled setup also admits the exact toolset payment pair; toolset
-  rule creation remains excluded. Both x402 tools use the approved two-call flow.
+  rule creation remains excluded. On an admitted mainnet server, an x402 payment
+  under Allow returns the payment in one call. Under RequireApproval it takes
+  two calls.
 - Every MPP tool refuses `stellar:mainnet` at handler entry with
   `mpp.network_forbidden`. Branch on all three codes,
   `network.mainnet_write_forbidden`, `policy.engine_required`, and
@@ -438,16 +445,16 @@ See `references/security.md` and `references/approvals-and-audit.md`.
 
 ## Reference Documentation
 
-- [CLI reference](./references/cli-reference.md) — the full `stellar-agent` command surface
-- [MCP tools](./references/mcp-tools.md) — the `stellar-agent-mcp` tool catalog with arguments
-- [Profiles and keys](./references/profiles-and-keys.md) — profile schema, the keyring, key rotation
-- [Approvals and audit](./references/approvals-and-audit.md) — policy engine, the approval spine, the audit log
-- [Smart accounts](./references/smart-accounts.md) — OpenZeppelin governance: rules, signers, passkeys, timelock, multicall
-- [DeFi](./references/defi.md) — Soroswap, DeFindex, and the channel pool
-- [Protocols](./references/protocols.md) — SEP coverage and x402 agent payments
-- [Toolsets feature](./references/toolsets-feature.md) — the wallet's capability-isolation packages
-- [Troubleshooting](./references/troubleshooting.md) — wire and error codes
-- [Security](./references/security.md) — the security model and safe operation
+- [CLI reference](./references/cli-reference.md): the full `stellar-agent` command surface
+- [MCP tools](./references/mcp-tools.md): the `stellar-agent-mcp` tool catalog with arguments
+- [Profiles and keys](./references/profiles-and-keys.md): profile schema, the keyring, key rotation
+- [Approvals and audit](./references/approvals-and-audit.md): policy engine, the approval spine, the audit log
+- [Smart accounts](./references/smart-accounts.md): OpenZeppelin governance, with rules, signers, passkeys, timelock, multicall
+- [DeFi](./references/defi.md): Soroswap, DeFindex, and the channel pool
+- [Protocols](./references/protocols.md): SEP coverage and x402 agent payments
+- [Toolsets feature](./references/toolsets-feature.md): the wallet's capability-isolation packages
+- [Troubleshooting](./references/troubleshooting.md): wire and error codes
+- [Security](./references/security.md): the security model and safe operation
 
 ## Common Pitfalls
 
@@ -463,7 +470,7 @@ with a unit), not a JSON number. `asset` is `"native"` or `"XLM"` for XLM, or
 ```
 
 **Build does not move funds; commit does.** `stellar_pay` only simulates and mints
-a nonce — it signs nothing. Funds move only when `stellar_pay_commit` succeeds.
+a nonce. It signs nothing. Funds move only when `stellar_pay_commit` succeeds.
 Do not treat a successful `stellar_pay` as a sent payment.
 
 **The envelope is authoritative at commit.** `stellar_pay_commit` decodes the

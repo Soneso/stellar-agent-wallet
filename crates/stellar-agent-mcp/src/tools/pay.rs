@@ -1112,8 +1112,9 @@ impl WalletServer {
     /// - `chain_id` does not match the profile's configured chain.
     /// - `source` is not a valid G-strkey or `destination` is not a valid G or
     ///   M strkey.
-    /// - `destination` is a C contract (`validation.contract_payment_unavailable`,
-    ///   or `validation.contract_payment_memo_unsupported` with a memo).
+    /// - `destination` is a canonical C contract or W muxed contract
+    ///   (`validation.contract_payment_unavailable`, or
+    ///   `validation.contract_payment_memo_unsupported` with a memo).
     /// - `asset` cannot be parsed.
     /// - Multiple memo variants are provided simultaneously.
     /// - The SEP-29 check fails (`validation.memo_required`).
@@ -1153,7 +1154,7 @@ impl WalletServer {
                        (simulate step). Supports native XLM and non-native assets. \
                        The destination is a G or M address; an M address keeps its mux ID \
                        and ledger reads use its G base account. \
-                       A C contract destination refuses with \
+                       A canonical C contract or W muxed contract destination refuses with \
                        validation.contract_payment_unavailable, or \
                        validation.contract_payment_memo_unsupported with any memo, before any \
                        request; on mainnet the commit's admission refusals come first. \
@@ -1924,7 +1925,8 @@ impl WalletServer {
     /// - `chain_id` does not match the profile.
     /// - `source` is not a valid G-strkey or `destination` is not a valid G or
     ///   M strkey.
-    /// - `envelope_xdr` is a contract transfer or `destination` a C contract
+    /// - `envelope_xdr` is a contract transfer or `destination` a
+    ///   canonical C contract or W muxed contract
     ///   (`validation.contract_payment_unavailable`,
     ///   `validation.contract_payment_memo_unsupported`, or
     ///   `validation.contract_payment_invalid`; see `contract_payment_refusal`).

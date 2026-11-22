@@ -4,9 +4,11 @@ The [deployment recipe](../dedicated-user.md) requires real-host evidence before
 No real-host run is recorded here. Native unit tests do not establish host isolation.
 Every macOS result is conditional: validated by the real-host run.
 
-Run `scripts/deploy/validate-linux.sh` or `scripts/deploy/validate-macos.sh` as the operator.
+Run `scripts/deploy/validate-linux.sh --record <dir>` or `scripts/deploy/validate-macos.sh --record <dir>` as the operator.
 Name a record directory that does not exist yet.
-The script creates it with mode 0700 and refuses an existing path.
+The script creates it with mode 0700 and refuses an existing path or a missing `--record` with exit 64.
+A provisioning step whose input flag is absent records `skipped`.
+The input flags are `--rpc-url`, `--providers`, `--policy`, `--cert`, `--key`, `--bind`, and `--rp-id`.
 The scripts call only the installed wrappers through `sudo -n -u stellar-agent`.
 They read no secret. Keep refusal text when an interface is unavailable.
 Do not record seeds, provider values, passwords, PEM contents, or bootstrap URLs.
@@ -41,9 +43,12 @@ Do not record seeds, provider values, passwords, PEM contents, or bootstrap URLs
 | Dialog counts, including zero item-access prompts | Not applicable | Not recorded |
 | Operation without a wallet desktop session | Not applicable | Not recorded |
 
-The validation scripts write no entry for the native audit writer lock race,
-approval UID binding, signed-origin provisioning, extended ACL refusal, or
-integrated-wrappers rows.
+The validation scripts write one `provisioning-order` entry, which runs the
+signed-origin steps when their flags are passed.
+They also write a `binary-identity` entry and exit 1 when it is not ok.
+They write no entry for the data-root mode, the profile file's owner, mode, and
+symlink refusal, the native audit writer lock race, approval UID binding,
+extended ACL refusal, or the integrated-wrappers row.
 Record those rows by hand with the binary digest, command, exit status, and
 sanitized output.
 

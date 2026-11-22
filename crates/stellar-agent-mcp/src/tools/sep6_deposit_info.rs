@@ -48,8 +48,7 @@ pub struct Sep6DepositInfoArgs {
     /// The anchor domain to resolve `TRANSFER_SERVER` from (e.g.
     /// `"testanchor.stellar.org"`).
     ///
-    /// Mutually exclusive with `transfer_server`.  If both are provided,
-    /// `anchor_domain` takes precedence.
+    /// Takes precedence if `transfer_server` is also given.
     #[serde(default)]
     pub anchor_domain: Option<String>,
 
@@ -59,7 +58,7 @@ pub struct Sep6DepositInfoArgs {
     /// resolve it from stellar.toml.  The URL must use HTTPS and have a
     /// public FQDN (≥2 labels, not an IP address).
     ///
-    /// Mutually exclusive with `anchor_domain`.
+    /// Used when `anchor_domain` is omitted.
     #[serde(default)]
     pub transfer_server: Option<String>,
 

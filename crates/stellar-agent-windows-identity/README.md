@@ -9,6 +9,8 @@ access to the current user's DPAPI master key. Key-authenticated SSH sessions
 can lack that access; an interactive desktop logon may help.
 The wallet's `headless-env` backend avoids this dependency and requires
 `STELLAR_AGENT_HEADLESS_KEYRING_KEY`.
+The crate also provides entropy-bound DPAPI calls and helpers for owner-only
+directories and file identity.
 
 Protect failures carry a typed numeric Windows code when available. The wallet
 reports them as `auth.keyring_platform_error`, naming `CryptProtectData`.
