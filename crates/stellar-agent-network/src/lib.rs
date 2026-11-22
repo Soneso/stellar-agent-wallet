@@ -112,11 +112,11 @@ pub use fee_bump_retry::submit_fee_bump_idempotent;
 #[cfg(any(test, feature = "test-loopback"))]
 pub use fees::validate_rpc_url_allowing_loopback;
 pub use fees::{
-    ALLOWED_RPC_HOSTS, CLASSIC_SINGLE_OPERATION_COUNT, ClassicFeeChoice, ClassicFeeSelection,
-    FeeDistribution, FeePercentile, FeeStatsView, RpcUrlError, check_built_fee_cap,
-    check_classic_fee_cap, check_contract_transfer_fee_cap, classic_fee_source,
-    classic_fee_source_for_argument, contract_transfer_fee_cap, fetch_fee_stats,
-    parse_classic_fee_choice, resolve_classic_fee_selection, validate_rpc_url,
+    CLASSIC_SINGLE_OPERATION_COUNT, ClassicFeeChoice, ClassicFeeSelection, FeeDistribution,
+    FeePercentile, FeeStatsView, RpcUrlError, check_built_fee_cap, check_classic_fee_cap,
+    check_contract_transfer_fee_cap, classic_fee_source, classic_fee_source_for_argument,
+    contract_transfer_fee_cap, fetch_fee_stats, parse_classic_fee_choice,
+    resolve_classic_fee_selection, validate_profile_rpc_url, validate_rpc_url,
 };
 pub use friendbot::{
     ALLOWED_FRIENDBOT_HOSTS, FriendbotResult, FriendbotUrlError, default_friendbot_url,

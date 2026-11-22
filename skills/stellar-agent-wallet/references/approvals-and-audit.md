@@ -917,6 +917,13 @@ rather than a chain transaction. `approve list` shows it as
 For `audit.tip_anchor_unavailable`, restore keyring access and retry. A live
 writer repairs the anchor value it still owes; an honest same-generation tail
 is absorbed at keyed acquisition. A mismatch requires the acknowledging repair.
+The audit verbs `profile rotate-audit-key`, `audit reanchor`,
+`audit bind-carriers`, `audit acknowledge-outbox-loss`, and `audit verify`
+report a keyring refusal on this state under the keyring's `auth.*` code, such
+as `auth.keyring_platform_error`. Any other store failure keeps this sub-code.
+On those verbs this sub-code means a value the keyring holds for the log, the
+anchor or a companion entry, is unusable, not that the keyring is unreachable.
+Report it to the operator.
 
 An outage covering both the handoff and first new-file anchor leaves the anchor
 on the pre-handoff tip. After process exit, open and verify report a mismatch

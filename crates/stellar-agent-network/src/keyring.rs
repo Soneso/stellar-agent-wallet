@@ -1082,9 +1082,14 @@ impl KeyringTipAnchorStore {
 ///
 /// The wallet error's `Display` already carries only non-secret coordinates and
 /// fixed labels, and the anchor itself is not secret, so the text is forwarded
-/// as the detail.
+/// as the detail. A typed [`AuthError`] is carried alongside it so callers can
+/// surface a keyring refusal under its own `auth.*` code.
 fn anchor_store_error(op: &str, e: &WalletError) -> TipAnchorStoreError {
-    TipAnchorStoreError::new(format!("{op}: {e}"))
+    let detail = format!("{op}: {e}");
+    match e {
+        WalletError::Auth(auth) => TipAnchorStoreError::from_auth(detail, auth.clone()),
+        _ => TipAnchorStoreError::new(detail),
+    }
 }
 
 impl KeyringTipAnchorStore {
@@ -1912,6 +1917,8 @@ fn identity_unusable(profile: &str, reason: &'static str) -> WalletError {
     WalletError::Auth(AuthError::EnrolledIdentityUnusable {
         profile: profile.to_owned(),
         reason,
+        enrolled: None,
+        source_flag: None,
     })
 }
 
@@ -2076,13 +2083,15 @@ pub fn enrolled_signer(
         return Err(identity_unusable(name, "pin_mismatch"));
     }
     if record.public_key() != *expected_key {
-        return Err(identity_unusable(
-            name,
-            match role {
+        return Err(WalletError::Auth(AuthError::EnrolledIdentityUnusable {
+            profile: name.to_owned(),
+            reason: match role {
                 EnrolledRole::Agent => "public_key_mismatch",
                 EnrolledRole::FeePayer => "fee_source_mismatch",
             },
-        ));
+            enrolled: Some(record.public_key_strkey()),
+            source_flag: None,
+        }));
     }
     Ok(EnrolledSigner {
         public_key: record.public_key(),
@@ -4907,6 +4916,90 @@ mod tests {
 
         #[test]
         #[serial_test::serial]
+        fn mismatch_refusal_names_enrolled_signer_and_repair_commands_match_their_reasons() {
+            let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+            let _storage_home =
+                stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+            let enrolled_address = pin();
+            let (dir, profile) = stored(&enrolled_address, Some(&agent_record()));
+
+            for (role, expected_reason) in [
+                (EnrolledRole::Agent, "public_key_mismatch"),
+                (EnrolledRole::FeePayer, "fee_source_mismatch"),
+            ] {
+                let err = produce(&dir, &profile, role, [0x22; 32]).unwrap_err();
+                assert_eq!(err.code(), "auth.enrolled_identity_unusable");
+                let msg = err.to_string();
+                assert!(msg.contains(expected_reason), "{msg}");
+                assert!(
+                    msg.contains(&enrolled_address),
+                    "must name enrolled signer {enrolled_address}: {msg}"
+                );
+                assert!(
+                    msg.ends_with("pass it as the source"),
+                    "must tell operator to pass enrolled signer as source and name no flag: {msg}"
+                );
+                assert!(!msg.contains("--repair-identity"), "{msg}");
+                assert!(!msg.contains("bind-signer"), "{msg}");
+            }
+
+            // Missing and malformed records still name `--repair-identity` and not `bind-signer`.
+            for (reason, record) in [
+                ("missing", None),
+                ("malformed", Some("not json")),
+                (
+                    "malformed_key",
+                    Some(r#"{"v":1,"public_key":"GABC","role":"agent"}"#),
+                ),
+            ] {
+                let (dir, profile) = stored(&enrolled_address, record);
+                let err = produce(&dir, &profile, EnrolledRole::Agent, PUBLIC_KEY).unwrap_err();
+                let msg = err.to_string();
+                assert!(msg.contains(reason), "{msg}");
+                assert!(msg.contains("--repair-identity"), "{reason}: {msg}");
+                assert!(!msg.contains("bind-signer"), "{reason}: {msg}");
+            }
+
+            // Unbound / owner mismatch / invalid binding signature name `bind-signer` only.
+            let unbound = SignerIdentityRecord::agent(PUBLIC_KEY, "enrolled", profile.chain_id)
+                .render()
+                .unwrap();
+            let (dir, profile) = stored(&enrolled_address, Some(&unbound));
+            let unbound_msg = produce(&dir, &profile, EnrolledRole::Agent, PUBLIC_KEY)
+                .unwrap_err()
+                .to_string();
+            assert!(unbound_msg.contains("unbound"), "{unbound_msg}");
+            assert!(unbound_msg.contains("bind-signer"), "{unbound_msg}");
+            assert!(!unbound_msg.contains("--repair-identity"), "{unbound_msg}");
+
+            let (dir, profile) = stored(&enrolled_address, Some(&agent_record()));
+            let owner_msg = enrolled_signer(
+                "enrolled",
+                dir.path(),
+                &profile,
+                EnrolledRole::Agent,
+                &PUBLIC_KEY,
+                &[12; 32],
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(owner_msg.contains("owner_mismatch"), "{owner_msg}");
+            assert!(owner_msg.contains("bind-signer"), "{owner_msg}");
+            assert!(!owner_msg.contains("--repair-identity"), "{owner_msg}");
+
+            // Reasons neither command repairs omit both commands.
+            let mut overlaid = profile.clone();
+            overlaid.mcp_signer_default = KeyringEntryRef::new("another-service", enrolled_address);
+            let disk_msg = produce(&dir, &overlaid, EnrolledRole::Agent, PUBLIC_KEY)
+                .unwrap_err()
+                .to_string();
+            assert!(disk_msg.contains("disk_disagreement"), "{disk_msg}");
+            assert!(!disk_msg.contains("--repair-identity"), "{disk_msg}");
+            assert!(!disk_msg.contains("bind-signer"), "{disk_msg}");
+        }
+
+        #[test]
+        #[serial_test::serial]
         fn an_unpinned_or_unstored_profile_refuses() {
             let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
             let _storage_home =
@@ -5104,5 +5197,51 @@ mod tests {
         assert_installation_write_refused(|entry| {
             write_rpc_credential(entry, &Zeroizing::new("replacement".to_owned()))
         });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn keyring_tip_anchor_store_preserves_auth_error_on_keyring_refusal() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let audit_ref = KeyringEntryRef::new("stellar-agent-audit-g5", "default");
+        let log_path = storage_sandbox.path().join("audit/g5.jsonl");
+        let store = KeyringTipAnchorStore::new(&audit_ref, &log_path);
+        let anchor_ref = store.anchor_entry_ref().clone();
+
+        keyring_mock::install_with_write_error(
+            &anchor_ref.service,
+            &anchor_ref.account,
+            None,
+            keyring_core::Error::PlatformFailure(Box::new(std::io::Error::other(
+                "credential store locked",
+            ))),
+        )
+        .unwrap();
+        let anchor = TipAnchor::new(1, format!("sha256:{}", "a".repeat(64)), 64);
+        let write_err = store.store_anchor(&anchor).unwrap_err();
+        let auth = write_err
+            .auth_error()
+            .expect("keyring platform refusal must preserve typed AuthError");
+        assert_eq!(auth.code(), "auth.keyring_platform_error");
+
+        // A corrupt stored anchor value is not a keyring access error, so
+        // `auth_error()` stays `None`.
+        keyring_mock::install().unwrap();
+        write_keyring_string(&anchor_ref, "corrupt-anchor").unwrap();
+        let parse_err = store.load_anchor().unwrap_err();
+        assert_eq!(parse_err.auth_error(), None);
+
+        // A non-Auth WalletError mapped through `anchor_store_error` keeps
+        // `auth_error()` as `None`.
+        let non_auth = anchor_store_error(
+            "carrier record write failed",
+            &WalletError::Validation(ValidationError::ConfigInvalid {
+                component: "audit",
+                reason: "bad".to_owned(),
+            }),
+        );
+        assert_eq!(non_auth.auth_error(), None);
     }
 }

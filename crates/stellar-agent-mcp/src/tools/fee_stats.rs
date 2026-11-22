@@ -18,7 +18,8 @@ pub struct StellarFeeStatsArgs {
     /// CAIP-2 chain identifier: `stellar:testnet` or `stellar:mainnet`.
     pub chain_id: String,
 
-    /// Optional allow-listed Stellar RPC URL override.
+    /// Optional Stellar RPC URL override matching an endpoint configured on the
+    /// active profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rpc_url: Option<String>,
 }
@@ -85,7 +86,8 @@ impl WalletServer {
 
 impl WalletServer {
     /// Builds the client `stellar_fee_stats` reads through: the profile's
-    /// primary endpoint, or the allow-listed `input` URL.
+    /// primary endpoint, or an `input` URL whose scheme, host, and port equal
+    /// an endpoint configured on the active profile.
     ///
     /// The primary credential goes only to the profile's own `rpc_url`, so an
     /// input URL that differs from it gets a client without a credential and
@@ -93,8 +95,9 @@ impl WalletServer {
     ///
     /// # Errors
     ///
-    /// Returns [`FeeStatsClientError::InvalidInput`] when `input` is not an
-    /// allow-listed URL, and [`FeeStatsClientError::Construction`] when the
+    /// Returns [`FeeStatsClientError::InvalidInput`] when `input` is invalid,
+    /// carries credentials, or does not match an endpoint configured on the
+    /// active profile, and [`FeeStatsClientError::Construction`] when the
     /// client cannot be built.
     fn fee_stats_client(
         &self,
@@ -102,7 +105,8 @@ impl WalletServer {
     ) -> Result<stellar_agent_network::StellarRpcClient, FeeStatsClientError> {
         let rpc_url = match input {
             Some(url) => {
-                validate_rpc_url_for_mcp(url).map_err(FeeStatsClientError::InvalidInput)?;
+                validate_rpc_url_for_mcp(url, &self.profile)
+                    .map_err(FeeStatsClientError::InvalidInput)?;
                 url
             }
             None => self.context.rpc_url.as_str(),
@@ -119,7 +123,8 @@ impl WalletServer {
 /// Why `stellar_fee_stats` has no client to read through.
 #[derive(Debug)]
 enum FeeStatsClientError {
-    /// The `rpc_url` input is not an allow-listed URL.
+    /// The `rpc_url` input is invalid, carries credentials, or does not match
+    /// an endpoint configured on the active profile.
     InvalidInput(rmcp::ErrorData),
     /// The client could not be built: a credential failure or a transport
     /// refusal of the URL.
@@ -151,8 +156,11 @@ impl WalletServer {
     }
 }
 
-fn validate_rpc_url_for_mcp(url: &str) -> Result<(), rmcp::ErrorData> {
-    stellar_agent_network::validate_rpc_url(url)
+fn validate_rpc_url_for_mcp(
+    url: &str,
+    profile: &stellar_agent_core::profile::schema::Profile,
+) -> Result<(), rmcp::ErrorData> {
+    stellar_agent_network::validate_profile_rpc_url(url, profile)
         .map_err(|err| rmcp::ErrorData::invalid_params(format!("invalid rpc_url: {err}"), None))
 }
 
@@ -177,9 +185,11 @@ mod tests {
 
     const PROFILE_RPC: &str = "https://rpc.profile.example/v1";
 
-    /// An input URL on another host builds a client without the credential
-    /// and reads no keyring entry; without an input the profile's endpoint
-    /// gets the credential, read once. Only construction runs, no request.
+    /// Configured profile endpoints whose URL differs from `profile.rpc_url`
+    /// build a client without the primary credential and read no keyring entry;
+    /// an exact match to `profile.rpc_url` (or `None`) reads the credential
+    /// once. Unconfigured or credentialed inputs refuse with `INVALID_PARAMS`
+    /// naming the failed rule and never the URL. Only construction runs.
     #[test]
     #[serial_test::serial(keyring)]
     #[serial_test::serial]
@@ -204,8 +214,10 @@ mod tests {
             .unwrap();
         let mut profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
             .rpc_url(PROFILE_RPC)
+            .oracle_provider_url(url::Url::parse("https://oracle.profile.example:8443/v1").unwrap())
             .with_noop_engine()
             .build();
+        profile.secondary_rpc_url = Some("https://secondary.profile.example/v2".to_owned());
         let mut providers = Providers::default();
         providers.primary = Some(
             PrimaryProviderRecord::new("Primary", "rpc.profile.example").with_credential(
@@ -218,13 +230,18 @@ mod tests {
         profile.providers = Some(providers);
         let server = WalletServer::new(profile).unwrap();
 
-        let input = "https://soroban-testnet.stellar.org";
-        let client = server.fee_stats_client(Some(input)).unwrap();
-        assert_eq!(client.url(), input);
+        for input in [
+            "https://rpc.profile.example",
+            "https://secondary.profile.example",
+            "https://oracle.profile.example:8443",
+        ] {
+            let client = server.fee_stats_client(Some(input)).unwrap();
+            assert_eq!(client.url(), input);
+        }
         assert_eq!(
             reads.load(Ordering::SeqCst),
             0,
-            "no keyring read for an input URL"
+            "no keyring read for configured endpoints that differ from profile.rpc_url"
         );
 
         let client = server.fee_stats_client(None).unwrap();
@@ -232,12 +249,38 @@ mod tests {
         assert_eq!(
             reads.load(Ordering::SeqCst),
             1,
-            "the profile endpoint reads the credential"
+            "the default profile endpoint reads the credential"
         );
 
-        assert!(matches!(
-            server.fee_stats_client(Some("https://untrusted.example.com")),
-            Err(super::FeeStatsClientError::InvalidInput(_))
-        ));
+        let client = server.fee_stats_client(Some(PROFILE_RPC)).unwrap();
+        assert_eq!(client.url(), PROFILE_RPC);
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            2,
+            "an exact match to profile.rpc_url reads the credential"
+        );
+
+        for (rejected, expected_rule) in [
+            ("https://untrusted.example.com", "configured endpoint"),
+            ("https://soroban-testnet.stellar.org", "configured endpoint"),
+            (
+                "https://user:secret@rpc.profile.example",
+                "embedded credentials",
+            ),
+        ] {
+            let err = match server.fee_stats_client(Some(rejected)) {
+                Err(super::FeeStatsClientError::InvalidInput(err)) => err,
+                Err(super::FeeStatsClientError::Construction(err)) => {
+                    panic!("expected InvalidInput for {rejected}, got Construction({err})")
+                }
+                Ok(_) => panic!("expected InvalidInput for {rejected}, got Ok"),
+            };
+            assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+            let msg = err.to_string();
+            assert!(msg.contains(expected_rule), "{rejected}: {msg}");
+            assert!(!msg.contains("allow-list"), "{rejected}: {msg}");
+            assert!(!msg.contains("secret"), "{rejected}: {msg}");
+            assert!(!msg.contains(rejected), "{rejected}: {msg}");
+        }
     }
 }

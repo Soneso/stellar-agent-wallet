@@ -33,6 +33,8 @@ mod dedicated_user;
 mod endpoint_identity_ordering;
 #[path = "cli/fee_reserve_boundary.rs"]
 mod fee_reserve_boundary;
+#[path = "cli/fees_stats_endpoint_rules.rs"]
+mod fees_stats_endpoint_rules;
 #[path = "cli/fresh_v1_ceremony.rs"]
 mod fresh_v1_ceremony;
 #[path = "cli/halt_check_discipline.rs"]

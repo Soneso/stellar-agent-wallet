@@ -108,7 +108,7 @@ use stellar_agent_core::{
         stored_anchor_disagrees_with_walk, verify_log,
     },
     envelope::Envelope,
-    error::{InternalError, ValidationError, WalletError},
+    error::{ValidationError, WalletError},
     profile::schema::Profile,
 };
 use stellar_agent_network::keyring::{
@@ -459,7 +459,7 @@ fn anchor_disagrees_with_log(
         &profile.audit_log_path,
     );
     let raw = stellar_agent_core::audit_log::TipAnchorStore::load_raw(&store)
-        .map_err(|e| tip_anchor_unavailable(&e))?;
+        .map_err(|e| super::tip_anchor_unavailable(&e))?;
     let stored = StoredTipAnchor::from_raw(raw.as_deref());
     let walked = verify_log(&profile.audit_log_path, None)
         .ok()
@@ -487,14 +487,8 @@ fn anchor_disagrees_with_log(
 fn previous_binding_anchor(old: &AuditBinding) -> Result<Option<String>, WalletError> {
     let store = KeyringTipAnchorStore::for_path_digest(&old.audit_key, &old.log_path_sha256);
     let raw = stellar_agent_core::audit_log::TipAnchorStore::load_raw(&store)
-        .map_err(|e| tip_anchor_unavailable(&e))?;
+        .map_err(|e| super::tip_anchor_unavailable(&e))?;
     Ok(StoredTipAnchor::from_raw(raw.as_deref()).coordinates())
-}
-
-fn tip_anchor_unavailable(e: &impl std::fmt::Display) -> WalletError {
-    WalletError::Internal(InternalError::UnexpectedState {
-        detail: format!("audit.tip_anchor_unavailable: {e}"),
-    })
 }
 
 /// The success payload for a completed repair.
@@ -2000,5 +1994,51 @@ mod tests {
                 .expect("decide"),
             "the anchor agrees with the repaired log"
         );
+    }
+
+    /// An anchor read the keyring refuses, at the current path or at the path
+    /// a previous binding named, reports the keyring's `auth.*` code.
+    #[test]
+    #[serial]
+    fn a_refused_anchor_read_reports_its_auth_code() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        keyring_mock::install().expect("mock keyring store");
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let mut profile = Profile::builder_testnet("reanchor-refused", "acct", "n-svc", "n-acct")
+            .with_profile_name("reanchor-refused")
+            .build();
+        profile.audit_log_path = dir.path().join("audit.jsonl");
+        let refuse = |store: &TestAnchorStore| {
+            let anchor = store.anchor_entry_ref().clone();
+            keyring_mock::inject_error(
+                &anchor.service,
+                &anchor.account,
+                keyring_core::Error::PlatformFailure(Box::new(std::io::Error::other(
+                    "credential store locked",
+                ))),
+            )
+            .expect("inject");
+        };
+
+        refuse(&TestAnchorStore::new(
+            &profile.audit_log_hash_chain_key_id,
+            &profile.audit_log_path,
+        ));
+        let current = anchor_disagrees_with_log(
+            &profile,
+            stellar_agent_core::audit_log::BindingHistory::NotRecorded,
+        )
+        .unwrap_err();
+        assert_eq!(current.code(), "auth.keyring_platform_error", "{current}");
+
+        let old = AuditBinding::for_profile(&profile);
+        refuse(&TestAnchorStore::for_path_digest(
+            &old.audit_key,
+            &old.log_path_sha256,
+        ));
+        let previous = previous_binding_anchor(&old).unwrap_err();
+        assert_eq!(previous.code(), "auth.keyring_platform_error", "{previous}");
     }
 }

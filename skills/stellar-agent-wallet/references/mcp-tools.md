@@ -736,7 +736,12 @@ byte-match the presented `envelope_xdr` returns `simulation.divergence`.
 | --- | --- | --- |
 | `stellar_fee_stats` | Fetch classic and Soroban inclusion-fee distributions for fee estimation. | Read-only. |
 
-Arguments: `chain_id`, and an optional allowlisted `rpc_url` override.
+Arguments: `chain_id`, and an optional `rpc_url` override.
+The tool accepts `rpc_url` only when its scheme, host, and port equal those of an endpoint the active profile configures: `rpc_url`, `secondary_rpc_url`, or `oracle_provider_url`.
+The path may differ.
+Any other value, or one with embedded credentials, refuses with `invalid_params`, naming the rule and never the URL.
+The primary credential goes only to a value equal to the profile's `rpc_url`.
+Without `rpc_url`, the tool reads the profile's own endpoint.
 
 ## Smart-account rules
 

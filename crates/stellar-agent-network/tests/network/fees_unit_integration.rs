@@ -730,31 +730,21 @@ async fn fee_stats_view_malformed_soroban_fee_returns_malformed_error() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// validate_rpc_url — allow-listed production hosts
+// validate_rpc_url: HTTPS without credentials
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn validate_rpc_url_testnet_https_allowed() {
-    assert!(
-        validate_rpc_url("https://soroban-testnet.stellar.org").is_ok(),
-        "testnet RPC URL must be allowed"
-    );
-}
-
-#[test]
-fn validate_rpc_url_mainnet_sorobanrpc_allowed() {
-    assert!(
-        validate_rpc_url("https://mainnet.sorobanrpc.com").is_ok(),
-        "mainnet sorobanrpc.com must be allowed"
-    );
-}
-
-#[test]
-fn validate_rpc_url_mainnet_stellar_org_allowed() {
-    assert!(
-        validate_rpc_url("https://soroban-mainnet.stellar.org").is_ok(),
-        "mainnet stellar.org RPC URL must be allowed"
-    );
+fn validate_rpc_url_accepts_https_hosts_without_credentials() {
+    for url in [
+        "https://rpc.operator.example",
+        "https://rpc.operator.example:8443/v1",
+        "https://127.0.0.1:8000",
+    ] {
+        assert!(
+            validate_rpc_url(url).is_ok(),
+            "HTTPS URL without credentials must be allowed: {url}"
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -780,9 +770,17 @@ fn validate_rpc_url_empty_string_returns_invalid_url() {
 }
 
 #[test]
+fn validate_rpc_url_hostless_url_returns_invalid_url() {
+    let err = validate_rpc_url("data:text/plain,hello").unwrap_err();
+    assert!(
+        matches!(err, RpcUrlError::InvalidUrl),
+        "hostless URL must yield InvalidUrl; got: {err:?}"
+    );
+}
+
+#[test]
 fn validate_rpc_url_http_scheme_not_allowed() {
-    // HTTP is never permitted for production RPC hosts.
-    let err = validate_rpc_url("http://soroban-testnet.stellar.org").unwrap_err();
+    let err = validate_rpc_url("http://rpc.operator.example").unwrap_err();
     assert!(
         matches!(err, RpcUrlError::NonHttps),
         "http:// scheme must yield NonHttps; got: {err:?}"
@@ -790,36 +788,22 @@ fn validate_rpc_url_http_scheme_not_allowed() {
 }
 
 #[test]
-fn validate_rpc_url_non_listed_https_host_returns_host_not_allowed() {
-    let err = validate_rpc_url("https://example.com/rpc").unwrap_err();
-    assert!(!err.to_string().contains("example.com"), "{err}");
-    assert!(!format!("{err:?}").contains("example.com"), "{err:?}");
-    match err {
-        RpcUrlError::HostNotAllowed { ref allowed } => {
-            // The allowed string must contain all three production hosts.
-            assert!(
-                allowed.contains("soroban-testnet.stellar.org"),
-                "allowed list must mention testnet; got: {allowed}"
-            );
-        }
-        other => panic!("expected HostNotAllowed, got: {other:?}"),
+fn validate_rpc_url_credentials_in_url_returns_credentials_error() {
+    for url in [
+        "https://user:secret@rpc.operator.example",
+        "https://:secret@rpc.operator.example",
+    ] {
+        let err = validate_rpc_url(url).unwrap_err();
+        assert!(
+            matches!(err, RpcUrlError::CredentialsInUrl),
+            "URL with credentials must yield CredentialsInUrl for {url}; got: {err:?}"
+        );
     }
 }
 
 #[test]
-fn validate_rpc_url_credentials_in_url_returns_credentials_error() {
-    // Credentials embedded in the URL must be rejected before any host check.
-    let err = validate_rpc_url("https://user:secret@soroban-testnet.stellar.org").unwrap_err();
-    assert!(
-        matches!(err, RpcUrlError::CredentialsInUrl),
-        "URL with credentials must yield CredentialsInUrl; got: {err:?}"
-    );
-}
-
-#[test]
 fn validate_rpc_url_username_only_credentials_returns_credentials_error() {
-    // Username without password is still a credential.
-    let err = validate_rpc_url("https://user@soroban-testnet.stellar.org").unwrap_err();
+    let err = validate_rpc_url("https://user@rpc.operator.example").unwrap_err();
     assert!(
         matches!(err, RpcUrlError::CredentialsInUrl),
         "URL with username-only credentials must yield CredentialsInUrl; got: {err:?}"
@@ -828,23 +812,10 @@ fn validate_rpc_url_username_only_credentials_returns_credentials_error() {
 
 #[test]
 fn validate_rpc_url_loopback_http_is_rejected_by_production_validator() {
-    // The production validator rejects loopback addresses (no allow_loopback).
-    // 127.0.0.1 is checked for loopback bypass AFTER the HTTPS check in the
-    // inner function, so it hits NonHttps.
     let err = validate_rpc_url("http://127.0.0.1:8000").unwrap_err();
     assert!(
         matches!(err, RpcUrlError::NonHttps),
         "http://loopback must yield NonHttps from production validator; got: {err:?}"
-    );
-}
-
-#[test]
-fn validate_rpc_url_loopback_https_is_rejected_as_not_allow_listed() {
-    // Even with HTTPS, loopback is not in the production allow-list.
-    let err = validate_rpc_url("https://127.0.0.1:8000").unwrap_err();
-    assert!(
-        matches!(err, RpcUrlError::HostNotAllowed { .. }),
-        "https://127.0.0.1 must yield HostNotAllowed (not in production list); got: {err:?}"
     );
 }
 
@@ -885,22 +856,19 @@ mod loopback_tests {
     }
 
     #[test]
-    fn loopback_validator_still_rejects_non_allow_listed_external_https() {
-        let err = validate_rpc_url_allowing_loopback("https://example.com").unwrap_err();
+    fn loopback_validator_rejects_external_http() {
+        let err = validate_rpc_url_allowing_loopback("http://rpc.operator.example").unwrap_err();
         assert!(
-            matches!(
-                err,
-                stellar_agent_network::RpcUrlError::HostNotAllowed { .. }
-            ),
-            "loopback validator must still reject unlisted external hosts; got: {err:?}"
+            matches!(err, stellar_agent_network::RpcUrlError::NonHttps),
+            "loopback validator must reject external http:// URLs; got: {err:?}"
         );
     }
 
     #[test]
-    fn loopback_validator_still_allows_production_hosts() {
+    fn loopback_validator_allows_external_https() {
         assert!(
-            validate_rpc_url_allowing_loopback("https://soroban-testnet.stellar.org").is_ok(),
-            "loopback validator must still accept allow-listed production hosts"
+            validate_rpc_url_allowing_loopback("https://rpc.operator.example").is_ok(),
+            "loopback validator must accept external HTTPS URLs"
         );
     }
 
@@ -913,6 +881,113 @@ mod loopback_tests {
             "loopback validator must reject credentialed loopback URLs; got: {err:?}"
         );
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// validate_profile_rpc_url: profile-configured endpoint matching
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+#[serial_test::serial]
+fn validate_profile_rpc_url_accepts_primary_secondary_and_oracle() {
+    use stellar_agent_core::profile::schema::Profile;
+    use stellar_agent_network::validate_profile_rpc_url;
+
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+
+    let mut profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
+        .rpc_url("https://primary.rpc.example/v1")
+        .oracle_provider_url(url::Url::parse("https://oracle.rpc.example:8443/rpc").unwrap())
+        .build();
+    profile.secondary_rpc_url = Some("https://secondary.rpc.example/v2".to_owned());
+
+    for accepted in [
+        "https://primary.rpc.example",
+        "https://primary.rpc.example:443",
+        "https://primary.rpc.example/v1",
+        "https://secondary.rpc.example",
+        "https://secondary.rpc.example/other",
+        "https://oracle.rpc.example:8443",
+        "https://oracle.rpc.example:8443/rpc",
+    ] {
+        assert!(
+            validate_profile_rpc_url(accepted, &profile).is_ok(),
+            "configured endpoint origin must be accepted: {accepted}"
+        );
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn validate_profile_rpc_url_refuses_wrong_scheme_port_or_host() {
+    use stellar_agent_core::profile::schema::Profile;
+    use stellar_agent_network::validate_profile_rpc_url;
+
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+
+    let mut profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
+        .rpc_url("https://primary.rpc.example/v1")
+        .oracle_provider_url(url::Url::parse("https://oracle.rpc.example:8443/rpc").unwrap())
+        .build();
+    profile.secondary_rpc_url = Some("https://secondary.rpc.example/v2".to_owned());
+
+    for refused in [
+        "http://primary.rpc.example",
+        "http://primary.rpc.example:443",
+        "https://primary.rpc.example:8443",
+        "https://oracle.rpc.example",
+        "https://oracle.rpc.example:9443",
+        "https://unconfigured.rpc.example",
+        "https://soroban-testnet.stellar.org",
+    ] {
+        let err = validate_profile_rpc_url(refused, &profile).unwrap_err();
+        assert!(
+            matches!(err, RpcUrlError::NotConfiguredEndpoint),
+            "unconfigured origin {refused} must yield NotConfiguredEndpoint; got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("configured endpoint"), "{msg}");
+        assert!(!msg.contains("allow-list"), "{msg}");
+        assert!(!msg.contains(refused), "{msg}");
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn validate_profile_rpc_url_refuses_credentials_and_invalid_urls() {
+    use stellar_agent_core::profile::schema::Profile;
+    use stellar_agent_network::validate_profile_rpc_url;
+
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+
+    let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
+        .rpc_url("https://primary.rpc.example/v1")
+        .build();
+
+    for cred in [
+        "https://user:pass@primary.rpc.example",
+        "https://user@primary.rpc.example",
+        "https://:pass@primary.rpc.example",
+    ] {
+        assert!(
+            matches!(
+                validate_profile_rpc_url(cred, &profile).unwrap_err(),
+                RpcUrlError::CredentialsInUrl
+            ),
+            "credentialed URL {cred} must yield CredentialsInUrl"
+        );
+    }
+    assert!(matches!(
+        validate_profile_rpc_url("not a url", &profile).unwrap_err(),
+        RpcUrlError::InvalidUrl
+    ));
+    assert!(matches!(
+        validate_profile_rpc_url("data:text/plain,hello", &profile).unwrap_err(),
+        RpcUrlError::InvalidUrl
+    ));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -932,21 +1007,21 @@ fn rpc_url_error_invalid_url_display_names_the_rule() {
 
 #[test]
 fn rpc_url_error_non_https_display_names_the_rule_not_the_url() {
-    let err = validate_rpc_url("http://soroban-testnet.stellar.org").unwrap_err();
+    let err = validate_rpc_url("http://rpc.operator.example").unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains("non-HTTPS") && msg.contains("must use https"),
         "NonHttps display must name the rule; got: {msg}"
     );
     assert!(
-        !msg.contains("soroban-testnet.stellar.org"),
+        !msg.contains("rpc.operator.example"),
         "NonHttps display must not repeat the rejected URL; got: {msg}"
     );
 }
 
 #[test]
 fn rpc_url_error_credentials_display_mentions_credentials() {
-    let err = validate_rpc_url("https://user:secret@soroban-testnet.stellar.org").unwrap_err();
+    let err = validate_rpc_url("https://user:secret@rpc.operator.example").unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains("credentials"),
@@ -955,24 +1030,45 @@ fn rpc_url_error_credentials_display_mentions_credentials() {
 }
 
 #[test]
-fn rpc_url_error_host_not_allowed_display_names_the_allowed_list_only() {
-    let err = validate_rpc_url("https://rogue.example.com").unwrap_err();
+#[serial_test::serial]
+fn rpc_url_error_not_configured_endpoint_display_names_the_rule_not_the_url() {
+    use stellar_agent_core::profile::schema::Profile;
+    use stellar_agent_network::validate_profile_rpc_url;
+
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+
+    let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
+        .rpc_url("https://primary.rpc.example")
+        .build();
+    let err = validate_profile_rpc_url("https://rogue.example.com", &profile).unwrap_err();
     let msg = err.to_string();
     assert!(
-        !msg.contains("rogue.example.com"),
-        "HostNotAllowed display must not repeat the rejected host; got: {msg}"
+        msg.contains("configured endpoint"),
+        "NotConfiguredEndpoint display must name the configured-endpoint rule; got: {msg}"
     );
     assert!(
-        msg.contains("soroban-testnet.stellar.org"),
-        "HostNotAllowed display must contain the allowed list; got: {msg}"
+        !msg.contains("rogue.example.com"),
+        "NotConfiguredEndpoint display must not repeat the rejected host; got: {msg}"
+    );
+    assert!(
+        !msg.contains("allow-list"),
+        "NotConfiguredEndpoint display must not name an allow-list; got: {msg}"
     );
 }
 
 /// A credential typed into any part of a rejected RPC URL never reaches the
 /// error, whichever rule refuses the URL.
 #[test]
+#[serial_test::serial]
 fn a_credential_in_a_rejected_rpc_url_is_not_echoed() {
+    use stellar_agent_core::profile::schema::Profile;
+    use stellar_agent_network::validate_profile_rpc_url;
     use stellar_agent_test_support::rejected_value::{CREDENTIAL_MARKER, assert_no_marker};
+
+    let sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(sandbox.path());
+
     let lower = CREDENTIAL_MARKER.to_ascii_lowercase();
     for (url, marker) in [
         (
@@ -980,45 +1076,35 @@ fn a_credential_in_a_rejected_rpc_url_is_not_echoed() {
             CREDENTIAL_MARKER.to_owned(),
         ),
         (
-            format!("http://soroban-testnet.stellar.org/{CREDENTIAL_MARKER}"),
+            format!("http://rpc.operator.example/{CREDENTIAL_MARKER}"),
             CREDENTIAL_MARKER.to_owned(),
         ),
         (
-            format!("https://user:{CREDENTIAL_MARKER}@soroban-testnet.stellar.org"),
+            format!("https://user:{CREDENTIAL_MARKER}@rpc.operator.example"),
             CREDENTIAL_MARKER.to_owned(),
         ),
-        (format!("https://{lower}.example/rpc"), lower.clone()),
     ] {
         let err = validate_rpc_url(&url).unwrap_err();
         assert_no_marker(&err, &marker);
     }
-}
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ALLOWED_RPC_HOSTS constant
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn allowed_rpc_hosts_contains_exactly_three_expected_entries() {
-    use stellar_agent_network::ALLOWED_RPC_HOSTS;
-
-    assert_eq!(
-        ALLOWED_RPC_HOSTS.len(),
-        3,
-        "ALLOWED_RPC_HOSTS must contain exactly 3 entries"
-    );
-    assert!(
-        ALLOWED_RPC_HOSTS.contains(&"soroban-testnet.stellar.org"),
-        "ALLOWED_RPC_HOSTS must include the Stellar testnet RPC host"
-    );
-    assert!(
-        ALLOWED_RPC_HOSTS.contains(&"mainnet.sorobanrpc.com"),
-        "ALLOWED_RPC_HOSTS must include mainnet.sorobanrpc.com"
-    );
-    assert!(
-        ALLOWED_RPC_HOSTS.contains(&"soroban-mainnet.stellar.org"),
-        "ALLOWED_RPC_HOSTS must include soroban-mainnet.stellar.org"
-    );
+    let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
+        .rpc_url("https://primary.rpc.example")
+        .build();
+    for (url, marker) in [
+        (format!("https://{lower}.example/rpc"), lower),
+        (
+            format!("https://unconfigured.example/{CREDENTIAL_MARKER}"),
+            CREDENTIAL_MARKER.to_owned(),
+        ),
+        (
+            format!("https://user:{CREDENTIAL_MARKER}@primary.rpc.example"),
+            CREDENTIAL_MARKER.to_owned(),
+        ),
+    ] {
+        let err = validate_profile_rpc_url(&url, &profile).unwrap_err();
+        assert_no_marker(&err, &marker);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

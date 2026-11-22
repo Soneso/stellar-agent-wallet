@@ -449,9 +449,10 @@ The server exposes three MCP resources. None contains a secret.
   endpoint as scheme, host, and port, network passphrase, `mcp_disabled`,
   `halted` and `halted_at` from the [halt marker](#emergency-stop), and the
   cross-check threshold in stroops).
-  An agent passing this resource's `rpc_url` to `stellar_fee_stats` passes an
-  authority-only URL; the allowlisted hosts have no path, so the call behaves
-  the same.
+  `stellar_fee_stats` accepts this resource's `rpc_url`, because its scheme,
+  host, and port match the profile's endpoint. The call reads that
+  authority-only URL. It gets the primary credential only when that URL equals
+  the profile's `rpc_url`. Omit `rpc_url` to read the profile's own endpoint.
 - `mcp-resource://accounts/<G>`: public account directory for the enrolled
   accounts across all configured profiles.
 
@@ -1136,6 +1137,13 @@ A verified opt-in permits the commit to continue to its witness.
 | Tool | Purpose | Gating |
 | --- | --- | --- |
 | `stellar_fee_stats` | Fetch network fee statistics (classic and Soroban inclusion-fee distributions) for fee estimation. | Read-only. |
+
+Arguments: `chain_id`, and an optional `rpc_url` override.
+The tool accepts `rpc_url` only when its scheme, host, and port equal those of an endpoint the active profile configures: `rpc_url`, `secondary_rpc_url`, or `oracle_provider_url`.
+The path may differ.
+Any other value, or one with embedded credentials, refuses with `invalid_params`, naming the rule and never the URL.
+The primary credential goes only to a value equal to the profile's `rpc_url`.
+Without `rpc_url`, the tool reads the profile's own endpoint.
 
 ### Smart-account rules
 

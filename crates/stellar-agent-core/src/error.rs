@@ -3367,7 +3367,7 @@ impl std::fmt::Display for KeyringMissingCause {
 /// # Secret-material policy
 ///
 /// No field in any variant carries secret material or a keyring coordinate.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum AuthError {
     /// The keyring is locked and must be unlocked before use.
@@ -3468,20 +3468,30 @@ pub enum AuthError {
     /// `bound_elsewhere`, `unbound`, `owner_required`, `owner_mismatch`, or
     /// `binding_signature_invalid`.
     ///
+    /// For `public_key_mismatch` and `fee_source_mismatch`, `enrolled` carries
+    /// the profile's enrolled signer G-strkey so the refusal tells the operator
+    /// which address to pass as the source, and `source_flag`, when set, names
+    /// the flag that takes it. `--repair-identity` appears only
+    /// for missing or malformed record reasons, and `bind-signer` only for
+    /// unbound signer or rotated-owner reasons.
+    ///
     /// # Wire code
     ///
     /// `"auth.enrolled_identity_unusable"`.
     #[error(
-        "the enrolled signer identity of profile `{profile}` cannot be used ({reason}); \
-         run `stellar-agent profile enroll-signer --profile {profile} --repair-identity` \
-         for a missing or malformed record, or `stellar-agent profile bind-signer \
-         --profile {profile} --owner-secret-env <VAR>` for an unbound signer or a rotated owner"
+        "{}",
+        format_enrolled_identity_unusable(profile, reason, enrolled.as_deref(), *source_flag)
     )]
     EnrolledIdentityUnusable {
         /// The selected profile name.
         profile: String,
         /// Which rule the identity breaks.
         reason: &'static str,
+        /// The enrolled signer G-strkey for source-mismatch reasons.
+        enrolled: Option<String>,
+        /// The verb's source flag a source-mismatch refusal names, such as
+        /// `--source` or `--from`. `None` names no flag.
+        source_flag: Option<&'static str>,
     },
 
     /// The resolved signer differs from the mainnet profile's enrolled key.
@@ -3539,6 +3549,42 @@ pub enum AuthError {
         /// The trait method the signer was asked to fulfil.
         requested_primitive: &'static str,
     },
+}
+
+fn format_enrolled_identity_unusable(
+    profile: &str,
+    reason: &str,
+    enrolled: Option<&str>,
+    source_flag: Option<&str>,
+) -> String {
+    match reason {
+        "public_key_mismatch" | "fee_source_mismatch" => match enrolled {
+            Some(address) => {
+                let flag = source_flag.map_or_else(String::new, |flag| format!(" with `{flag}`"));
+                format!(
+                    "the enrolled signer identity of profile `{profile}` cannot be used \
+                     ({reason}); the enrolled signer is `{address}`; pass it as the source{flag}"
+                )
+            }
+            None => format!(
+                "the enrolled signer identity of profile `{profile}` cannot be used ({reason}); \
+                 pass the profile's enrolled signer as the source"
+            ),
+        },
+        "missing" | "malformed" | "unsupported_version" | "malformed_key" | "unsupported_role" => {
+            format!(
+                "the enrolled signer identity of profile `{profile}` cannot be used ({reason}); \
+                 run `stellar-agent profile enroll-signer --profile {profile} --repair-identity`"
+            )
+        }
+        "unbound" | "owner_mismatch" | "binding_signature_invalid" => format!(
+            "the enrolled signer identity of profile `{profile}` cannot be used ({reason}); \
+             run `stellar-agent profile bind-signer --profile {profile} --owner-secret-env <VAR>`"
+        ),
+        _ => {
+            format!("the enrolled signer identity of profile `{profile}` cannot be used ({reason})")
+        }
+    }
 }
 
 impl AuthError {
@@ -5754,6 +5800,8 @@ mod tests {
                 AuthError::EnrolledIdentityUnusable {
                     profile: "mainnet".into(),
                     reason: "missing",
+                    enrolled: None,
+                    source_flag: None,
                 },
                 "auth.enrolled_identity_unusable",
             ),
@@ -5803,6 +5851,122 @@ mod tests {
 
         let wallet_err = WalletError::Auth(AuthError::KeyringLocked);
         assert_eq!(wallet_err.category(), ErrorCategory::Auth);
+    }
+
+    #[test]
+    fn enrolled_identity_unusable_formats_mismatch_with_address() {
+        let address = "GAQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCB5Q";
+        for reason in ["public_key_mismatch", "fee_source_mismatch"] {
+            for (source_flag, tail) in [
+                (None, "pass it as the source"),
+                (Some("--from"), "pass it as the source with `--from`"),
+                (Some("--sponsor"), "pass it as the source with `--sponsor`"),
+            ] {
+                let with_addr = AuthError::EnrolledIdentityUnusable {
+                    profile: "ops".into(),
+                    reason,
+                    enrolled: Some(address.into()),
+                    source_flag,
+                };
+                assert_eq!(with_addr.code(), "auth.enrolled_identity_unusable");
+                let msg = with_addr.to_string();
+                assert!(msg.contains(reason), "{msg}");
+                assert!(msg.contains(address), "{msg}");
+                assert!(msg.ends_with(tail), "{msg}");
+                assert!(!msg.contains("--repair-identity"), "{msg}");
+                assert!(!msg.contains("bind-signer"), "{msg}");
+            }
+        }
+    }
+
+    #[test]
+    fn enrolled_identity_unusable_formats_mismatch_without_address() {
+        for reason in ["public_key_mismatch", "fee_source_mismatch"] {
+            let without_addr = AuthError::EnrolledIdentityUnusable {
+                profile: "ops".into(),
+                reason,
+                enrolled: None,
+                source_flag: None,
+            };
+            let fallback_msg = without_addr.to_string();
+            assert!(fallback_msg.contains(reason), "{fallback_msg}");
+            assert!(
+                fallback_msg.contains("pass the profile's enrolled signer as the source"),
+                "{fallback_msg}"
+            );
+            assert!(
+                !fallback_msg.contains("--repair-identity"),
+                "{fallback_msg}"
+            );
+            assert!(!fallback_msg.contains("bind-signer"), "{fallback_msg}");
+        }
+    }
+
+    #[test]
+    fn enrolled_identity_unusable_formats_repair_identity_reasons() {
+        for reason in [
+            "missing",
+            "malformed",
+            "unsupported_version",
+            "malformed_key",
+            "unsupported_role",
+        ] {
+            let err = AuthError::EnrolledIdentityUnusable {
+                profile: "ops".into(),
+                reason,
+                enrolled: None,
+                source_flag: None,
+            };
+            let msg = err.to_string();
+            assert!(msg.contains(reason), "{msg}");
+            assert!(
+                msg.contains("stellar-agent profile enroll-signer --profile ops --repair-identity"),
+                "{msg}"
+            );
+            assert!(!msg.contains("bind-signer"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn enrolled_identity_unusable_formats_bind_signer_reasons() {
+        for reason in ["unbound", "owner_mismatch", "binding_signature_invalid"] {
+            let err = AuthError::EnrolledIdentityUnusable {
+                profile: "ops".into(),
+                reason,
+                enrolled: None,
+                source_flag: None,
+            };
+            let msg = err.to_string();
+            assert!(msg.contains(reason), "{msg}");
+            assert!(
+                msg.contains(
+                    "stellar-agent profile bind-signer --profile ops --owner-secret-env <VAR>"
+                ),
+                "{msg}"
+            );
+            assert!(!msg.contains("--repair-identity"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn enrolled_identity_unusable_formats_other_reasons_without_commands() {
+        for reason in [
+            "disk_disagreement",
+            "pin_mismatch",
+            "bound_elsewhere",
+            "owner_required",
+        ] {
+            let err = AuthError::EnrolledIdentityUnusable {
+                profile: "ops".into(),
+                reason,
+                enrolled: None,
+                source_flag: None,
+            };
+            let msg = err.to_string();
+            assert!(msg.contains(reason), "{msg}");
+            assert!(!msg.contains("--repair-identity"), "{msg}");
+            assert!(!msg.contains("bind-signer"), "{msg}");
+        }
     }
 
     /// Round-trip coverage for `SubmissionError::TxTimeout` and related variants.

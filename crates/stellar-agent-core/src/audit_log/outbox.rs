@@ -973,11 +973,19 @@ fn generation_verifies(key: &[u8; 32], g: u64, tag: &[u8; 32]) -> bool {
 }
 
 /// Reads the audit key the store holds now.
+///
+/// A failed read carries a fixed detail, never the backend's text. A
+/// classified keyring refusal keeps its typed error, so callers report its
+/// `auth.*` code.
 fn reload_stored_key(
     store: &dyn TipAnchorStore,
 ) -> Result<Option<Zeroizing<[u8; 32]>>, WriterError> {
-    store.reload_audit_key().map_err(|_| {
-        WriterError::TipAnchorStore(TipAnchorStoreError::new("audit key reload failed"))
+    store.reload_audit_key().map_err(|error| {
+        let detail = "audit key reload failed";
+        WriterError::TipAnchorStore(match error.auth_error() {
+            Some(auth) => TipAnchorStoreError::from_auth(detail, auth.clone()),
+            None => TipAnchorStoreError::new(detail),
+        })
     })
 }
 
@@ -8660,6 +8668,8 @@ mod tests {
     }
 
     /// A failed key read refuses with a static reason and preserves the queue.
+    /// An untyped store error keeps that detail and carries no keyring error;
+    /// a classified keyring refusal keeps its `AuthError`.
     #[test]
     fn owner_verify_reports_a_failed_key_read() {
         let (_dir, path, store, writer) = cut_over_fixture();
@@ -8671,7 +8681,28 @@ mod tests {
             error.to_string(),
             "audit.tip_anchor_unavailable: audit log tip anchor unavailable: audit tip anchor store: audit key reload failed"
         );
+        assert!(
+            matches!(&error, WriterError::TipAnchorStore(store_error) if store_error.auth_error().is_none()),
+            "{error:?}"
+        );
         assert!(!format!("{error:?}").contains("private-marker"));
+        assert_eq!(OpenEvidence::read(&path, &store), before);
+
+        let auth = crate::error::AuthError::KeyringPlatformError {
+            detail: "read Linux Secret Service: credential store operation failed".to_owned(),
+        };
+        store.set_reload_error(TipAnchorStoreError::from_auth(
+            "private-marker",
+            auth.clone(),
+        ));
+        let typed = check_outbox_commitment(&path, store.as_ref()).unwrap_err();
+        match &typed {
+            WriterError::TipAnchorStore(store_error) => {
+                assert_eq!(store_error.auth_error(), Some(&auth));
+                assert_eq!(store_error.detail, "audit key reload failed");
+            }
+            other => panic!("expected a tip-anchor store error, got {other:?}"),
+        }
         assert_eq!(OpenEvidence::read(&path, &store), before);
     }
 
