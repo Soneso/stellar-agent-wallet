@@ -44,8 +44,14 @@ they pass through a redaction layer before they are written, so a client that
 captures `stderr` receives already-redacted output. Mixing log lines into
 `stdout` would corrupt the protocol stream, which is why the split is strict.
 
-The transport enforces a 1 MiB maximum line length on inbound and outbound
-JSON-RPC frames. Frames longer than that are rejected.
+The transport reads one line at a time and enforces a 1 MiB maximum length on
+each inbound line. An empty line, or one that holds only `\r`, is skipped. A
+line that is not a JSON-RPC message, or one over the 1 MiB limit, is answered
+with a JSON-RPC `-32700` error without an `id`, and the session continues. A
+line that is not a JSON-RPC message and holds a `method` the server does not
+know and no `id` is skipped without an answer. The session ends at end of
+input, on a read error, or when an answer cannot be written. The server's own
+outbound frames are not checked against the limit.
 
 This alpha does not offer an HTTP or SSE transport. stdio is the only transport.
 
@@ -335,9 +341,14 @@ After the initialize response, send this notification:
 {"jsonrpc": "2.0", "method": "notifications/initialized"}
 ```
 
-The first message must be the `initialize` request. Any other first message
-ends the session before it starts: the server logs that the client must open
-the session with an initialize request and exits 1.
+The first request must be `initialize`. A `ping` request before it is answered.
+Any other JSON-RPC message first ends the session before it starts: the server
+logs that the client must open the session with an initialize request and
+exits 1. That includes a JSON-RPC notification with a method the server does
+not know. A line before it that is not a JSON-RPC message, or one over the line
+limit, gets its `-32700` answer, and the server keeps waiting for
+`initialize`. A line before it that is not a JSON-RPC message and holds a
+`method` the server does not know and no `id` is skipped without an answer.
 
 List the tools and the resources, and read one resource:
 

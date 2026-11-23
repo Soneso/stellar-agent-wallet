@@ -51,8 +51,13 @@ approval attestations) see `./approvals-and-audit.md` and `./security.md`.
   `--help` and `--version`; any other argument exits with usage code 2.
 - Transport: MCP JSON-RPC over stdio (newline-delimited). `stdout` is the
   protocol wire; logs go to `stderr` (already redacted). The transport enforces a
-  1 MiB maximum line length on inbound and outbound frames. There is no HTTP or
-  SSE transport.
+  1 MiB maximum length on each inbound line; the server's own outbound frames
+  are not checked against it. An empty line, or one that holds only `\r`, is
+  skipped. A line that is not a JSON-RPC message, or one over the 1 MiB limit,
+  is answered with a JSON-RPC `-32700` error without an `id`, and the session
+  continues. A line that is not a JSON-RPC message and holds a `method` the
+  server does not know and no `id` is skipped without an answer. There is no
+  HTTP or SSE transport.
 - Protocol version `2024-11-05`. Declared capabilities: `tools` and `resources`.
 - Server identity at `initialize`: name `stellar-agent-mcp`, version matching
   the workspace package version, `0.1.0-alpha.13`.
@@ -132,8 +137,13 @@ After the initialize response, send this notification:
 {"jsonrpc": "2.0", "method": "notifications/initialized"}
 ```
 
-The first message must be the `initialize` request. Any other first message
-ends the session before it starts, and the server exits 1.
+The first request must be `initialize`. A `ping` request before it is answered.
+Any other JSON-RPC message first ends the session before it starts, and the
+server exits 1. That includes a JSON-RPC notification with a method the server
+does not know. A line before it that is not a JSON-RPC message, or one over the
+line limit, gets its `-32700` answer, and the server keeps waiting for
+`initialize`. A line before it that is not a JSON-RPC message and holds a
+`method` the server does not know and no `id` is skipped without an answer.
 
 List the tools and the resources, and read one resource:
 

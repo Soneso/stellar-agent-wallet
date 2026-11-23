@@ -13,6 +13,7 @@ use std::io::Write as _;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -104,8 +105,8 @@ fn initialize(protocol_version: &str) -> Value {
     })
 }
 
-/// A request before `initialize` is refused with the fixed text, and neither
-/// the error's forms nor its source chain hold the message.
+/// A request other than `ping` before `initialize` is refused with the fixed text,
+/// and neither the error's forms nor its source chain hold the message.
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial]
 async fn a_request_before_initialize_is_refused_without_its_payload() {
@@ -136,29 +137,164 @@ async fn a_request_before_initialize_is_refused_without_its_payload() {
     assert!(!logs.contains(MARKER), "{logs}");
 }
 
-/// A frame of malformed typed JSON ends the session with an event that holds
-/// its position alone.
+/// The `tools/list` request with id 2 that follows each refused line.
+fn tools_list() -> Vec<u8> {
+    frame(&json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }))
+}
+
+/// The `-32700` answer without an `id` that refuses a line with `message`.
+fn parse_error(message: &str) -> Value {
+    json!({ "jsonrpc": "2.0", "error": { "code": -32700, "message": message } })
+}
+
+/// The answer to a line over the line limit.
+fn line_limit_error() -> Value {
+    parse_error(&format!(
+        "the frame exceeds the line limit of {STELLAR_AGENT_MCP_MAX_LINE_BYTES} bytes"
+    ))
+}
+
+/// A line of `MARKER` repeats over the line limit, with its newline.
+fn oversized_line() -> Vec<u8> {
+    let mut line = MARKER.repeat(STELLAR_AGENT_MCP_MAX_LINE_BYTES / MARKER.len() + 2);
+    line.push('\n');
+    line.into_bytes()
+}
+
+/// `initialize`, `notifications/initialized`, `line`, and the `tools/list`
+/// request with id 2.
+fn after_initialize(line: &[u8]) -> Vec<u8> {
+    let mut frames = frame(&initialize("2024-11-05"));
+    frames.extend(frame(
+        &json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+    ));
+    frames.extend_from_slice(line);
+    frames.extend(tools_list());
+    frames
+}
+
+/// Serves a session whose client writes `frames` at once and reads the
+/// server's answers up to the one with id 2, then closes its input.
+///
+/// Returns the answers in order and the outcome of the session.
+async fn answers_up_to_id_2(frames: &[u8]) -> (Vec<Value>, Result<(), String>) {
+    let (client, server_side) = tokio::io::duplex(4 << 20);
+    let (server_read, server_write) = tokio::io::split(server_side);
+    let session = tokio::spawn(serve_on_send(testnet_server(), server_read, server_write));
+    let (client_read, mut client_write) = tokio::io::split(client);
+    client_write.write_all(frames).await.unwrap();
+    let mut lines = BufReader::new(client_read).lines();
+    let mut answers = Vec::new();
+    loop {
+        let line = tokio::time::timeout(Duration::from_secs(30), lines.next_line())
+            .await
+            .expect("the server answers within the wait")
+            .unwrap()
+            .expect("the server answers id 2 before its output ends");
+        let answer: Value = serde_json::from_str(&line).unwrap();
+        let last = answer["id"] == 2;
+        answers.push(answer);
+        if last {
+            break;
+        }
+    }
+    client_write.shutdown().await.unwrap();
+    let outcome = session.await.unwrap();
+    (answers, outcome)
+}
+
+/// Asserts that `answers` hold the `initialize` result, `refusal` when it is
+/// given, and the `tools/list` result for id 2, in that order.
+fn assert_answers(answers: &[Value], refusal: Option<&Value>) {
+    assert_eq!(answers[0]["id"], 1, "{answers:?}");
+    assert!(answers[0]["result"].is_object(), "{answers:?}");
+    let rest: Vec<&Value> = answers[1..answers.len() - 1].iter().collect();
+    assert_eq!(rest, refusal.into_iter().collect::<Vec<_>>(), "{answers:?}");
+    let listed = &answers[answers.len() - 1];
+    assert_eq!(listed["id"], 2, "{answers:?}");
+    assert!(listed["result"]["tools"].is_array(), "{answers:?}");
+}
+
+/// After `initialize`, a skipped or refused line leaves the session open: an
+/// empty line and a `\r` line get no answer, a line that is not a JSON-RPC
+/// message and one over the line limit get the `-32700` answer without an
+/// `id`, and the next request is answered. No event holds the line.
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial]
-async fn a_malformed_frame_logs_its_position_alone() {
+async fn a_refused_line_after_initialize_leaves_the_session_open() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let malformed = parse_error("Parse error");
+    let cases = [
+        ("empty", b"\n".to_vec(), None, None),
+        ("carriage return", b"\r\n".to_vec(), None, None),
+        (
+            "malformed JSON",
+            format!("{{\"id\": \"{MARKER}\"\n").into_bytes(),
+            Some(&malformed),
+            Some("the frame is not a valid JSON-RPC message"),
+        ),
+        (
+            "empty object",
+            b"{}\n".to_vec(),
+            Some(&malformed),
+            Some("the frame is not a valid JSON-RPC message"),
+        ),
+        (
+            "object the model refuses",
+            frame(&json!({ MARKER: true })),
+            Some(&malformed),
+            Some("the frame is not a valid JSON-RPC message"),
+        ),
+        (
+            "over the line limit",
+            oversized_line(),
+            Some(&line_limit_error()),
+            Some("the frame exceeds the line limit"),
+        ),
+    ];
+    for (case, line, refusal, event) in cases {
+        let capture = TraceCapture::start(FormatChoice::Pretty);
+        let (answers, outcome) = answers_up_to_id_2(&after_initialize(&line)).await;
+
+        assert_answers(&answers, refusal);
+        assert_eq!(outcome, Ok(()), "{case}");
+        let logs = capture.logs();
+        match event {
+            Some(event) => assert!(logs.contains(event), "{case}: {logs}"),
+            None => assert!(!logs.contains("the frame"), "{case}: {logs}"),
+        }
+        assert!(!logs.contains(MARKER), "{case}: {logs}");
+        assert!(
+            !answers
+                .iter()
+                .any(|answer| answer.to_string().contains(MARKER)),
+            "{case}: {answers:?}"
+        );
+    }
+}
+
+/// A frame of malformed typed JSON is answered with the `-32700` answer, the
+/// session goes on, and its event holds its position alone.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn a_malformed_frame_is_answered_and_logs_its_position_alone() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let _storage_home =
         stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     for format in [FormatChoice::Pretty, FormatChoice::Json] {
         let capture = TraceCapture::start(format);
-        let error = serve_frames(&frame(&json!({
+        let (answers, outcome) = answers_up_to_id_2(&after_initialize(&frame(&json!({
             "jsonrpc": "2.0",
             "id": { MARKER: true },
             "method": 7,
             "params": MARKER,
-        })))
-        .await
-        .expect_err("the session refuses");
+        }))))
+        .await;
 
-        assert_eq!(
-            error.to_string(),
-            "the MCP client must stay connected until the session starts"
-        );
+        assert_answers(&answers, Some(&parse_error("Parse error")));
+        assert_eq!(outcome, Ok(()));
         let logs = capture.logs();
         assert!(
             logs.contains("the frame is not a valid JSON-RPC message"),
@@ -169,23 +305,76 @@ async fn a_malformed_frame_logs_its_position_alone() {
     }
 }
 
-/// A frame over the line limit ends the session with the fixed event.
+/// A frame over the line limit is answered with the line limit, the session
+/// goes on, and its event is the fixed one.
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial]
-async fn an_oversized_frame_logs_the_line_limit() {
+async fn an_oversized_frame_is_answered_with_the_line_limit() {
     let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
     let _storage_home =
         stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
     let capture = TraceCapture::start(FormatChoice::Pretty);
-    let mut line = MARKER.repeat(STELLAR_AGENT_MCP_MAX_LINE_BYTES / MARKER.len() + 2);
-    line.push('\n');
-    serve_frames(line.as_bytes())
-        .await
-        .expect_err("the session refuses");
+    let (answers, outcome) = answers_up_to_id_2(&after_initialize(&oversized_line())).await;
 
+    assert_answers(&answers, Some(&line_limit_error()));
+    assert_eq!(outcome, Ok(()));
     let logs = capture.logs();
     assert!(logs.contains("the frame exceeds the line limit"), "{logs}");
     assert!(!logs.contains(MARKER), "{logs}");
+}
+
+/// A malformed line or a line over the limit before `initialize` is answered
+/// with its `-32700` answer, and the session goes on to serve `initialize`.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn a_refused_line_before_initialize_is_answered_and_initialize_is_served() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let cases = [
+        (
+            format!("{{\"id\": \"{MARKER}\"\n").into_bytes(),
+            parse_error("Parse error"),
+        ),
+        (oversized_line(), line_limit_error()),
+    ];
+    for (line, refusal) in cases {
+        let capture = TraceCapture::start(FormatChoice::Pretty);
+        let mut frames = line;
+        frames.extend(after_initialize(b""));
+        let (answers, outcome) = answers_up_to_id_2(&frames).await;
+
+        assert_eq!(answers.len(), 3, "{answers:?}");
+        assert_eq!(answers[0], refusal);
+        assert_answers(&answers[1..], None);
+        assert_eq!(outcome, Ok(()));
+        let logs = capture.logs();
+        assert!(logs.contains("MCP server ready"), "{logs}");
+        assert!(!logs.contains(MARKER), "{logs}");
+    }
+}
+
+/// A `ping` request before `initialize` is answered, and the session goes on
+/// to serve `initialize` and the next request. The test pins rmcp's handshake
+/// through the wallet's transport, as the guard of the documented first-message
+/// rule.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn a_ping_before_initialize_is_answered_and_initialize_is_served() {
+    let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+    let _storage_home =
+        stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+    let mut frames = frame(&json!({ "jsonrpc": "2.0", "id": 7, "method": "ping" }));
+    frames.extend(after_initialize(b""));
+    let (answers, outcome) = answers_up_to_id_2(&frames).await;
+
+    assert_eq!(answers.len(), 3, "{answers:?}");
+    assert_eq!(
+        answers[0],
+        json!({ "jsonrpc": "2.0", "id": 7, "result": {} })
+    );
+    assert_answers(&answers[1..], None);
+    assert_eq!(outcome, Ok(()));
 }
 
 /// A reader that fails with an error whose text holds the marker.

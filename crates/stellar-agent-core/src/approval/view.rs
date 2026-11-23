@@ -52,15 +52,16 @@ pub struct PendingApprovalView {
     pub expired: bool,
 
     /// `true` if the entry already carries a recorded operator consent: an
-    /// HMAC attestation (`PaymentSimulated` / `ClaimSimulated` / `TrustlineSimulated` /
-    /// `TrustlineClawbackOptIn` / `RuleProposalSimulated` / `MppChargeSimulated`)
-    /// or a WebAuthn result (`SignWithPasskey` /
+    /// HMAC attestation (`X402Payment` / `PaymentSimulated` / `ClaimSimulated` /
+    /// `TrustlineSimulated` / `TrustlineClawbackOptIn` / `RuleProposalSimulated` /
+    /// `MppChargeSimulated`) or a WebAuthn result (`SignWithPasskey` /
     /// `RegisterPasskey`).
     ///
     /// Always `false` for `ToolsetFirstInvokeGate` (approval consumes the
     /// entry immediately, so an entry of this kind in a snapshot is by
-    /// definition not yet approved) and for `Rejected` (a rejection, not an
-    /// attestation).
+    /// definition not yet approved), for `Rejected` (a rejection, not an
+    /// attestation), and for `Consumed` (a consumed entry no longer holds
+    /// consent).
     pub attested: bool,
 
     /// Kind-specific, non-secret summary fields.

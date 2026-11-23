@@ -1464,6 +1464,8 @@ Read-only. Enumerates pending approvals from the profile's store: opens it, rend
 
 For a consumed x402 approval, the tombstone's `tx_hash` holds the payment digest. It is not a chain transaction hash. Mainnet hashes the final envelope's base64 text. Testnet hashes the signed authorization entries' XDR vector. JSON reports it redacted in `summary.tx_hash_redacted`. Its table row reads `spent (X402Payment), payment digest <redacted digest>, outcome <outcome>`.
 
+`attested` is `true` only for a request entry that holds unspent consent, and a `Consumed` entry reports `false`. To see that an approval was attested, read `approve status`, whose `state` is `attested` while the consent is unspent, or the `approval_attested` audit row.
+
 ```bash
 stellar-agent approve list --profile default --output table
 ```
