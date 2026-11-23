@@ -86,9 +86,9 @@ inventory = { workspace = true }
 stellar-strkey = { workspace = true }
 
 # MCP server framework. The default IntoTransport adapter is not used; the
-# transport is an AsyncRwTransport constructed with an explicit
-# JsonRpcMessageCodec::new_with_max_length (1 MiB) in transport.rs, which
-# entry.rs serves through.
+# transport is the wallet's own BoundedTransport in transport.rs, built with
+# JsonRpcMessageCodec::new_with_max_length (1 MiB), which entry.rs serves
+# through.
 rmcp      = { workspace = true }
 schemars  = { workspace = true }
 
@@ -110,10 +110,11 @@ uuid = { workspace = true }
 # URL parsing for secondary override validation in server.rs.
 url = { workspace = true }
 
-# Codec framing for the bounded max-line transport (FramedRead / FramedWrite).
+# Codec and framed writer of the bounded max-line transport (Decoder /
+# FramedWrite, BytesMut), and the session's CancellationToken.
 tokio-util = { workspace = true }
 
-# SinkExt + StreamExt traits for the bounded stdio transport.
+# SinkExt and poll_fn for the bounded stdio transport.
 futures = { workspace = true }
 
 # Tokio async runtime: `rt-multi-thread` for the MCP stdio server, `signal` and

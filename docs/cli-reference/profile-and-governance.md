@@ -1497,6 +1497,10 @@ are included (`kind_name` `Consumed` or `Rejected`) until their TTL ends;
 `approve gc --include-consumed` removes consumed ones earlier. Only an entry
 with a request `kind_name`, such as `PaymentSimulated` or
 `TrustlineSimulated`, awaits a decision.
+`attested` is `true` only for a request entry that holds unspent consent, and a
+`Consumed` entry reports `false`. To see that an approval was attested, read
+`approve status`, whose `state` is `attested` while the consent is unspent, or
+the `approval_attested` audit row.
 
 - `--include-expired`: also show entries whose TTL has elapsed (they are
   counted in `expired_count` either way).

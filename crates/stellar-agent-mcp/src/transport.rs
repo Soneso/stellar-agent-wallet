@@ -14,9 +14,9 @@
 //! re-exported from `stellar-agent-core`, where it is shared with the CLI so
 //! both surfaces reconcile a profile against its own name identically.
 
-use futures::{SinkExt, StreamExt};
+use futures::SinkExt;
 use rmcp::{
-    RoleServer, ServiceExt,
+    ErrorData, RoleServer, ServiceExt,
     service::{RxJsonRpcMessage, ServerInitializeError, TxJsonRpcMessage},
     transport::{
         Transport,
@@ -25,9 +25,10 @@ use rmcp::{
 };
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
 use tokio::sync::Mutex as TokioMutex;
-use tokio_util::codec::{FramedRead, FramedWrite};
+use tokio_util::bytes::BytesMut;
+use tokio_util::codec::{Decoder, FramedWrite};
 use tokio_util::sync::CancellationToken;
 
 use crate::STELLAR_AGENT_MCP_MAX_LINE_BYTES;
@@ -101,26 +102,54 @@ pub fn load_selected_profile(
 /// Codec-framed writer of the bounded transport.
 type BoundedWriter<W> = FramedWrite<W, JsonRpcMessageCodec<TxJsonRpcMessage<RoleServer>>>;
 
-/// Codec-framed reader of the bounded transport.
-type BoundedReader<R> = FramedRead<R, JsonRpcMessageCodec<RxJsonRpcMessage<RoleServer>>>;
-
 // ─────────────────────────────────────────────────────────────────────────────
 // BoundedTransport: max-line mitigation
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// A custom `Transport` implementation that enforces the 1 MiB max-line bound.
 ///
-/// This type wraps `FramedRead<R, JsonRpcMessageCodec>` and
-/// `FramedWrite<W, JsonRpcMessageCodec>` constructed with
+/// The reader reads one line at a time and holds at most
+/// [`STELLAR_AGENT_MCP_MAX_LINE_BYTES`] of it. Each complete line is parsed by
+/// a `JsonRpcMessageCodec` constructed with
 /// `JsonRpcMessageCodec::new_with_max_length(STELLAR_AGENT_MCP_MAX_LINE_BYTES)`,
-/// bypassing the default `usize::MAX` codec that `AsyncRwTransport::new` uses.
+/// and the writer is a `FramedWrite<W, JsonRpcMessageCodec>` built the same
+/// way, bypassing the default `usize::MAX` codec that `AsyncRwTransport::new`
+/// uses. rmcp's encoder does not check `max_length`, so outbound frames are
+/// not bounded.
+///
+/// A line that is empty or holds only `\r` is skipped. A line that is not a
+/// JSON-RPC message, or one over the bound, is answered with a JSON-RPC
+/// `-32700` error without an `id`, and the transport reads the next line. A
+/// line that is not a JSON-RPC message and holds a `method` the server does
+/// not know and no `id` is skipped without an answer, under rmcp's
+/// compatibility parse. A line that is not a JSON-RPC message and holds an
+/// `id` and a `notifications/` method the server does not know is skipped too.
+/// A JSON-RPC notification with a method the server does not know is returned
+/// as a message. The session ends at end of input, on a read error, or when an
+/// answer cannot be written.
 ///
 /// # Implements
 ///
 /// `rmcp::transport::Transport<RoleServer>` — the trait required by
 /// `ServiceExt::serve` to drive the MCP JSON-RPC loop.
 pub struct BoundedTransport<R, W> {
-    read: BoundedReader<R>,
+    read: BufReader<R>,
+    codec: JsonRpcMessageCodec<RxJsonRpcMessage<RoleServer>>,
+    /// The bytes of the current line read so far, at most the bound.
+    line: Vec<u8>,
+    /// Whether the current line is over the bound and is being discarded up to
+    /// its newline.
+    discarding: bool,
+    /// The answer to a refused line that is not yet handed to the writer.
+    ///
+    /// rmcp drops a pending `receive` when another event wins its select, so
+    /// the answer stays here until the writer takes it, and the next `receive`
+    /// writes it.
+    answer: Option<TxJsonRpcMessage<RoleServer>>,
+    /// Whether an answer is handed to the writer and its flush has not yet
+    /// completed. A `receive` dropped during the flush leaves it set, and the
+    /// next `receive` finishes the flush before it reads.
+    flush_owed: bool,
     write: Arc<TokioMutex<Option<BoundedWriter<W>>>>,
 }
 
@@ -149,6 +178,9 @@ impl BoundedStdioTransport {
 impl<R: AsyncRead, W: AsyncWrite> BoundedTransport<R, W> {
     /// Constructs the transport over `read` and `write` with the 1 MiB
     /// max-line codec on both directions.
+    ///
+    /// The bound applies to inbound lines. rmcp's encoder does not check
+    /// `max_length`, so the server's own outbound frames are not bounded.
     #[must_use]
     pub fn over(read: R, write: W) -> Self {
         let codec_rx = JsonRpcMessageCodec::<RxJsonRpcMessage<RoleServer>>::new_with_max_length(
@@ -158,8 +190,140 @@ impl<R: AsyncRead, W: AsyncWrite> BoundedTransport<R, W> {
             STELLAR_AGENT_MCP_MAX_LINE_BYTES,
         );
         Self {
-            read: FramedRead::new(read, codec_rx),
+            read: BufReader::new(read),
+            codec: codec_rx,
+            line: Vec::new(),
+            discarding: false,
+            answer: None,
+            flush_owed: false,
             write: Arc::new(TokioMutex::new(Some(FramedWrite::new(write, codec_tx)))),
+        }
+    }
+}
+
+/// The `-32700` answer, without an `id`, to a line that is not a JSON-RPC
+/// message.
+fn parse_error_answer() -> TxJsonRpcMessage<RoleServer> {
+    TxJsonRpcMessage::<RoleServer>::error(ErrorData::parse_error("Parse error", None), None)
+}
+
+/// The `-32700` answer, without an `id`, to a line over the line limit.
+fn line_limit_answer() -> TxJsonRpcMessage<RoleServer> {
+    TxJsonRpcMessage::<RoleServer>::error(
+        ErrorData::parse_error(
+            format!("the frame exceeds the line limit of {STELLAR_AGENT_MCP_MAX_LINE_BYTES} bytes"),
+            None,
+        ),
+        None,
+    )
+}
+
+impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> BoundedTransport<R, W> {
+    /// Parses one complete line without its newline.
+    ///
+    /// Returns the message, or `None` for a line that is skipped or refused.
+    /// A refused line leaves its answer in `self.answer`.
+    fn parse_line(&mut self, line: &[u8]) -> Option<RxJsonRpcMessage<RoleServer>> {
+        if line.is_empty() || line == b"\r" {
+            return None;
+        }
+        let mut frame = BytesMut::with_capacity(line.len() + 1);
+        frame.extend_from_slice(line);
+        frame.extend_from_slice(b"\n");
+        // The frame holds one complete line within the bound, so the codec
+        // either parses it, skips it under rmcp's compatibility rule
+        // (`Ok(None)`), or returns its `Serde` error.
+        match self.codec.decode(&mut frame) {
+            Ok(message) => message,
+            Err(err) => {
+                log_frame_error(&err);
+                self.answer = Some(parse_error_answer());
+                None
+            }
+        }
+    }
+
+    /// Hands the pending answer to the shared writer, under its lock, and
+    /// flushes it, or finishes the owed flush of an answer handed over before.
+    ///
+    /// The answer leaves `self.answer` only once the writer is ready to take
+    /// it, and `self.flush_owed` stays set from the hand-over until the flush
+    /// completes, so a call dropped at any await leaves the rest to the next
+    /// one. Returns `false` when the writer is closed or a write fails.
+    async fn write_answer(&mut self) -> bool {
+        let lock = Arc::clone(&self.write);
+        let mut guard = lock.lock().await;
+        let Some(writer) = guard.as_mut() else {
+            return false;
+        };
+        if futures::future::poll_fn(|cx| writer.poll_ready_unpin(cx))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        // With no answer left, the call only finishes an owed flush.
+        if let Some(answer) = self.answer.take() {
+            if writer.start_send_unpin(answer).is_err() {
+                return false;
+            }
+            self.flush_owed = true;
+        }
+        if writer.flush().await.is_err() {
+            return false;
+        }
+        self.flush_owed = false;
+        true
+    }
+
+    /// Reads the next message, skipping and answering refused lines.
+    async fn next_message(&mut self) -> Option<RxJsonRpcMessage<RoleServer>> {
+        loop {
+            if (self.answer.is_some() || self.flush_owed) && !self.write_answer().await {
+                return None;
+            }
+            let chunk = match self.read.fill_buf().await {
+                Ok(chunk) => chunk,
+                Err(err) => {
+                    log_frame_error(&JsonRpcMessageCodecError::Io(err));
+                    return None;
+                }
+            };
+            if chunk.is_empty() {
+                // End of input. A last line without its newline is still a
+                // line; once it is parsed, the next pass ends the session. A
+                // discarded line holds no bytes.
+                if self.line.is_empty() {
+                    return None;
+                }
+                let line = std::mem::take(&mut self.line);
+                if let Some(message) = self.parse_line(&line) {
+                    return Some(message);
+                }
+                continue;
+            }
+            let newline = chunk.iter().position(|byte| *byte == b'\n');
+            let taken = newline.unwrap_or(chunk.len());
+            let over_limit =
+                !self.discarding && self.line.len() + taken > STELLAR_AGENT_MCP_MAX_LINE_BYTES;
+            if !self.discarding && !over_limit {
+                self.line.extend_from_slice(&chunk[..taken]);
+            }
+            self.read
+                .consume(newline.map_or(taken, |offset| offset + 1));
+            if over_limit {
+                self.line = Vec::new();
+                self.discarding = true;
+                log_frame_error(&JsonRpcMessageCodecError::MaxLineLengthExceeded);
+                self.answer = Some(line_limit_answer());
+            }
+            // The newline ends a discarded line without parsing it.
+            if newline.is_some() && !std::mem::replace(&mut self.discarding, false) {
+                let line = std::mem::take(&mut self.line);
+                if let Some(message) = self.parse_line(&line) {
+                    return Some(message);
+                }
+            }
         }
     }
 }
@@ -212,17 +376,8 @@ where
         }
     }
 
-    fn receive(
-        &mut self,
-    ) -> impl std::future::Future<Output = Option<RxJsonRpcMessage<RoleServer>>> {
-        let next = self.read.next();
-        async move {
-            next.await.and_then(
-                |result: Result<RxJsonRpcMessage<RoleServer>, JsonRpcMessageCodecError>| {
-                    result.inspect_err(log_frame_error).ok()
-                },
-            )
-        }
+    async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleServer>> {
+        self.next_message().await
     }
 
     async fn close(&mut self) -> Result<(), Self::Error> {
@@ -456,7 +611,8 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SessionStartError {
-    /// The client's first message is not an initialize request.
+    /// The client's first message other than a `ping` request is not an
+    /// initialize request.
     ExpectedInitializeRequest,
     /// The connection ended during the initialization handshake.
     ConnectionClosed,
@@ -508,6 +664,400 @@ pub fn mcp_disabled_refusal(profile: &Profile) -> Option<&'static str> {
 /// rendered under any other layout would tell the operator something untrue
 /// about their own files.
 pub const STARTUP_STATE_LAYOUT: ProfileStateLayout = ProfileStateLayout::DerivedThroughout;
+
+#[cfg(test)]
+mod receive_tests {
+    #![allow(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        reason = "test-only; panics acceptable in unit tests"
+    )]
+
+    use super::BoundedTransport;
+    use crate::STELLAR_AGENT_MCP_MAX_LINE_BYTES;
+    use rmcp::transport::Transport;
+    use serde_json::{Value, json};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+    use tokio::io::{
+        AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, BufReader, DuplexStream, ReadHalf,
+        WriteHalf,
+    };
+
+    type Peer = (BufReader<ReadHalf<DuplexStream>>, WriteHalf<DuplexStream>);
+
+    /// A transport over an in-memory stream and the peer's two halves.
+    fn transport() -> (
+        BoundedTransport<ReadHalf<DuplexStream>, WriteHalf<DuplexStream>>,
+        Peer,
+    ) {
+        let (server, client) = tokio::io::duplex(4 << 20);
+        let (server_read, server_write) = tokio::io::split(server);
+        let (client_read, client_write) = tokio::io::split(client);
+        (
+            BoundedTransport::over(server_read, server_write),
+            (BufReader::new(client_read), client_write),
+        )
+    }
+
+    fn ping(id: u64) -> String {
+        json!({ "jsonrpc": "2.0", "id": id, "method": "ping" }).to_string()
+    }
+
+    async fn received_id(
+        transport: &mut BoundedTransport<ReadHalf<DuplexStream>, WriteHalf<DuplexStream>>,
+    ) -> Option<Value> {
+        transport
+            .receive()
+            .await
+            .map(|message| serde_json::to_value(message).unwrap()["id"].clone())
+    }
+
+    /// Every line the transport wrote, read after the transport is dropped.
+    async fn written(peer: &mut Peer) -> Vec<Value> {
+        let mut written = String::new();
+        peer.0.read_to_string(&mut written).await.unwrap();
+        written
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    fn line_limit_error() -> Value {
+        json!({ "jsonrpc": "2.0", "error": { "code": -32700, "message":
+            format!("the frame exceeds the line limit of {STELLAR_AGENT_MCP_MAX_LINE_BYTES} bytes") } })
+    }
+
+    /// A line of exactly the bound is read; one byte more is refused with the
+    /// line limit and the next line is read.
+    #[tokio::test]
+    async fn the_bound_admits_a_line_of_its_length_alone() {
+        let (mut transport, mut peer) = transport();
+        let mut exact = ping(1);
+        exact.push_str(&" ".repeat(STELLAR_AGENT_MCP_MAX_LINE_BYTES - exact.len()));
+        let mut over = ping(2);
+        over.push_str(&" ".repeat(STELLAR_AGENT_MCP_MAX_LINE_BYTES + 1 - over.len()));
+        let input = format!("{exact}\n{over}\n{}\n", ping(3));
+        peer.1.write_all(input.as_bytes()).await.unwrap();
+
+        peer.1.shutdown().await.unwrap();
+
+        assert_eq!(received_id(&mut transport).await, Some(json!(1)));
+        assert_eq!(received_id(&mut transport).await, Some(json!(3)));
+        assert_eq!(received_id(&mut transport).await, None);
+        drop(transport);
+        assert_eq!(written(&mut peer).await, [line_limit_error()]);
+    }
+
+    /// A last line without its newline is read at end of input, and the next
+    /// receive ends the session.
+    #[tokio::test]
+    async fn a_last_line_without_its_newline_is_read() {
+        let (mut transport, mut peer) = transport();
+        peer.1.write_all(ping(1).as_bytes()).await.unwrap();
+        peer.1.shutdown().await.unwrap();
+
+        assert_eq!(received_id(&mut transport).await, Some(json!(1)));
+        assert_eq!(received_id(&mut transport).await, None);
+    }
+
+    /// A malformed last line without its newline is answered before the
+    /// session ends.
+    #[tokio::test]
+    async fn a_malformed_last_line_is_answered_before_the_end() {
+        let (mut transport, mut peer) = transport();
+        peer.1.write_all(b"{").await.unwrap();
+        peer.1.shutdown().await.unwrap();
+
+        assert_eq!(received_id(&mut transport).await, None);
+        drop(transport);
+        assert_eq!(
+            written(&mut peer).await,
+            [json!({ "jsonrpc": "2.0", "error": { "code": -32700, "message": "Parse error" } })]
+        );
+    }
+
+    /// Input that ends inside a line over the bound is answered once and ends
+    /// the session. The line runs three read chunks past the bound, so bytes
+    /// arrive after the refusal.
+    #[tokio::test]
+    async fn input_that_ends_inside_an_oversized_line_ends_the_session() {
+        let (mut transport, mut peer) = transport();
+        peer.1
+            .write_all(&vec![b'x'; STELLAR_AGENT_MCP_MAX_LINE_BYTES + 3 * 8192])
+            .await
+            .unwrap();
+        peer.1.shutdown().await.unwrap();
+
+        assert_eq!(received_id(&mut transport).await, None);
+        drop(transport);
+        assert_eq!(written(&mut peer).await, [line_limit_error()]);
+    }
+
+    /// An empty line and a line that holds only `\r` get no answer.
+    #[tokio::test]
+    async fn an_empty_or_carriage_return_line_gets_no_answer() {
+        let (mut transport, mut peer) = transport();
+        peer.1
+            .write_all(format!("\n\r\n{}\n", ping(1)).as_bytes())
+            .await
+            .unwrap();
+        peer.1.shutdown().await.unwrap();
+
+        assert_eq!(received_id(&mut transport).await, Some(json!(1)));
+        assert_eq!(received_id(&mut transport).await, None);
+        drop(transport);
+        assert_eq!(written(&mut peer).await, Vec::<Value>::new());
+    }
+
+    /// A frame that rmcp's compatibility parse skips gets no answer.
+    #[tokio::test]
+    async fn a_skipped_notification_gets_no_answer() {
+        let (mut transport, mut peer) = transport();
+        // rmcp's model parses a custom notification, so the skipped frame is
+        // a notification of another protocol that the model refuses.
+        let input = format!(
+            "{}\n{}\n",
+            json!({ "method": "textDocument/didOpen", "params": {} }),
+            ping(1)
+        );
+        peer.1.write_all(input.as_bytes()).await.unwrap();
+        peer.1.shutdown().await.unwrap();
+
+        assert_eq!(received_id(&mut transport).await, Some(json!(1)));
+        assert_eq!(received_id(&mut transport).await, None);
+        drop(transport);
+        assert_eq!(written(&mut peer).await, Vec::<Value>::new());
+    }
+
+    /// An answer that waits for the writer survives a dropped receive and is
+    /// written once by the next one.
+    #[tokio::test]
+    async fn a_dropped_receive_keeps_its_answer() {
+        let (mut transport, mut peer) = transport();
+        peer.1.write_all(b"{\n").await.unwrap();
+        let lock = std::sync::Arc::clone(&transport.write);
+        let guard = lock.lock().await;
+        let waiting = tokio::time::timeout(Duration::from_millis(50), transport.receive()).await;
+        assert!(waiting.is_err(), "the receive waits for the writer");
+        drop(guard);
+        drop(lock);
+        peer.1
+            .write_all(format!("{}\n", ping(1)).as_bytes())
+            .await
+            .unwrap();
+
+        assert_eq!(received_id(&mut transport).await, Some(json!(1)));
+        peer.1.shutdown().await.unwrap();
+        assert_eq!(received_id(&mut transport).await, None);
+        drop(transport);
+        assert_eq!(
+            written(&mut peer).await,
+            [json!({ "jsonrpc": "2.0", "error": { "code": -32700, "message": "Parse error" } })]
+        );
+    }
+
+    /// A valid message and a refused line that end in `\r\n` are served and
+    /// answered like their `\n` forms.
+    #[tokio::test]
+    async fn lines_that_end_in_crlf_are_served_and_answered() {
+        let (mut transport, mut peer) = transport();
+        peer.1
+            .write_all(format!("{{\r\n{}\r\n", ping(1)).as_bytes())
+            .await
+            .unwrap();
+        peer.1.shutdown().await.unwrap();
+
+        assert_eq!(received_id(&mut transport).await, Some(json!(1)));
+        assert_eq!(received_id(&mut transport).await, None);
+        drop(transport);
+        assert_eq!(
+            written(&mut peer).await,
+            [json!({ "jsonrpc": "2.0", "error": { "code": -32700, "message": "Parse error" } })]
+        );
+    }
+
+    /// A line whose newline arrives many reads after it crossed the bound is
+    /// answered once, and the valid line after it is read.
+    #[tokio::test]
+    async fn a_late_newline_after_the_bound_ends_the_discarded_line() {
+        let (mut transport, mut peer) = transport();
+        let mut input = vec![b'x'; STELLAR_AGENT_MCP_MAX_LINE_BYTES + 50_000];
+        input.push(b'\n');
+        input.extend_from_slice(format!("{}\n", ping(3)).as_bytes());
+        peer.1.write_all(&input).await.unwrap();
+        peer.1.shutdown().await.unwrap();
+
+        assert_eq!(received_id(&mut transport).await, Some(json!(3)));
+        assert_eq!(received_id(&mut transport).await, None);
+        drop(transport);
+        assert_eq!(written(&mut peer).await, [line_limit_error()]);
+    }
+
+    /// The shared state of a [`GatedWriter`].
+    #[derive(Default)]
+    struct Gate {
+        open: bool,
+        written: Vec<u8>,
+        waker: Option<std::task::Waker>,
+    }
+
+    /// A writer that is pending on every write and flush while its gate is
+    /// closed.
+    struct GatedWriter(std::sync::Arc<std::sync::Mutex<Gate>>);
+
+    impl AsyncWrite for GatedWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let mut gate = self.0.lock().unwrap();
+            if !gate.open {
+                gate.waker = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+            gate.written.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            let mut gate = self.0.lock().unwrap();
+            if !gate.open {
+                gate.waker = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// An answer whose flush is pending when the receive is dropped is
+    /// written by the next receive before it returns the next message.
+    #[tokio::test]
+    async fn a_receive_dropped_during_the_flush_leaves_the_flush_owed() {
+        let (server, client) = tokio::io::duplex(1 << 10);
+        let (_client_read, mut client_write) = tokio::io::split(client);
+        let gate = std::sync::Arc::new(std::sync::Mutex::new(Gate::default()));
+        let mut transport =
+            BoundedTransport::over(server, GatedWriter(std::sync::Arc::clone(&gate)));
+        client_write
+            .write_all(format!("{{\n{}\n", ping(1)).as_bytes())
+            .await
+            .unwrap();
+
+        let waiting = tokio::time::timeout(Duration::from_millis(50), transport.receive()).await;
+        assert!(waiting.is_err(), "the receive waits for the flush");
+        assert!(gate.lock().unwrap().written.is_empty());
+        {
+            let mut open = gate.lock().unwrap();
+            open.open = true;
+            if let Some(waker) = open.waker.take() {
+                waker.wake();
+            }
+        }
+
+        let id = transport
+            .receive()
+            .await
+            .map(|message| serde_json::to_value(message).unwrap()["id"].clone());
+        let written: Vec<Value> = String::from_utf8(gate.lock().unwrap().written.clone())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            written,
+            [json!({ "jsonrpc": "2.0", "error": { "code": -32700, "message": "Parse error" } })]
+        );
+        assert_eq!(id, Some(json!(1)));
+    }
+
+    /// Once an answer is flushed, no flush is owed: a later valid line is read
+    /// while the writer is held by a send.
+    #[tokio::test]
+    async fn a_flushed_answer_leaves_no_flush_owed() {
+        let (mut transport, mut peer) = transport();
+        peer.1
+            .write_all(format!("{{\n{}\n{}\n", ping(1), ping(2)).as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(received_id(&mut transport).await, Some(json!(1)));
+        let lock = std::sync::Arc::clone(&transport.write);
+        let _guard = lock.lock().await;
+
+        let read = tokio::time::timeout(Duration::from_secs(5), received_id(&mut transport)).await;
+        assert_eq!(read.ok(), Some(Some(json!(2))));
+    }
+
+    /// With no answer pending, a valid line is read while the writer is held
+    /// by a send.
+    #[tokio::test]
+    async fn a_valid_line_is_read_while_the_writer_is_busy() {
+        let (mut transport, mut peer) = transport();
+        peer.1
+            .write_all(format!("{}\n", ping(1)).as_bytes())
+            .await
+            .unwrap();
+        let lock = std::sync::Arc::clone(&transport.write);
+        let _guard = lock.lock().await;
+
+        let read = tokio::time::timeout(Duration::from_secs(5), received_id(&mut transport)).await;
+        assert_eq!(read.ok(), Some(Some(json!(1))));
+    }
+
+    /// A writer that fails every write.
+    struct FailingWriter;
+
+    impl AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Err(std::io::Error::other("write refused")))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Err(std::io::Error::other("flush refused")))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// An answer that cannot be written ends the session.
+    #[tokio::test]
+    async fn an_answer_that_cannot_be_written_ends_the_session() {
+        let (server, client) = tokio::io::duplex(1 << 10);
+        let (_client_read, mut client_write) = tokio::io::split(client);
+        let mut transport = BoundedTransport::over(server, FailingWriter);
+        client_write
+            .write_all(format!("{{\n{}\n", ping(1)).as_bytes())
+            .await
+            .unwrap();
+
+        assert!(transport.receive().await.is_none());
+    }
+
+    /// An answer after the transport is closed ends the session.
+    #[tokio::test]
+    async fn an_answer_after_close_ends_the_session() {
+        let (mut transport, mut peer) = transport();
+        peer.1
+            .write_all(format!("{{\n{}\n", ping(1)).as_bytes())
+            .await
+            .unwrap();
+        transport.close().await.unwrap();
+
+        assert_eq!(received_id(&mut transport).await, None);
+    }
+}
 
 #[cfg(test)]
 mod tests {
