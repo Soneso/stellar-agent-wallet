@@ -246,8 +246,8 @@
             rp: { id: options.rp_id, name: "Stellar Agent Wallet" },
             user: {
               id: crypto.getRandomValues(new Uint8Array(16)),
-              name: "operator",
-              displayName: "Operator",
+              name: label,
+              displayName: label,
             },
             challenge: ceremony.challenge,
             pubKeyCredParams: [{ type: "public-key", alg: options.alg }],

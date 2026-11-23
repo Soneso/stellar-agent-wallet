@@ -109,7 +109,8 @@ pub use stellar_agent_loopback_http::{LoopbackFamily, PairBindError};
 pub use templates::{
     DETAIL_STYLE, INBOX_STYLE, INCONSISTENT_MESSAGE, INCONSISTENT_NOTICE, SIMULATED_FEE_NOTE,
     approve_button_label, asset_code, escape_value, html_escape, kind_pill, pending_json_value,
-    render_context_header_html, render_rule_proposal_definition_html, render_summary_html,
+    render_context_header_html, render_expiry_html, render_rule_proposal_definition_html,
+    render_summary_html,
 };
 pub use web::APP_SHARED_JS;
 

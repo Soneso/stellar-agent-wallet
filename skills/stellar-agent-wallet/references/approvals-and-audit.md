@@ -114,6 +114,16 @@ passkey ceremony. RequireApproval runs a ceremony with its rule lifetime.
 A mainnet RequireApproval rule sets `ttl_secs` from 1 through 86,400 seconds;
 an unlisted approval escalation uses the default one-day lifetime.
 The presence challenge retains its separate 120-second bound.
+Pending browser pages show `Created <time>. Approve by <time> (in <duration>).`
+Only pending mainnet consent pages that render an intent add `After approval, the action must run within <window>.`
+The server renders the shorter of the entry lifetime and 900 seconds as whole minutes and seconds, such as `1 minute 40 seconds`.
+Detail pages and consent pages without an intent show only the approval deadline.
+Inbox rows say `approve within` before the remaining duration.
+Mainnet consent pages disable every available decision button after a final entry
+outcome. Cancellation also disables them in a one-shot session.
+Inbox cancellation shows the result and keeps Approve and Reject available for
+a new ceremony. Disabled buttons have half opacity and a not-allowed cursor.
+Retryable failures keep decisions available.
 On mainnet, classic MCP approvals expire at the shorter prepare/commit
 lifetime, with Allow contributing 600 seconds. Both names need matching rules.
 On a mainnet MCP server, Allow signs without an approval, and RequireApproval
@@ -497,6 +507,10 @@ validation is refused with `approval.already_attested`, `approval.rejected`, or
 
 The CLI summary and both inbox detail pages show the profile name, CAIP-2 chain id, endpoint authority, and enrolled signer.
 An enrollment placeholder appears as `(not enrolled)`.
+Classic intent pages show `Fee cap per operation (stroops)` with the explicit
+per-operation fee when chosen, otherwise the tighter profile or signed policy cap.
+Contract payment intent pages show `Total fee cap (stroops)` and a separate
+`Inclusion bid (stroops)` row.
 Payment, claim, and trustline summaries are decoded from the envelope the approval attests: every destination, amount, asset, memo, limit, balance id, fee, and sequence number shown is the envelope's.
 The effective source is the operation source when the operation has one, otherwise the transaction source.
 A SEP-43 transaction tool counts another source's operations only when that source's signer set lists the wallet key; this never makes a transaction of two or more operations approvable, and the approval binds the complete envelope.
@@ -509,6 +523,8 @@ The CLI names the action `trustline change (ChangeTrust)`.
 The CLI limit reads `unlimited`, `0 stroops (removes the trustline)`, or the exact
 stroop count and decimal asset amount.
 Both inboxes label it `TRUSTLINE` and offer `Approve trustline`.
+The detail headline reads `Remove <code> trustline` for a zero limit and
+`Add or change <code> trustline` otherwise. The issuer has its own row.
 
 ### The attestation
 

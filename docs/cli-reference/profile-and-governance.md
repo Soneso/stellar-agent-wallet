@@ -1271,6 +1271,17 @@ CLI approval prompt. The reason is display text and grants no authority.
 
 The CLI summary and both inbox detail pages show the profile name, CAIP-2 chain id, endpoint authority, and enrolled signer.
 An enrollment placeholder appears as `(not enrolled)`.
+Pending browser pages show `Created <time>. Approve by <time> (in <duration>).`
+Only pending mainnet consent pages that render an intent add `After approval, the action must run within <window>.`
+The server renders the shorter of the entry lifetime and 900 seconds as whole minutes and seconds, such as `1 minute 40 seconds`.
+Detail pages and consent pages without an intent show only the approval deadline.
+Inbox rows say `approve within` before the remaining duration.
+
+Classic intent pages show `Fee cap per operation (stroops)`.
+The value is the explicit per-operation fee when chosen, otherwise the tighter
+of the profile cap and the signed policy cap.
+Contract payment intent pages show `Total fee cap (stroops)` and a separate
+`Inclusion bid (stroops)` row.
 
 Payment, claim, and trustline summaries are decoded from the transaction envelope the approval attests.
 Every destination, amount, asset, memo, limit, balance id, fee, and sequence number shown is the envelope's.
@@ -1290,6 +1301,8 @@ The CLI names the action `trustline change (ChangeTrust)`.
 The CLI limit reads `unlimited`, `0 stroops (removes the trustline)`, or the exact
 stroop count and decimal asset amount.
 Both inboxes label it `TRUSTLINE` and offer `Approve trustline`.
+The detail headline reads `Remove <code> trustline` for a zero limit and
+`Add or change <code> trustline` otherwise. The issuer has its own row.
 An MPP charge summary shows the profile, network, payer, transport, authority, target, amount in the token's base units, token contract, recipient, challenge expiry, and fee.
 Before the summary is shown and before consent is recorded, the profile, payer, amount, token contract, recipient, and challenge expiry are checked against the entry's authorization fingerprint, and the network against the passphrase digest the fingerprint binds.
 A mismatch, or an entry that holds no binding digests, makes the entry inconsistent and prevents approval; an MPP entry without binding digests must be prepared again.
@@ -1560,6 +1573,10 @@ writer (`audit.writer_locked`).
 
 On a mainnet profile, `approve serve` needs a V1 profile that `profile enable-mainnet` has enabled. Without an enablement record the local inbox exits `1` with `approval.presence_policy_unavailable` before it binds a port.
 On a mainnet profile, Approve with passkey requests a fresh verified assertion.
+Final entry outcomes disable all available decision buttons, with half opacity
+and a not-allowed cursor. Cancellation also disables them in a one-shot session.
+Inbox cancellation shows the result and keeps Approve and Reject available for
+a new ceremony. Retryable failures keep decisions available.
 The terminal-style approve route refuses with `approval.presence_required`.
 Reject works. Default mainnet mode refuses `--no-open` and browser-launch failures, and
 prints only a startup notice and the port. It keeps the private redirect file
@@ -1669,6 +1686,10 @@ binding is what decides which of the two modes applies:
   cookie; both POSTs of the ceremony require the session cookie, the session
   proof, and a CSRF value. The session expires after 15 minutes without
   operator activity or 8 hours after bootstrap.
+
+  The page requires a label before starting the ceremony.
+  It trims surrounding whitespace and uses the label as the passkey's user
+  name and display name. `--label` pre-fills the field.
 
   The ceremony runs in four steps:
 
@@ -1826,8 +1847,11 @@ Stdout remains one JSON envelope. The token is single-use; keep stderr private.
 - `--profile <NAME>` (required): a persisted mainnet profile. Neither an
   enabled installation nor a mainnet policy is required, so a credential can be
   enrolled before the policy that lists it.
-- `--label <LABEL>`: pre-fills the page's label field. The label stays on the
-  page and is absent from the output.
+- `--label <LABEL>`: pre-fills the page's required label field. The wallet's
+  enrollment page trims surrounding whitespace and uses the label as the
+  passkey's user name and display name, on loopback and with `--origin-from`.
+  The remote approval host's enrollment page keeps the user name `operator`.
+  The label is absent from the command output.
 - `--timeout-seconds <SECS>`: one deadline for the browser registration and
   the terminal code, from 1 to 600 (default 300).
 

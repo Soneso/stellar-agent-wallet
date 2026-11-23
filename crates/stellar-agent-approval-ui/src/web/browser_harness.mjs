@@ -93,6 +93,9 @@ export function browser({
     },
   };
   class FakeDate extends Date {
+    constructor(...args) {
+      super(...(args.length ? args : [clock.now]));
+    }
     static now() {
       return clock.now;
     }

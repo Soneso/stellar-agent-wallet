@@ -35,13 +35,13 @@ mod tests {
     )]
     use super::*;
 
-    /// The loopback ceremony script keeps its base bytes.
+    /// The loopback ceremony script matches its pinned digest.
     #[test]
     fn loopback_enroll_asset_keeps_base_bytes() {
         use sha2::{Digest as _, Sha256};
         assert_eq!(
             hex::encode(Sha256::digest(OPERATOR_ENROLL_JS)),
-            "15166ed844f390b525c6582adce8d2432258d484d9a899eea302337d35d3395f"
+            "a3636dd8ed6ba06c41cb9d84fa1c2edb16fb8aaee82f0de73186f0903876f027"
         );
     }
 

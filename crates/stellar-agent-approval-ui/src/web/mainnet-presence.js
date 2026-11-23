@@ -17,6 +17,8 @@
 // posts the rejection alone. A response without a JSON body means the session
 // has ended. Once every handler is wired, the root element carries
 // data-presence="ready".
+// Final entry outcomes and one-shot cancellation disable every decision
+// button. Inbox cancellation and retryable failures leave decisions available.
 
 (function () {
   'use strict';
@@ -32,6 +34,12 @@
   var result = document.getElementById('presence-result');
   var busy = false;
   var done = false;
+  function finish() {
+    done = true;
+    [approve, cancel, reject].forEach(function (button) {
+      if (button) { button.disabled = true; }
+    });
+  }
   shared.refreshTimestamps();
   setInterval(shared.refreshTimestamps, 1000);
   function decode(value) {
@@ -67,6 +75,9 @@
     if (!reply.ok) {
       throw new Error(typeof reply.value.message === 'string' ? reply.value.message : UNAVAILABLE);
     }
+    if (['expired', 'already_resolved', 'not_found', 'rejected'].indexOf(reply.value.status) !== -1) {
+      finish();
+    }
     return reply.value;
   }
   function failed(error) {
@@ -75,6 +86,7 @@
   }
   async function end(reason) {
     await post('cancel', { reason: reason });
+    if (!inbox) { finish(); }
     result.className = 'result refused';
     result.textContent = reason === 'browser_unavailable'
       ? 'Mainnet consent requires a local browser with WebAuthn user verification; no approval is recorded.'
@@ -121,11 +133,11 @@
       var response = await post('assertion', signed);
       if (inbox) {
         shared.renderResult(result, response);
-        done = response.status === 'attested' || response.status === 'grant_active';
+        if (response.status === 'attested' || response.status === 'grant_active') { finish(); }
       } else if (response.status === 'presence_verified') {
         result.className = 'result';
         result.textContent = 'Presence verified. Check the command result.';
-        done = true;
+        finish();
       } else {
         shared.renderRefusal(result, response, UNAVAILABLE);
       }
@@ -138,8 +150,14 @@
   });
   if (cancel) {
     cancel.addEventListener('click', async function (event) {
-      if (!event.isTrusted || done) { return; }
-      try { await end('operator_cancel'); done = true; approve.disabled = true; } catch (error) { failed(error); }
+      if (!event.isTrusted || busy || done) { return; }
+      busy = true;
+      cancel.disabled = true;
+      try { await end('operator_cancel'); } catch (error) { failed(error); }
+      finally {
+        busy = false;
+        cancel.disabled = done;
+      }
     });
   }
   if (reject) {
@@ -154,7 +172,7 @@
         }
         var reply = await send('reject', body);
         shared.renderRefusal(result, reply.value, 'HTTP ' + reply.status);
-        if (reply.ok) { done = true; approve.disabled = true; }
+        if (reply.ok) { finish(); }
       } catch (error) {
         failed(error);
       } finally {

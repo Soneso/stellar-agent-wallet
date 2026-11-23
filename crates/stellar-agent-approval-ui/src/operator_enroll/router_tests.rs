@@ -1892,25 +1892,24 @@ async fn loopback_transcript(purpose: super::EnrollmentPurpose) -> String {
         .replace(&format!("localhost:{}", addr.port()), "localhost:{port}")
 }
 
-/// Both loopback purposes keep their base transcript: URLs, pages, data
+/// Both loopback purposes pin their transcript: URLs, pages, data
 /// islands, cookies, assets, challenge options and 404 answers, including
 /// 404 for the signed code asset and the code route.
 #[tokio::test]
 async fn loopback_enrollment_transcript_keeps_base_bytes() {
     use sha2::{Digest as _, Sha256};
-    // `whole_name` is the hash the base tree yields with the whole cookie
-    // name replaced; it ties this transcript to the base bytes. `expected`
-    // keeps the purpose prefix of the cookie name.
+    // `whole_name` replaces the whole cookie name; `expected` keeps its
+    // purpose prefix. Both digests pin the pages and registration protocol.
     for (purpose, expected, whole_name) in [
         (
             super::EnrollmentPurpose::RemoteOperator,
-            "ece062491853771fc8e1b3da36c34d18cd6cabbcff6a83d0a9b3da3d3bf09bab",
-            "f6df8795002c881b6ba786017514c45ec3e104b76840820eb5e4529bad2891cc",
+            "c3fd925a12b16b831a924ae80e0190feb6ba1568b5395b74232c8c6211696d9c",
+            "3c716fff370b8feb6b62b5eef5054b9a0910399bfb4cf239199528363ef9817f",
         ),
         (
             super::EnrollmentPurpose::MainnetApproval,
-            "3c87a65a9eee4608a0206a58c593451e2a967c43b461ace7d47c13fe288ee803",
-            "9c69bcc0ac07ba80c6083f4ebe8e8013e1e183485988d54b038a969c72cf7322",
+            "fb32326524a0ad04bb94792b8c96710d406788db91f58abe39352e4cf156a95c",
+            "313b09fbeddaad942a7914c1870a4c568843ee24a1e3e12fc012bf3730aa618e",
         ),
     ] {
         let transcript = loopback_transcript(purpose).await;
@@ -1924,7 +1923,7 @@ async fn loopback_enrollment_transcript_keeps_base_bytes() {
         assert_eq!(
             hex::encode(Sha256::digest(whole.as_bytes())),
             whole_name,
-            "{purpose:?} transcript against the base value:\n{transcript}"
+            "{purpose:?} transcript with the cookie name normalized:\n{transcript}"
         );
         assert_eq!(
             hex::encode(Sha256::digest(transcript.as_bytes())),

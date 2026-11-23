@@ -226,6 +226,7 @@ body {
   font-family: inherit;
 }
 .btn.approve { background: var(--ink-navy); color: #ffffff; }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .btn.reject {
   background: #ffffff;
   color: var(--danger-ink);

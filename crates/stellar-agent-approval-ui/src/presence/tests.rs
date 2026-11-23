@@ -1239,8 +1239,8 @@ fn refusal_statuses_follow_the_variant() {
 /// unknown entry is the not-found page with 404, and an expired, rejected
 /// or spent entry is its detail card with its notice and no passkey
 /// consent; the inbox still offers the reject the detail route offers.
-/// Only the inbox, which has a reject route, promises rejection after
-/// expiry; the one-shot ceremony points an expired request at a new one.
+/// Pending envelope pages show the approval deadline.
+/// The one-shot ceremony points an expired request at a new one.
 #[tokio::test]
 #[serial_test::serial]
 async fn mainnet_detail_keeps_entry_outcomes() {
@@ -1257,7 +1257,11 @@ async fn mainnet_detail_keeps_entry_outcomes() {
                 .count(),
             1
         );
-        assert_eq!(html.contains("only be rejected"), !one_shot, "{mode}");
+        assert!(html.contains(". Approve by"), "{mode}");
+        assert!(
+            !html.contains("After approval, the action must run within"),
+            "{mode}"
+        );
 
         let missing = if one_shot {
             let mut store = PendingApprovalStore::open(h.fixture.store_path()).unwrap();
@@ -1601,7 +1605,7 @@ async fn mainnet_page_binds_the_rendered_intent() {
     );
     assert_eq!(island["consent_view_digest"], digest);
     assert_ne!(digest, h.digest());
-    assert!(html.contains("<dt>Fee at most (stroops)</dt><dd>300</dd>"));
+    assert!(html.contains("<dt>Fee cap per operation (stroops)</dt><dd>300</dd>"));
     assert!(!html.contains("Simulated seq num"));
 
     let (_, changed_html) =
@@ -1622,7 +1626,8 @@ async fn mainnet_page_binds_the_rendered_intent() {
         crate::operator_enroll::test_support::island(&legacy, "presence-data").unwrap();
     assert_eq!(legacy_island["consent_view_digest"], h.digest());
     assert!(legacy.contains("Simulated seq num"));
-    assert!(!legacy.contains("Fee at most"));
+    assert!(!legacy.contains("Fee cap per operation"));
+    assert!(!legacy.contains("Total fee cap"));
 
     let pending = issue_mainnet_intent_presence(
         &h.entry,
