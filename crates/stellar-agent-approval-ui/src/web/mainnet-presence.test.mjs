@@ -116,7 +116,7 @@ function bareReply(status) {
 // Cancel) or the inbox ("inbox", with Reject), served at a signed approval
 // origin when `signedOrigin` is set. `replies` maps the action a POST names to
 // its reply.
-function consentPage({ webauthn = true, failure, mode = "one_shot", replies = {}, signedOrigin = false } = {}) {
+function consentPage({ webauthn = true, failure, mode = "one_shot", replies = {}, signedOrigin = false, allButtons = false } = {}) {
   const raw = Uint8Array.of(1, 2, 3).buffer;
   const storageKey = mode === "inbox" ? INBOX_KEY : CONSENT_KEY;
   const island = { nonce: "nonce", csrf: "csrf", consent_view_digest: "digest", storageKey, mode };
@@ -124,7 +124,8 @@ function consentPage({ webauthn = true, failure, mode = "one_shot", replies = {}
   const page = browser({
     webauthn,
     islands: { "presence-data": island },
-    elements: ["presence-approve", mode === "inbox" ? "presence-reject" : "presence-cancel", "presence-result"],
+    elements: allButtons ? ["presence-approve", "presence-reject", "presence-cancel", "presence-result"]
+      : ["presence-approve", mode === "inbox" ? "presence-reject" : "presence-cancel", "presence-result"],
     storage: { [storageKey]: PROOF },
     reply: (url) => {
       const action = url.split("/").at(-1);
@@ -215,6 +216,8 @@ for (const action of ["challenge", "assertion"]) {
     await page.byId["presence-approve"].listeners.click[0]({ isTrusted: true });
     assert.equal(page.byId["presence-result"].textContent, SESSION_ENDED);
     assert.doesNotMatch(page.byId["presence-result"].textContent, /JSON|Unexpected/);
+    assert.equal(page.byId["presence-approve"].disabled, false);
+    assert.notEqual(page.byId["presence-reject"].disabled, true);
   });
 }
 test("a cancel reply without a JSON body shows the ended session", async () => {
@@ -282,4 +285,123 @@ test("a signed-origin Reject whose ceremony is canceled posts no rejection", asy
   assert.ok(page.fetches.every(({ url }) => !url.endsWith("/reject")));
   assert.equal(JSON.parse(page.fetches.at(-1).init.body).reason, "authenticator_canceled");
   assert.notEqual(page.byId["presence-approve"].disabled, true);
+  assert.notEqual(page.byId["presence-reject"].disabled, true);
+});
+
+test("an inbox authenticator cancel leaves both decisions available for a new ceremony", async () => {
+  const page = consentPage({ mode: "inbox", failure: "NotAllowedError" });
+  page.run("./mainnet-presence.js");
+  await page.byId["presence-approve"].listeners.click[0]({ isTrusted: true });
+  assert.equal(page.byId["presence-result"].textContent, "Mainnet consent is canceled; no approval is recorded.");
+  assert.equal(page.byId["presence-approve"].disabled, false);
+  assert.notEqual(page.byId["presence-reject"].disabled, true);
+  await page.byId["presence-approve"].listeners.click[0]({ isTrusted: true });
+  assert.equal(page.credentialCalls.length, 2);
+  assert.deepEqual(page.fetches.map(({ url }) => url.split("/").at(-1)), ["challenge", "cancel", "challenge", "cancel"]);
+});
+
+test("a double click sends one cancel while Cancel is disabled", async () => {
+  let complete;
+  const page = consentPage({ replies: { cancel: () => new Promise((resolve) => { complete = resolve; }) } });
+  page.run("./mainnet-presence.js");
+  const click = page.byId["presence-cancel"].listeners.click[0];
+  const first = click({ isTrusted: true });
+  assert.equal(page.byId["presence-cancel"].disabled, true);
+  const second = click({ isTrusted: true });
+  assert.equal(page.fetches.length, 1);
+  await page.byId["presence-approve"].listeners.click[0]({ isTrusted: true });
+  assert.equal(page.fetches.length, 1);
+  complete(await jsonReply(200, { status: "canceled" }));
+  await Promise.all([first, second]);
+});
+
+test("a failed cancel re-enables Cancel and allows a retry", async () => {
+  const page = consentPage({ replies: { cancel: () => jsonReply(503, { message: "Try again." }) } });
+  page.run("./mainnet-presence.js");
+  const click = page.byId["presence-cancel"].listeners.click[0];
+  await click({ isTrusted: true });
+  assert.equal(page.byId["presence-cancel"].disabled, false);
+  assert.equal(page.byId["presence-result"].textContent, "Try again.");
+  await click({ isTrusted: true });
+  assert.equal(page.fetches.length, 2);
+});
+
+for (const action of ["challenge", "assertion"]) {
+  for (const status of ["expired", "already_resolved", "not_found", "rejected"]) {
+    test(`a final ${status} ${action} reply disables both inbox decisions`, async () => {
+      const page = consentPage({ mode: "inbox", replies: { [action]: () => jsonReply(200, { status }) } });
+      page.run("./mainnet-presence.js");
+      await page.byId["presence-approve"].listeners.click[0]({ isTrusted: true });
+      assert.equal(page.byId["presence-approve"].disabled, true);
+      assert.equal(page.byId["presence-reject"].disabled, true);
+      const requests = page.fetches.length;
+      await page.byId["presence-approve"].listeners.click[0]({ isTrusted: true });
+      await page.byId["presence-reject"].listeners.click[0]({ isTrusted: true });
+      assert.equal(page.fetches.length, requests);
+    });
+  }
+  for (const [name, code, value] of [
+    ["unknown status", 200, { status: "unknown" }],
+    ["empty body", 200, null],
+    ["HTTP error", 503, { status: "expired" }],
+  ]) {
+    test(`an ${name} ${action} reply keeps both inbox decisions available`, async () => {
+      const page = consentPage({ mode: "inbox", replies: { [action]: () => jsonReply(code, value) } });
+      page.run("./mainnet-presence.js");
+      await page.byId["presence-approve"].listeners.click[0]({ isTrusted: true });
+      assert.equal(page.byId["presence-approve"].disabled, false);
+      assert.notEqual(page.byId["presence-reject"].disabled, true);
+      const requests = page.fetches.length;
+      await page.byId["presence-approve"].listeners.click[0]({ isTrusted: true });
+      assert.ok(page.fetches.length > requests);
+    });
+  }
+}
+
+for (const [outcome, setup, clicked] of [
+  ["presence_verified", {}, "approve"],
+  ["attested", { mode: "inbox", replies: { assertion: () => jsonReply(200, { status: "attested" }) } }, "approve"],
+  ["grant_active", { mode: "inbox", replies: { assertion: () => jsonReply(200, { status: "grant_active" }) } }, "approve"],
+  ["canceled", {}, "cancel"],
+  ["authenticator_canceled", { failure: "NotAllowedError" }, "approve"],
+  ["rejected", { mode: "inbox", replies: { reject: () => jsonReply(200, { status: "rejected" }) } }, "reject"],
+]) {
+  test(`all decision buttons are disabled after ${outcome}`, async () => {
+    const page = consentPage({ ...setup, allButtons: true });
+    page.run("./mainnet-presence.js");
+    await page.byId[`presence-${clicked}`].listeners.click[0]({ isTrusted: true });
+    for (const action of ["approve", "cancel", "reject"]) {
+      assert.equal(page.byId[`presence-${action}`].disabled, true, action);
+    }
+    const requests = page.fetches.length;
+    for (const action of ["approve", "cancel", "reject"]) {
+      await page.byId[`presence-${action}`].listeners.click[0]({ isTrusted: true });
+    }
+    assert.equal(page.fetches.length, requests, "a final outcome sends no further decisions");
+  });
+}
+
+test("a retryable approval failure re-enables Approve", async () => {
+  const page = consentPage({ allButtons: true, replies: {
+    assertion: () => jsonReply(503, { message: "Try again." }),
+  } });
+  page.run("./mainnet-presence.js");
+  await page.byId["presence-approve"].listeners.click[0]({ isTrusted: true });
+  assert.equal(page.byId["presence-approve"].disabled, false);
+  assert.notEqual(page.byId["presence-cancel"].disabled, true);
+  assert.notEqual(page.byId["presence-reject"].disabled, true);
+  assert.equal(page.byId["presence-result"].textContent, "Try again.");
+  await page.byId["presence-approve"].listeners.click[0]({ isTrusted: true });
+  assert.equal(page.credentialCalls.length, 2);
+});
+
+test("an unrecognized inbox assertion response leaves Approve available", async () => {
+  const page = consentPage({ mode: "inbox", allButtons: true, replies: {
+    assertion: () => jsonReply(200, {}),
+  } });
+  page.run("./mainnet-presence.js");
+  await page.byId["presence-approve"].listeners.click[0]({ isTrusted: true });
+  assert.equal(page.byId["presence-approve"].disabled, false);
+  assert.notEqual(page.byId["presence-cancel"].disabled, true);
+  assert.notEqual(page.byId["presence-reject"].disabled, true);
 });

@@ -37,7 +37,7 @@ use stellar_agent_core::approval::{ApprovalSummaryView, PendingApprovalView};
 // two approval surfaces cannot present the same entry differently.
 use stellar_agent_approval_ui::{
     DETAIL_STYLE, INBOX_STYLE, INCONSISTENT_NOTICE, approve_button_label, html_escape, kind_pill,
-    render_rule_proposal_definition_html, render_summary_html,
+    render_expiry_html, render_rule_proposal_definition_html, render_summary_html,
 };
 use stellar_agent_loopback_http::brand::{BRAND_STYLE, PageIdentity, TRUST_LINE_SELF_HOSTED};
 
@@ -353,9 +353,9 @@ pub(crate) fn render_not_found_page(identity: &PageIdentity) -> String {
 /// [`approval_view_digest`]: stellar_agent_core::approval::approval_view_digest
 ///
 /// The two absolute unix-millisecond timestamps are rendered as text AND as
-/// `data-created-ms` / `data-expires-ms` attributes, from which
-/// `/static/app.js` derives the readable wording. The raw values are what
-/// survives if the script does not run.
+/// `data-created-ms` / `data-expires-ms` attributes. With `data-expiry-form`,
+/// `/static/app-shared.js` reads them to format timestamps and the remaining
+/// approval duration. The raw values survive if the script does not run.
 #[must_use]
 pub(crate) fn render_detail_page(
     view: &PendingApprovalView,
@@ -441,38 +441,7 @@ pub(crate) fn render_detail_page(
             .to_owned()
     };
 
-    // The sentence around the two timestamps is chosen server-side, because
-    // only the server knows whether a decision is still available. A live
-    // request gets the remaining-time form and the clause naming what happens
-    // at expiry; one that can no longer be approved gets the plain form, with
-    // no action clause to contradict a page that offers no approve button.
-    // `data-expiry-form` tells `/static/app-shared.js` which slot filling the
-    // sentence expects.
-    let expiry_line = if view.expired
-        || view.attested
-        || matches!(
-            view.summary,
-            ApprovalSummaryView::Rejected { .. }
-                | ApprovalSummaryView::Consumed { .. }
-                | ApprovalSummaryView::Inconsistent { .. }
-        ) {
-        format!(
-            r#"<p class="expiry" id="expiry-line" data-created-ms="{created}" data-expires-ms="{expires}" data-expiry-form="absolute">
-        Created <b id="created-text">{created} (unix ms)</b>. Expiry:
-        <b id="expires-text">{expires} (unix ms)</b>.</p>"#,
-            created = view.created_at_unix_ms,
-            expires = view.expires_at_unix_ms,
-        )
-    } else {
-        format!(
-            r#"<p class="expiry" id="expiry-line" data-created-ms="{created}" data-expires-ms="{expires}" data-expiry-form="remaining">
-        Created <b id="created-text">{created} (unix ms)</b>, expires
-        <b id="expires-text">{expires} (unix ms)</b>. After that this request can
-        only be rejected.</p>"#,
-            created = view.created_at_unix_ms,
-            expires = view.expires_at_unix_ms,
-        )
-    };
+    let expiry_line = render_expiry_html(view, false);
 
     let data_island = json_data_island(&serde_json::json!({
         "nonce": view.approval_nonce,
@@ -1353,10 +1322,8 @@ mod tests {
         );
     }
 
-    /// The sentence around the timestamps is chosen by state. A live request
-    /// says what happens at expiry; one that can no longer be approved must
-    /// not, because the page it sits on offers no approve button — and an
-    /// expired one must not read "expires expired (...)".
+    /// Pending requests show the approval deadline.
+    /// Unavailable requests keep their absolute timestamps.
     #[test]
     #[serial_test::serial]
     fn detail_page_expiry_sentence_is_selected_by_state() {
@@ -1373,7 +1340,11 @@ mod tests {
             &neutral(),
         );
         assert!(live.contains(r#"data-expiry-form="remaining""#), "{live}");
-        assert!(live.contains("After that this request can"), "{live}");
+        assert!(live.contains(". Approve by"), "{live}");
+        assert!(
+            !live.contains("After approval, the action must run within"),
+            "{live}"
+        );
 
         let dir = TempDir::new().unwrap();
         let expired = render_detail_page(
@@ -1389,8 +1360,8 @@ mod tests {
             "{expired}"
         );
         assert!(
-            !expired.contains("After that this request can"),
-            "an expired request has no 'after that': {expired}"
+            !expired.contains("After approval, the action must run within"),
+            "an expired request has no execution window: {expired}"
         );
 
         let dir = TempDir::new().unwrap();
@@ -1407,7 +1378,7 @@ mod tests {
             "{attested}"
         );
         assert!(
-            !attested.contains("can\n        only be rejected"),
+            !attested.contains("After approval, the action must run within"),
             "a resolved request offers no actions, so it cannot promise one: {attested}"
         );
 
@@ -1425,9 +1396,38 @@ mod tests {
             "{rejected}"
         );
         assert!(
-            !rejected.contains("only be rejected"),
+            !rejected.contains("After approval, the action must run within"),
             "a rejected request cannot be rejected again: {rejected}"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn remote_detail_has_no_execution_window() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let dir = TempDir::new().unwrap();
+        let mut view = payment_view(&dir, false, NOW_MS);
+        view.created_at_unix_ms = NOW_MS;
+        for lifetime_ms in [86_400_000, 600_000, 100_000] {
+            view.expires_at_unix_ms = NOW_MS + lifetime_ms;
+            let html = render_detail_page(
+                &view,
+                &test_context(),
+                &"c".repeat(64),
+                None,
+                None,
+                &neutral(),
+            );
+            assert!(html.contains(&format!(
+                r#"data-created-ms="{NOW_MS}" data-expires-ms="{}""#,
+                NOW_MS + lifetime_ms
+            )));
+            assert!(html.contains(". Approve by"));
+            assert!(!html.contains("data-execution-minutes"));
+            assert!(!html.contains("After approval, the action must run within"));
+        }
     }
 
     /// The nonce is what the operator matches against the CLI and the audit
@@ -1797,10 +1797,18 @@ mod tests {
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = TempDir::new().unwrap();
         let mut view = trustline_view(&dir);
-        for (limit, shown) in [
-            (None, "unlimited"),
-            (Some(0), "0 stroops (removes the trustline)"),
-            (Some(9_007_199_254_740_993), "9007199254740993 stroops"),
+        for (limit, shown, headline) in [
+            (None, "unlimited", "Add or change USDC trustline"),
+            (
+                Some(0),
+                "0 stroops (removes the trustline)",
+                "Remove USDC trustline",
+            ),
+            (
+                Some(9_007_199_254_740_993),
+                "9007199254740993 stroops",
+                "Add or change USDC trustline",
+            ),
         ] {
             if let ApprovalSummaryView::Trustline { limit_stroops, .. } = &mut view.summary {
                 *limit_stroops = limit;
@@ -1816,7 +1824,8 @@ mod tests {
             for text in [
                 "TRUSTLINE",
                 ">Approve trustline</button>",
-                "USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+                &format!(r#"<div class="d-amount">{headline}</div>"#),
+                &format!("<dt>Issuer</dt><dd>{USDC_ISSUER_G}</dd>"),
                 &format!(r#"<div class="addr">{SOURCE_G}</div>"#),
                 shown,
                 &format!("<dt>Source</dt><dd>{SOURCE_G}</dd>"),

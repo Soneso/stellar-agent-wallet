@@ -470,7 +470,7 @@ async fn revocation_authentication_matrix() {
     assert_eq!(std::fs::read(&h.store_path).unwrap(), before);
 }
 
-/// SHA-256 of each unaffected page fragment and asset, rendered from fixed
+/// SHA-256 of each page fragment and asset, rendered from fixed
 /// inputs.
 pub(crate) fn unaffected_outputs() -> Vec<(&'static str, String)> {
     use sha2::{Digest as _, Sha256};
@@ -628,9 +628,7 @@ pub(crate) fn unaffected_outputs() -> Vec<(&'static str, String)> {
     ]
 }
 
-/// The pinned digests of [`unaffected_outputs`]. Each equals the base tree's
-/// rendering except `app_shared.js`, whose inbox rows show a muxed payment
-/// destination in full and every toolset destination in full.
+/// The pinned digests of [`unaffected_outputs`] from fixed rendering inputs.
 const BASE_OUTPUTS: &[(&str, &str)] = &[
     (
         "summary",
@@ -642,31 +640,31 @@ const BASE_OUTPUTS: &[(&str, &str)] = &[
     ),
     (
         "detail",
-        "a59bf288a513244185344d675fce9d3ab07c44fa3b482df292b94062b4ac2d86",
+        "ea8ca599025c533524f83479246fbe4576b090f4b1310a9cc3a465a6280c1d6b",
     ),
     (
         "consent",
-        "6829ab444be1ddd7ad083356454b9112812a29023ac82f940d9ca1eaad4c9408",
+        "1f4be3d25f09f27b7050cc998b914ba3517c245a920485106cbe44a8726401ec",
     ),
     (
         "intent_pay",
-        "2b69abbb981631315b2e35f6ad25b6a8470eb986c3d7d37aee1d2af2d6132b78",
+        "697cf8a3705b791e4b59ffabc8a5b6dc745aa3cb75c09a5bb8e1ba12fad3b14f",
     ),
     (
         "intent_trustline",
-        "ff84b352ccf0413f14cde7214cb29da686eebddc936ab1b8cc8a78cb2220afb0",
+        "c3cf390434d64615c68d365f57f13de7faf4f1dad17d1032ffd02a7bf7e72470",
     ),
     (
         "intent_unlimited",
-        "4267b34b56da7ce91534a65378fd25627ee48917184830d10f2605c91c01f5f6",
+        "a3b71d75c756a8a3ec744fadde393cbcef26d0ac829364edf4790d9b8920b5ed",
     ),
     (
         "intent_claim",
-        "15e21d04edbb5bc75fc48af96499bbc49175c7237d933af7d8641563e6d9d826",
+        "d312ad91c8c553b131e4aeb76a8ea7b18f2d924fb08a134d29d618a3ba2ff515",
     ),
     (
         "consent_intent",
-        "84508618c3bd269118a1328917d49e1e855d50724d09a7961c35235399d0f708",
+        "fab2c2bf57bbb5d6f811dd63eb03b60ab65e4ed9e4ac16f7f393f77f9cf9a650",
     ),
     (
         "app.js",
@@ -674,11 +672,11 @@ const BASE_OUTPUTS: &[(&str, &str)] = &[
     ),
     (
         "app_shared.js",
-        "01c6bb0d504cb894964bb8e2ff47ba372f9012a97351dda20d1960f71213ae42",
+        "2b322abfb843c8b828e37230e088fea2b9780cf3c01176aff735735bfed510ec",
     ),
     (
         "mainnet-presence.js",
-        "cf6feb17fa9ad5bfe87722a5145898b35af4533e487957e5b21233dd69402478",
+        "33e1630b8b2a4a35c30bacebbd0c1ea0fa13c422accb78798b85836fb6d870f4",
     ),
 ];
 

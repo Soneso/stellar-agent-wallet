@@ -16,6 +16,16 @@ runs on a headless host or a different machine than the one you carry around.
 The wallet host mints an attestation under the serving profile name and CAIP-2 chain id.
 The shared HMAC also binds the pending nonce, digest, and process uid.
 The detail page shows the profile, network, endpoint authority, and enrolled signer above the request summary.
+Pending detail pages show `Created <time>. Approve by <time> (in <duration>).`
+Only pending mainnet consent pages that render an intent add `After approval, the action must run within <window>.`
+The server renders the shorter of the entry lifetime and 900 seconds as whole minutes and seconds, such as `1 minute 40 seconds`.
+Remote detail pages and consent pages without an intent show only the approval deadline.
+Inbox rows say `approve within` before the remaining duration.
+Mainnet consent pages disable every available decision button after a final entry
+outcome. Cancellation also disables them in a one-shot session.
+Inbox cancellation shows the result and keeps Approve and Reject available for
+a new ceremony. Disabled buttons have half opacity and a not-allowed cursor.
+Retryable failures keep decisions available.
 Summary rows render challenge-bound entry data. Header rows come from the serving profile. The profile and network rows are inputs of the view digest the challenge covers; the endpoint authority and enrolled signer rows are display context.
 A payment, claim, or trustline summary is decoded from the transaction envelope whose digest the challenge and the attestation bind, so the page shows the transaction an approval signs.
 The detail page carries a digest of the request it renders: its terms, nonce, requester, lifetime, profile, and network. Approve sends that digest when it asks for a challenge. The listener mints a challenge only while the digest names the current pending request, and the challenge is derived over it, so the passkey assertion commits to the request the page showed. The approval gate compares the same digest with the request it attests.
@@ -35,6 +45,11 @@ Signed-origin consent records attestation version 5 for an envelope and version 
 The receipt binds the signed origin, policy digest and served leaf pin.
 The audit log distinguishes remote `approval_attested_remote` / `approval_rejected_remote` events from loopback `approval_attested` / `approval_rejected` events.
 Each row is written before the decision takes effect; a decision whose row cannot be written is refused and the entry stays pending.
+
+Classic intent pages show `Fee cap per operation (stroops)` with the explicit
+per-operation fee when chosen, otherwise the tighter profile or signed policy cap.
+Contract payment intent pages show `Total fee cap (stroops)` and a separate
+`Inclusion bid (stroops)` row.
 
 On testnet, two independent layers must hold for an approve or reject to take effect:
 
@@ -179,6 +194,9 @@ The approving device must already trust the certificate, as for consent.
 The terminal prints the URL, `<signed-origin>/enroll`, and an eight-digit enrollment code.
 On the approving device, open the URL and type the enrollment code.
 The code works once, admits five attempts and lives the timeout, at most ten minutes.
+The wallet's enrollment page requires a label, on loopback and with `--origin-from`.
+It trims surrounding whitespace and uses the label as the passkey's user name and display name.
+The remote approval host's enrollment page keeps the user name `operator`.
 Then create the passkey; the page shows a confirmation code.
 Type that confirmation code at the terminal before the timeout.
 Only that match exports the credential entry, with `rp_id` set to the signed host.
@@ -305,7 +323,9 @@ approval, names another `rp_id` or another chain, or cannot be read.
 3. You land on the inbox: the pending approvals list, updating automatically.
 4. Click an entry to see the wallet-decoded summary of the parked action:
    payment, claim, or trustline, decoded from its transaction envelope. A
-   trustline names the full holder and issuer, asset code, and limit. A claim
+   trustline names the full holder and issuer, asset code, and limit.
+   Its headline reads `Remove <code> trustline` for a zero limit and
+   `Add or change <code> trustline` otherwise, with the issuer in its own row. A claim
    names the balance by id; its asset and amount are not part of the signed
    claim transaction.
 5. Click Approve or Reject. Each one prompts a FRESH passkey assertion.

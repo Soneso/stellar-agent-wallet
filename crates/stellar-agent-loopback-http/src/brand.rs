@@ -318,6 +318,7 @@ body {
   font-family: inherit;
 }
 .btn.approve { background: var(--ink-navy); color: #ffffff; }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .btn.reject {
   background: #ffffff;
   color: var(--danger-ink);
@@ -487,10 +488,9 @@ pub const MAX_DISPLAY_NAME_CHARS: usize = 64;
 ///
 /// This type renders the identity block only: the page title suffix, the card
 /// header above a page's `<h1>`, and the header bar's left-hand cell. It can
-/// reach no part of the transaction-detail block — the amount, the
-/// destination, the facts grid, the approve and reject controls, the caution
-/// line, and the expiry sentence are rendered from the approval entry alone
-/// and take no configured input.
+/// reach no part of the transaction-detail block. The amount, destination,
+/// facts grid, decision controls, and caution line come from the approval entry.
+/// Its deadline and the bounded execution window take no configured input.
 ///
 /// That boundary is the point. The decision page is a consent surface: its
 /// purpose is the faithful display of what is about to be signed. Configured
@@ -652,6 +652,11 @@ impl PageIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disabled_buttons_look_unavailable() {
+        assert!(BRAND_STYLE.contains(".btn:disabled { opacity: 0.5; cursor: not-allowed; }"));
+    }
 
     /// The CSP forbids every remote origin; a token referencing one would
     /// render as a silently missing asset rather than a load error.

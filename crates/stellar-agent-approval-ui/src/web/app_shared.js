@@ -182,16 +182,14 @@ var stellarAgentApproval = (function () {
     return dayLabel(date, new Date()) + " " + clockText(date);
   }
 
-  // The remaining-time phrase for an expiry that has NOT passed. The server
-  // selects the sentence this fills, so a passed expiry is the caller's
-  // `absoluteText` case and never composes into "expires expired (...)".
+  // The approval deadline and remaining time for a live request.
   function remainingText(unixMs) {
     // A bare clock time is ambiguous once the expiry is not today, so the day
     // label comes along in that case.
     var date = new Date(unixMs);
     var day = dayLabel(date, new Date());
     var when = day === "today" ? clockText(date) : day + " " + clockText(date);
-    return "in " + longDuration(unixMs - Date.now()) + " (" + when + ")";
+    return when + " (in " + longDuration(unixMs - Date.now()) + ")";
   }
 
   // ── Approval summaries ─────────────────────────────────────────────────
@@ -339,7 +337,7 @@ var stellarAgentApproval = (function () {
       el.appendChild(gone);
       return;
     }
-    el.appendChild(document.createTextNode("expires in"));
+    el.appendChild(document.createTextNode("approve within"));
     el.appendChild(document.createElement("br"));
     var value = document.createElement("b");
     if (remaining < TEN_MINUTES_MS) {
@@ -425,7 +423,7 @@ var stellarAgentApproval = (function () {
   //
   // The server chooses the surrounding sentence and marks it with
   // `data-expiry-form`: "remaining" for a live request, "absolute" for one that
-  // can no longer be approved. This only fills the two slots.
+  // can no longer be approved. Execution window text is final server text.
   function refreshTimestamps() {
     var line = document.getElementById("expiry-line");
     if (!line) {

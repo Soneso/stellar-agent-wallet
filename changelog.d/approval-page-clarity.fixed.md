@@ -1,0 +1,5 @@
+- Show the execution window in exact minutes and seconds on pending mainnet intent consent pages. Other pending pages show only the approval deadline. Label inbox countdowns as approve within.
+- Disable all decision buttons after a final mainnet entry outcome or one-shot cancellation, with half opacity and a not-allowed cursor. Keep inbox cancellation retryable and prevent duplicate Cancel requests.
+- Name trustline removal or addition and change in the detail headline, with the issuer in its own row.
+- Label classic intent fees as caps per operation and contract payment intent fees as total caps.
+- Use the wallet enrollment page's trimmed label as the passkey user name and display name on loopback and signed origins. The remote approval host's enrollment page keeps the user name operator.

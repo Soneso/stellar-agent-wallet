@@ -1542,6 +1542,10 @@ A WebAuthn credential is bound to its `rp.id` at creation time, and a loopback o
 | `--label <LABEL>` | Operator-chosen name for the credential (e.g. `"laptop"`); required in import mode, optional page pre-fill in interactive mode |
 | `--sign-count <U32>` | Best-effort sign-counter seed read at enrollment time; import mode only (interactive mode extracts it automatically). Advisory only: never affects authorization |
 
+The local enrollment page requires a label before starting the ceremony.
+It trims surrounding whitespace and uses the label as the passkey's user name
+and display name. `--label` pre-fills the field.
+
 ```bash
 # Local or SSH-tunneled listener
 stellar-agent approve operator enroll --interactive --label laptop
@@ -1589,8 +1593,12 @@ Stdout remains one JSON envelope. The token is single-use; keep stderr private.
 | `--open-by-operator` | Prints the local mainnet enrollment URL once on stderr, with no browser launch or private handoff. |
 | `--origin-from <PATH>` | Enrolls at the signed approval origin of an unsigned policy body; conflicts with `--open-by-operator` |
 | `--profile <NAME>` | Required. The persisted mainnet profile |
-| `--label <LABEL>` | Page label pre-fill; absent from the output |
+| `--label <LABEL>` | Pre-fills the required page label; absent from the command output |
 | `--timeout-seconds <SECS>` | Deadline for registration and code, 1 to 600 (default 300) |
+
+The wallet's enrollment page trims the label for the passkey's user name and
+display name, on loopback and with `--origin-from`.
+The remote approval host's enrollment page keeps the user name `operator`.
 
 ```bash
 stellar-agent approve credential enroll --profile operator --label laptop

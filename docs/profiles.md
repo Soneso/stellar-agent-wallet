@@ -691,8 +691,10 @@ The page design (layout, palette, typography, and the decision page's
 hierarchy) is not configurable, and neither is anything the approval page says
 about a transaction. The approval page is a consent surface: its purpose is the
 faithful display of what is about to be signed, so the amount, the destination,
-the facts grid, the approve and reject controls, the caution line, and the
-expiry sentence are rendered from the approval entry alone. Configured CSS,
+the facts grid, the approve and reject controls, and the caution line are
+rendered from the approval entry. Pending pages show the approval deadline.
+Only mainnet consent pages that render a pending intent show the execution window,
+the shorter of its lifetime and the 15-minute execution maximum. Configured CSS,
 markup, or asset URLs would let anything able to write this file make the page
 misstate the transaction without touching a signing key.
 

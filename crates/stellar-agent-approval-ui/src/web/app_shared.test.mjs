@@ -4,6 +4,66 @@ import { readFileSync } from "node:fs";
 import renderers from "./app_shared.js";
 import { b64url, browser, jsonReply, until } from "./browser_harness.mjs";
 
+for (const [lifetime, deadline] of [[86_400_000, "tomorrow 12:00 (in 1 day)"], [600_000, "12:10 (in 10 minutes)"]]) {
+  test(`pending detail renders the approval deadline after ${lifetime} ms`, () => {
+    const created = new Date(2026, 0, 2, 12, 0).getTime();
+    const module = { exports: {} };
+    const page = browser({
+      elements: ["expiry-line", "created-text", "expires-text", "execution-minutes"],
+      attributes: { "expiry-line": {
+        "data-created-ms": String(created), "data-expires-ms": String(created + lifetime),
+        "data-expiry-form": "remaining",
+      } },
+      globals: { module },
+    });
+    page.clock.now = created;
+    // refreshTimestamps leaves the server-rendered execution text unchanged.
+    const execution = "After approval, the action must run within 1 minute 40 seconds.";
+    page.byId["execution-minutes"].textContent = execution;
+    page.run("./app_shared.js");
+    module.exports.refreshTimestamps();
+    assert.equal(`Created ${page.byId["created-text"].textContent}. Approve by ${page.byId["expires-text"].textContent}.`,
+      `Created today 12:00. Approve by ${deadline}.`);
+    assert.equal(page.byId["execution-minutes"].textContent, execution);
+  });
+}
+
+test("resolved detail keeps absolute timestamps", () => {
+  const created = new Date(2026, 0, 2, 12, 0).getTime();
+  const expires = created + 600_000;
+  const module = { exports: {} };
+  const page = browser({
+    elements: ["expiry-line", "created-text", "expires-text"],
+    attributes: { "expiry-line": {
+      "data-created-ms": String(created), "data-expires-ms": String(expires), "data-expiry-form": "absolute",
+    } },
+    globals: { module },
+  });
+  page.clock.now = created;
+  page.run("./app_shared.js");
+  const renderers = module.exports;
+  renderers.refreshTimestamps();
+  assert.equal(page.byId["created-text"].textContent, renderers.absoluteText(created));
+  assert.equal(page.byId["expires-text"].textContent, renderers.absoluteText(expires));
+});
+
+test("inbox requests say approve within", () => {
+  globalThis.document = {
+    createElement: () => ({ children: [], appendChild(child) { this.children.push(child); } }),
+    createTextNode: (text) => ({ textContent: text }), getElementById: () => null,
+  };
+  const row = renderers.approvalRow({ expires_at_unix_ms: Date.now() + 600_000, summary: { kind: "payment" } });
+  assert.equal(row.children[2].children[0].textContent, "approve within");
+});
+
+test("today's approval deadline includes its clock time and remaining minutes", () => {
+  const module = { exports: {} };
+  const page = browser({ globals: { module } });
+  page.clock.now = new Date(2026, 0, 2, 12, 0).getTime();
+  page.run("./app_shared.js");
+  assert.equal(module.exports.remainingText(page.clock.now + 600_000), "12:10 (in 10 minutes)");
+});
+
 for (const [limit, rendered] of [
   [null, "unlimited"],
   ["0", "0 stroops (remove)"],
@@ -552,6 +612,29 @@ function enrollPage(storage, options = {}) {
   page.run("../operator_enroll/web/operator-enroll.js");
   return page;
 }
+
+test("local enrollment uses the trimmed label as both passkey user names", async () => {
+  const page = enrollPage({ [ENROLL_PROOF_KEY]: PROOF }, { reply: server() });
+  page.byId["label-input"].value = "  Travel key  ";
+  page.byId["enroll-btn"].listeners.click[0]();
+  await until(() => page.byId["confirmation-code"].textContent !== "", "the enrollment confirmation code");
+  assert.equal(page.credentialCalls.length, 1);
+  const user = page.credentialCalls[0].publicKey.user;
+  assert.equal(user.name, "Travel key");
+  assert.equal(user.displayName, "Travel key");
+  assert.equal(JSON.parse(page.fetches[1].init.body).label, "Travel key");
+});
+
+test("local enrollment with an empty label stops before the ceremony", () => {
+  for (const label of ["", "   "]) {
+    const page = enrollPage({ [ENROLL_PROOF_KEY]: PROOF }, { reply: server() });
+    page.byId["label-input"].value = label;
+    page.byId["enroll-btn"].listeners.click[0]();
+    assert.equal(page.byId.status.textContent, "Enter a label first.");
+    assert.equal(page.credentialCalls.length, 0);
+    assert.equal(page.fetches.length, 0);
+  }
+});
 
 test("enrollment registers over the server challenge and posts the authenticator response", async () => {
   const page = enrollPage({ [ENROLL_PROOF_KEY]: PROOF }, { reply: server() });

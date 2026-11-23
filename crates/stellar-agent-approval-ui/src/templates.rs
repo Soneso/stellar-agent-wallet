@@ -30,12 +30,14 @@
 //!
 //! Everything the operator consents to is server-rendered: the amount in both
 //! denominations, the untruncated destination, and every remaining summary
-//! field. The client formats only the two absolute unix-millisecond timestamps
-//! into readable text, reading them from `data-` attributes; if its script
-//! never runs, the raw values stay on the page rather than the field vanishing.
+//! field, including the execution window on pending intent consent pages.
+//! The client reads `data-created-ms`, `data-expires-ms` and `data-expiry-form`
+//! to format timestamps and the remaining approval duration. If its script
+//! never runs, the raw timestamps stay on the page.
 
 use stellar_agent_core::amount::StellarAmount;
 use stellar_agent_core::approval::view::format_trustline_limit;
+use stellar_agent_core::approval::witness::APPROVAL_EXECUTION_MAX_MS;
 use stellar_agent_core::approval::{
     ApprovalSummaryView, ContextRuleProposalSnapshot, IntentPayloadView, IntentView,
     PendingApprovalView, RuleProposalContextType, RuleProposalSignerKind,
@@ -467,7 +469,7 @@ pub(crate) fn render_detail_page_with(
             .to_owned()
     };
 
-    let expiry_line = expiry_line_html(view, decisions);
+    let expiry_line = render_expiry_html(view, false);
 
     let data_island = json_data_island(&serde_json::json!({
         "nonce": view.approval_nonce,
@@ -530,7 +532,8 @@ pub(crate) enum ConsentPageMode {
 /// Render the mainnet consent page of a pending entry.
 ///
 /// The card is the detail page's: the kind pill, the serving profile, the
-/// server-rendered summary and the expiry line, under the same stylesheet.
+/// server-rendered summary and deadline, under the same stylesheet.
+/// A pending intent also shows its execution window.
 /// With an `intent`, [`render_intent_html`] replaces the summary, so the page
 /// shows the lasting intent facts and the fee bound rather than the
 /// simulated fee and sequence. For an x402 payment the authoritative intent
@@ -560,7 +563,7 @@ pub(crate) fn render_mainnet_consent_page(
             html_escape(digest)
         )
     });
-    let expiry_line = expiry_line_html(view, mode == ConsentPageMode::Inbox);
+    let expiry_line = render_expiry_html(view, intent.is_some());
     let (back, topbar_label, second) = match mode {
         ConsentPageMode::Inbox => (
             r#"<a class="back" href="/inbox">&larr; Back to inbox</a>"#,
@@ -675,16 +678,12 @@ fn status_notice_html(view: &PendingApprovalView, rejectable: bool) -> &'static 
     }
 }
 
-/// The sentence around the two timestamps is chosen server-side, because
-/// only the server knows whether a decision is still available. A live
-/// request gets the remaining-time form and the clause naming what happens
-/// at expiry; one that cannot be approved gets the plain form, with
-/// no action clause to contradict a page that offers no approve button.
-/// The clause promises rejection only when `rejectable` says the serving
-/// listener has a reject route; otherwise the live form names the deadline
-/// alone. `data-expiry-form` tells `/static/app-shared.js` which slot filling
-/// the sentence expects.
-fn expiry_line_html(view: &PendingApprovalView, rejectable: bool) -> String {
+/// Renders creation time and the approval deadline for both listeners.
+/// Pending requests whose page renders an intent also show the execution window.
+/// The window is the shorter of the entry lifetime and the execution maximum.
+/// Resolved or unavailable requests show absolute timestamps.
+#[must_use]
+pub fn render_expiry_html(view: &PendingApprovalView, renders_intent: bool) -> String {
     if view.expired
         || view.attested
         || matches!(
@@ -701,20 +700,32 @@ fn expiry_line_html(view: &PendingApprovalView, rejectable: bool) -> String {
             created = view.created_at_unix_ms,
             expires = view.expires_at_unix_ms,
         )
-    } else if rejectable {
-        format!(
-            r#"<p class="expiry" id="expiry-line" data-created-ms="{created}" data-expires-ms="{expires}" data-expiry-form="remaining">
-        Created <b id="created-text">{created} (unix ms)</b>, expires
-        <b id="expires-text">{expires} (unix ms)</b>. After that this request can
-        only be rejected.</p>"#,
-            created = view.created_at_unix_ms,
-            expires = view.expires_at_unix_ms,
-        )
     } else {
+        let execution_line = if renders_intent {
+            let window_seconds = view
+                .expires_at_unix_ms
+                .saturating_sub(view.created_at_unix_ms)
+                .min(APPROVAL_EXECUTION_MAX_MS)
+                / 1000;
+            let minutes = window_seconds / 60;
+            let seconds = window_seconds % 60;
+            let minute_unit = if minutes == 1 { "minute" } else { "minutes" };
+            let second_unit = if seconds == 1 { "second" } else { "seconds" };
+            let window = match (minutes, seconds) {
+                (0, seconds) => format!("{seconds} {second_unit}"),
+                (minutes, 0) => format!("{minutes} {minute_unit}"),
+                _ => format!("{minutes} {minute_unit} {seconds} {second_unit}"),
+            };
+            format!(
+                "\n        <p class=\"expiry\">After approval, the action must run within {window}.</p>"
+            )
+        } else {
+            String::new()
+        };
         format!(
             r#"<p class="expiry" id="expiry-line" data-created-ms="{created}" data-expires-ms="{expires}" data-expiry-form="remaining">
-        Created <b id="created-text">{created} (unix ms)</b>, expires
-        <b id="expires-text">{expires} (unix ms)</b>.</p>"#,
+        Created <b id="created-text">{created} (unix ms)</b>. Approve by
+        <b id="expires-text">{expires} (unix ms)</b>.</p>{execution_line}"#,
             created = view.created_at_unix_ms,
             expires = view.expires_at_unix_ms,
         )
@@ -868,6 +879,15 @@ fn base_account_block(base: Option<&str>) -> String {
         .unwrap_or_default()
 }
 
+/// Names the trustline action without putting the issuer in the headline.
+fn trustline_headline(code: &str, removal: bool) -> String {
+    let action = if removal { "Remove" } else { "Add or change" };
+    format!(
+        "      <div class=\"d-amount\">{action} {} trustline</div>\n",
+        escape_value(code)
+    )
+}
+
 /// Renders the intent an entry is approved under: the amount headline, the
 /// untruncated primary address, and rows for the kind, network, source, the
 /// operation fields, the typed memo, the fee bound and the short policy
@@ -923,13 +943,10 @@ pub(crate) fn render_intent_html(nonce: &str, intent: &IntentView) -> String {
             issuer,
             code,
             limit,
-            ..
+            limit_stroops,
         } => (
             "Trustline",
-            format!(
-                "      <div class=\"d-amount\">{}</div>\n",
-                escape_value(&format!("{code}:{issuer}"))
-            ),
+            trustline_headline(code, *limit_stroops == 0),
             address_block("Issuer", issuer),
             [fact_row("Asset code", code), fact_row("Limit", limit)].concat(),
         ),
@@ -977,7 +994,11 @@ pub(crate) fn render_intent_html(nonce: &str, intent: &IntentView) -> String {
         operation,
         fact_row("Memo", &intent.memo().display()),
         fact_row(
-            "Fee at most (stroops)",
+            if matches!(intent.payload(), IntentPayloadView::ContractPay { .. }) {
+                "Total fee cap (stroops)"
+            } else {
+                "Fee cap per operation (stroops)"
+            },
             &intent.fee_at_most_stroops().to_string(),
         ),
         fact_row("Policy digest", intent.policy_digest_short()),
@@ -1084,9 +1105,9 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
             seq_num,
             memo,
         } => {
-            let asset = format!("{asset_code}:{asset_issuer}");
             let limit = format_trustline_limit(*limit_stroops);
             let mut rows = fact_row("Limit", &limit);
+            rows.push_str(&fact_row("Issuer", asset_issuer));
             rows.push_str(&fact_row("Source", holder));
             rows.push_str(&fact_row("Memo", &memo.display()));
             rows.push_str(&fact_row(
@@ -1095,8 +1116,8 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
             ));
             rows.push_str(&fact_row("Simulated seq num", &seq_num.to_string()));
             format!(
-                "      <div class=\"d-amount\">{}</div>\n{}{}",
-                escape_value(&asset),
+                "{}{}{}",
+                trustline_headline(asset_code, *limit_stroops == Some(0)),
                 address_block("Account", holder),
                 facts(&rows)
             )
@@ -1730,12 +1751,11 @@ mod tests {
                 "{mode:?}"
             );
             assert!(html.contains(&kind_head_html(&view)), "{mode:?}");
-            let rejectable = mode == ConsentPageMode::Inbox;
+            assert!(html.contains(&render_expiry_html(&view, false)), "{mode:?}");
             assert!(
-                html.contains(&expiry_line_html(&view, rejectable)),
+                !html.contains("After approval, the action must run within"),
                 "{mode:?}"
             );
-            assert_eq!(html.contains("only be rejected"), rejectable, "{mode:?}");
             assert!(html.contains("<dt>Intent digest</dt><dd><code>ab12</code></dd>"));
             assert!(html.contains(r#"id="presence-approve""#));
             assert!(html.contains("Approve with passkey"));
@@ -1803,9 +1823,19 @@ mod tests {
                 "destination": "CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ", "asset": "native", "amount_stroops": "1", "explicit_inclusion_bid_stroops": "100"
             }}}),
         );
-        let html = render_intent_html("nonce", &IntentView::new(&intent));
+        let html = render_mainnet_consent_page(
+            &view,
+            &context,
+            &serde_json::json!({"nonce": view.approval_nonce}),
+            Some("ab12"),
+            Some(&IntentView::new(&intent)),
+            ConsentPageMode::OneShot,
+            &neutral(),
+        );
         assert!(html.contains("Contract payment"));
         assert!(html.contains("<dt>Inclusion bid (stroops)</dt><dd>100</dd>"));
+        assert!(html.contains("<dt>Total fee cap (stroops)</dt><dd>300</dd>"));
+        assert!(!html.contains("Fee cap per operation"));
         assert!(html.contains("CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ"));
     }
 
@@ -1822,6 +1852,56 @@ mod tests {
             "fee_bound_stroops": "300",
             "memo": memo,
         })
+    }
+
+    /// The view carries the resolved bound from either an explicit fee or caps.
+    fn assert_classic_intent_fee_row(bound: &str) {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let dir = TempDir::new().unwrap();
+        let view = payment_view(&dir, false, NOW_MS);
+        let mut base = intent_base(&serde_json::json!("none"));
+        base["fee_bound_stroops"] = serde_json::json!(bound);
+        for payload in [
+            serde_json::json!({"pay": {
+                "destination": "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL",
+                "asset": "native",
+                "amount_stroops": "25000000",
+            }}),
+            serde_json::json!({"trustline": {
+                "issuer": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+                "code": "USDC",
+                "limit_stroops": "100",
+            }}),
+        ] {
+            let intent = intent_of(serde_json::json!({"base": base, "payload": payload}));
+            let html = render_mainnet_consent_page(
+                &view,
+                &test_context(),
+                &serde_json::json!({"nonce": view.approval_nonce}),
+                Some("ab12"),
+                Some(&IntentView::new(&intent)),
+                ConsentPageMode::OneShot,
+                &neutral(),
+            );
+            assert!(html.contains(&format!(
+                "<dt>Fee cap per operation (stroops)</dt><dd>{bound}</dd>"
+            )));
+            assert!(!html.contains("Total fee cap"));
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn classic_intent_page_labels_an_explicit_fee_per_operation() {
+        assert_classic_intent_fee_row("175");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn classic_intent_page_labels_a_fee_cap_per_operation() {
+        assert_classic_intent_fee_row("300");
     }
 
     /// The mainnet consent page of a payment intent to M0 or M17 shows the
@@ -1937,7 +2017,7 @@ mod tests {
             "<dt>Amount (stroops)</dt><dd>25000000</dd>",
             "<small>25000000 stroops</small>",
             "<dt>Memo</dt><dd>text &quot;&lt;b&gt;&amp;&quot;x&quot;</dd>",
-            "<dt>Fee at most (stroops)</dt><dd>300</dd>",
+            "<dt>Fee cap per operation (stroops)</dt><dd>300</dd>",
             "<dt>Policy digest</dt><dd>11111111...11111111</dd>",
             "<dt>Intent digest</dt><dd><code>ab12</code></dd>",
             r#"id="presence-approve""#,
@@ -1947,16 +2027,25 @@ mod tests {
         }
         assert!(html.contains(&kind_head_html(&view)));
         assert!(html.contains(&render_context_header_html(&context)));
-        assert!(html.contains(&expiry_line_html(&view, true)));
+        assert!(html.contains(&render_expiry_html(&view, true)));
         assert!(!html.contains(&render_summary_html(&view)));
         assert!(!html.contains("<b>&"));
         for absent in ["seq num", "Simulated fee", "Sequence"] {
             assert!(!html.contains(absent), "{absent}");
         }
 
-        for (limit, expected) in [
-            ("0", "0 stroops (removes the trustline)"),
-            ("9223372036854775807", "unlimited"),
+        for (limit, expected, headline) in [
+            (
+                "0",
+                "0 stroops (removes the trustline)",
+                "Remove USDC trustline",
+            ),
+            ("100", "100 stroops", "Add or change USDC trustline"),
+            (
+                "9223372036854775807",
+                "unlimited",
+                "Add or change USDC trustline",
+            ),
         ] {
             let html = render(&intent_of(serde_json::json!({
                 "base": intent_base(&serde_json::json!("none")),
@@ -1967,6 +2056,9 @@ mod tests {
                 }},
             })));
             assert!(html.contains("<dt>Kind</dt><dd>Trustline</dd>"));
+            assert!(html.contains(&format!(r#"<div class="d-amount">{headline}</div>"#)));
+            assert!(html.contains(r#"<div class="addr-label">Issuer</div>"#));
+            assert!(html.contains(r#"<div class="addr">GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN</div>"#));
             assert!(html.contains("<dt>Asset code</dt><dd>USDC</dd>"));
             assert!(
                 html.contains(&format!("<dt>Limit</dt><dd>{expected}</dd>")),
@@ -2819,11 +2911,9 @@ mod tests {
         }
     }
 
-    /// The consent surface is not themeable. The decision card — amount,
-    /// destination, facts grid, approve and reject controls, caution line,
-    /// expiry sentence — must render byte-identically no matter what a
-    /// deployment configured, or configuration would be a channel for making
-    /// the page misstate what is being signed.
+    /// The consent surface is not themeable. The decision card, including its
+    /// approval deadline, renders identically under every identity.
+    /// Configuration cannot change what the page says is being signed.
     #[test]
     #[serial_test::serial]
     fn the_transaction_detail_block_is_identical_under_every_identity() {
@@ -3087,10 +3177,8 @@ mod tests {
         assert_eq!(kind_pill(&payment), ("PAYMENT".to_owned(), false));
     }
 
-    /// The sentence around the timestamps is chosen by state. A live request
-    /// says what happens at expiry; one that can no longer be approved must
-    /// not, because the page it sits on offers no approve button — and an
-    /// expired one must not read "expires expired (...)".
+    /// Pending detail pages show the approval deadline.
+    /// Unavailable requests keep their absolute timestamps.
     #[test]
     #[serial_test::serial]
     fn detail_page_expiry_sentence_is_selected_by_state() {
@@ -3108,7 +3196,11 @@ mod tests {
             &neutral(),
         );
         assert!(live.contains(r#"data-expiry-form="remaining""#), "{live}");
-        assert!(live.contains("After that this request can"), "{live}");
+        assert!(live.contains(". Approve by"), "{live}");
+        assert!(
+            !live.contains("After approval, the action must run within"),
+            "{live}"
+        );
 
         let dir = TempDir::new().unwrap();
         let expired = render_detail_page(
@@ -3125,8 +3217,8 @@ mod tests {
             "{expired}"
         );
         assert!(
-            !expired.contains("After that this request can"),
-            "an expired request has no 'after that': {expired}"
+            !expired.contains("After approval, the action must run within"),
+            "an expired request has no execution window: {expired}"
         );
 
         let dir = TempDir::new().unwrap();
@@ -3144,7 +3236,7 @@ mod tests {
             "{attested}"
         );
         assert!(
-            !attested.contains("can\n        only be rejected"),
+            !attested.contains("After approval, the action must run within"),
             "a resolved request offers no actions, so it cannot promise one: {attested}"
         );
 
@@ -3163,9 +3255,164 @@ mod tests {
             "{rejected}"
         );
         assert!(
-            !rejected.contains("only be rejected"),
+            !rejected.contains("After approval, the action must run within"),
             "a rejected request cannot be rejected again: {rejected}"
         );
+    }
+
+    fn consent_expiry_page(view: &PendingApprovalView, renders_intent: bool) -> String {
+        let intent = intent_of(serde_json::json!({
+            "base": intent_base(&serde_json::json!("none")),
+            "payload": {"pay": {
+                "destination": "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL",
+                "asset": "native", "amount_stroops": "25000000",
+            }},
+        }));
+        render_mainnet_consent_page(
+            view,
+            &test_context(),
+            &serde_json::json!({"nonce": view.approval_nonce}),
+            None,
+            renders_intent.then(|| IntentView::new(&intent)).as_ref(),
+            ConsentPageMode::OneShot,
+            &neutral(),
+        )
+    }
+
+    fn assert_execution_window(lifetime_ms: u64, window: &str) {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let dir = TempDir::new().unwrap();
+        let mut view = payment_view(&dir, false, NOW_MS);
+        view.created_at_unix_ms = NOW_MS;
+        view.expires_at_unix_ms = NOW_MS + lifetime_ms;
+        let html = consent_expiry_page(&view, true);
+        assert!(html.contains(&format!(
+            r#"data-created-ms="{NOW_MS}" data-expires-ms="{}""#,
+            NOW_MS + lifetime_ms
+        )));
+        assert!(html.contains(". Approve by"));
+        assert!(!html.contains("data-execution-minutes"));
+        assert!(
+            html.contains(&format!(
+                "After approval, the action must run within {window}."
+            )),
+            "{html}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn day_entry_has_fifteen_minute_execution_window() {
+        assert_execution_window(86_400_000, "15 minutes");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn short_entry_has_ten_minute_execution_window() {
+        assert_execution_window(600_000, "10 minutes");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn execution_window_preserves_partial_minutes() {
+        assert_execution_window(100_000, "1 minute 40 seconds");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn execution_window_formats_seconds_and_singular_units() {
+        for (lifetime, window) in [
+            (45_000, "45 seconds"),
+            (60_000, "1 minute"),
+            (1_000, "1 second"),
+            (61_000, "1 minute 1 second"),
+            (121_999, "2 minutes 1 second"),
+        ] {
+            assert_execution_window(lifetime, window);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn consent_without_intent_has_no_execution_window() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let dir = TempDir::new().unwrap();
+        let html = consent_expiry_page(&payment_view(&dir, false, NOW_MS), false);
+        assert!(html.contains(". Approve by"));
+        assert!(!html.contains("After approval, the action must run within"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn unavailable_intent_has_no_execution_window() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let dir = TempDir::new().unwrap();
+        let mut view = payment_view(&dir, false, NOW_MS);
+        view.expired = true;
+        assert!(
+            !consent_expiry_page(&view, true)
+                .contains("After approval, the action must run within")
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn execution_window_saturates_reversed_timestamps() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let dir = TempDir::new().unwrap();
+        let mut view = payment_view(&dir, false, NOW_MS);
+        view.created_at_unix_ms = view.expires_at_unix_ms + 1;
+        assert!(
+            consent_expiry_page(&view, true)
+                .contains("After approval, the action must run within 0 seconds.")
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn trustline_headline_escapes_asset_code() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let dir = TempDir::new().unwrap();
+        let mut view = trustline_view(&dir);
+        let ApprovalSummaryView::Trustline { asset_code, .. } = &mut view.summary else {
+            panic!("trustline fixture");
+        };
+        *asset_code = "<USD>\u{202e}".into();
+        for html in [
+            render_detail_page(
+                &view,
+                &test_context(),
+                "csrf",
+                "activity",
+                None,
+                None,
+                &neutral(),
+            ),
+            render_mainnet_consent_page(
+                &view,
+                &test_context(),
+                &serde_json::json!({}),
+                None,
+                None,
+                ConsentPageMode::OneShot,
+                &neutral(),
+            ),
+        ] {
+            assert!(html.contains(
+                "<div class=\"d-amount\">Add or change &lt;USD&gt;\\u{202e} trustline</div>"
+            ));
+            assert!(!html.contains("<USD>"));
+        }
     }
 
     /// The nonce is what the operator matches against the CLI and the audit
@@ -3454,10 +3701,18 @@ mod tests {
             stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
         let dir = TempDir::new().unwrap();
         let mut view = trustline_view(&dir);
-        for (limit, shown) in [
-            (None, "unlimited"),
-            (Some(0), "0 stroops (removes the trustline)"),
-            (Some(9_007_199_254_740_993), "9007199254740993 stroops"),
+        for (limit, shown, headline) in [
+            (None, "unlimited", "Add or change USDC trustline"),
+            (
+                Some(0),
+                "0 stroops (removes the trustline)",
+                "Remove USDC trustline",
+            ),
+            (
+                Some(9_007_199_254_740_993),
+                "9007199254740993 stroops",
+                "Add or change USDC trustline",
+            ),
         ] {
             if let ApprovalSummaryView::Trustline { limit_stroops, .. } = &mut view.summary {
                 *limit_stroops = limit;
@@ -3474,7 +3729,8 @@ mod tests {
             for text in [
                 "TRUSTLINE",
                 ">Approve trustline</button>",
-                "USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+                &format!(r#"<div class="d-amount">{headline}</div>"#),
+                &format!("<dt>Issuer</dt><dd>{USDC_ISSUER_G}</dd>"),
                 &format!(r#"<div class="addr">{SOURCE_G}</div>"#),
                 shown,
                 &format!("<dt>Source</dt><dd>{SOURCE_G}</dd>"),

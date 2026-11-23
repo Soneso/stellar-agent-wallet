@@ -361,7 +361,7 @@ async fn canonical_routes_share_stored_intent_and_recover() {
                 let (status, html) = page_text(h.send(None, json!({})).await).await;
                 assert_eq!(status, StatusCode::OK, "canonical page: {html}");
                 assert!(
-                    html.contains("<dt>Fee at most (stroops)</dt><dd>500</dd>"),
+                    html.contains("<dt>Fee cap per operation (stroops)</dt><dd>500</dd>"),
                     "canonical fee bound"
                 );
                 assert!(!html.contains("Simulated seq num"), "no ephemeral sequence");

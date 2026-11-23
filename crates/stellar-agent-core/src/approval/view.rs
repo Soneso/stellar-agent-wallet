@@ -549,7 +549,10 @@ impl IntentView {
         &self.memo
     }
 
-    /// The fee bound, in stroops.
+    /// The fee bound in stroops: a per-operation bound for classic intents,
+    /// or the total fee cap for a contract payment intent.
+    /// A classic bound is the explicit per-operation fee when chosen,
+    /// otherwise the tighter of the profile cap and the signed policy cap.
     #[must_use]
     pub fn fee_at_most_stroops(&self) -> u32 {
         self.fee_at_most_stroops
