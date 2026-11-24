@@ -201,23 +201,18 @@ the signed file to `stellar-agent-mcp` with `derive-alias.sh`, notarizes both,
 verifies both signatures, and packs the archive through the composite action
 in `.github/actions/macos-sign-notarize/`.
 
-The Windows build leg links libsodium from `libsodium-1.0.22-stable-msvc.zip`,
-and `.github/scripts/release/sodium.sh` pins its SHA-256 in
-`SODIUM_MSVC_SHA256`. Upstream replaces that stable archive in place when the
-stable branch moves, and the Windows build then fails at the sodium step. The
-failure message prints the expected and the actual SHA-256. To update the
-pin, download the archive and its `.minisig` from the URL that `sodium.sh`
-uses, verify the signature with the key that `libsodium-sys-stable` embeds in
-its build script, and set `SODIUM_MSVC_SHA256` to the archive's digest. A
-`libsodium-sys-stable` update that changes the libsodium version changes the
-file names and the pin together.
+The Windows build leg links libsodium from `libsodium-1.0.22-stable-msvc.zip`.
+The build script of `libsodium-sys-stable` verifies it with the minisign key
+embedded in that pinned dependency and fails the build on an invalid signature.
+Upstream replaces stable archives in place, so
+`.github/scripts/release/sodium.sh` logs the fetched archive's SHA-256 and
+pins no digest. An update of `libsodium-sys-stable` that changes the libsodium
+version changes the file names in `sodium.sh`, and one that changes the
+minisign key changes the key in the command below.
+Verify a downloaded archive by hand with:
 
 ```sh
-base=https://download.libsodium.org/libsodium/releases
-curl --fail --location --remote-name "$base/libsodium-1.0.22-stable-msvc.zip"
-curl --fail --location --remote-name "$base/libsodium-1.0.22-stable-msvc.zip.minisig"
 minisign -Vm libsodium-1.0.22-stable-msvc.zip -P RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3
-sha256sum libsodium-1.0.22-stable-msvc.zip
 ```
 
 ## GitHub settings
