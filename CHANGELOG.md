@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0-alpha.1] - 2026-11-24
+
+An agent can move funds on mainnet through the CLI and MCP server under an owner-signed policy, with passkey approval above policy thresholds. The CLI and MCP server ship as one `stellar-agent` executable.
+
+Contributions by @agenticsymphony-tech (#542), @aolieman (#544), @himanchalkaushale (#531, #546), @huong8373tt-beep (#532), @jiangyuer018 (#577), @painbaba (#609, #610), @pennyops (#566, #569, #574, #576, #579, #580, #581, #584, #586, #587, #589), @PrathaMesh3056 (#607, #616, #617) and @Vamsi-2581 (#530).
+
 ### Added
 
 - `presets::classify_recipient` classifies G, M, C, and W payment destinations.
@@ -327,6 +333,280 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refuses a malformed share before the first build. The `Testnet acceptance`
   workflow runs the suites in two chained jobs, one share each, within
   GitHub's six-hour job limit.
+- Add a non-consuming core approval inspection API for retained HMAC and
+  WebAuthn consent, with compare-only policy loading and safe error mapping
+  for opening the approval inbox.
+- `approve status` and `stellar_approval_status` inspect retained approval
+  state and consent without consuming approvals or granting retry authority.
+- `approve --id` commits consent for an existing mainnet value approval record
+  before reporting success. A queued consent row keeps its outbox reference in
+  the durable record. A retry recovers missing consent from the stored receipt.
+  It then returns `approval.already_attested`. A revoked, consumed, or expired
+  record, or one that does not match the inbox entry, refuses with its approval
+  code before presence and before recovery. These refusals write nothing.
+- Authenticated recovery run records provide bounded reading, exposure validation, contextual classification, and pure scheduling views.
+  Run objects select a dedicated wire version, which remains after compaction. Builds supporting only version 12 refuse these files.
+  The maximum operation size changes from 184,365 to 192,685 bytes. Admission headroom changes the file threshold from 1,179,648 to 1,048,576 bytes.
+  The threshold also applies to existing version-12 files. Eligible pruning frees capacity; protected authorizations retain their records.
+  Public `recover_outcomes` writes run records; production dispatch and status continue to use the legacy driver.
+  The driver retains its request, selection, timeout, and settlement behavior and preserves run bytes on every commit.
+  Views grant no proof, debit release, successor permission, or retry command.
+  `stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge` records an accounting acknowledgement.
+  Untimed holds also require `--acknowledge-unbounded`; neither acknowledgement proves a chain outcome or permits a successor.
+- Add authenticated submission progress to library transaction status. It
+  separates ordinary evidence recovery, checked receipt projection and
+  predecessor eligibility for a suitably authorized successor. Admission
+  revalidates the prospective authorization, policy and envelope.
+- Keep failed current receipt repair visible as pending even after its
+  decision was acknowledged, without changing successor permission. A later
+  successful repair clears display pending. CLI and MCP payloads stay unchanged.
+- `transaction_effects` values the SEP-41 calls `transfer`, `transfer_from`, `approve`, `burn` and `burn_from` that a transaction signature authorizes for the source account. Other authorized contract functions are reported as unvalued. An operation that holds both is reported once as unvalued with its valued legs. Every leg names its token contract. A transaction with a payment leg and a text memo that is not UTF-8 returns `UnreadableMemo`.
+- Public `recover_outcomes` filters runnable attempts and writes owned run reservations, stops, and resolved decisions.
+  A call can commit matched expiry evidence and a checked account decision together.
+  The public API adds `RecoveryAttemptResult` and `RecoveryReport::attempts`; `RecoveryError` and `RecoveryReport` are `#[non_exhaustive]`, and `RecoveryReport` is no longer `Copy`.
+  Recovery uses a read-only identity and health prefix, up to four shared requests and six requests per timed attempt.
+  One 20-second network deadline covers up to four reached attempts; each spends one of sixteen reservations.
+  Failed prefixes leave attempts unchanged and can repeat without a durable throttle or a reservation charge.
+  Prefix invocations are outside the spent-run cap and its associated cost totals.
+  Successful partial evidence remains authenticated but cannot complete a paired proof.
+  Production dispatch, sequence recovery, and status retain their existing behavior and do not call this driver.
+  Status still makes its separate diagnostic lookup; these recovery budgets do not bound status.
+  A diagnostic failure can mask an earlier recovery result; structured CLI and MCP reporting remains deferred.
+  Receipt replacement and acknowledgement remain separate from the checked accounting decision.
+  `stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge` records an accounting acknowledgement.
+  Untimed holds also require `--acknowledge-unbounded`; neither acknowledgement proves an outcome or permits a successor.
+  No chain-proof command or retry flag resolves high account sequences, exhausted runs, or unusable records.
+  Frozen targets and production activation remain separate deliveries.
+- The acceptance runner gives the two approval browser suites a test certificate authority that only their Chromium trusts.
+  Before each attempt it generates the authority and a leaf, installs the authority into fresh NSS databases below `target/tmp`, and fails the suite before cargo when setup fails.
+  Each suite carries trust controls: a page served with a leaf the authority issued loads, and a signed listener with another authority's leaf never loads.
+  The consent control stores nothing, and the enrollment control stages no registration.
+  The operator-enroll suite enrolls a credential at the signed origin in Chromium and exports it only after the terminal confirmation of the displayed code.
+  The consent suite consents at the signed origin through the approval link, and checks that an assertion from another origin, a page of another RP, and the local inbox under the signed policy cannot consent.
+  The browser keeps certificate errors fatal; no host trust store or keychain changes, and the HTTPS cases run on Linux only.
+  The testnet workflow installs `libnss3-tools` for `certutil`.
+  `stellar-agent-approval-remote` gains a default-off `mainnet-write` feature that forwards to the core, network and MCP crates, so `MAINNET_WRITE=on` reaches its suites.
+- Add a budget projection to the network library. It reads one verified
+  window generation under the shared lock. It writes no policy, budget,
+  approval, or audit state. It reports each rule's limits with the used,
+  reserved, and remaining amounts of each accumulating limit, or why it has
+  none. It also reports every authorization's native obligation at the
+  stored observation. A missing or unreadable committed file, or an
+  unreadable generation counter, refuses with a typed error. The
+  transaction, period, total, and unlisted budget criteria describe their
+  amount limits.
+- Connect stored canonical intent to CLI and browser consent, including claim
+  value, fee bounds, V6 verification and durable recovery. Preserve signed clocks
+  and audit provenance without changing the store wire version or activating
+  canonical transaction producers.
+- Add canonical intent rebuild helpers for classic mainnet operations.
+  `canonical_slot_intent` validates a stored canonical intent against its digest and the current chain, source, and policy.
+  `match_envelope` checks a rebuilt envelope's shape, source, fee, and deadline, and requires the intent rebuilt from its memo and operation to hash to the stored digest.
+  `rebuild_canonical` builds a fresh envelope after the readiness check, the account read, and the fee selection, and binds a new oracle proof to it.
+  `require_intent_claim` checks a fresh claimable balance against the intent and its first matching claimant.
+  No command or tool uses these helpers yet.
+- Add explicit composition of one payment's policy holds. It keeps each
+  accounting key and epoch once, with the tighter compatible limit. Payment
+  handlers supply one evaluation, so their accounting is unchanged.
+- Operation recorders collect each state edge whose generation commit returns success as a `CommittedTransition` in a `CommittedBatch`.
+  `OperationRecorder`, `ApprovalRecorder`, `WalletSubmissionRecorder`, and `StageMarkedRecorder` expose `take_committed`, which drains the batch once.
+  An exposure, pure evidence, a refused step, a replay, or a commit that returns an error adds no entry.
+  Edges committed before a later refusal in the same call stay in the batch.
+  `begin_classic_attempt_committed`, `end_operation_attempt_committed`, `reconcile_pass_committed`, `reconcile_legacy_pass_committed`, and `transaction_status_committed` append their commits to a caller's batch.
+  The existing functions keep their signatures, results, and request order.
+  `OperationStatus::watch_classes` classifies the operations `list_since` selects as settled, needing attention, or pending, from one verified read.
+- Consent records carry authenticated delivery metadata, and consumers check exact queued delivery and evidence time. Production kinds remain unenforced until their integration prerequisites hold.
+- `approve --id` reports a queued approval success with `audit_code: audit.outbox_queued`; a directly written success omits the field.
+- Mainnet confirmation and `approve --id` record consent through the attesters that return a delivery reference, so a direct consent needs a current audit tip anchor and a queued consent requests delivery evidence.
+- Rotate the audit key of initialized consent evidence while preserving its records and time floor, with fenced recovery after interruption.
+- Authenticated storage for consent delivery evidence. Two fixed evidence files
+  beside the audit outbox hold a tagged snapshot that a version 2 owner value
+  commits. Initialization turns earlier recent digests into migration pins. A
+  restored older owner entry recommits the newest authenticated snapshot, and
+  two distinct newest snapshots refuse with `owner rollback`. Every evidence
+  refusal uses the code `audit.outbox_evidence_unusable` with a fixed reason.
+  Existing profiles keep their version 1 owner value until initialization.
+- Retain consent evidence throughout each approval's permitted lifetime, with a 4,096-slot admission cap and `approval.evidence_capacity` for new requests.
+- Defer consent batches when evidence reports owner rollback, while unrelated payments continue. Anchored delivery and explicit lifecycle clocks preserve existing grants through publication retries.
+- Adopt a migration pin as Delivered consent evidence of a caller-verified queue reference, with exact retries and `missing migration pin` for an absent proof.
+- Authenticate consent evidence during carrier binding and `audit verify`. A binding commits a newer source image before staging it, and verification refuses a pending image with `owner recommit required` without repairing it.
+- Add the consent admission and publication foundation for mainnet approvals.
+  A strict mainnet consent other than a clawback opt-in stores an
+  authenticated sink handoff with its inbox attestation.
+  `record_consent_with_delivery` commits the verified sink and exact queued
+  reference. Admission reserves evidence for the committed pending record and
+  refuses while no owner-scope inventory exists. No approval kind enables
+  delivery enforcement.
+- Refuse payments to C contract recipients on every payment surface with
+  `validation.contract_payment_unavailable`, or
+  `validation.contract_payment_memo_unsupported` with a text, id, hash, or
+  return memo. MCP preparation and commit, both toolset payment actions, CLI
+  full and build-only payments, and the mainnet CLI refuse before any
+  request, approval, nonce, or signing. On mainnet the mode, feature,
+  admission, and freshness refusals come first.
+- Refuse an envelope holding one contract transfer on CLI `--sign-only` and
+  `--submit-only`, MCP and toolset commit, the paired commit evaluation, and
+  the mainnet resolver. It refuses with `validation.contract_payment_invalid`
+  without a valid asset. Otherwise it refuses with
+  `validation.contract_payment_memo_unsupported` when it carries a memo,
+  `validation.contract_payment_unavailable` once proven for the asset, and
+  `validation.contract_payment_invalid` when not proven. The paired evaluation has no asset, so it always answers
+  `validation.contract_payment_invalid`. Such a transfer never signs under
+  the opaque-signing posture. SEP-43 transaction tools keep their own policy
+  decision.
+- Add a signed total transaction fee cap for contract transfers to policy versions 1 and 2. Presets and mainnet enablement insert 1,000,000 stroops when absent and preserve explicit zero. Shared lookup and checking APIs use verified policy metadata, preserve full u64 totals, and report cap provenance. The resource-fee criterion remains unknown; contract payment execution remains unavailable.
+- `stellar_agent_core::policy::transaction_effects` decodes a caller-supplied
+  transaction into the operations a payment rule decides, the effects the
+  wallet cannot value, and the fee the wallet account pays.
+  An account merge and a signer, weight or threshold change refuse.
+  A negative operation amount refuses the whole transaction before valuation.
+  The refusal identifies the operation index, kind, and field.
+- A mainnet CLI value command under an approval rule opens a durable approval
+  record before the passkey ceremony and commits its consent before the
+  witness returns. A rerun of the same operation reuses the record's entry,
+  completes an attested entry's consent without a second ceremony, and removes
+  the unattested entries of the same envelope that a crash left before the
+  record opened. A presence refusal keeps the entry and the record until the
+  waiting expiry. The open stores the prepare decision and ends the
+  operation's waiting window at the earlier of the signed waiting expiry and
+  the envelope's end. A new consent payload keeps a queued row's outbox
+  reference, or names its row `written` or `recovered`.
+- Add read-only durable approval facts and envelope and intent verification APIs.
+  Retain intent challenge subjects and distinguish revoked approval records.
+  Callers constructing `ConsentPayload` set `challenge_subject` to `None`;
+  `record_consent` fills the verified intent value.
+- A mainnet payment, claim, trustline, or x402 approval through `approve serve`,
+  on the loopback inbox or at the signed origin, commits its consent to the
+  durable approval record before the attestation response. A failed commit
+  answers unavailable and keeps the attested entry. A repeated approve, an
+  assertion retry, or the stored attestation page then completes the consent
+  from the stored receipt without a second row. An entry without a record
+  keeps its inbox path.
+- Open durable approval records for MCP create-account, trustline and claim
+  preparations. Retries reuse the linked approval, and consent completes its
+  record before a mainnet commit uses it.
+- Open durable approval records for MCP payment preparations. A retry recovers
+  the retained payment approval and its nonce, and an interrupted preparation
+  keeps its entry for that retry.
+- Add offline contract payment intents, contextual decoding, and approval
+  records with verified summaries and active-network binding. Approval views
+  show full contract recipients and fee components; payment audit records
+  retain redacted recipients and full-destination hashes. Payment execution
+  routes retain their current admission rules.
+- Add offline verification of classic-asset contract payments, with validated
+  context, closed refusal codes, forward footprint and atomic restoration checks,
+  and a single supplied total fee bound. The API grants no signing or execution
+  authority and changes no CLI or MCP payment admission.
+- Select a transaction status by business id. `stellar-agent tx status`
+  takes `--business-id` beside an optional hash, and `stellar_transaction_status`
+  takes `business_id` beside an optional `tx_hash`. On mainnet both must name
+  the same operation, and an unknown business id refuses with
+  `operation.unknown`; neither selector refuses with `validation.usage_error`.
+  A business id without an exposed hash reads no network. On testnet the id is
+  checked and echoed.
+- Report the stored mainnet operation as `operation`: its state, attempts
+  with their exposed identity, last transition, bucket hold, awaiting approval
+  and result, from one authenticated read. It is `null` for an unrecorded hash
+  and on testnet, and it carries no amounts, next action or recovery outcome.
+- `stellar_agent_core::payment_accounts::PaymentAccount` parses the canonical,
+  checksum-valid G account or M address of a classic payment. An M address
+  keeps its complete text and ID, including ID zero. C, W, bad checksums,
+  whitespace, and other spellings refuse with `validation.address_invalid`.
+- Core `sign-payment` first-invoke grants accept G and M destinations. A G
+  grant covers its account and every M address of that account. An M grant
+  covers only its complete address. The attestation binds the stored
+  destination bytes exactly, and `sign-rule-create` keeps its C destination.
+- Payment summaries and `sign-payment` grants validate the destination at
+  construction, deserialization, and store insertion. Existing checksum-valid
+  G records load without changing their destination or attestation bytes.
+- A stored grant or pending entry whose destination fails the canonical
+  check loads and lives as an ordinary record: it is listed, found,
+  rejected, revoked, expired, and counted like any other. A grant matches
+  nothing. Approval, consumption before a send, and commit return
+  `approval.entry_inconsistent`. Rejection, revocation, and the receipt
+  repair after a send read no destination.
+- `ApprovalSummaryView::ToolsetFirstInvokeGate` adds `destination`, the
+  complete validated destination, and keeps `destination_redacted`.
+- `ValueLegRecord::from_payment_leg` adds `destination_sha256`, the lowercase
+  hexadecimal SHA-256 of the complete payment destination. The generic
+  conversion adds no hash. Rows without the field read, serialize, and verify
+  unchanged.
+- These core interfaces do not change which destinations the CLI and MCP
+  payment paths admit.
+- CLI pay results, MCP payment commits, and retries of a retained payment show the complete destination, including the full muxed ID, and list each payment operation's destination when they differ. Toolset consent shows the complete destination for G and M accounts. A payment preparation refuses with the read error when the destination account cannot be read.
+- `profile policy add-counterparty --profile <NAME> --recipient <ADDRESS>`
+  adds one G, M, C, or W recipient to the target payment rules, and
+  `--tool` narrows the selection. It previews the edited body on stderr with
+  `edit_scope` before the authoring guard, the prompt, and any write.
+  On an unsigned draft it edits the body, signs nothing, and names
+  `profile sign-policy` as the next step.
+  On a signed body it rechecks the file, the profile, and the pin under the
+  guard and again after a hidden seed prompt, then signs the change with the
+  next sequence. It compares the pin and replaces the file under the
+  policy-state lock.
+  A W recipient carries a note that the entry takes effect when the wallet
+  pays W destinations. New codes: `profile.policy_changed_during_edit`,
+  `profile.policy_owner_prompt_required`, `profile.policy_owner_rotation_pending`,
+  and `profile.policy_version_required`.
+- Queued consent APIs return durable row references for delivery evidence.
+  Mainnet consent through `attest_and_persist_with_row` or
+  `attest_mainnet_confirmation_with_row` requires a keyed outbox, or a direct
+  writer whose configured tip anchor can be made current. A direct writer
+  without an anchor store completes after row durability. Non-mainnet
+  `attest_and_persist_with_row` accepts unkeyed queues and uses best-effort direct anchoring.
+  Existing `attest_and_persist` and `attest_mainnet_confirmation` callers observe
+  no change in results or written rows, retaining unkeyed queue acceptance and
+  best-effort direct anchoring. Their queue writes use ordinary append with
+  marker `r=0`; only reference-returning entries request delivery evidence with `r=1`.
+- Mainnet dispatch reconciliation and transaction status now free native holds
+  that both recovery endpoints prove due: expired x402 signatures and terminal
+  classic transactions whose `maxTime` both latest closes passed. Each release
+  uses the smaller paired ledger and close time and commits its release row
+  atomically; live x402 expiry also records its transition audit row. Stores
+  with only such obligations read one identity and health prefix, and the
+  releases take no classic recovery slot. Untimed holds still need
+  `tx receipt clear --acknowledge --acknowledge-unbounded`.
+- `OperationStatus::release_candidates` lists the authenticated release
+  obligations before their proof, optionally for one transaction hash.
+- Transaction status reports `recovery` results for managed mainnet attempts in
+  both the CLI and MCP output. The new default-off `--retry-recovery` flag and
+  `retry_recovery` argument start one bounded evidence run for a stopped
+  attempt, also after its runs are exhausted. That run never resubmits.
+- Add a restricted classic payment authorization for a live toolset grant. It
+  binds the checked grant, installation, and exact invocation, evaluates the
+  routed and toolset rules in one private policy frame, expires no later than
+  the grant, and holds the grant's lease until the authorization drops or,
+  once submission starts, until submission returns.
+  Composition of one payment's holds pairs each accounting key and epoch
+  across the two evaluations only, so each evaluation keeps its repeated
+  criteria and a shared key takes the larger count and the tighter compatible
+  limit. The mainnet toolset payment commit supplies this restriction.
+  On mainnet, toolset signing admits only the exact `stellar_pay` and
+  `stellar_pay_commit` actions.
+- Add an optional toolset context to the shared payment commit handler. With
+  it, the routed and the toolset's outer policy rule both govern the payment:
+  either approval requirement applies, the earlier end bounds the approval,
+  and an outer denial refuses. Off mainnet, a required approval is queued with
+  that interval before any nonce use or send. On mainnet, a required approval
+  is queued through the durable approval record of the prepared operation,
+  before any nonce use or send. The verified grant stays leased from before
+  nonce verification until submission returns. Public toolset payments
+  require approval only when the composed policies require it. On mainnet,
+  toolset signing admits only the exact `stellar_pay` and `stellar_pay_commit`
+  actions.
+- The codes `policy.total_epoch_unavailable` and `policy.total_epoch_stale`
+  refuse total-budget accounting without a readable, matching policy pin.
+  CLI, MCP, MPP, x402, and mainnet authorization paths report them, and
+  `policy.total_epoch_retired`, under their own codes.
+- Smart-account signing admits total-budget legs under the pinned policy. Unexposed cancellation releases them; witnessed closure retains their charge.
+- `profile enable-mainnet --check` reports authenticated total-budget use and remaining amounts without changing wallet state.
+- `stellar_sep43_sign_transaction` and `stellar_sep43_sign_and_submit_transaction` accept `approval_nonce` and `approval_attestation`. A single payment, path payment, account creation or trustline change that needs approval returns a pending approval and signs on the attested repeat.
+- A sign-only signature under approval consumes the approval before the signature is returned. Its `opaque_payload_signed` row records `require_approval`.
+- A transaction of another shape that needs approval keeps `policy.approval_required_unsupported`.
+- `stellar_x402_create_payment` and `stellar_x402_authenticated_payment` queue a payment for owner approval on testnet when the policy requires approval.
+  The repeated call with the approval proof pays once.
+- `stellar_agent_x402::exact::create_payment_with_pre_sign` runs a caller check immediately before the payer signs.
+- `KeyringSignHandle::sign_soroban_address_auth_payload_checked` runs a caller check after the payer-key read, immediately before signing.
 
 ### Changed
 
@@ -1085,6 +1365,435 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with an unreachable secondary RPC refuses with
   `smart_account.ledger_witness_unavailable`, and one simulated above the
   witnessed pair refuses with `simulation.divergence.ledger_skew`.
+- `audit acknowledge-outbox-loss` acknowledges a loss of a keyed audit outbox
+  under owner state. Without a loss it refuses with
+  `audit.outbox_loss_not_found` before any write.
+- `stellar_sep43_sign_auth_entry` decides each `transfer`, `transfer_from`, `approve`, `burn` and `burn_from` the signing account authorizes in the entry's invocation tree under the `stellar_pay_commit` rule, with the contract asset, the exact quantity and the recipient. A transfer that rule refuses is not signed.
+- The tool admits those payments and its own rule's count to the policy windows before it loads the signer. A signer or signing failure keeps them, and each call charges again.
+- A call in the tree the wallet cannot value needs `allow_opaque_signing = true` on the tool's rule. An approval requirement refuses with `policy.approval_required_unsupported`, and a profile signer that is not a G-strkey refuses with `policy.engine_required`.
+- The preimage passes the SEP-43 input checks before any account read, and its `opaque_payload_signed` row carries the allowed payment legs.
+- `stellar_agent_sep43::signing::validate_soroban_auth_entry` runs the `signAuthEntry` input checks without a signer.
+- Bind canonical transaction authorizations to their stored intent, exact envelope, operation, and previous attempt.
+  Reread claimable balances during canonical resolution.
+  Refuse a canonical intent prepared under a different signed policy.
+  Keep consented intent operations resumable through their execution window after the waiting window closes.
+  Persist optional authorization lineage under store wire version 17, retaining compatibility with legacy records.
+  Canonical slot creation remains internal; command and tool preparation continues to use envelope slots.
+- Stage canonical classic preparations with full intent bindings and retained
+  audit decisions. Validate authenticated intent handoff, preserve legacy
+  envelope behavior, and distinguish claim reread outages from intent changes.
+- Contributors add changelog entries in separate files under `changelog.d/`.
+  Release preparation folds these entries into the released section.
+- Native balance criteria count the current network's native asset contract and
+  use checked debit and fee arithmetic. The policy engine refuses negative or
+  malformed native facts with `AccountingInvalid` and overflow with
+  `AccountingOverflow`; the CLI and MCP server surface both as
+  `policy.engine_required`.
+- Every classic prepare in the MCP server (pay, claim, create account,
+  trustline) selects the fee and runs the fee-cap check before policy
+  evaluation, so a request that policy would deny can return a fee-cap or
+  network refusal first.
+- The durable store exposes a strict native reservation projection and rechecks
+  checked floor facts under its mint lock. Missing legacy amounts and ambiguous
+  Soroban zeros refuse floor use while lifecycle and recovery remain available.
+  Public payment paths still refuse configured floors until observed reads and
+  retained-history coverage are supplied. No stored format or migration changes.
+- The CLI verbs `pay`, `claim`, `trustline` and sponsored `accounts create`
+  on mainnet now prepare a canonical record: the lasting intent, the policy
+  decision and the envelope built at preparation. The confirmation shows the
+  intent. After it the verb rebuilds the envelope with the account's current
+  sequence, the fee the `--fee` choice gives now, a new deadline at the
+  earlier of 120 seconds and the last second before the end of the
+  approval's execution window or the policy decision's authority, and a
+  fresh oracle check, then mints the authorization inside the attempt's
+  begin. A slow confirmation no longer refuses with `deadline_elapsed`, and
+  a refused begin leaves no authorization.
+- A business id whose record holds an exact envelope keeps that envelope: the
+  verb signs the stored transaction and never rebuilds it.
+- A rebuilt claim whose balance no longer matches the stored intent refuses
+  with `simulation.divergence` before any signature.
+- After a canonical send the inbox approval stays unconsumed until the
+  operation ends or its execution window passes; `tx status` then records the
+  consumption.
+- A published consent of a canonical record, on `approve --id` and at the
+  confirmation, now completes as a consent to the stored intent.
+- `approve list` puts `Consumed` and `Rejected` tombstones in `resolved`, with the same entry shape and `kind_name` distinction. `pending` holds only non-tombstones; table output groups tombstones under `Resolved`.
+- CLI `balances` and MCP `stellar_balances` report `asset_type` as `native`, `credit_alphanum4`, or `credit_alphanum12`. Credit assets carry `code` beside `issuer`.
+- Recovery releases held funds when two endpoints confirm a transaction was
+  never included across its full validity window. It checks the transaction
+  again after saving the completed ledger scan. Accounts missing from both
+  endpoints can use this recovery path.
+- Mainnet claim and trustline approvals now enforce consent delivery
+  evidence. A request reserves its evidence slot before it is shown, and
+  its consent records delivery facts. A commit refuses consent without
+  exact delivery. A live claim or trustline grant without delivery facts
+  blocks new requests of every enforced kind in its scope until it ends or
+  is revoked. A request pending from before the upgrade whose scope holds
+  no consent evidence refuses approval with `audit.outbox_evidence_unusable`
+  and the reason `consent evidence not initialized`, and must be prepared
+  again. A scope whose evidence holds a migration pin that no live grant
+  adopts refuses every request, a fresh one included, with the reason
+  `unresolved migration pin`.
+- A CLI confirmation of a canonical intent request of an enforced kind
+  compares the approval with the intent digest its entry binds, and
+  completes its consent through the intent verifier.
+- Add capability-gated CLI consent admission and authenticated publication,
+  preserving exact queued references and same-grant recovery. Production
+  capabilities remain disabled pending complete route and lifecycle integration.
+- The wallet releases consent evidence only after an authenticated revocation
+  or the final termination of its operation. Integrated admission, recovery,
+  and CLI revocation retry the release. Every Approval mint, claim,
+  consumption, and signing expiry check of an enforced kind uses the fresh
+  persistent evidence floor. The production capabilities stay disabled.
+- Add capability-gated consent admission and authenticated publication to both
+  approval inbox listeners. Every inbox response shows a value attestation only
+  after its verified direct delivery commits. Production capabilities remain
+  disabled.
+- Mainnet payment and account creation approvals now enforce consent
+  delivery evidence. A request reserves its evidence slot before it is
+  shown, and its consent records delivery facts. A commit refuses consent
+  without exact delivery. A live payment grant without delivery facts
+  blocks new requests of every enforced kind in its scope until it ends or
+  is revoked.
+  A payment or account creation request pending from before the upgrade
+  refuses approval with `audit.outbox_evidence_unusable` and the reason
+  `unresolved migration pin`, or `consent evidence not initialized` when
+  the scope holds no consent evidence. In that second case a new request
+  initializes the evidence, so the payment must be requested again.
+- A testnet `trade` or `vault` refusal that requires approval names only
+  the approval requirement. It no longer points to the MCP server, which
+  has no approval path for either verb.
+- Integrated consent admission proves its owner scope ready from stored
+  state. It refuses while a sibling profile shares the scope's audit
+  coordinates, a profile file or the profiles directory cannot be read, or
+  the verified window holds a live consent of an enforced kind without
+  delivery facts. A migration pin that matches a live grant's queued
+  reference is adopted; any other pin keeps refusing. The production
+  capabilities stay disabled.
+- Mainnet x402 payment approvals now enforce consent delivery evidence, for
+  both the plain and the authenticated x402 tools. A request reserves its
+  evidence slot before it returns the approval, and a payment call refuses
+  consent without exact delivery before it mints the Soroban intent. A live
+  x402 grant without delivery facts blocks new requests of every enforced
+  kind in its scope until it ends or is revoked. An x402 request pending
+  from before the upgrade refuses approval with
+  `audit.outbox_evidence_unusable` and the reason `unresolved migration pin`,
+  or `consent evidence not initialized` when the scope holds no consent
+  evidence. With this change, all four approval kinds enforce consent
+  delivery evidence: payment, which covers account creation, claim,
+  trustline, and x402 payment.
+- A pull request into `mainnet-write` that changes only documentation skips
+  the `ci.yml` build and test jobs. The new `changes` job decides with
+  `.github/scripts/classify-docs-only.py`, which prints `docs_only=false`
+  for every other event, base, or path, and after any error.
+- On such a pull request the new `docs-tests` job runs the tests that read a
+  documentation path, in both feature states, and checks every listed package
+  with `cargo check --all-targets`. The registry `.github/docs-tests.tsv`
+  lists the tests, and `.github/scripts/check-docs-reads.py` fails on a
+  documentation read that the registry does not cover.
+- Documentation now describes the version 2 policy additions as the loader
+  and evaluator enforce them. The skill policy reference covers unlisted
+  recipient modes, total budgets, balance floors, and memo bindings. The
+  profile guides state that each `profile sign-policy` starts a new total
+  allocation and that `profile reset-window-state` keeps total-budget usage.
+  They state that a matched balance floor refuses a payment with
+  `account.unread` on the shipped CLI and MCP payment paths. Memo bindings are
+  documented beside SEP-29, and the skill troubleshooting reference lists the
+  six refusal codes of the version 2 additions. Mainnet pages distinguish
+  Allow, which signs without an approval, from RequireApproval, which needs
+  one. The `minimum_reserve` description names the CLI commands that count the
+  envelope fee. It states that a balance equal to reserve plus margin passes
+  and that the paired MCP commit check counts the encoded fee during
+  preparation.
+- `fees stats --rpc-url` with `--profile` follows the shared endpoint rules.
+  Without `--profile`, it takes an HTTPS URL without credentials. MCP
+  `stellar_fee_stats` accepts `rpc_url` only when its scheme, host, and port
+  match an endpoint the profile configures; other values refuse with
+  `invalid_params`. No fixed host list applies.
+- `profile rotate-audit-key`, `audit reanchor`, `audit bind-carriers`,
+  `audit acknowledge-outbox-loss`, and `audit verify` report a keyring refusal
+  on the tip anchor or its companion entries under its `auth.*` code, such as
+  `auth.keyring_platform_error`. Another failure on that state keeps its code.
+  When `profile rotate-audit-key` refuses at the anchor write it owes, the
+  message says that the audit key was not rotated and names the command to
+  rerun.
+- `auth.enrolled_identity_unusable` names the remedy for its reason. A source
+  mismatch names the enrolled signer address to pass as the source. On the
+  CLI, it names the verb's source flag: `--source` on `pay` and `claim`,
+  `--from` on `trustline`, and `--sponsor` on `accounts create`. A missing
+  or malformed record names `profile enroll-signer --repair-identity`, and an
+  unbound signer or a rotated owner names `profile bind-signer`.
+- On mainnet, `stellar_create_account`, `stellar_trustline` and
+  `stellar_claim` now store the lasting intent under the business id. Under
+  an approval requirement the approval binds that intent's digest; under
+  `Allow` no approval record opens.
+- Their commits look the business id up, rebuild the envelope from the stored
+  intent with a fresh sequence, deadline and oracle witness at the prepared
+  envelope's fee per operation, and sign under the stored record's approval
+  or a fresh policy decision. The deadline is the earlier of 120 seconds
+  after the commit and the last whole second strictly before the end of the
+  authority: an approval's execution end, or a policy decision's governing
+  end; a successor's deadline also stays before the record's execution end.
+  The resolver refuses a canonical envelope whose deadline does not lie
+  before that end. The `nonce`, `expires_at_unix_ms` and `envelope_xdr`
+  arguments are optional on that route and play no part, so a commit after
+  a server restart proceeds.
+  A lasting argument other than the stored intent's refuses with
+  `operation.business_id_conflict`, and a claimable balance that changed
+  since the preparation refuses with `simulation.divergence`.
+- An operation recorded with its exact envelope and every call off mainnet
+  keep the envelope route, which answers an omitted `nonce`,
+  `expires_at_unix_ms` or `envelope_xdr` with the tool's fixed argument
+  refusal.
+- On mainnet, `stellar_pay` now stores the lasting payment intent under the
+  business id, as the other three classic tools do. Under an approval
+  requirement the approval binds the intent digest, and a retried
+  preparation recovers the same approval nonce. A retry after a crash before
+  the first approval record opened queues a new entry over the decision's
+  whole lifetime, and its consent admits the payment on either route. A
+  crash after that record's reservation and before its inbox entry ends the
+  business id with `approval.not_found`; prepare again under a new one.
+- `stellar_pay_commit` on mainnet rebuilds the envelope from the stored
+  intent with a fresh sequence, deadline and oracle witness, at the fee per
+  operation of the envelope the preparation returned, so it proceeds more
+  than 120 seconds after the preparation and after a server restart. The
+  deadline is the earlier of 120 seconds after the commit and the last whole
+  second strictly before the end of its authority; a successor's deadline
+  also stays before the record's execution end. Its `nonce`,
+  `expires_at_unix_ms` and `envelope_xdr` arguments are optional on that
+  route. A source, destination, asset, amount or memo
+  other than the stored intent's refuses with
+  `operation.business_id_conflict`, also after the payment was sent.
+- On mainnet one payment has one record per business id, and its first
+  preparation decides its kind: `stellar_pay` stores the intent, a toolset
+  preparation the exact envelope. Either route resumes that record.
+- A toolset commit, a direct commit of a record with its exact envelope, and
+  every payment off mainnet keep the envelope route and its 120-second
+  nonce lifetime. A toolset commit of a `stellar_pay` record signs only an
+  envelope of its stored intent; any other refuses
+  `operation.business_id_conflict` and sends nothing. The envelope a mainnet
+  `stellar_pay` preparation stores carries the earlier of 120 seconds after
+  the preparation and the last whole second before its decision's end. A
+  toolset commit of a direct-first payment signs that envelope unchanged
+  while the authority it adds outlasts the stored deadline; an authority
+  that ends sooner refuses with `network.mainnet_authorization_refused` and
+  sends nothing, and a direct commit of the record completes it. On the
+  envelope route an omitted `nonce`, `expires_at_unix_ms` or `envelope_xdr`
+  answers the tool's fixed argument refusal, and a present value, empty or
+  zero included, keeps its own refusal.
+- Add capability-gated consent admission to the six MCP approval producers.
+  When enabled, payment, account creation, claim, trustline, and both x402
+  tools reserve the committed record's evidence slot before they store an inbox
+  entry or return an approval block. Production capabilities remain disabled.
+- The policy window store writes format version 18, which carries an
+  authenticated native coverage marker. Builds that read at most version 17
+  refuse the file. Retention and a window reset keep every value-holding or
+  fee-holding authorization without a release row, and a reset keeps both
+  admissible floors. The first write that sets the marker raises the
+  close-time floor 300 seconds past the store clock.
+- The native floor projection refuses with `account.unread` when the store
+  file or its marker is missing. A legacy claimed authorization without
+  amounts keeps floor use refused on its profile; a new profile is the remedy.
+  A floor that passes still refuses with `account.unread` on every public
+  path.
+- A matched `balance_floor` on a mainnet classic action reads the operating
+  account after a readiness check and counts its retained native reservations.
+  The CLI `pay`, `claim`, `trustline`, and `accounts create` verbs, the MCP
+  claim, create-account, and trustline tools, and signing resolution use these
+  facts, so a breach refuses with `account.floor_refused` and an old read with
+  `account.stale`. A floor that passes still refuses with `account.unread`,
+  because retained history cannot prove that it counts every native
+  obligation. MCP `stellar_pay` and the x402 tools keep refusing configured
+  floors with `account.unread`.
+- Account denials keep their codes under a policy authority at signing
+  resolution, and accounting errors of a mainnet evaluation keep
+  `policy.accounting_invalid` and `policy.accounting_overflow` on the CLI and
+  MCP paths and at classic signing resolution.
+- A mainnet `balance_floor` that passes now admits the action when the window
+  store carries its native coverage marker and the balance read lies past
+  both admissible floors. The mint checks the floor again under its lock with
+  the action's amounts: when native exposure committed after the read takes
+  the balance below the floor, the action refuses with
+  `account.floor_refused`. Without the marker the floor still refuses with
+  `account.unread`.
+- MCP `stellar_pay` and `stellar_pay_commit` read the operating account and
+  its reservations for a floor on mainnet, and the commit reads them again.
+- A mainnet MCP pay, claim, create-account, or trustline commit refuses with
+  `account.unread` when the preparation tool's rule carries a
+  `balance_floor` and the commit tool's rule carries none, or a lower one.
+  Put the same floor on both tool names.
+- Both mainnet x402 tools read the enrolled payer before their preparation:
+  under a `balance_floor` with its reservations, and under a
+  `minimum_reserve` alone as a bounded account read. A reserve rule no longer
+  refuses with `policy.engine_required`.
+- A mainnet x402 payment on the native asset contract records its amount as
+  a native debit. The resolver refuses an amount above the 64-bit range with
+  `policy.accounting_overflow` when it records the debit. Such an amount
+  always needs the cross-check witness, which the resolver checks first; a
+  call without one refuses there.
+- When the resolver refuses an x402 payment with an accounting refusal, the
+  x402 tool result carries `policy.accounting_overflow`,
+  `policy.accounting_invalid`, or `policy.approval_required` in place of
+  `network.mainnet_authorization_refused`.
+- The policy summary describes a mainnet x402 floor as a funding condition;
+  off mainnet such a floor still denies every call.
+- Give ordinary wallet tests and child processes owned, marked storage with filtered wallet settings. Strengthen refusal, path, MCP protocol and child diagnostic assertions, and label explicit native acceptance routes separately from fixture storage. The manual testnet workflow gains a `keyring` input, headless by default, that selects the platform keyring for the declared native routes.
+- Recovery resumes its two-endpoint ledger scan across bounded runs, starting
+  from the authenticated record of the ledger recorded before the payment was
+  exposed. A pruned ledger or a missing starting record stops the scan with an
+  explicit reason, and a configuration change restarts a stopped scan.
+- Coverage measures feature-off and feature-on in two parallel jobs,
+  `coverage (feature-off)` and `coverage (feature-on)`. The required `coverage`
+  check passes only when both jobs succeed and both reports pass their floors.
+- Pushes to `mainnet-write` and `main` run the Coverage workflow and seed its
+  caches. Rust caches in CI and Coverage save on push runs only. The
+  stellar-cli caches save on push and schedule runs only.
+- Each coverage report carries the run attempt in its artifact name, so the
+  `coverage` check reads only reports of its own attempt. After a failed
+  download, a maintainer reruns all jobs.
+- The changelog guard refuses a sync merge whose `CHANGELOG.md` differs from
+  the clean three-way merge and names only the maintainer remedy.
+- `ToolsetGrant` keeps its capability and destination private behind the
+  `capability()` and `destination()` accessors. Deserialization and
+  `ToolsetGrantStore::insert` refuse a `sign-payment` destination that is not
+  a canonical G account or M address.
+- Production dispatch and targeted transaction status now run the bounded outcome driver of `recover_outcomes` once per call.
+  The driver applies the runnable filter before the four oldest attempts, so isolated, exhausted, live-lease, and future-due attempts send no recovery request.
+  Each reached attempt reserves one of sixteen runs with a 20-second lease, stores a contextual stop with automatic backoff, or commits a checked decision in the same call.
+  A store refusal of the reservation, the release or stop, or the decision write returns `RecoveryError::Context` with the store root code, the verified progress of the selected attempts, and `; decided: N`.
+  `recover_sequences` keeps its signature and returns the driver's report, with per-attempt results, evaluated counts, and selection of attempts that hold a matched release.
+  The public `OperationStatus::recovery_snapshot` is removed; `outcome_snapshot` selects attempts with a matched release as well.
+  The legacy sequence collector, its health refresh, and its saved-upper target veto are removed; shared requests stay at four per call.
+  Targeted status acquires the audit writer at most once after reconciliation and shares it with recovery, accounting delivery, and receipt repair.
+  Status still makes its separate diagnostic lookup outside the recovery budget; its failure can replace the returned answer while committed recovery state persists.
+  Failed identity or health prefixes leave attempts unchanged and are not bounded by the run cap; structured CLI and MCP recovery reporting remains deferred.
+  `stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge` records an accounting acknowledgement, not chain proof or permission for a successor.
+  No chain-proof command or retry flag resolves high account sequences, exhausted runs, or unusable records.
+- Submission receipts keep the muxed destination of a transaction with several payment operations and list each payment operation's destination when they differ. Receipts rebuilt from a reservation, an accounting expiry, or a committed decision keep it. Window state with destination fields uses version 14 and keeps that committed floor.
+- Recovery of an uncertain mainnet payment requests one ledger per history
+  call and reads a compact health answer. A read that cannot prove
+  non-inclusion reports a typed reason with the endpoint, the method and the
+  missing evidence, and the debit stays held.
+- Refusals of spending state that no verb recovers now end with "No verb
+  recovers such state; create a profile under a new name." This covers
+  `policy.window_state_unverifiable`, `policy.window_chain_unverifiable`, a
+  window-state generation mismatch, and a window-state store whose tag or
+  content does not verify.
+- The `stellar_toolset_invoke` tool description now states that on mainnet
+  only the exact `stellar_pay` and `stellar_pay_commit` actions run, after
+  setup, and every other action refuses.
+- Add the public `RecoveryError::Context` variant for authenticated sequence progress and bounded receipt repair diagnostics while preserving refusal codes.
+- Transaction status uses authenticated recovery results for managed classic
+  mainnet attempts and reports UNKNOWN when validated evidence is unavailable.
+  It sends no additional transaction lookup for these attempts. Unknown
+  submission errors include targeted-status guidance and a checked retry time
+  or a typed reason that the time is unavailable.
+- Upgrading: a `v0.1.0-alpha.13` build cannot open a profile's audit log once this build has written to it. The first keyed open writes an `audit_entry_tags_started` row, and `audit bind-carriers` writes an `audit_carriers_bound` row; alpha.13 knows neither kind.
+- The MCP server's `profile.mainnet_requires_explicit_profile` message names the selection source and `stellar-agent-mcp --profile <name>`, and leaves out the requested name. The CLI message for the same refusal names the profile.
+- A testnet classic envelope carries no time bound, so a testnet commit that reserved spending keeps its reservation open after a reported `SUCCESS`. `tx status` answers `chain_status: SUCCESS` with `record.reservation_open: true` until `tx receipt clear <ENVELOPE_HASH> --acknowledge --acknowledge-unbounded`. A commit that reserved nothing answers `record.reservation_open: false`.
+- On mainnet, a recovery decision runs once the host clock is at least six seconds past the envelope's maxTime. It needs identical answers from the primary endpoint and the oracle, and it takes the profile's audit writer. While an MCP server holds that writer, a CLI `tx status` answers `chain_status: UNKNOWN` with `recovery.refusal.code: audit.chain_key_unavailable`.
+- A commit on mainnet follows the stricter decision of its own rule and its preparation's rule. On testnet the commit's own rule alone decides, so a commit rule needs its own `decision = "require_approval"` to require an approval.
+- `profile enroll-signer` writes `[mcp_signer_default].account` before the keyring entry. After a refused keyring write, a re-run with the same seed completes the enrollment.
+- `profile enroll-signer` and `pool init` change only their own keys, and they write the whole profile file again with keys sorted within each table and comments dropped.
+- Each `balances` entry carries `asset.asset_type`, which is `native` for XLM or the asset code, such as `USDC`, and a trustline adds `asset.issuer`.
+- Signing a policy leaves the installation pin at its old sequence until the first CLI value verb or MCP server start moves it. A `profile enable-mainnet --check` before that reports `total_budget_usage: null` with `policy.total_epoch_stale`. Sign, restart the MCP server, then run the check.
+- No wallet command deletes a profile. Retire one by moving its funds out, stopping its processes, and deleting its files and keyring entries, the policy pin and the enablement nonce together. The keyring holds the only copy of the pool master seed, so deleting it gives up the channel accounts and their sponsored reserves.
+- Policy loads that only compare the policy pin share the policy-state lock.
+  A load takes the lock exclusively only to advance the pin, and compares the
+  pin again under that lock before it writes. A load that cannot take the
+  required lock through its retries fails before it checks freshness. A
+  writer causes this, and so does a reader when the load must advance the pin.
+  The mainnet approval surfaces then answer `approval.presence_policy_busy`,
+  and the remote approval listener answers a retriable `503` `store_busy`.
+  Other policy callers keep their own codes. A signed-origin login, consent
+  assertion, or rejection takes the lock shared, and a revocation takes it
+  exclusively, before it consumes its challenge. Each holds that one guard
+  until it answers, and a revocation writes its durable record under it. Its
+  busy answer leaves the challenge, the counter, the session, and the entry
+  unchanged. No busy answer
+  grants a session, a consent, or a pin change. The lock does not order edits
+  of the policy file. A rolled-back policy answers busy while the lock is
+  busy, and its rollback refusal once the lock is free. A login or consent
+  refused after its assertion verified needs a fresh ceremony.
+- Toolset grant writers and installers now coordinate through advisory locks.
+  Every grant insertion and revocation holds an exclusive lock on a sidecar of
+  the grant store, so concurrent `approve`, approval UI, and outbox-loss
+  recovery writes no longer lose or resurrect a grant. The gated toolset
+  resolver holds the toolsets lock shared and the grant lock while it looks for
+  a grant, and releases both before it queues a first-invoke approval. A held
+  lock refuses outbox-loss recovery with `approval.writer_locked` before it
+  revokes anything. The resolver and the grant writer return the library
+  result `toolset.coordination_busy`. An MCP toolset payment call answers it as
+  that business code. An MCP toolset rule-creation call nests it in an internal
+  error whose message starts with `toolset.enforcement_error:`, and `approve`
+  nests it in the detail of `approval.grant_persist`.
+  Existing grants keep matching, and the resolver returns the verified grant's
+  identity and stored expiry. A library recheck verifies that exact grant and
+  installation under shared locks, creates no file, and never renews expiry.
+  Its library results are `toolset.grant_invocation_mismatch`,
+  `toolset.coordination_busy`, `toolset.coordination_unavailable`,
+  `toolset.grant_changed`, `toolset.grant_expired`, and
+  `toolset.io_error: clock_unavailable` for a clock failure.
+- `stellar_toolset_invoke` compares its `toolset` and `action` arguments
+  exactly as sent, at the server's halt check and in routing. A name that
+  differs only by an escape sequence or a control character no longer reaches
+  the tool its display form names; it answers `toolset.not_installed` or
+  `toolset.unknown_action`, and a halted profile refuses it as an unknown tool.
+- Window files use wire version 12.
+- An operator clear and an accounting expiry keep a total debit counted. A
+  checked failure or non-inclusion releases that attempt's total debit once
+  and keeps its fee charged.
+- A reservation that its writer cancels before the signed bytes leave the
+  process releases its total debit. Any other cancellation keeps it counted.
+- Every spelling of one asset, such as `native` and its asset contract,
+  counts against one total-budget allocation.
+- Final total-budget charges fold into per-policy sums after one week. Their full amount remains charged through restart and reset.
+- `stellar_sep43_sign_transaction` and `stellar_sep43_sign_and_submit_transaction` decide each payment of a transaction under the rule of its payment tool, with the signed asset, amount, recipient and memo. A payment that rule refuses or escalates is not signed.
+- Both tools admit the payment usage to the policy windows before they load the signer. A signer, signing or send failure keeps it, and each sign-only call charges again.
+- An account merge, except another account's merge into the wallet account, and a signer, master weight or threshold change refuse with `policy.deny.unsizable_value_effect`. Offers, pool deposits, sponsorship, wallet clawbacks and contract calls the wallet cannot value need `allow_opaque_signing = true` on the tool's rule.
+- A fee the wallet account pays passes the classic per-operation cap, and a resource transaction's full fee passes the contract transfer fee cap.
+- A negative operation amount, a resource fee above the transaction fee, and a text memo that is not UTF-8 on a valued transaction refuse with `sep43.invalid_xdr`.
+- `opaque_payload_signed` rows of the sign-only transaction tool and the pending rows of the submitting tool carry the allowed payment legs.
+- `per_tx_cap` and `approval_above` refuse or escalate a debit sum beyond the representable range.
+- Refuse overflowing period, total, and unlisted budget sums with the governing limit's denial code. Exact-cap use remains allowed.
+- Add ordered authorized accounting batches, a first-rule opaque-signing consent query, and optional value legs on signing audit rows. Existing signing callers retain empty legs.
+- `stellar_sep43_sign_transaction` and `stellar_sep43_sign_and_submit_transaction` count an operation of another source account only when that account's signer set lists the wallet key, at any weight. Each call reads those signer sets once over the profile's RPC endpoint, and a read failure refuses with its own `network.*` or `protocol.*` code.
+- Operations of an account that does not list the wallet key add no payment, opt-in requirement, refusal, window charge or audit leg. Negative amount fields refuse for every source, and fee ownership is unchanged.
+- An approval still covers the complete envelope: a transaction of two operations with one counted payment keeps `policy.approval_required_unsupported`.
+- `stellar_agent_network::account::fetch_account_signers` is public, and `stellar_agent_core::policy::transaction_effects` adds `transaction_source_candidates` and `transaction_effects_for_sources`.
+- Toolset payments no longer force per-payment approval under an Allow policy.
+  Exact payment preparation and commit actions support enabled mainnet profiles,
+  compose the outer and routed policies, and retain first-invoke grant checks.
+  Required consent keeps its original recovery interval; rule creation still
+  requires its existing approval and remains excluded on mainnet.
+- On a mainnet profile, a payment to an unlisted recipient beyond the
+  `unlisted` budget's per-payment or rolling bound requests a per-payment
+  approval instead of failing with `policy.deny.unlisted_budget_exceeded`.
+  The approved payment counts in full, and every cap, rate limit, and total
+  budget still applies. Other networks keep the denial.
+- Every spelling of an unlisted budget's asset, such as a classic asset and
+  its asset contract, counts in one budget, including rows an earlier build
+  stored.
+- An unlisted budget sum that overflows refuses with
+  `policy.accounting_overflow`, and a negative stored amount with
+  `policy.accounting_invalid`. A mainnet authorization under policy authority
+  that finds the budget spent refuses with `policy.approval_required`.
+- The spending summary states `unlisted_exhaustion = "approval"` on mainnet.
+  Its largest unlisted payment is the hard maximum available with approval,
+  which neither unlisted budget bound limits, while the unattended bounds
+  still keep the budget's window counter.
+- Document mainnet approval beyond unlisted allowance bounds, continued hard
+  limits, and the shared classic/SAC counter across re-signing and restart.
+  Add fixture companions for the network split and durable alias history.
+  Correct fixture descriptions of zero-digest loading and structured denials.
+- Upgrading: on testnet, every signing `smart-account` verb, a rule reinstall through rule `0` included, needs a secondary RPC on a host other than the primary's. Set `secondary_rpc_url` in the profile, or pass `--secondary-rpc-url` to the verb. Without one the verb refuses with `smart_account.ledger_witness_unavailable`. `profile init` writes no secondary, so a `v0.1.0-alpha.13` testnet profile needs one before it reinstalls rules.
+- Upgrading: once this build has written a profile's spending state, a `v0.1.0-alpha.13` build refuses the file, as not valid JSON or as a newer wire version. Its message advises `profile reset-window-state`. Do not run that reset with the alpha.13 build. The reset discards the upgraded state. This build then refuses the profile with `policy.window_chain_unverifiable`, which no verb recovers. Continue with a profile under a new name.
+- Pending approvals record the subject kind `intent-digest` only for a mainnet payment, account creation, claim, or trustline prepared under a business id. Every testnet approval records `envelope-text`, which `approve status` reports as `binding: "legacy-envelope"`.
+- MCP startup requires `approval_credentials` only when a signed policy has a `[mainnet]` table. The server starts on a mainnet policy without that table. Mainnet writes and `approve serve` still need `profile enable-mainnet`.
+- Testnet approval escalation queues every supported address form.
+- Testnet approvals refuse a clock reading before their creation without consuming the approval.
+- `stellar-agent approve list` labels a spent x402 approval with its payment digest.
+- `stellar_agent_core::approval::subject::verified_x402_subject` is public.
 
 ### Removed
 
@@ -1161,6 +1870,138 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   RPC within the same pre-submit deadline. Only a replacement outside the
   pair's range refuses with `simulation.divergence.ledger_skew`; a simulation
   above the range refuses without a re-simulation.
+- Show the execution window in exact minutes and seconds on pending mainnet intent consent pages. Other pending pages show only the approval deadline. Label inbox countdowns as approve within.
+- Disable all decision buttons after a final mainnet entry outcome or one-shot cancellation, with half opacity and a not-allowed cursor. Keep inbox cancellation retryable and prevent duplicate Cancel requests.
+- Name trustline removal or addition and change in the detail headline, with the issuer in its own row.
+- Label classic intent fees as caps per operation and contract payment intent fees as total caps.
+- Use the wallet enrollment page's trimmed label as the passkey user name and display name on loopback and signed origins. The remote approval host's enrollment page keeps the user name operator.
+- Refuse approvals revoked during the CLI presence ceremony before writing
+  consent, and preserve the MCP protocol error channel for approval directory
+  and initial inbox-open failures.
+- An x402 retry no longer opens a second approval record, an authenticated
+  message mint no longer uses an approval without its operation, and CLI or
+  inbox presence no longer starts for a value approval without its durable
+  record. On mainnet, the second x402 call reuses the first
+  call's `business_id`; another `business_id` refuses with
+  `policy.approval_consumed`.
+- Approval refusals keep their own codes. A request changed after review refuses with approval.presence_changed, and a record of another kind refuses with approval.wrong_kind. Both inboxes answer a wrong-kind or inconsistent entry with HTTP 409.
+- Retry full simulation queues within the path deadline while preserving signed limits and refusal reasons.
+- Keep each request future of a busy-simulation retry on the heap, so the futures of the submission paths no longer grow by the size of the request.
+- A classic CLI or MCP payment to a destination with a memo binding no longer
+  fails with `policy.deny.memo_binding_mismatch` when it carries the bound
+  memo. Policy evaluation keeps the kind and exact value of every classic memo,
+  including an ID of zero and the full 64-bit ID range. Preparation checks the
+  parsed memo, and signing and commit check the memo signed in the envelope.
+- CLI help and MCP tool descriptions match the code. They state the mainnet
+  refusals of the signing, vault, trade, and SEP-43 tools, and the mainnet
+  admission of the classic commit tools. They name the approval proof fields
+  each commit step takes and the codes a refused approval returns. They list
+  every subcommand of `approve`, `audit`, `counterparty`, `profile`,
+  `toolsets`, and `smart-account`.
+- `toolsets run` help states that the command checks an action and does not
+  execute the routed tool. `stellar_rules_list` states its fixed scan of rule
+  IDs 0 to 49.
+- `--profile` help states that a mainnet profile must be named with the flag.
+  The `approve` help states the mainnet limits of `--open-by-operator`,
+  `--no-open`, and `--remote`. The classic MCP tool descriptions state the
+  account read a mainnet `balance_floor` rule adds.
+- The concepts guide and the skill reference now state that an
+  `approval_above` escalation makes CLI `pay` return `policy.approval_required`
+  on testnet and run the passkey ceremony on mainnet. The mainnet consent
+  sentences no longer limit the ceremony to the local browser, and Ledger
+  signing needs the ceremony only under an approval requirement. The skill,
+  its tool, CLI, security, and troubleshooting references, and the CLI
+  rustdoc now describe the same consent paths and refusal.
+- The enrollment prompt could start while a loopback listener was still open
+  after the shutdown timeout. On that timeout, shutdown now aborts both server
+  tasks and waits for both cancellations before the prompt starts.
+- Mainnet success output from `pay`, `claim`, sponsored `accounts create`, and `trustline` echoes a supplied `business_id`.
+- `profile enable-mainnet` lists policy hints only for missing or invalid settings and a sign-policy hint whenever the policy needs a signature.
+- Readiness retries a `getLedgers` read that timed out or failed in transport, up to three attempts within the caller deadline, with pauses of 250 ms and 500 ms. Each refusal of the read keeps `network.endpoint_not_ready` and names the attempts made.
+- The getting started guide now states that an MCP mainnet write signs
+  without an approval under Allow and needs a verified approval under
+  RequireApproval, as the server enforces.
+- One invalid line on the MCP stdio input no longer ends the session. An empty
+  line or a line that holds only `\r` is skipped. A line that is not a JSON-RPC
+  message, or one over the 1 MiB line limit, is answered with a JSON-RPC
+  `-32700` error without an `id`, and the server reads the next line, also
+  before `initialize`. A line that is not a JSON-RPC message and holds a
+  `method` the server does not know and no `id` is skipped without an answer.
+  The session still ends at end of input or on a read error, and also when an
+  answer cannot be written.
+- The `minimum_reserve` criterion adds one base reserve for each trustline a call opens, so it refuses a trustline the network would reject for low reserve before signing. The trustline commands and SEP-43 signing read the trustline the call names, so removing a held trustline or changing the limit of a held credit trustline adds nothing. A trustline the account read cannot show counts as opened. In SEP-43 signing, each wallet-sourced pool share `ChangeTrust` with a nonzero limit raises the checked reserve by two base reserves, whether or not the wallet holds that trustline. The `stellar_trustline_commit` rule judges each wallet-sourced pool share `ChangeTrust` as its own trustline operation, with or without other operations, and one with a limit of 0 opens nothing. Its leg carries no asset, so an `asset_allowlist` on that rule refuses it with `policy.deny.asset_not_allowlisted`. The trustline commands judge the asset the transaction carries, the resolved `CODE:ISSUER`, whatever spelling the caller used.
+- Accept muxed payment destinations in CLI and MCP payments, gated toolset payments, payment URIs, MCP balances, and MCP account resources. The transaction, signed policy decisions, and submission receipts keep the complete M address and its ID. A submission receipt carries no muxed destination for a transaction with several operations, a receipt rebuilt from a reservation, or an absent receipt rebuilt from a committed decision. A stored receipt repaired from a committed decision keeps its muxed destination. Approval pages, the approval inbox, and `approve run` show a muxed destination in full with its base account on a separate row, and `approve list` shows the base account in parentheses beside the address. Read ledger state from the base account and skip the SEP-29 lookup for muxed destinations. Refuse muxed addresses in account-creation and issuer fields with the field name and reason.
+- Payment approvals now display retained envelope facts with structured memo details, preserve exact policy expiry through queueing delay, and bound mainnet signing authority by the captured decision end.
+- Repeated payment preparation queued another approval nonce for the same payment.
+  A retry of the same payment under the same profile, chain, verified policy, and operation now reuses the original approval nonce and interval.
+  While its recovery binding is retained, a recorded expiry, rejection, consumption, or collection keeps its refusal, also after the clock moves backward.
+  The binding is written atomically with the approval inbox.
+  Recovery needs a verified policy. Without one, the forced toolset approval still queues an entry with no recovery binding.
+  A payment approval under split rules ends at the earlier decision end, also off mainnet.
+- The startup advisory names only rules without an `sa_context_rule_deleted`
+  row in the local audit log. A rule removed with `smart-account rules delete`
+  produces no warning on any command for its revoked or retired
+  verifier or for its pin record of eight-byte hash prefixes, and the advisory
+  appends no `sa_verifier_allowlist_advisory` row for it.
+- Paired policy checks stay on one private state, cache, and time frame, so
+  concurrent requests cannot replace the window image between evaluations.
+- On Windows, the checked receipt repair no longer refuses a receipt that is
+  already current with `Access is denied. (os error 5)`. A repair after a
+  crash or a repeated repair confirms the stored receipt durable and
+  acknowledges its decision, as on Linux and macOS.
+- CLI `pay`, the MCP payment tools, and the toolset payment actions refuse a canonical W muxed contract destination as they refuse a C destination. The code is `validation.contract_payment_unavailable`, or `validation.contract_payment_memo_unsupported` with a memo. The refusal comes before the keyring and any request. The CLI no longer initializes the keyring for such a destination. MCP no longer answers with an invalid-params protocol error.
+- `audit verify`, `audit bind-carriers`, `audit acknowledge-outbox-loss`, and `audit reanchor` report a carrier refusal under its documented code instead of `internal.unexpected_state`. The codes are `audit.carrier_replaced`, `audit.carriers_unbound`, `audit.carrier_identity_unavailable`, `audit.carriers_busy`, and `audit.carrier_binding_incomplete`.
+- An audit verb failure whose message starts with its own code, such as `audit.tip_anchor_unavailable` or `audit.outbox_full`, no longer carries the verb's general failure code ahead of it.
+- A policy refusal raised while the policy engine loads, such as `policy.engine_selection_unsigned`, no longer repeats its code at the start of the message.
+- An explicit MCP `fee` above `classic_max_fee_per_op_stroops` on `stellar_pay`, `stellar_create_account`, or `stellar_trustline` refuses with a `fees.percentile_exceeds_cap` message that names `fee`. The message no longer tells an MCP caller to lower the CLI flag `--fee`.
+- On Linux, the MCP server sets `PR_SET_DUMPABLE` and `PR_SET_NO_NEW_PRIVS` on its initial thread before it starts any other thread. Every server thread inherits both flags. The initial thread and the runtime worker threads no longer run without no-new-privs.
+- `profile enable-mainnet` refuses any set `STELLAR_AGENT_KEYRING_BACKEND` value with `network.mainnet_keyring_backend_unsupported` before the keyring initializes, in every mode. A non-platform backend that fails to initialize no longer surfaces as `profile.enable_mainnet_precondition`. A testnet profile refuses with `profile.enable_mainnet_not_mainnet` before the backend check and before the keyring initializes.
+- `profile enable-mainnet` refusal messages name the failed check and its accepted form or cause. For example, `profile.enable_mainnet_not_mainnet` says "the profile's chain_id must be stellar:mainnet" instead of "chain_id". The `profile.enable_mainnet_precondition` details for `body_version`, `contract_transfer_max_fee_stroops`, `mainnet_table`, `nonce`, and `classic_max_fee_per_op_stroops` no longer stop at the check name. The `profile.enable_mainnet_profile_flag_required` and `profile.enable_mainnet_default_refused` messages name `--profile <name>` instead of "supply --profile" and "use a dedicated profile".
+- The `profile init` next steps name the policy file to sign by its path, `policies/<name>.toml`. On mainnet, the signing step no longer calls the generated version 2 policy "the V1 policy file".
+- The `profile init` total-budget prompt and the spending summary notes state the allocation rule per policy version. Signing identical version 1 bytes keeps the allocation, and every signing of a version 2 body gives it a new sequence, digest, and allocation. The text no longer says that signing the same policy body again keeps the allocation.
+- `sign_policy.policy_file_unreadable` names `--file` only when the caller passed it. Without the flag, the message names the profile's policy file instead of "the policy file --file names".
+- A repeated `tx receipt clear` on a submission recorded as `cleared_by_operator` refuses with `submission.not_clearable` and says the submission is already cleared by an operator. The message is the same whether or not a hold remains. It no longer says the submission is not cleared by an operator.
+- `profile policy-check` accepts an unsigned version 2 body without `sequence`, as `profile sign-policy` does, instead of refusing it. An explicit invalid `sequence` and a `sequence` in a version 1 body still refuse.
+- `profile policy-check` refuses a `[mainnet]` table on a testnet profile with `policy.mainnet_table_on_testnet` and exit code 65. Signing already refused such a body, and `policy-check` no longer reports it as valid.
+- A crash between a committed recovery decision and the write of its receipt
+  no longer leaves the receipt behind the decision. The next dispatch rewrites
+  the receipt of every committed decision with the exact identity and failure
+  code of its attempt, or names the missing fact. `tx status` and
+  `stellar_transaction_status` run the same repair and report their result
+  even when a repair fails. A repair keeps an operator clear and a consumed
+  approval, and a refusal lists the repaired and the refused decisions.
+- A browser that negotiated HTTP/2 with a signed-origin listener got `421 host_header_rejected` and could not sign in, approve, or enroll.
+  The signed consent listener and the signed enrollment listener now offer only `http/1.1` over ALPN, so browsers send the `Host` header that the signed authority check reads.
+  A client that offers only `h2` fails the TLS handshake.
+  Testnet remote listeners keep their protocol list.
+- A smart-account refusal names the contract error when the simulation
+  reports it in a diagnostic event, for example
+  `Error(Contract, #3221) [OZ:SpendingLimitExceeded]`. The code comes from an
+  `error` event of the invoked contract or of a smart account the auth entries
+  name. Without such an event the message carries the top-level error.
+- A successor attempt whose predecessor has no attempt or no non-inclusion
+  proof refuses with `recovery.retry_refused`. A successor under a linked
+  authorization whose policy the current pin no longer names refuses with
+  `policy_pin_mismatch` before admission writes anything.
+- Tests, examples and repository scripts isolate wallet storage. Test builds refuse native storage outside explicit live acceptance entry points and resolve wallet overrides only inside marked sandboxes. Fixture temporary paths remain caller-selected.
+- A `total_budget` allocation counts every debit of its signed policy across
+  restarts, state refreshes, pruning, and owner resets.
+- A policy with a different signed digest starts its total budget at zero,
+  and an engine under a replaced policy cannot spend.
+- An expired hold frees total-budget capacity only once a committed sweep
+  removes it, so a clock rollback cannot revive capacity already reused.
+- A multi-leg debit whose total-budget sum overflows refuses with a typed
+  error.
+- Total-budget guidance identifies the signed policy digest as the allocation boundary.
+- The README and user guides state the MCP mainnet `allow` path, the default
+  `mainnet-write` build feature, the MCP tools without `chain_id`, the policy
+  gate coverage, and the conditions of the retained-intent reset messages as
+  the code decides them. The CLI reference corrects the home domain bounds,
+  the `list-rules` endpoint flags, the startup advisory exemptions, the DeFi
+  pre-sign order, and the `init` next steps. The guides also state the mainnet
+  approval witness and `business_id`, the balance floor refusal codes, the
+  SEP-43 fee and credential coverage, the toolset and MPP refusal codes, and
+  the audit outbox codes of `audit verify` and key rotation.
 
 ### Security
 
@@ -1659,6 +2500,120 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   features the workspace does not enable. The MCP server speaks over stdio and
   never runs an rmcp HTTP client. The entry goes when the server moves to
   `rmcp` 3.9 or later.
+- `approve revoke` on a mainnet approval whose stored state is pending now
+  writes `revoked` and appends its `approval_revoked` audit row at any time,
+  also after the waiting expiry. An inbox revocation admitted on a live,
+  unconsented record also revokes when the waiting expiry passes before the
+  record is read again. Before, a revocation after that expiry reported
+  `expired`, wrote nothing, and a consent received before the expiry could
+  still commit and be used. A later consent commit refuses with
+  `approval.revoked`, and every later mint refuses as revoked.
+- A revocation now also refuses the payment authorization of an
+  authenticated x402 approval under its used SEP-10 message authorization,
+  and the x402 payload-release authorization under a used Soroban intent
+  authorization. Before, these legs were still authorized after
+  `approve revoke` reported `revoked`. An authorization minted before the
+  revocation keeps its lifetime.
+- A canonical operation's authorization is now minted only inside its
+  attempt's begin, together with the approval's consumption and the
+  `sending` attempt. The public mint refuses with
+  `network.mainnet_authorization_refused` (logged as `intent_mismatch`) a
+  request whose link or approval operation names one. The CLI and MCP
+  surfaces still create envelope records only, so no command or tool takes
+  the canonical route yet.
+- A canonical operation's successor attempt may reuse its approval nonce
+  after each earlier attempt's checked non-inclusion. The mint admits the
+  nonce only when every earlier holder is such an attempt of the same
+  operation or an unused carrier of it: an earlier authorization that was
+  never claimed and that no exposure names. The receipt claim and the CLI and
+  MCP receipt checks admit it only when every other receipt that holds it
+  belongs to such an attempt. Any other holder keeps its refusal.
+- On mainnet, where canonical records exist, the approval tombstone of a
+  canonical attempt waits until its operation is terminal or past its
+  execution expiry. The next repair after that, by the status call or by the
+  send recorder, writes the tombstone and acknowledges its receipt and every
+  other sent receipt of the nonce.
+- A canonical transaction now refuses with `simulation.divergence` when a
+  field of its envelope differs from its stored intent. A claim refuses the
+  same way when the claimable balance the resolver rereads from the ledger
+  differs in asset or amount, or no longer exists. Every other mainnet
+  authorization refusal keeps `network.mainnet_authorization_refused`.
+- A business id that holds an envelope record keeps that record's exact
+  envelope under a canonical preparation: the request resumes or replays it,
+  and the record is never rebuilt with a fresh sequence.
+- When two preparations open an approval on one profile at the same time,
+  the one that finds the producer lock held refuses with
+  `approval.writer_locked`, opens nothing, and can be retried with the same
+  business id.
+- CLI mainnet writes under an approval rule now verify the presented consent
+  against its committed durable record before granting authority. A revoked
+  record refuses with `approval.revoked` and a missing one with
+  `approval.not_found`. A nonce that a submission receipt names, or a record
+  of another operation, refuses with `approval.consumed`.
+- Check a mainnet transaction authorization's issue time and expiry in the keyring, software, and hardware signers, after the secret read or the device's key answer and immediately before the signature is produced. An authorization that ends during key access produces no signature and refuses with `network.mainnet_authorization_refused`, logging `expired` or `not_yet_valid`.
+- On mainnet, an unsigned profile threshold can no longer remove the oracle
+  witness requirement. Before, when the signed policy carried no native
+  threshold, raising `cross_check_threshold_stroops` in the profile let a
+  native payment of any size that carries a memo sign without an oracle
+  comparison. The same held for a token whose threshold existed only in
+  `[cross_check_thresholds]`.
+- A mainnet threshold now never exceeds the value that applies without a
+  profile value: the signed threshold in `[mainnet.cross_check_thresholds]`,
+  else 1000 XLM for XLM and its SAC. A profile value only lowers a threshold.
+  Testnet thresholds are unchanged.
+- A mainnet token payment that needs a witness threshold, x402 payments
+  included, now needs a signed entry for the token in
+  `[mainnet.cross_check_thresholds]`. Without one it refuses whatever the
+  profile sets: `network.witness_unavailable` from the caller checks,
+  `network.mainnet_authorization_refused` from the resolver. The refusal text
+  names the signed table on mainnet and the profile table on other networks.
+- MCP mainnet commits verify a supplied approval against its durable record
+  and the operation the call continues, never against the approval inbox.
+  A collected, locked or edited inbox entry changes no outcome, except that a
+  live rejection entry answers `policy.approval_rejected`, and an inbox
+  consent without a record refuses with `policy.approval_required`. A revoked
+  approval returns `approval.revoked`, and a proof of another operation
+  returns `policy.approval_consumed`.
+- Mainnet approvals without a durable record refuse with
+  `approval_not_found` at the resolver and at the mint, also in a store
+  without a file, so no gate admits on inbox material alone. SEP-10 message
+  signing checks the record of the operation it names and never links it.
+  A used message proof keeps its authenticated payment through a later
+  revocation, within the record's bound.
+- Transaction and Soroban resolution check retained approval state. The mint
+  checks it again under the lock. For retained records, durable consent bounds
+  authorizations and operation execution. Retained records refuse in this order:
+  revoked, unconsented while waiting, expired, then bound to another operation.
+  Receipt mismatches have a distinct refusal.
+- `approve revoke` on a mainnet approval consumed inside its window now writes
+  `revoked` and appends its `approval_revoked` audit row whatever the state of
+  its operation. Before, a consumed record whose operation was closed returned
+  its view without a write, and a child mint without an operation link, such
+  as the payment under a used SEP-10 message authorization, could still
+  succeed. Every later mint under the record now refuses as revoked.
+- A consent commit under a revoked mainnet approval now refuses with
+  `approval.revoked`, also when it repeats the receipt the record already
+  holds. Before, that repeat returned the revoked record as a success and
+  wrote nothing.
+- Bind every mainnet settlement path to the signed endpoint hosts. `pay`, `claim`, `trustline` and `accounts create` verify the enablement before their reconcile pass and before any client is built. `tx status` and `tx receipt clear` verify it before any client is built and refuse a failed check with `profile.mainnet_enablement_invalid`. The MCP status tool and dispatch-gate pass need the startup enablement record and the per-call freshness check, which refuses with `network.mainnet_write_forbidden`. A mainnet profile without an enablement record runs no reconciliation, recovery or release, and `tx receipt clear` refuses on it. The mainnet write context also refuses a merged `oracle_provider_url` that differs from the stored one. A same-user process that edits the profile file can no longer choose the endpoints whose answers settle a submission.
+- Bind the oracle endpoint in the owner-signed policy. The `[mainnet]` section requires `oracle_host`, which `profile enable-mainnet` stages from the host of `oracle_provider_url`; its result reports `endpoint_host` and `oracle_host` as the written policy carries them. Enablement refuses a stored or merged oracle URL on another host with `profile.mainnet_enablement_invalid` naming `on_disk_oracle_host` or `merged_oracle_host`, and a mainnet signature accepts a cross-check witness only from the signed host. A mainnet write builds its post-send oracle client only for the signed host and refuses another stored oracle URL with `network.mainnet_authorization_refused`. A same-user process that edits the profile file can no longer point the witness at another host. A mainnet policy without `oracle_host` refuses with `policy.policy_file_parse_failed` until the owner adds the host and signs it again.
+- `url` moves from 2.5.8 to 2.5.9, which resolves RUSTSEC-2026-0592, and
+  `form_urlencoded` moves from 1.2.2 to 1.2.3 because `url` 2.5.9 requires it.
+  In `url` 2.5.8, `Url::origin()` and `url::quirks::origin()` on a nested
+  `blob:` URL recurse until the stack overflows and abort the process. The two
+  wallet calls of `Url::origin()` take the origin and resource URLs of an MPP
+  challenge's HTTP request context, which comes from an MCP tool argument or
+  `mpp charge authorize` input, and run only after both URLs pass a check that
+  refuses every scheme other than `https`, so a `blob:` URL never reaches them.
+  No wallet crate calls `url::quirks::origin()`.
+- The build dependency `zip` moves from 8.6.0 to 9.5.1 through
+  `libsodium-sys-stable` 1.24.6, which resolves RUSTSEC-2026-0545,
+  RUSTSEC-2026-0546, RUSTSEC-2026-0547, and RUSTSEC-2026-0548. `zip` runs only
+  in the `libsodium-sys-stable` build script and is not linked into the
+  binaries.
+- `deny.toml` accepts RUSTSEC-2026-0543: `chrono` 0.4.45 is unmaintained, and
+  no release resolves the advisory. Only `rmcp`, `schemars`, and `serde-aux`
+  depend on it, and no wallet crate calls it.
 
 ## [0.1.0-alpha.13] - 2026-10-31
 
@@ -5070,7 +6025,8 @@ policy engine, operator-approval spine, and tamper-evident audit log.
 - An agent integration guide (`docs/agents.md`) and capability-isolation example
   toolsets under `examples/toolsets/`.
 
-[Unreleased]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.13...HEAD
+[Unreleased]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.2.0-alpha.1...HEAD
+[0.2.0-alpha.1]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.13...v0.2.0-alpha.1
 [0.1.0-alpha.13]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.12...v0.1.0-alpha.13
 [0.1.0-alpha.12]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.11...v0.1.0-alpha.12
 [0.1.0-alpha.11]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.10...v0.1.0-alpha.11

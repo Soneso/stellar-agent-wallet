@@ -116,7 +116,7 @@ and other AI coding agents discover tools. A first session looks like this:
    [Prerequisites](getting-started.md#prerequisites)):
 
    ```bash
-   git clone --branch v0.1.0-alpha.13 https://github.com/Soneso/stellar-agent-wallet
+   git clone --branch v0.2.0-alpha.1 https://github.com/Soneso/stellar-agent-wallet
    cd stellar-agent-wallet && cargo build --release --locked
    cp target/release/stellar-agent target/release/stellar-agent-mcp
    ```

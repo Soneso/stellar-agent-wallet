@@ -1,5 +1,0 @@
-- `stellar_sep43_sign_auth_entry` decides each `transfer`, `transfer_from`, `approve`, `burn` and `burn_from` the signing account authorizes in the entry's invocation tree under the `stellar_pay_commit` rule, with the contract asset, the exact quantity and the recipient. A transfer that rule refuses is not signed.
-- The tool admits those payments and its own rule's count to the policy windows before it loads the signer. A signer or signing failure keeps them, and each call charges again.
-- A call in the tree the wallet cannot value needs `allow_opaque_signing = true` on the tool's rule. An approval requirement refuses with `policy.approval_required_unsupported`, and a profile signer that is not a G-strkey refuses with `policy.engine_required`.
-- The preimage passes the SEP-43 input checks before any account read, and its `opaque_payload_signed` row carries the allowed payment legs.
-- `stellar_agent_sep43::signing::validate_soroban_auth_entry` runs the `signAuthEntry` input checks without a signer.

@@ -1,2 +1,0 @@
-- Retain consent evidence throughout each approval's permitted lifetime, with a 4,096-slot admission cap and `approval.evidence_capacity` for new requests.
-- Defer consent batches when evidence reports owner rollback, while unrelated payments continue. Anchored delivery and explicit lifecycle clocks preserve existing grants through publication retries.

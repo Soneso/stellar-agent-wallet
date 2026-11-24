@@ -11,7 +11,7 @@ This crate is a library with no executable. The `stellar-agent` executable of th
 Install the `stellar-agent-cli` package:
 
 ```
-cargo install --locked stellar-agent-cli@0.1.0-alpha.13
+cargo install --locked stellar-agent-cli@0.2.0-alpha.1
 ```
 
 `--locked` makes cargo build with the `Cargo.lock` published in the crate. The

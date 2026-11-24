@@ -1,1 +1,0 @@
-- `profile enable-mainnet --check` reports authenticated total-budget use and remaining amounts without changing wallet state.

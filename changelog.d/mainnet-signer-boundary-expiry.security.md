@@ -1,1 +1,0 @@
-- Check a mainnet transaction authorization's issue time and expiry in the keyring, software, and hardware signers, after the secret read or the device's key answer and immediately before the signature is produced. An authorization that ends during key access produces no signature and refuses with `network.mainnet_authorization_refused`, logging `expired` or `not_yet_valid`.
