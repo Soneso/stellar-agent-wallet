@@ -6,8 +6,8 @@
 //! state. A waiting record continues: a canonical record is rebuilt after the
 //! confirmation, and an envelope record signs its stored envelope. An unknown
 //! id opens a canonical record for the intent, the decision and the envelope
-//! the run built. Off mainnet a supplied id is validated and echoed, and no
-//! record exists.
+//! the run built. Both mainnet and off-mainnet success outputs echo the
+//! supplied id; off mainnet no record exists.
 
 use std::io::Write;
 

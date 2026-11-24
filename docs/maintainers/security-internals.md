@@ -1689,9 +1689,30 @@ The probe runs on the client instance that will carry `sendTransaction`, not on 
 
 After the identity probe, every classic prepare on MCP and every classic value verb on the CLI runs `operational::operational_check` on the same client. It runs before the first account read whose answer the verb signs against, on every network. The CLI mainnet write runs the check in its build and does not repeat it in the write ceremony.
 
-The check reads `getHealth` under the caller's deadline and refuses a status other than `healthy`. It then reads the latest ledger through `getLedgers` under the earlier of that deadline and `LEDGER_READ_TIMEOUT`, 2 seconds. It accepts the answer under the rule the window store applies to the same read. Last it reads the host clock. A close time more than `MAX_LEDGER_CLOSE_LAG`, 60 seconds, behind the host clock means a stalled endpoint, a stalled network, or a lagging host clock. A close time more than 60 seconds ahead means a skewed host clock.
+The check reads `getHealth` under the caller's deadline and refuses a status
+other than `healthy`. It then reads the latest ledger through `getLedgers`,
+with up to three attempts on timeout or transport failure. Each attempt is bounded
+by the earlier of that deadline and `LEDGER_READ_TIMEOUT`, 2 seconds from its
+start. Pauses before retries are 250 ms and 500 ms. The check requires each
+pause to fit before the caller's deadline and checks the deadline again after
+the pause. If the deadline has passed, it returns the refusal from the
+preceding attempt without starting another. JSON-RPC error answers, decode
+errors, and close-time validation failures are not retried.
+`operational_check_single` reads the ledger at most once.
 
-An endpoint refusal is `network.endpoint_not_ready`. Its reason names the status, the failed read, or the ledger and its lag, and never the endpoint URL. A host clock that cannot be read refuses with `wallet.clock_error` instead.
+The check accepts the answer under the rule the window store applies to the
+same read. Last it reads the host clock. A close time more than
+`MAX_LEDGER_CLOSE_LAG`, 60 seconds, behind the host clock means a stalled
+endpoint, a stalled network, or a lagging host clock. A close time more than
+60 seconds ahead means a skewed host clock.
+
+An endpoint refusal is `network.endpoint_not_ready`. Its reason names the
+status, the failed read, or the ledger and its lag, and never the endpoint
+URL. Every `getLedgers` read refusal in the retry loop names the attempts
+made, including timeouts, transport failures, JSON-RPC error answers, and
+decode errors. Close-time validation after the loop names no attempt count.
+A close-time lag refusal names the ledger and its lag. A host clock that
+cannot be read refuses with `wallet.clock_error` instead.
 
 On MCP and on the CLI mainnet path, the account read that follows the check runs under the same absolute deadline. A read still running at that deadline refuses with `network.endpoint_not_ready`. On MCP, the sequence catch-up after a confirmed submit ends its wait at that deadline and keeps the last account it read. The account read follows the check on the same client. So the sequence the envelope is signed against is at least as fresh as the ledger the check observed. The MCP prepare result carries that ledger as `operational`, and the CLI mainnet summary names it. A stale endpoint therefore refuses before the summary and before the presence ceremony.
 

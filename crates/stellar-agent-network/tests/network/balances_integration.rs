@@ -32,7 +32,7 @@
 
 use serde_json::json;
 use stellar_agent_core::error::{NetworkError, WalletError};
-use stellar_agent_network::{Asset, StellarRpcClient, fetch_account};
+use stellar_agent_network::{Asset, AssetType, StellarRpcClient, fetch_account};
 use stellar_agent_test_support::EchoIdResponder;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer};
@@ -181,7 +181,8 @@ async fn fetch_account_returns_native_balance_for_funded_account() {
     );
     let native = &account.balances[0];
     assert_eq!(
-        native.asset.asset_type, "native",
+        native.asset.asset_type,
+        AssetType::Native,
         "first balance must be native XLM"
     );
     assert!(
@@ -351,13 +352,23 @@ async fn fetch_account_with_trustlines_present_included_absent_omitted() {
 
     let native = &account.balances[0];
     assert_eq!(
-        native.asset.asset_type, "native",
+        native.asset.asset_type,
+        AssetType::Native,
         "first entry must be native"
     );
     assert!(native.limit.is_none(), "native must have no limit");
 
     let usdc = &account.balances[1];
-    assert_eq!(usdc.asset.asset_type, "USDC", "second entry must be USDC");
+    assert_eq!(
+        usdc.asset.asset_type,
+        AssetType::CreditAlphanum4,
+        "second entry must be credit_alphanum4"
+    );
+    assert_eq!(
+        usdc.asset.code.as_deref(),
+        Some("USDC"),
+        "second entry must be USDC"
+    );
     assert_eq!(
         usdc.asset.issuer.as_deref(),
         Some(TEST_USDC_ISSUER),
@@ -377,7 +388,7 @@ async fn fetch_account_with_trustlines_present_included_absent_omitted() {
     let eurc_present = account
         .balances
         .iter()
-        .any(|b| b.asset.asset_type == "EURC");
+        .any(|b| b.asset.code.as_deref() == Some("EURC"));
     assert!(!eurc_present, "EURC must be absent from balances");
 }
 
@@ -414,7 +425,7 @@ async fn fetch_account_empty_trustline_slice_returns_native_only() {
         1,
         "empty trustline slice → native only"
     );
-    assert_eq!(account.balances[0].asset.asset_type, "native");
+    assert_eq!(account.balances[0].asset.asset_type, AssetType::Native);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -495,11 +506,23 @@ async fn fetch_account_trustlines_in_request_order_despite_response_order() {
     // Verify REQUEST ORDER: balances[1] must be USDC (first in request),
     // balances[2] must be EURC (second in request).
     assert_eq!(
-        account.balances[1].asset.asset_type, "USDC",
+        account.balances[1].asset.asset_type,
+        AssetType::CreditAlphanum4,
+        "balances[1] must be credit_alphanum4"
+    );
+    assert_eq!(
+        account.balances[1].asset.code.as_deref(),
+        Some("USDC"),
         "balances[1] must be USDC (first in request order)"
     );
     assert_eq!(
-        account.balances[2].asset.asset_type, "EURC",
+        account.balances[2].asset.asset_type,
+        AssetType::CreditAlphanum4,
+        "balances[2] must be credit_alphanum4"
+    );
+    assert_eq!(
+        account.balances[2].asset.code.as_deref(),
+        Some("EURC"),
         "balances[2] must be EURC (second in request order)"
     );
 }

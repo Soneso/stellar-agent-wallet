@@ -309,7 +309,7 @@ async fn t1_classic_trustline_add_two_phase_happy_path_under_minimum_reserve_rul
         .expect("source account fetch after commit");
     let usdc_present = |account: &stellar_agent_network::AccountView| {
         account.balances.iter().any(|b| {
-            b.asset.asset_type == "USDC"
+            b.asset.code.as_deref() == Some("USDC")
                 && b.asset.issuer.as_deref()
                     == Some("GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5")
         })
@@ -327,7 +327,7 @@ async fn t1_classic_trustline_add_two_phase_happy_path_under_minimum_reserve_rul
         .balances
         .iter()
         .find(|b| {
-            b.asset.asset_type == "USDC"
+            b.asset.code.as_deref() == Some("USDC")
                 && b.asset.issuer.as_deref()
                     == Some("GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5")
         })

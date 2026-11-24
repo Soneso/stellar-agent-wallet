@@ -270,8 +270,7 @@ pub struct PayResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cross_check: Option<CrossCheckView>,
 
-    /// The business id the run named, echoed off mainnet, where no record
-    /// exists. Absent when the run named none.
+    /// The business id the run named. Absent when the run named none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub business_id: Option<String>,
 }
@@ -2677,7 +2676,7 @@ where
                 ledger: Some(submitted.result.ledger),
                 stage: "build+sign+submit".to_owned(),
                 selected_fee_percentile: Some(built.fee_selection.selected_fee_percentile),
-                business_id: None,
+                business_id: args.business_id.clone(),
             };
             print_success(&Envelope::ok(result), args.output);
             0
@@ -10266,6 +10265,27 @@ pub(crate) mod tests {
             assert!(
                 fixture.oracle.received_requests().await.unwrap().is_empty(),
                 "no request may reach the oracle fixture for W destination"
+            );
+        }
+
+        /// Mainnet `pay` echoes the run's `business_id` on success.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn mainnet_pay_success_echoes_business_id() {
+            let fixture = Spec::new("mainnet-pay-business-id")
+                .rules(vec![pay_rule("allow", "")])
+                .build()
+                .await;
+            let mut args = mainnet_args(&fixture);
+            args.business_id = Some("pay-mainnet-bid-1".to_owned());
+
+            let run = run(&fixture, &args).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            assert_eq!(
+                run.envelope["data"]["business_id"], "pay-mainnet-bid-1",
+                "{}",
+                run.envelope
             );
         }
     }

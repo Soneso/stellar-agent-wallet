@@ -446,17 +446,34 @@ impl BalanceView {
     }
 }
 
+/// Stellar asset kind for a balance entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssetType {
+    /// Native XLM.
+    Native,
+    /// Credit asset whose code has 1 to 4 characters.
+    CreditAlphanum4,
+    /// Credit asset whose code has 5 to 12 characters.
+    CreditAlphanum12,
+}
+
 /// Asset identifier for a balance entry.
 ///
-/// `"native"` for XLM. Non-native assets carry `code` and `issuer`.
+/// Native XLM uses [`AssetType::Native`] and omits `code` and `issuer`.
+/// Credit assets set `asset_type` by code length and carry `code` and `issuer`.
 #[non_exhaustive]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssetView {
-    /// `"native"` for XLM; the alphanumeric asset code otherwise (e.g. `"USDC"`).
-    pub asset_type: String,
+    /// Asset kind: `native`, `credit_alphanum4`, or `credit_alphanum12`.
+    pub asset_type: AssetType,
+
+    /// `None` for native XLM; the alphanumeric asset code otherwise (e.g. `"USDC"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
 
     /// `None` for native XLM; the issuer G-strkey otherwise.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issuer: Option<String>,
 }
 
@@ -465,20 +482,31 @@ impl AssetView {
     #[must_use]
     pub fn native() -> Self {
         Self {
-            asset_type: "native".to_owned(),
+            asset_type: AssetType::Native,
+            code: None,
             issuer: None,
         }
     }
 
     /// Constructs a non-native asset view.
     ///
+    /// Selects [`AssetType::CreditAlphanum4`] for codes up to 4 bytes and
+    /// [`AssetType::CreditAlphanum12`] for longer codes.
+    ///
     /// # Panics
     ///
     /// Never panics.
     #[must_use]
     pub fn credit(code: impl Into<String>, issuer: impl Into<String>) -> Self {
+        let code = code.into();
+        let asset_type = if code.len() <= 4 {
+            AssetType::CreditAlphanum4
+        } else {
+            AssetType::CreditAlphanum12
+        };
         Self {
-            asset_type: code.into(),
+            asset_type,
+            code: Some(code),
             issuer: Some(issuer.into()),
         }
     }
@@ -595,13 +623,13 @@ impl SignerView {
 /// # Examples
 ///
 /// ```no_run
-/// use stellar_agent_network::{StellarRpcClient, fetch_account};
+/// use stellar_agent_network::{AssetType, StellarRpcClient, fetch_account};
 ///
 /// # async fn run() -> Result<(), stellar_agent_core::WalletError> {
 /// let client = StellarRpcClient::new("https://soroban-testnet.stellar.org")?;
 /// // Native-only (no trustline assets requested):
 /// let account = fetch_account(&client, "GABC...XYZ", &[]).await?;
-/// assert_eq!(account.balances[0].asset.asset_type, "native");
+/// assert_eq!(account.balances[0].asset.asset_type, AssetType::Native);
 /// # Ok(()) }
 /// ```
 pub async fn fetch_account(
@@ -2331,15 +2359,49 @@ mod tests {
     #[test]
     fn asset_view_native() {
         let a = AssetView::native();
-        assert_eq!(a.asset_type, "native");
+        assert_eq!(a.asset_type, AssetType::Native);
+        assert!(a.code.is_none());
         assert!(a.issuer.is_none());
+        assert_eq!(
+            serde_json::to_value(&a).unwrap(),
+            serde_json::json!({ "asset_type": "native" })
+        );
     }
 
     #[test]
-    fn asset_view_credit() {
-        let a = AssetView::credit("USDC", "GA5Z...");
-        assert_eq!(a.asset_type, "USDC");
-        assert_eq!(a.issuer.as_deref(), Some("GA5Z..."));
+    fn asset_view_credit_alphanum4() {
+        for code in ["A", "EU", "USD", "USDC"] {
+            let a = AssetView::credit(code, "GA5Z...");
+            assert_eq!(a.asset_type, AssetType::CreditAlphanum4);
+            assert_eq!(a.code.as_deref(), Some(code));
+            assert_eq!(a.issuer.as_deref(), Some("GA5Z..."));
+            assert_eq!(
+                serde_json::to_value(&a).unwrap(),
+                serde_json::json!({
+                    "asset_type": "credit_alphanum4",
+                    "code": code,
+                    "issuer": "GA5Z...",
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn asset_view_credit_alphanum12() {
+        for code in ["ABCDE", "EURMTL", "ABCDEFGHIJKL"] {
+            let a = AssetView::credit(code, "GACK...");
+            assert_eq!(a.asset_type, AssetType::CreditAlphanum12);
+            assert_eq!(a.code.as_deref(), Some(code));
+            assert_eq!(a.issuer.as_deref(), Some("GACK..."));
+            assert_eq!(
+                serde_json::to_value(&a).unwrap(),
+                serde_json::json!({
+                    "asset_type": "credit_alphanum12",
+                    "code": code,
+                    "issuer": "GACK...",
+                })
+            );
+        }
     }
 
     // ─── trim_asset_code unit tests ───────────────────────────────────────────

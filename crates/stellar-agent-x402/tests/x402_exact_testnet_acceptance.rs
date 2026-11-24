@@ -72,7 +72,7 @@ use stellar_agent_network::cross_check::SorobanCrossCheck;
 use stellar_agent_network::signing::SoftwareSigningKey;
 use stellar_agent_network::signing::envelope_signing::attach_signature;
 use stellar_agent_network::{
-    SUPPORTED_PROTOCOL_VERSIONS, StellarRpcClient, fetch_account, redact_tx_hash,
+    AssetType, SUPPORTED_PROTOCOL_VERSIONS, StellarRpcClient, fetch_account, redact_tx_hash,
     submit_transaction_and_wait,
 };
 use stellar_agent_x402::constants::X402_STELLAR_TESTNET;
@@ -169,7 +169,7 @@ async fn native_balance(rpc: &StellarRpcClient, account: &str) -> i64 {
             let native = view
                 .balances
                 .iter()
-                .find(|balance| balance.asset.asset_type == "native")
+                .find(|balance| balance.asset.asset_type == AssetType::Native)
                 .expect("every account holds native balance");
             return native
                 .balance

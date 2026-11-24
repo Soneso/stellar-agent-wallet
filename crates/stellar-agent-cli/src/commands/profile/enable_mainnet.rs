@@ -652,30 +652,77 @@ pub(super) fn execute(
     tests::observe_authoring("replace", policy_path);
     write_policy(policy_path, &rewritten)
         .map_err(|e| precondition(format!("policy rewrite: {e}")))?;
-    let mut next = vec![
-        "Review [mainnet].classic_max_fee_per_op_stroops (10000 when absent), and set optional \
-         authorization_ttl_seconds and cross_check_thresholds."
-            .to_owned(),
-        format!(
-            "Enroll an approval credential with stellar-agent approve credential enroll \
-             --profile {name} and add its entry to [mainnet].approval_credentials."
-        ),
-        format!("stellar-agent profile sign-policy --profile {name} --secret-env OWNER_SEED"),
-    ];
-    if !cfg!(feature = "mainnet-write") {
-        next.push("Mainnet writes require a build with mainnet-write enabled.".into());
-    }
+    let policy_needs_signature = true;
+    let next = next_steps(name, profile, &body, policy_needs_signature);
     Ok(serde_json::json!({
         "profile": name,
         "endpoint_host": written_endpoint_host,
         "oracle_host": written_oracle_host,
         "installation_nonce_sha256": digest,
         "policy_path": policy_path,
-        "policy_needs_signature": true,
+        "policy_needs_signature": policy_needs_signature,
         "rotated": args.rotate,
         "next": next,
         "spending_summary": spending_summary,
     }))
+}
+
+/// Builds the `next` operator hints for the enablement output.
+///
+/// Each policy hint appears only while its state is missing or invalid in
+/// `body` before the rewrite fills defaults. The sign-policy hint appears
+/// whenever `policy_needs_signature` is `true`. The build-feature notice stays
+/// present on builds without `mainnet-write`.
+fn next_steps(
+    name: &str,
+    profile: &Profile,
+    body: &toml_edit::DocumentMut,
+    policy_needs_signature: bool,
+) -> Vec<String> {
+    let outcomes = mainnet_minimum::evaluate(body, profile, name);
+    let passed = |requirement: &str| {
+        outcomes.iter().any(|outcome| {
+            outcome.requirement == requirement && outcome.status == RequirementStatus::Passed
+        })
+    };
+    let mainnet = body.get("mainnet").and_then(toml_edit::Item::as_table_like);
+    let has_fee_cap = passed("fee_cap");
+    let has_ttl = mainnet
+        .and_then(|table| table.get("authorization_ttl_seconds"))
+        .is_some()
+        && passed("ttl");
+    let has_thresholds = mainnet
+        .and_then(|table| table.get("cross_check_thresholds"))
+        .and_then(toml_edit::Item::as_table_like)
+        .is_some_and(|table| !table.is_empty())
+        && passed("thresholds");
+    let has_credentials = passed("approval_credentials");
+
+    let mut next = Vec::new();
+    if !has_fee_cap {
+        next.push("Review [mainnet].classic_max_fee_per_op_stroops (10000 when absent).".into());
+    }
+    if !has_ttl {
+        next.push("Set optional [mainnet].authorization_ttl_seconds.".into());
+    }
+    if !has_thresholds {
+        next.push("Set optional [mainnet].cross_check_thresholds.".into());
+    }
+    if !has_credentials {
+        next.push(format!(
+            "Enroll an approval credential with stellar-agent approve credential enroll \
+             --profile {name} and add its entry to [mainnet].approval_credentials."
+        ));
+    }
+    if policy_needs_signature {
+        next.push(format!(
+            "stellar-agent profile sign-policy --profile {name} --secret-env OWNER_SEED"
+        ));
+    }
+    if !cfg!(feature = "mainnet-write") {
+        next.push("Mainnet writes require a build with mainnet-write enabled.".into());
+    }
+    next
 }
 
 /// Refuses an installation that holds an enablement nonce at `nonce` but no
@@ -5142,6 +5189,235 @@ mod tests {
         assert_eq!(persisted(&fixture), snapshot);
         assert_eq!(fixture.pin(), pin);
         assert_eq!(get(&fixture.nonce_ref()), nonce);
+    }
+
+    /// A profile whose policy already carries fee cap, approval TTL,
+    /// cross-check thresholds, and approval credentials gets only the
+    /// sign-policy hint after a rewrite (plus the build-feature hint when
+    /// built without `mainnet-write`).
+    #[test]
+    #[serial]
+    fn full_policy_gets_only_sign_policy_hint() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let mut fixture = Fixture::new();
+        fixture.sign(&unbound_body(false));
+        let first = fixture.run().unwrap();
+        let mut expected = vec![
+            "stellar-agent profile sign-policy --profile operator --secret-env OWNER_SEED"
+                .to_owned(),
+        ];
+        if !cfg!(feature = "mainnet-write") {
+            expected.push("Mainnet writes require a build with mainnet-write enabled.".to_owned());
+        }
+        assert_eq!(first["next"], serde_json::json!(expected), "{first}");
+
+        fixture.signed_body(9);
+        fixture.args.rotate = true;
+        let rotated = fixture.run().unwrap();
+        assert_eq!(rotated["next"], serde_json::json!(expected), "{rotated}");
+    }
+
+    /// Fee-cap hint appears when `[mainnet].classic_max_fee_per_op_stroops` is
+    /// absent in the read policy (even though rewrite inserts the preset
+    /// 10000) and disappears when already present.
+    #[test]
+    #[serial]
+    fn next_hint_fee_cap_follows_policy_state() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let fixture = Fixture::new();
+        let present: toml_edit::DocumentMut = unbound_body(false).parse().unwrap();
+        fixture.sign(&present.to_string());
+        let with_cap = fixture.run().unwrap();
+        assert!(
+            !with_cap["next"]
+                .to_string()
+                .contains("classic_max_fee_per_op_stroops"),
+            "{with_cap}"
+        );
+
+        let unconfigured = Fixture::new();
+        let without_cap = unconfigured.run().unwrap();
+        assert!(
+            without_cap["next"]
+                .to_string()
+                .contains("classic_max_fee_per_op_stroops"),
+            "{without_cap}"
+        );
+
+        let mut single_missing: toml_edit::DocumentMut = FULL.parse().unwrap();
+        single_missing["mainnet"]
+            .as_table_like_mut()
+            .unwrap()
+            .remove("classic_max_fee_per_op_stroops");
+        let isolated = next_steps("operator", &fixture.profile, &single_missing, true);
+        assert!(
+            isolated
+                .iter()
+                .any(|h| h.contains("classic_max_fee_per_op_stroops")),
+            "{isolated:?}"
+        );
+    }
+
+    /// Approval-TTL hint appears when `[mainnet].authorization_ttl_seconds` is
+    /// missing or invalid and disappears when valid.
+    #[test]
+    #[serial]
+    fn next_hint_approval_ttl_follows_policy_state() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let fixture = Fixture::new();
+        let mut present: toml_edit::DocumentMut = unbound_body(false).parse().unwrap();
+        fixture.sign(&present.to_string());
+        let with_ttl = fixture.run().unwrap();
+        assert!(
+            !with_ttl["next"]
+                .to_string()
+                .contains("authorization_ttl_seconds"),
+            "{with_ttl}"
+        );
+
+        let fixture = Fixture::new();
+        present["mainnet"]
+            .as_table_like_mut()
+            .unwrap()
+            .remove("authorization_ttl_seconds");
+        fixture.sign(&present.to_string());
+        let without_ttl = fixture.run().unwrap();
+        assert!(
+            without_ttl["next"]
+                .to_string()
+                .contains("authorization_ttl_seconds"),
+            "{without_ttl}"
+        );
+
+        present["mainnet"]["authorization_ttl_seconds"] = toml_edit::value(999);
+        let invalid_ttl = next_steps("operator", &fixture.profile, &present, true);
+        assert!(
+            invalid_ttl
+                .iter()
+                .any(|h| h.contains("authorization_ttl_seconds")),
+            "{invalid_ttl:?}"
+        );
+    }
+
+    /// Cross-check thresholds hint appears when `[mainnet].cross_check_thresholds`
+    /// is missing, empty, or invalid, and disappears when populated and valid.
+    #[test]
+    #[serial]
+    fn next_hint_cross_check_thresholds_follows_policy_state() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let fixture = Fixture::new();
+        let mut present: toml_edit::DocumentMut = unbound_body(false).parse().unwrap();
+        fixture.sign(&present.to_string());
+        let with_thresholds = fixture.run().unwrap();
+        assert!(
+            !with_thresholds["next"]
+                .to_string()
+                .contains("cross_check_thresholds"),
+            "{with_thresholds}"
+        );
+
+        let fixture = Fixture::new();
+        present["mainnet"]
+            .as_table_like_mut()
+            .unwrap()
+            .remove("cross_check_thresholds");
+        fixture.sign(&present.to_string());
+        let without_thresholds = fixture.run().unwrap();
+        assert!(
+            without_thresholds["next"]
+                .to_string()
+                .contains("cross_check_thresholds"),
+            "{without_thresholds}"
+        );
+
+        present["mainnet"]["cross_check_thresholds"] =
+            toml_edit::Item::Table(toml_edit::Table::new());
+        let empty_thresholds = next_steps("operator", &fixture.profile, &present, true);
+        assert!(
+            empty_thresholds
+                .iter()
+                .any(|h| h.contains("cross_check_thresholds")),
+            "{empty_thresholds:?}"
+        );
+
+        present["mainnet"]["cross_check_thresholds"]["native"] = toml_edit::value("-1");
+        let invalid_thresholds = next_steps("operator", &fixture.profile, &present, true);
+        assert!(
+            invalid_thresholds
+                .iter()
+                .any(|h| h.contains("cross_check_thresholds")),
+            "{invalid_thresholds:?}"
+        );
+    }
+
+    /// Credential-enrollment hint appears when `[mainnet].approval_credentials`
+    /// is absent or empty and disappears when a valid credential is present.
+    #[test]
+    #[serial]
+    fn next_hint_approval_credentials_follows_policy_state() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let fixture = Fixture::new();
+        let present: toml_edit::DocumentMut = unbound_body(false).parse().unwrap();
+        fixture.sign(&present.to_string());
+        let with_creds = fixture.run().unwrap();
+        assert!(
+            !with_creds["next"]
+                .to_string()
+                .contains("approval_credentials"),
+            "{with_creds}"
+        );
+
+        let unconfigured = Fixture::new();
+        let without_creds = unconfigured.run().unwrap();
+        assert!(
+            without_creds["next"]
+                .to_string()
+                .contains("approval_credentials"),
+            "{without_creds}"
+        );
+
+        let mut single_missing: toml_edit::DocumentMut = FULL.parse().unwrap();
+        single_missing["mainnet"]
+            .as_table_like_mut()
+            .unwrap()
+            .remove("approval_credentials");
+        let isolated = next_steps("operator", &fixture.profile, &single_missing, true);
+        assert!(
+            isolated.iter().any(|h| h.contains("approval_credentials")),
+            "{isolated:?}"
+        );
+    }
+
+    /// The sign-policy hint appears when `policy_needs_signature` is `true`
+    /// and is absent when `policy_needs_signature` is `false`.
+    #[test]
+    #[serial]
+    fn next_hint_sign_policy_follows_policy_needs_signature() {
+        let storage_sandbox = stellar_agent_test_support::sandbox::StateSandbox::new().unwrap();
+        let _storage_home =
+            stellar_agent_test_support::StellarAgentHomeGuard::new(storage_sandbox.path());
+        let profile = Fixture::profile();
+        let body: toml_edit::DocumentMut = FULL.parse().unwrap();
+        let needs_sig = next_steps("operator", &profile, &body, true);
+        let no_sig = next_steps("operator", &profile, &body, false);
+        assert!(
+            needs_sig.iter().any(|h| h.contains("sign-policy")),
+            "{needs_sig:?}"
+        );
+        assert!(
+            !no_sig.iter().any(|h| h.contains("sign-policy")),
+            "{no_sig:?}"
+        );
     }
 
     include!("enable_mainnet_authoring_tests.rs");

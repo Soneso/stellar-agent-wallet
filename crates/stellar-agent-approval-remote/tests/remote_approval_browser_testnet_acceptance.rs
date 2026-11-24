@@ -103,7 +103,7 @@ use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_core::timefmt;
 use stellar_agent_mcp::server::{StellarPayArgs, StellarPayCommitArgs, WalletServer};
-use stellar_agent_network::{StellarRpcClient, fetch_account};
+use stellar_agent_network::{AssetType, StellarRpcClient, fetch_account};
 use stellar_agent_test_support::StellarAgentHomeGuard;
 use stellar_agent_test_support::keyring_mock;
 use stellar_agent_test_support::sandbox::StateSandbox;
@@ -170,7 +170,7 @@ async fn native_balance_stroops(g_strkey: &str) -> i64 {
         .expect("fetch_account must succeed for a funded, queryable account");
     view.balances
         .iter()
-        .find(|b| b.asset.asset_type == "native")
+        .find(|b| b.asset.asset_type == AssetType::Native)
         .map(|b| b.balance_stroops().expect("native balance parses"))
         .unwrap_or(0)
 }

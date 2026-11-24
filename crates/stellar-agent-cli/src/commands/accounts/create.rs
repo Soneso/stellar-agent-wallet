@@ -297,8 +297,7 @@ pub struct CreateAccountResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cross_check: Option<CrossCheckView>,
 
-    /// The business id the run named, echoed off mainnet, where no record
-    /// exists. Absent when the run named none.
+    /// The business id the run named. Absent when the run named none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub business_id: Option<String>,
 }
@@ -1724,7 +1723,7 @@ where
                 ),
                 selected_fee_percentile: Some(fee_selection.selected_fee_percentile),
                 cross_check: Some(submitted.cross_check(&cross_check).view()),
-                business_id: None,
+                business_id: args.business_id.clone(),
             };
             print_success(&Envelope::ok(result), args.output);
             0
@@ -4419,6 +4418,24 @@ pub(crate) mod tests {
                 run.envelope
             );
             assert!(fixture.sent_envelopes().await.is_empty());
+        }
+
+        /// Mainnet `accounts create` echoes the run's `business_id` on success.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn mainnet_create_account_success_echoes_business_id() {
+            let fixture = Spec::new("mainnet-create-business-id").build().await;
+            let mut args = mainnet_args(&fixture);
+            args.business_id = Some("create-mainnet-bid-1".to_owned());
+
+            let run = run(&fixture, &args).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            assert_eq!(
+                run.envelope["data"]["business_id"], "create-mainnet-bid-1",
+                "{}",
+                run.envelope
+            );
         }
     }
 

@@ -109,7 +109,10 @@ These recur with the same meaning across groups:
 | `--secondary-rpc-url <URL>` | Testnet override; refused on mainnet; credentials refused; sends no keyring credential | profile secondary |
 | `--timeout-seconds <SECONDS>` | Bounds submission and simulation. On `pay`, `claim`, sponsored `accounts create`, and `trustline`, it bounds the send and the confirmation poll; the endpoint checks and the reads before the send run under a fixed 30-second pre-send budget | `60`; on those four, the profile's `submit_timeout_seconds`, then `60` |
 | `--output <FORMAT>` | `json` (default) or `table`; not accepted on every command | `json` |
-| `--business-id <ID>` | Names one value operation on `pay`, `claim`, `trustline` and `accounts create`; required on mainnet, validated and echoed elsewhere | none |
+| `--business-id <ID>` | Names one value operation on `pay`, `claim`, `trustline` and `accounts create`; required on mainnet, validated when supplied elsewhere | none |
+
+Success output from these verbs echoes a supplied id in `data.business_id`
+on mainnet and testnet. The field is omitted when no id is supplied.
 
 ### Signer source
 
@@ -456,7 +459,7 @@ and removes only terminal markers older than 30 days.
 
 ## balances
 
-`balances [flags]`: reads native XLM balance and trustlines via RPC `getLedgerEntries`. Read-only; no mainnet gate. `--account` is required; omitting it exits `1` with `validation.usage_error`. In each `balances` entry, `asset.asset_type` is `native` for XLM or the asset code, such as `USDC`, and a trustline adds `asset.issuer`.
+`balances [flags]`: reads native XLM balance and trustlines via RPC `getLedgerEntries`. Read-only; no mainnet gate. `--account` is required; omitting it exits `1` with `validation.usage_error`. In each `balances` entry, `asset.asset_type` is `native`, `credit_alphanum4`, or `credit_alphanum12`. Credit assets carry `asset.code` and `asset.issuer`; native XLM omits both. Codes of 1 to 4 characters use `credit_alphanum4`; codes of 5 to 12 characters use `credit_alphanum12`.
 
 | Flag | Meaning | Default |
 |---|---|---|
@@ -1027,9 +1030,13 @@ ceremony writes the spending preview to stderr as one JSON line, with
 `authority_status = "requires_signature"`. It summarizes the body
 `profile sign-policy` signs from the written file. An unwritable preview refuses with
 `profile.spending_preview_unwritable` and writes nothing. Later refusals carry
-the preview at `error.details.preview`. The operator reviews the fee cap,
-sets the optional authorization TTL and thresholds, then signs the policy as
-the output's `next` list directs.
+the preview at `error.details.preview`.
+The `next` list checks the profile and policy read before the rewrite fills
+defaults. It lists fee-cap, optional authorization TTL, optional cross-check
+threshold, and approval-credential hints only while their settings are missing
+or invalid. An empty threshold table also gets its hint.
+The `profile sign-policy` hint appears whenever `policy_needs_signature` is
+`true`.
 
 See [the policy schema and minimum](profiles-and-keys.md#mainnet-policy-body) for
 required signed fields and rules. After enablement, complete and sign the
@@ -1452,13 +1459,17 @@ stellar-agent approve gc --profile default --include-consumed
 
 ### `approve list`
 
-Read-only. Enumerates pending approvals from the profile's store: opens it, renders a redacted snapshot, and exits. No keyring access, no network calls.
+Read-only. Opens the profile's approval store, renders a redacted snapshot,
+and exits. `pending` contains only non-tombstone entries. `resolved` contains
+both tombstone kinds, `Consumed` and `Rejected`, distinguished by `kind_name`
+with the same entry shape. Table output groups tombstones under `Resolved`
+when any are listed. No keyring access, no network calls.
 
 | Flag | Meaning | Default |
 |---|---|---|
 | `--profile <NAME>` | Profile whose store to read | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--output <FORMAT>` | `json` (default) or `table` | `json` |
-| `--include-expired` | Include already-expired entries instead of omitting them | `false` |
+| `--include-expired` | Include already-expired entries in `pending` and `resolved` | `false` |
 
 `data.profile` is present only when the name resolves to a saved profile, in `approve list` and `approve gc` alike. `data.expired_count` always reports the number of expired entries regardless of `--include-expired`, so the operator can tell whether `approve gc` is due even when expired entries are hidden.
 

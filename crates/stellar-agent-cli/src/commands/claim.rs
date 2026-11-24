@@ -240,8 +240,7 @@ pub struct ClaimResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cross_check: Option<CrossCheckView>,
 
-    /// The business id the run named, echoed off mainnet, where no record
-    /// exists. Absent when the run named none.
+    /// The business id the run named. Absent when the run named none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub business_id: Option<String>,
 }
@@ -1651,7 +1650,7 @@ async fn guard_and_build(
     let native_balance_stroops = account_view
         .balances
         .first()
-        .filter(|b| b.asset.asset_type == "native")
+        .filter(|b| b.asset.asset_type == stellar_agent_network::AssetType::Native)
         .map(stellar_agent_network::BalanceView::balance_stroops)
         .transpose()?
         .unwrap_or(0);
@@ -2295,7 +2294,7 @@ where
                 ledger: Some(submitted.result.ledger),
                 stage: "build+sign+submit".to_owned(),
                 balance_id_hex72: Some(built.balance_id_hex72),
-                business_id: None,
+                business_id: args.business_id.clone(),
             },
         ),
         Err(envelope) => failed(envelope),
@@ -5778,6 +5777,24 @@ pub(crate) mod tests {
             .await;
 
             assert_build_only_reserve_refusal(&run);
+        }
+
+        /// Mainnet `claim` echoes the run's `business_id` on success.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn mainnet_claim_success_echoes_business_id() {
+            let fixture = spec("mainnet-claim-business-id").build().await;
+            let mut args = mainnet_args(&fixture);
+            args.business_id = Some("claim-mainnet-bid-1".to_owned());
+
+            let run = run(&fixture, &args).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            assert_eq!(
+                run.envelope["data"]["business_id"], "claim-mainnet-bid-1",
+                "{}",
+                run.envelope
+            );
         }
     }
     #[tokio::test(flavor = "current_thread")]

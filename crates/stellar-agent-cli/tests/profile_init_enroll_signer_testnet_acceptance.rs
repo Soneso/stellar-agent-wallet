@@ -563,7 +563,7 @@ async fn profile_init_then_enroll_signer_enables_a_real_signing_operation() {
         account_after
             .balances
             .iter()
-            .any(|b| b.asset.asset_type == PROOF_ASSET_CODE
+            .any(|b| b.asset.code.as_deref() == Some(PROOF_ASSET_CODE)
                 && b.asset.issuer.as_deref() == Some(issuer_g.as_str())),
         "the account must now carry a trustline balance for {PROOF_ASSET_CODE}:{issuer_g}: {:?}",
         account_after.balances

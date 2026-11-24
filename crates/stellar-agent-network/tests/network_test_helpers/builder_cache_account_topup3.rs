@@ -10,7 +10,8 @@
 //! - `project_signer` for `SignerKey::Ed25519SignedPayload` — the signer_type
 //!   field must be `"ed25519_signed_payload"`.
 //! - `project_trustline_entry` with `TrustLineAsset::Native` — produces an
-//!   `AssetView` whose `asset_type == "native"` and `issuer == None`.
+//!   `AssetView` with `asset_type` `AssetType::Native`, `code` `None`, and
+//!   `issuer` `None`.
 //!
 //! cache.rs
 //! - `base64_decode_key` with a string that is not valid base64 at all (not
@@ -253,7 +254,8 @@ async fn fetch_account_v1_extension_surfaces_liabilities() {
     // The first balance entry is always native XLM.
     let native_balance = &view.balances[0];
     assert_eq!(
-        native_balance.asset.asset_type, "native",
+        native_balance.asset.asset_type,
+        stellar_agent_network::AssetType::Native,
         "first balance must be native"
     );
     // buying_liabilities = 5_000_000 stroops = 0.5000000 XLM
@@ -335,7 +337,8 @@ async fn fetch_account_ed25519_signed_payload_signer_produces_correct_type() {
 
 /// When the RPC returns a trustline entry with `TrustLineAsset::Native`,
 /// `project_trustline_entry` must produce a `BalanceView` with
-/// `asset.asset_type == "native"` and `asset.issuer == None`.
+/// `asset.asset_type` `AssetType::Native`, `asset.code` `None`, and
+/// `asset.issuer` `None`.
 ///
 /// The Stellar protocol does not create native trustlines in normal operation,
 /// but the XDR schema permits it.  The `TrustLineAsset::Native` arm in
@@ -416,8 +419,13 @@ async fn fetch_account_native_trustline_asset_produces_native_balance_view() {
     );
     let tl_balance_view = &view.balances[1];
     assert_eq!(
-        tl_balance_view.asset.asset_type, "native",
-        "TrustLineAsset::Native must project to asset_type='native'"
+        tl_balance_view.asset.asset_type,
+        stellar_agent_network::AssetType::Native,
+        "TrustLineAsset::Native must project to AssetType::Native"
+    );
+    assert!(
+        tl_balance_view.asset.code.is_none(),
+        "TrustLineAsset::Native must have no code"
     );
     assert!(
         tl_balance_view.asset.issuer.is_none(),
