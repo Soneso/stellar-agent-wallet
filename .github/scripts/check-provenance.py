@@ -7,9 +7,13 @@ not signatures: docs/verifying-releases.md describes signature
 verification. The predicate must name the generator at v2.1.0, the release
 workflow, the repository, tag and commit the job passes, and a material at
 that commit, and its subjects must equal SHA256SUMS. Its build type is the
-generator's generic one, its environment is empty, and its parameters hold
-only the vars context the generator records, a mapping of names to string
-values. The release workflow, the workflows it calls and its local actions
+generator's generic one. Its environment is an object with exactly the 15
+keys in ENVIRONMENT_KEYS. The github_sha1, github_ref and
+github_repository_owner values match the commit, ref and repository owner
+arguments; github_ref_type is tag and github_event_name is push. Other
+environment values vary per run and are not compared. Its parameters hold
+only the vars context, a mapping of names to string values.
+The release workflow, the workflows it calls and its local actions
 never read that context, which check-workflow-invariants.py enforces.
 """
 import argparse
@@ -22,6 +26,12 @@ import sys
 BUILDER = ('https://github.com/slsa-framework/slsa-github-generator/'
            '.github/workflows/generator_generic_slsa3.yml@refs/tags/v2.1.0')
 BUILD_TYPE = 'https://github.com/slsa-framework/slsa-github-generator/generic@v1'
+ENVIRONMENT_KEYS = {
+    'github_actor', 'github_actor_id', 'github_base_ref', 'github_event_name',
+    'github_event_payload', 'github_head_ref', 'github_ref', 'github_ref_type',
+    'github_repository_id', 'github_repository_owner', 'github_repository_owner_id',
+    'github_run_attempt', 'github_run_id', 'github_run_number', 'github_sha1',
+}
 
 
 def check_parameters(parameters):
@@ -41,6 +51,24 @@ def check_parameters(parameters):
         raise ValueError('invocation.parameters vars holds a name or value that is not a string')
 
 
+def check_environment(environment, sha, repository, ref):
+    """The environment has the generator's keys and the expected tag push identity."""
+    if not isinstance(environment, dict):
+        raise ValueError('invocation.environment is not a mapping')
+    if set(environment) != ENVIRONMENT_KEYS:
+        raise ValueError('invocation.environment keys differ')
+    expected = {
+        'github_sha1': sha,
+        'github_ref': ref,
+        'github_ref_type': 'tag',
+        'github_event_name': 'push',
+        'github_repository_owner': repository.split('/', 1)[0],
+    }
+    for key, value in expected.items():
+        if environment[key] != value:
+            raise ValueError(f'invocation.environment {key} differs')
+
+
 def check(document, sums, sha, repository, ref):
     envelope = document.get('dsseEnvelope') if isinstance(document, dict) else None
     if not isinstance(envelope, dict):
@@ -56,8 +84,7 @@ def check(document, sums, sha, repository, ref):
     if predicate.get('buildType') != BUILD_TYPE:
         raise ValueError('buildType differs')
     check_parameters(predicate['invocation'].get('parameters'))
-    if predicate['invocation'].get('environment') != {}:
-        raise ValueError('invocation.environment differs')
+    check_environment(predicate['invocation'].get('environment'), sha, repository, ref)
     source = predicate['invocation']['configSource']
     if source['entryPoint'] != '.github/workflows/release.yml':
         raise ValueError('entry point differs')
@@ -95,7 +122,9 @@ def main():
         print(f'provenance: {error}', file=sys.stderr)
         return 1
     print('provenance: builder, source, subjects and build type match, '
-          'the parameters hold only string vars, and the environment is empty')
+          'the parameters hold only string vars, and the environment has exactly '
+          'the 15 generator keys with matching commit, ref and repository owner '
+          'and a tag push event')
     return 0
 
 
